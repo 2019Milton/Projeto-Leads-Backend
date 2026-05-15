@@ -3642,6 +3642,55 @@ app.put("/admin/usuarios/:id/tipo", authMiddleware, async (c) => {
   return c.json({ sucesso: true });
 });
 
+app.delete("/admin/usuarios/:id", authMiddleware, async (c) => {
+
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    if (id === Number(user.id)) {
+      return c.json({
+        error: "Você não pode excluir seu próprio usuário."
+      }, 400);
+    }
+
+    const alvo = await client.query(
+      "SELECT id, tipo FROM usuarios WHERE id = $1",
+      [id]
+    );
+
+    if (alvo.rows.length === 0) {
+      return c.json({ error: "Usuário não encontrado" }, 404);
+    }
+
+    if (alvo.rows[0].tipo === "super_admin") {
+      return c.json({
+        error: "Não é permitido excluir usuário Super Admin."
+      }, 400);
+    }
+
+    await client.query(
+      "DELETE FROM usuarios WHERE id = $1",
+      [id]
+    );
+
+    return c.json({ sucesso: true });
+
+  } catch (err) {
+    console.error("ERRO EXCLUIR USUARIO:", err);
+
+    return c.json({
+      error: "Erro ao excluir usuário"
+    }, 500);
+  }
+});
+
+
+
 
 // 🔐 ALTERAR SENHA
 app.post("/admin/trocar-senha", authMiddleware, async (c) => {
