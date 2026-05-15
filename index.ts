@@ -3800,6 +3800,11 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 
+app.get("/api/version", (c) => c.json({
+  version: "delete-user-route-v1",
+  delete_user_route: true
+}));
+
 /* =========================
    🚀 START
 ========================= */
