@@ -2,8 +2,188 @@ import { Hono } from "hono@4";
 import { cors } from "hono/cors";
 import { Client } from "pg";
 import bcrypt from "bcryptjs";
+import { Buffer } from "node:buffer";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 const app = new Hono();
+
+const DEFAULT_TOKEN_SECRET = "troque-esta-chave-em-producao";
+
+const TOKEN_SECRET =
+  Bun.env.JWT_SECRET ||
+  Bun.env.AUTH_SECRET ||
+  Bun.env.SESSION_SECRET ||
+  DEFAULT_TOKEN_SECRET;
+
+const TOKEN_TTL_SECONDS =
+  Number(Bun.env.TOKEN_TTL_SECONDS) ||
+  60 * 60 * 24 * 7;
+
+if (TOKEN_SECRET === DEFAULT_TOKEN_SECRET) {
+  console.warn(
+    "JWT_SECRET nao configurado. Defina essa variavel no Railway em producao."
+  );
+}
+
+const allowedOrigins = new Set(
+  [
+    Bun.env.FRONTEND_URL,
+    Bun.env.VERCEL_URL ? `https://${Bun.env.VERCEL_URL}` : null,
+    "https://projeto-leads-snowy.vercel.app"
+  ].filter(Boolean) as string[]
+);
+
+function resolverOrigemCors(origin: string) {
+  if (!origin) {
+    return "*";
+  }
+
+  if (
+    allowedOrigins.has(origin) ||
+    origin.endsWith(".vercel.app")
+  ) {
+    return origin;
+  }
+
+  return "";
+}
+
+function base64Url(input: Buffer) {
+  return input
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function limparCampoToken(value: unknown) {
+  return String(value ?? "").replace(/:/g, " ");
+}
+
+function assinarPayload(payload: string) {
+  return base64Url(
+    createHmac("sha256", TOKEN_SECRET)
+      .update(payload)
+      .digest()
+  );
+}
+
+function compararAssinatura(
+  recebida: string,
+  esperada: string
+) {
+  const a = Buffer.from(recebida);
+  const b = Buffer.from(esperada);
+
+  return (
+    a.length === b.length &&
+    timingSafeEqual(a, b)
+  );
+}
+
+function criarTokenUsuario(user: any) {
+  const expiraEm =
+    Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
+
+  const payload = [
+    user.id,
+    user.email,
+    user.tipo,
+    user.nome || "",
+    user.sobrenome || "",
+    expiraEm
+  ].map(limparCampoToken).join(":");
+
+  const assinatura = assinarPayload(payload);
+
+  return btoa(`${payload}:${assinatura}`);
+}
+
+function decodificarTokenUsuario(token: string) {
+  const decoded = atob(token);
+  const partes = decoded.split(":");
+
+  if (partes.length < 3) {
+    return null;
+  }
+
+  const [id, email, tipo] = partes;
+
+  if (!id || !email) {
+    return null;
+  }
+
+  if (partes.length >= 7) {
+    const payload = partes.slice(0, 6).join(":");
+    const expiraEm = Number(partes[5]);
+    const assinatura = partes[6];
+    const assinaturaEsperada = assinarPayload(payload);
+
+    if (
+      !assinatura ||
+      !compararAssinatura(assinatura, assinaturaEsperada)
+    ) {
+      return null;
+    }
+
+    if (!Number.isFinite(expiraEm) || expiraEm < Date.now() / 1000) {
+      return null;
+    }
+  } else if (Bun.env.REJECT_LEGACY_TOKENS === "true") {
+    return null;
+  }
+
+  return {
+    id: Number(id),
+    email,
+    tipo,
+    nome: partes[3] || "",
+    sobrenome: partes[4] || ""
+  };
+}
+
+function senhaPareceHash(senhaSalva: string | null | undefined) {
+  return Boolean(
+    senhaSalva &&
+    /^\$2[aby]\$/.test(senhaSalva)
+  );
+}
+
+async function gerarHashSenha(senha: string) {
+  return bcrypt.hash(senha, 12);
+}
+
+async function senhaConfere(
+  senhaInformada: string,
+  senhaSalva: string | null | undefined
+) {
+  if (!senhaSalva) {
+    return false;
+  }
+
+  if (senhaPareceHash(senhaSalva)) {
+    return bcrypt.compare(senhaInformada, senhaSalva);
+  }
+
+  return senhaInformada === senhaSalva;
+}
+
+async function atualizarSenhaLegadaSePreciso(
+  usuarioId: number,
+  senhaInformada: string,
+  senhaSalva: string | null | undefined
+) {
+  if (
+    senhaSalva &&
+    !senhaPareceHash(senhaSalva) &&
+    senhaInformada === senhaSalva
+  ) {
+    await client.query(
+      "UPDATE usuarios SET senha = $1 WHERE id = $2",
+      [await gerarHashSenha(senhaInformada), usuarioId]
+    );
+  }
+}
 
 // 🔥 SCORE AUTOMÁTICO
 function calcularScoreLead(
@@ -169,7 +349,7 @@ function calcularScoreLead(
 
 
 app.use("/*", cors({
-  origin: "*",
+  origin: resolverOrigemCors,
 
   allowMethods: [
     "GET",
@@ -187,15 +367,6 @@ app.use("/*", cors({
   credentials: true,
 }));
 
-
-app.options("/*", (c) => {
-  return c.text("", 200, {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  });
-});
-
 app.get("/", (c) => c.text("API OK 🚀"));
 
 
@@ -210,19 +381,13 @@ const authMiddleware = async (c: any, next: any) => {
 
     const token = authHeader.replace("Bearer ", "").trim();
 
-    // 🔓 decodifica token simples
-    const decoded = atob(token);
-    const [id, email, tipo] = decoded.split(":");
+    const user = decodificarTokenUsuario(token);
 
-    if (!id || !email) {
+    if (!user) {
       return c.json({ error: "Token inválido" }, 401);
     }
 
-    c.set("user", {
-      id: Number(id),
-      email,
-      tipo,
-    });
+    c.set("user", user);
 
     await next();
   } catch (err) {
@@ -423,9 +588,11 @@ app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
   const { email, senha } = body;
 
   try {
+    const senhaHash = await gerarHashSenha(senha);
+
     await client.query(
       "INSERT INTO usuarios (email, senha, tipo) VALUES ($1,$2,'cliente')",
-      [email, senha]
+      [email, senhaHash]
     );
 
     return c.json({ message: "Usuário criado" });
@@ -1699,6 +1866,65 @@ await client.query(`
   );
 `);
 
+await client.query(`
+  CREATE TABLE IF NOT EXISTS lead_historico (
+    id SERIAL PRIMARY KEY,
+    lead_id INTEGER,
+    usuario_id INTEGER,
+    tipo TEXT,
+    descricao TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS nome TEXT,
+    ADD COLUMN IF NOT EXISTS sobrenome TEXT,
+    ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT true,
+    ADD COLUMN IF NOT EXISTS admin_id INTEGER,
+    ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+`);
+
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS lead_id TEXT,
+    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'novo',
+    ADD COLUMN IF NOT EXISTS origem TEXT DEFAULT 'manual',
+    ADD COLUMN IF NOT EXISTS campanha TEXT,
+    ADD COLUMN IF NOT EXISTS observacao TEXT,
+    ADD COLUMN IF NOT EXISTS score TEXT,
+    ADD COLUMN IF NOT EXISTS score_manual TEXT,
+    ADD COLUMN IF NOT EXISTS motivo_perda TEXT;
+`);
+
+await client.query(`
+  ALTER TABLE meta_conexoes
+    ADD COLUMN IF NOT EXISTS ultimo_sync TIMESTAMP;
+`);
+
+await client.query(`
+  ALTER TABLE campanhas
+    ADD COLUMN IF NOT EXISTS adset_id TEXT,
+    ADD COLUMN IF NOT EXISTS ad_id TEXT,
+    ADD COLUMN IF NOT EXISTS form_id TEXT,
+    ADD COLUMN IF NOT EXISTS page_id TEXT,
+    ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP;
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_usuarios_email
+    ON usuarios(email);
+  CREATE INDEX IF NOT EXISTS idx_leads_usuario_id
+    ON leads(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_leads_lead_id
+    ON leads(lead_id);
+  CREATE INDEX IF NOT EXISTS idx_campanhas_usuario_id
+    ON campanhas(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_meta_conexoes_usuario_id
+    ON meta_conexoes(usuario_id);
+`);
+
 /* =========================
    🔐 LOGIN
 ========================= */
@@ -1713,18 +1939,28 @@ app.get("/login-test", async (c) => {
     }
 
     const result = await client.query(
-      "SELECT id, email, tipo FROM usuarios WHERE email=$1 AND senha=$2",
-      [email, senha]
+      `
+      SELECT id, email, senha, tipo, nome, sobrenome
+      FROM usuarios
+      WHERE email=$1
+      AND COALESCE(ativo, true) = true
+      `,
+      [email]
     );
-
-    if (result.rows.length === 0) {
-      return c.json({ error: "Login inválido" }, 401);
-    }
 
     const user = result.rows[0];
 
-    // 🔥 TOKEN SIMPLES (base64)
-    const token = btoa(`${user.id}:${user.email}:${user.tipo}`);
+    if (!user || !(await senhaConfere(senha, user.senha))) {
+      return c.json({ error: "Login inválido" }, 401);
+    }
+
+    await atualizarSenhaLegadaSePreciso(
+      user.id,
+      senha,
+      user.senha
+    );
+
+    const token = criarTokenUsuario(user);
 
     return c.json({
       message: "Login OK",
@@ -1741,25 +1977,28 @@ app.post("/login", async (c) => {
   const { email, senha } = await c.req.json();
 
   const result = await client.query(
-    "SELECT id, email, tipo, nome FROM usuarios WHERE email=$1 AND senha=$2 AND COALESCE(ativo, true) = true",
-    [email, senha]
+    `
+    SELECT id, email, senha, tipo, nome, sobrenome
+    FROM usuarios
+    WHERE email=$1
+    AND COALESCE(ativo, true) = true
+    `,
+    [email]
   );
-
-  if (result.rows.length === 0) {
-    return c.json({ error: "Login inválido" }, 401);
-  }
 
   const user = result.rows[0];
 
-  const token = btoa(
-    [
-      user.id,
-      user.email,
-      user.tipo,
-      user.nome || "",
-      user.sobrenome || ""
-    ].join(":")
+  if (!user || !(await senhaConfere(senha, user.senha))) {
+    return c.json({ error: "Login inválido" }, 401);
+  }
+
+  await atualizarSenhaLegadaSePreciso(
+    user.id,
+    senha,
+    user.senha
   );
+
+  const token = criarTokenUsuario(user);
 
   return c.json({
     message: "Login OK",
@@ -1793,19 +2032,25 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
 
     const atual = await client.query(
       `
-      SELECT id
+      SELECT id, senha
       FROM usuarios
       WHERE id = $1
-      AND senha = $2
       `,
-      [user.id, senha_atual]
+      [user.id]
     );
 
-    if (atual.rows.length === 0) {
+    const usuarioAtual = atual.rows[0];
+
+    if (
+      !usuarioAtual ||
+      !(await senhaConfere(senha_atual, usuarioAtual.senha))
+    ) {
       return c.json({
         error: "Senha atual incorreta"
       }, 400);
     }
+
+    const novaSenhaHash = await gerarHashSenha(nova_senha);
 
     await client.query(
       `
@@ -1813,7 +2058,7 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
       SET senha = $1
       WHERE id = $2
       `,
-      [nova_senha, user.id]
+      [novaSenhaHash, user.id]
     );
 
     return c.json({
@@ -3048,6 +3293,8 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       }, 400);
     }
 
+    const senhaHash = await gerarHashSenha(senha);
+
     await client.query(
       `
       INSERT INTO usuarios (
@@ -3067,7 +3314,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         nome,
         sobrenome,
         email,
-        senha,
+        senhaHash,
         tipo || "corretor",
         admin_id || null
       ]
@@ -3104,13 +3351,15 @@ app.put("/admin/usuarios/:id/senha", authMiddleware, async (c) => {
     return c.json({ error: "Senha obrigatória" }, 400);
   }
 
+  const senhaHash = await gerarHashSenha(senha);
+
   await client.query(
     `
     UPDATE usuarios
     SET senha = $1
     WHERE id = $2
     `,
-    [senha, id]
+    [senhaHash, id]
   );
 
   return c.json({ sucesso: true });
@@ -3204,7 +3453,8 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
       }, 403);
     }
 
-    // 🔥 hash senha
+    const novaSenhaHash = await gerarHashSenha(nova_senha);
+
     await client.query(
       `
       UPDATE usuarios
@@ -3212,7 +3462,7 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
       WHERE id = $2
       `,
       [
-        nova_senha,
+        novaSenhaHash,
         usuario_id
       ]
     );
