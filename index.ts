@@ -1,0 +1,3265 @@
+import { Hono } from "hono@4";
+import { cors } from "hono/cors";
+import { Client } from "pg";
+import bcrypt from "bcryptjs";
+
+const app = new Hono();
+
+// 🔥 SCORE AUTOMÁTICO
+function calcularScoreLead(
+  lead: any
+) {
+
+  // 🔥 SCORE MANUAL
+  if (lead.score_manual) {
+
+    return {
+      score: lead.score_manual,
+      pontos: null,
+      base: [
+        "Score definido manualmente"
+      ]
+    };
+  }
+
+  let pontos = 0;
+
+  const base = [];
+
+  // 🆕 Lead novo
+  pontos += 10;
+  base.push("+10 Lead recém capturado");
+
+  // 📢 Origem Meta
+  if (lead.origem === "meta") {
+
+    pontos += 15;
+    base.push("+15 Veio de campanha Meta");
+  }
+
+  // 📈 CTR da campanha
+  const ctr =
+    Number(lead.ctr || 0);
+
+  if (ctr >= 4) {
+
+    pontos += 10;
+    base.push("+10 Campanha com CTR acima de 4%");
+  }
+
+  // 🎯 Campanha de intenção forte
+  const campanha =
+    (lead.campanha || "").toLowerCase();
+
+  if (
+    campanha.includes("visita") ||
+    campanha.includes("agendar") ||
+    campanha.includes("financiamento") ||
+    campanha.includes("simulação") ||
+    campanha.includes("simulacao") ||
+    campanha.includes("entrada")
+  ) {
+
+    pontos += 30;
+    base.push("+30 Campanha indica intenção forte");
+  }
+
+  // 💬 Observações do corretor
+  const obs =
+    (lead.observacao || "").toLowerCase();
+
+  if (
+    obs.includes("visita") ||
+    obs.includes("interesse") ||
+    obs.includes("entrada") ||
+    obs.includes("financiamento") ||
+    obs.includes("proposta") ||
+    obs.includes("fotos")
+  ) {
+
+    pontos += 30;
+    base.push("+30 Observação indica interesse forte");
+  }
+
+  if (
+    obs.includes("não responde") ||
+    obs.includes("nao responde") ||
+    obs.includes("sem interesse") ||
+    obs.includes("desistiu")
+  ) {
+
+    pontos -= 30;
+    base.push("-30 Observação indica baixo interesse");
+  }
+
+  // 🔄 Lead repetido
+  if (lead.repetido) {
+
+    pontos += 20;
+    base.push("+20 Lead retornou novamente");
+  }
+
+  // ⏳ Tempo parado
+  const criado =
+    new Date(lead.criado_em);
+
+  const agora =
+    new Date();
+
+  const dias =
+    Math.floor(
+      (agora.getTime() - criado.getTime()) /
+      (1000 * 60 * 60 * 24)
+    );
+
+  if (dias >= 15) {
+
+    pontos -= 40;
+    base.push("-40 Lead parado há mais de 15 dias");
+
+  } else if (dias >= 7) {
+
+    pontos -= 20;
+    base.push("-20 Lead parado há mais de 7 dias");
+  }
+
+  // ✅ Status atual
+  if (lead.status === "primeiro_contato") {
+
+    pontos += 10;
+    base.push("+10 Primeiro contato realizado");
+  }
+
+  if (lead.status === "em_conversa") {
+
+    pontos += 30;
+    base.push("+30 Lead em conversa");
+  }
+
+  if (lead.status === "fechado") {
+
+    pontos += 50;
+    base.push("+50 Lead fechado");
+  }
+
+  if (lead.status === "perdido") {
+
+    pontos -= 60;
+    base.push("-60 Lead perdido");
+  }
+
+  // 🔥 Classificação final
+  let score = "frio";
+
+  if (pontos >= 70) {
+
+    score = "quente";
+
+  } else if (pontos >= 35) {
+
+    score = "morno";
+  }
+
+  return {
+    score,
+    pontos,
+    base
+  };
+}
+
+
+app.use("/*", cors({
+  origin: "*",
+
+  allowMethods: [
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "OPTIONS"
+  ],
+
+  allowHeaders: [
+    "Content-Type",
+    "Authorization"
+  ],
+
+  credentials: true,
+}));
+
+
+app.options("/*", (c) => {
+  return c.text("", 200, {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  });
+});
+
+app.get("/", (c) => c.text("API OK 🚀"));
+
+
+// 🔐 middleware (token simples)
+const authMiddleware = async (c: any, next: any) => {
+  try {
+    const authHeader = c.req.header("Authorization");
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return c.json({ error: "Token não fornecido" }, 401);
+    }
+
+    const token = authHeader.replace("Bearer ", "").trim();
+
+    // 🔓 decodifica token simples
+    const decoded = atob(token);
+    const [id, email, tipo] = decoded.split(":");
+
+    if (!id || !email) {
+      return c.json({ error: "Token inválido" }, 401);
+    }
+
+    c.set("user", {
+      id: Number(id),
+      email,
+      tipo,
+    });
+
+    await next();
+  } catch (err) {
+    console.error("AUTH ERROR:", err);
+    return c.json({ error: "Token inválido" }, 401);
+  }
+};
+
+const masterMiddleware = async (c: any, next: any) => {
+  const user = c.get("user");
+
+  if (
+    user.tipo !== "master" &&
+    user.tipo !== "super_admin"
+  ) {
+    return c.json({
+      error: "Acesso restrito ao administrador"
+    }, 403);
+  }
+
+  await next();
+};
+
+async function obterContaAnuncios(token: string) {
+
+  const adAccounts = await fetch(
+    `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,funding_source&access_token=${token}`
+  ).then(r => r.json());
+
+  console.log(
+    "META AD ACCOUNTS:",
+    JSON.stringify(adAccounts, null, 2)
+  );
+
+  if (
+    adAccounts.error
+  ) {
+
+    throw new Error(
+      adAccounts.error.message
+    );
+  }
+
+  if (
+    !adAccounts.data ||
+    adAccounts.data.length === 0
+  ) {
+
+    return null;
+  }
+
+  return adAccounts.data[0];
+}
+
+
+
+async function sincronizarTodasCampanhas() {
+
+  try {
+
+    console.log("🔄 AUTO SYNC INICIADO");
+
+    // 🔥 BUSCA TODOS USUÁRIOS COM META
+    const usuarios = await client.query(`
+      SELECT DISTINCT usuario_id, access_token
+      FROM meta_conexoes
+    `);
+
+    for (const user of usuarios.rows) {
+
+      try {
+
+        const token = user.access_token;
+
+        // 🔥 CONTAS
+        const contaAds =
+          await obterContaAnuncios(token);
+        
+        if (!contaAds) {
+
+          console.log(
+            `⚠️ Usuário ${user.usuario_id} sem conta de anúncios`
+          );
+        
+          continue;
+        }
+                
+        const adAccountId = contaAds.id;
+
+        // 🔥 CAMPANHAS
+        const campanhasMeta = await fetch(
+          `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?fields=id,name,status,effective_status,objective&limit=500&access_token=${token}`
+        ).then(r => r.json());
+
+        if (!campanhasMeta.data) {
+          continue;
+        }
+
+        for (const campanha of campanhasMeta.data) {
+
+          const statusFinal =
+            campanha.status ||
+            campanha.effective_status ||
+            "UNKNOWN";
+
+          const existe = await client.query(
+            `
+            SELECT id
+            FROM campanhas
+            WHERE campaign_id = $1
+            `,
+            [campanha.id]
+          );
+
+          if (existe.rows.length > 0) {
+
+            await client.query(
+              `
+              UPDATE campanhas
+              SET
+                nome = $1,
+                status = $2,
+                atualizado_em = NOW()
+              WHERE campaign_id = $3
+              `,
+              [
+                campanha.name,
+                statusFinal,
+                campanha.id
+              ]
+            );
+
+          } else {
+
+            await client.query(
+              `
+              INSERT INTO campanhas (
+                usuario_id,
+                campaign_id,
+                nome,
+                status,
+                origem,
+                atualizado_em
+              )
+              VALUES ($1,$2,$3,$4,$5,NOW())
+              `,
+              [
+                user.usuario_id,
+                campanha.id,
+                campanha.name,
+                statusFinal,
+                "meta"
+              ]
+            );
+          }
+        }
+
+        // 🔥 ATUALIZA ÚLTIMO SYNC
+        await client.query(
+          `
+          UPDATE meta_conexoes
+          SET ultimo_sync = NOW()
+          WHERE usuario_id = $1
+          `,
+          [user.usuario_id]
+        );
+
+        console.log(
+          `✅ Sync usuário ${user.usuario_id}`
+        );
+
+      } catch (err) {
+
+        console.error(
+          "ERRO USUÁRIO:",
+          user.usuario_id,
+          err
+        );
+      }
+    }
+
+    console.log("🚀 AUTO SYNC FINALIZADO");
+
+  } catch (err) {
+
+    console.error(
+      "ERRO AUTO SYNC:",
+      err
+    );
+  }
+}
+
+
+
+app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
+  const body = await c.req.json();
+
+  const { email, senha } = body;
+
+  try {
+    await client.query(
+      "INSERT INTO usuarios (email, senha, tipo) VALUES ($1,$2,'cliente')",
+      [email, senha]
+    );
+
+    return c.json({ message: "Usuário criado" });
+
+  } catch {
+    return c.json({ error: "Usuário já existe" }, 400);
+  }
+});
+
+app.get("/usuarios", authMiddleware, masterMiddleware, async (c) => {
+  const result = await client.query(
+    "SELECT id, email, tipo FROM usuarios ORDER BY id DESC"
+  );
+
+  return c.json(result.rows);
+});
+
+app.delete("/usuarios/:id", authMiddleware, masterMiddleware, async (c) => {
+  const id = c.req.param("id");
+
+  await client.query("DELETE FROM usuarios WHERE id=$1", [id]);
+
+  return c.json({ message: "Usuário removido" });
+});
+
+app.put("/admin/usuarios/:id/status", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const id = c.req.param("id");
+
+    const body = await c.req.json();
+
+    const ativo = body.ativo;
+
+    await client.query(`
+      UPDATE usuarios
+      SET ativo = $1
+      WHERE id = $2
+    `, [ativo, id]);
+
+    return c.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO STATUS USUARIO:", err);
+
+    return c.json({
+      error: "Erro ao alterar status"
+    }, 500);
+  }
+});
+
+
+app.put("/admin/usuarios/:id/vinculo", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const id = c.req.param("id");
+
+    const body = await c.req.json();
+
+    await client.query(`
+      UPDATE usuarios
+      SET admin_id = $1
+      WHERE id = $2
+    `, [
+      body.admin_id || null,
+      id
+    ]);
+
+    return c.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO VINCULO:", err);
+
+    return c.json({
+      error: "Erro ao alterar vínculo"
+    }, 500);
+  }
+});
+
+
+app.put("/usuarios/:id", authMiddleware, masterMiddleware, async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json();
+
+  await client.query(
+    "UPDATE usuarios SET email=$1 WHERE id=$2",
+    [body.email, id]
+  );
+
+  return c.json({ message: "Usuário atualizado" });
+});
+
+
+/* =========================
+   🔗 META LOGIN
+========================= */
+
+// 🔹 REDIRECIONA PARA LOGIN META
+app.get("/auth/meta/login", (c) => {
+
+  const token = c.req.query("token");
+
+  if (!token) {
+    return c.text("Token não enviado");
+  }
+
+  const clientId = Bun.env.META_APP_ID;
+  const redirectUri = Bun.env.META_REDIRECT_URI;
+
+  // 🔥 repassa token no state
+  const state = encodeURIComponent(token);
+
+  const scopes = [
+
+    "ads_management",
+    "ads_read",
+    "business_management",
+    "leads_retrieval",
+    "pages_show_list",
+    "pages_read_engagement",
+    "pages_manage_ads"
+
+  ].join(",");
+
+  const url =
+    `https://www.facebook.com/v19.0/dialog/oauth` +
+    `?client_id=${clientId}` +
+    `&redirect_uri=${redirectUri}` +
+    `&scope=${scopes}` +
+    `&state=${state}`;
+
+  return c.redirect(url);
+});
+
+
+// 🔹 CALLBACK (SALVA TOKEN)
+app.get("/auth/meta/callback", async (c) => {
+  try {
+    const code = c.req.query("code");
+
+    if (!code) {
+      return c.text("Erro: code não recebido");
+    }
+
+    const clientId = Bun.env.META_APP_ID;
+    const clientSecret = Bun.env.META_APP_SECRET;
+    const redirectUri = Bun.env.META_REDIRECT_URI;
+
+    // 🔥 troca code por token
+    const tokenRes = await fetch(
+      `https://graph.facebook.com/v19.0/oauth/access_token?client_id=${clientId}&redirect_uri=${redirectUri}&client_secret=${clientSecret}&code=${code}`
+    );
+
+    const tokenData = await tokenRes.json();
+    const access_token = tokenData.access_token;
+
+    console.log("TOKEN META:", tokenData);
+
+    // 🔐 pega token do state
+    const state = c.req.query("state");
+    
+    if (!state) {
+      return c.text("State não recebido");
+    }
+    
+    // 🔓 decodifica token login
+    const decoded = atob(state);
+    
+    const [usuario_id] = decoded.split(":");
+    
+    if (!usuario_id) {
+      return c.text("Usuário inválido");
+    }
+
+    // 💾 salva no banco
+    await client.query(
+      "INSERT INTO meta_conexoes (usuario_id, access_token) VALUES ($1, $2)",
+      [usuario_id, access_token]
+    );
+
+    return c.html(`
+      <script>
+        alert("Conta conectada e salva com sucesso 🚀");
+        window.close();
+      </script>
+    `);
+
+  } catch (err) {
+    console.error("ERRO META:", err);
+    return c.text("Erro ao conectar Meta");
+  }
+});
+
+
+/* =========================
+   🧪 TESTE META
+========================= */
+
+app.get("/meta/teste", async (c) => {
+  try {
+    const result = await client.query(
+      "SELECT access_token FROM meta_conexoes ORDER BY id DESC LIMIT 1"
+    );
+
+    if (result.rows.length === 0) {
+      return c.json({ error: "Nenhuma conexão encontrada" });
+    }
+
+    const token = result.rows[0].access_token;
+
+    const fbRes = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+    );
+
+    const data = await fbRes.json();
+
+    return c.json(data);
+
+  } catch (err) {
+    console.error("ERRO TESTE META:", err);
+    return c.json({ error: "Erro ao testar conexão" }, 500);
+  }
+});
+
+
+app.post("/meta/campanha", async (c) => {
+  try {
+    const {
+      usuario_id,
+      nome,
+      objetivo
+    } = await c.req.json();
+
+    const conn = await client.query(
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuario_id]
+    );
+
+    const token = conn.rows[0].access_token;
+
+    const contaAds =
+      await obterContaAnuncios(token);
+    
+    if (!contaAds) {
+    
+      return c.json({
+        error: "Nenhuma conta de anúncios encontrada"
+      }, 400);
+    }
+    
+    const adAccountId = contaAds.id;
+    
+    const campanha = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/campaigns`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: nome || "Campanha Leads Plataforma",
+          objective: objetivo || "OUTCOME_LEADS",
+          status: "PAUSED",
+          special_ad_categories: [],
+          is_adset_budget_sharing_enabled: false,
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    if (!campanha.id) {
+
+      return c.json({
+        error: "Erro ao criar campanha",
+        detalhe: campanha
+      }, 400);
+    }
+    
+    await client.query(
+      `
+      INSERT INTO campanhas (
+        usuario_id,
+        campaign_id,
+        nome,
+        status,
+        origem
+      )
+      VALUES ($1,$2,$3,$4,$5)
+      `,
+      [
+        usuario_id,
+        campanha.id,
+        nome || "Campanha Plataforma",
+        "PAUSED",
+        "plataforma"
+      ]
+    );
+
+    return c.json(campanha);
+
+  } catch (err) {
+
+      console.error(
+        "ERRO COMPLETO CAMPANHA:",
+        err
+      );
+    
+      return c.json({
+        error: String(err) || "Erro ao criar campanha"
+      }, 500);
+  }
+});
+
+app.post("/meta/adset", async (c) => {
+  try {
+    const {
+      usuario_id,
+      campaign_id,
+      page_id,
+      form_id,
+      daily_budget
+    } = await c.req.json();
+
+    const conn = await client.query(
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuario_id]
+    );
+
+    const token = conn.rows[0].access_token;
+
+    const contaAds =
+      await obterContaAnuncios(token);
+    
+    if (!contaAds) {
+    
+      return c.json({
+        error: "Nenhuma conta de anúncios encontrada"
+      }, 400);
+    }
+    
+    const adAccountId = contaAds.id;
+
+    const adset = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: `AdSet Leads ${Date.now()}`,
+        
+          campaign_id,
+        
+          billing_event: "IMPRESSIONS",
+        
+          optimization_goal: "LEAD_GENERATION",
+          
+          destination_type: "ON_AD",
+        
+          bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+        
+          daily_budget: daily_budget || 2000,
+        
+          start_time: new Date(Date.now() + 60000).toISOString(),
+        
+          targeting: {
+            geo_locations: {
+              countries: ["BR"]
+            }
+          },
+        
+          promoted_object: {
+            page_id
+          },
+        
+          status: "PAUSED",
+        
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    console.log("ADSET RESPONSE:", adset);
+
+    return c.json(adset);
+
+  } catch (err) {
+    console.error(err);
+    return c.json({ error: "Erro ao criar adset" }, 500);
+  }
+});
+
+
+app.post("/meta/formulario", async (c) => {
+  try {
+    const {
+      usuario_id,
+      adset_id,
+      page_id,
+      form_id,
+      texto,
+      cta
+    } = await c.req.json();
+
+    // 🔐 pega token salvo
+    const conn = await client.query(
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuario_id]
+    );
+
+    if (conn.rows.length === 0) {
+      return c.json({ error: "Meta não conectada" }, 400);
+    }
+
+    const userToken = conn.rows[0].access_token;
+
+    // 🔥 pega PAGE TOKEN (IMPORTANTE)
+    const pages = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?access_token=${userToken}`
+    ).then(r => r.json());
+
+    const page = pages.data.find((p: any) => p.id === page_id);
+
+    if (!page) {
+      return c.json({ error: "Página não encontrada no token" }, 400);
+    }
+
+    const pageToken = page.access_token;
+
+    // 🚀 cria formulário
+    const form = await fetch(
+      `https://graph.facebook.com/v19.0/${page_id}/leadgen_forms`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: `Form Leads ${Date.now()}`,
+          locale: "pt_BR",
+          questions: [
+            { type: "FULL_NAME" },
+            { type: "EMAIL" },
+            { type: "PHONE" }
+          ],
+          privacy_policy: {
+            url: "https://google.com",
+            link_text: "Política de Privacidade"
+          },
+          thank_you_page: {
+            title: "Obrigado!",
+            body: "Recebemos seus dados 🚀",
+            button_type: "VIEW_WEBSITE",
+            button_text: "Ver mais",
+            website_url: "https://google.com"
+          },
+            access_token: pageToken
+        })
+      }
+    ).then(r => r.json());
+
+    return c.json(form);
+
+  } catch (err) {
+    console.error("ERRO FORM:", err);
+    return c.json({ error: "Erro ao criar formulário" }, 500);
+  }
+});
+
+
+app.post("/meta/upload-imagem", async (c) => {
+
+  try {
+
+    const body = await c.req.formData();
+
+    console.log("BODY RECEBIDO");
+
+    const imagem = body.get("imagem") as File;
+
+    console.log(
+      "IMAGEM:",
+      imagem?.name,
+      imagem?.size,
+      imagem?.type
+    );
+
+    const usuario_id = body.get("usuario_id");
+
+    console.log(
+      "USUARIO:",
+      usuario_id
+    );
+
+    if (!imagem) {
+
+      return c.json({
+        error: "Imagem não enviada"
+      }, 400);
+    }
+
+    // 🔐 TOKEN META
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [usuario_id]
+    );
+
+    if (conn.rows.length === 0) {
+
+      return c.json({
+        error: "Meta não conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    // 🔥 CONTA DE ANÚNCIOS
+    const contaAds =
+      await obterContaAnuncios(token);
+
+    if (!contaAds) {
+
+      return c.json({
+        error: "Conta anúncios não encontrada"
+      }, 400);
+    }
+
+    const adAccountId = contaAds.id;
+
+    console.log(
+      "AD ACCOUNT:",
+      adAccountId
+    );
+
+    // 🔥 FORMDATA PARA META
+    const metaForm = new FormData();
+
+    metaForm.append(
+      "filename",
+      imagem,
+      imagem.name
+    );
+
+    metaForm.append(
+      "access_token",
+      token
+    );
+
+    // 🔥 UPLOAD PARA META
+    const response = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/adimages`,
+      {
+        method: "POST",
+        body: metaForm
+      }
+    );
+    
+    const texto = await response.text();
+    
+    console.log(
+      "STATUS META:",
+      response.status
+    );
+    
+    console.log(
+      "RESPOSTA META:",
+      texto
+    );
+    
+    const upload = JSON.parse(texto);
+
+    console.log(
+      "UPLOAD META:",
+      JSON.stringify(upload, null, 2)
+    );
+
+    // 🔥 HASH DA IMAGEM
+    const primeiraImagem =
+      Object.values(upload.images || {})?.[0] as any;
+
+    const hash = primeiraImagem?.hash;
+
+    if (!hash) {
+
+      return c.json({
+        error: "Erro upload imagem",
+        detalhe: upload
+      }, 400);
+    }
+
+    return c.json({
+      sucesso: true,
+      hash
+    });
+
+  } catch (err) {
+
+    console.error(
+      "UPLOAD IMAGEM:",
+      err
+    );
+
+    return c.json({
+      error: "Erro upload imagem"
+    }, 500);
+  }
+});
+
+
+
+app.post("/meta/anuncio", async (c) => {
+
+  try {
+
+    const {
+      usuario_id,
+      campaign_id,
+      adset_id,
+      page_id,
+      form_id,
+      texto,
+      cta,
+      campanha_nome,
+      imageHash
+    } = await c.req.json();
+
+    console.log("IMAGE HASH:", imageHash);
+
+    console.log("FORM ID:", form_id);
+
+    console.log("PAGE ID:", page_id);
+
+    console.log("ADSET ID:", adset_id);
+
+    console.log("CAMPAIGN ID:", campaign_id);
+
+    if (!form_id) {
+
+      return c.json({
+        error: "form_id não enviado"
+      }, 400);
+    }
+
+    // 🔐 TOKEN META
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [usuario_id]
+    );
+
+    if (conn.rows.length === 0) {
+
+      return c.json({
+        error: "Meta não conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    // 🔥 CONTA ADS
+    const contaAds =
+      await obterContaAnuncios(token);
+
+    if (!contaAds) {
+
+      return c.json({
+        error: "Nenhuma conta de anúncios encontrada"
+      }, 400);
+    }
+
+    const adAccountId = contaAds.id;
+
+    // 🔥 CRIATIVO
+    const creative = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+
+          name: `Criativo Leads ${Date.now()}`,
+
+          object_story_spec: {
+
+            page_id,
+
+            link_data: {
+
+              link: "https://google.com",
+
+              image_hash: imageHash,
+
+              message:
+                texto ||
+                "Quer mais clientes? 🚀",
+
+              name: "Saiba mais",
+
+              description:
+                "Entre em contato agora",
+
+              call_to_action: {
+
+                type:
+                  cta ||
+                  "LEARN_MORE",
+
+                value: {
+                  lead_gen_form_id: form_id
+                }
+              }
+            }
+          },
+
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    console.log(
+      "CREATIVE RESPONSE:",
+      creative
+    );
+
+    if (!creative.id) {
+
+      console.error(
+        "ERRO CREATIVE COMPLETO:",
+        creative
+      );
+
+      return c.json({
+        error: "Erro ao criar criativo",
+        detalhe:
+          creative.error || creative
+      }, 400);
+    }
+
+    // 🔥 ANÚNCIO
+    const adRes = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/ads`,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+
+          name:
+            `Anúncio Leads ${Date.now()}`,
+
+          adset_id,
+
+          creative: {
+            creative_id: creative.id
+          },
+
+          status: "PAUSED",
+
+          access_token: token
+        })
+      }
+    );
+
+    const ad = await adRes.json();
+
+    console.log("AD RESPONSE:", ad);
+
+    if (!ad.id) {
+
+      console.error("ERRO AD:", ad);
+
+      return c.json({
+        error: "Erro ao criar anúncio",
+        detalhe: ad
+      }, 400);
+    }
+
+    // 🔎 DEBUG CAMPANHAS
+    console.log(
+      "UPDATE IDS:",
+      {
+        campaign_id_recebido: campaign_id,
+        adset_id: adset_id,
+        ad_id: ad.id
+      }
+    );
+
+    const campanhasBanco =
+      await client.query(
+        `
+        SELECT
+          id,
+          nome,
+          campaign_id
+        FROM campanhas
+        ORDER BY id DESC
+        LIMIT 5
+        `
+      );
+
+    console.log(
+      "CAMPANHAS BANCO:",
+      campanhasBanco.rows
+    );
+
+    // 💾 UPDATE CAMPANHA
+    const update = await client.query(
+      `
+      UPDATE campanhas
+      SET
+        adset_id = $1,
+        ad_id = $2,
+        form_id = $3,
+        page_id = $4
+      WHERE CAST(campaign_id AS TEXT) = $5
+      `,
+      [
+        adset_id,
+        ad.id,
+        form_id,
+        page_id,
+        String(campaign_id)
+      ]
+    );
+
+    console.log(
+      "UPDATED ROWS:",
+      update.rowCount
+    );
+
+    return c.json(ad);
+
+  } catch (err: any) {
+
+    console.error(
+      "ERRO ANUNCIO COMPLETO:",
+      err
+    );
+
+    return c.json({
+      error: "Erro ao criar anúncio",
+      detalhe:
+        err?.message || err
+    }, 500);
+  }
+});
+
+
+app.get(
+  "/meta/status-completo",
+  authMiddleware,
+  async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const usuario_id = user.id;
+
+    // 🔐 TOKEN
+    const conn = await client.query(
+      `
+      SELECT access_token, ultimo_sync
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [usuario_id]
+    );
+
+    if (conn.rows.length === 0) {
+
+      return c.json({
+        conectado: false,
+        erro: "Meta não conectada"
+      });
+    }
+
+    const token = conn.rows[0].access_token;
+
+    // 🔥 USUÁRIO META
+    const me = await fetch(
+      `https://graph.facebook.com/v19.0/me?fields=id,name,picture&access_token=${token}`
+    ).then(r => r.json());
+
+    // 🔥 CONTAS DE ANÚNCIOS
+    const contaAds =
+      await obterContaAnuncios(token);
+    
+    if (!contaAds) {
+    
+      return c.json({
+        error: "Nenhuma conta de anúncios encontrada"
+      }, 400);
+    }
+    
+    const adAccountId = contaAds.id;
+
+    const conta = contaAds;
+
+    // 🔥 PÁGINAS
+    const pages = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+    ).then(r => r.json());
+
+    const primeiraPagina = pages.data?.[0];
+
+    // 🔥 INSTAGRAM
+    let instagram = null;
+
+    if (primeiraPagina?.id) {
+
+      const instaRes = await fetch(
+        `https://graph.facebook.com/v19.0/${primeiraPagina.id}?fields=instagram_business_account&access_token=${token}`
+      ).then(r => r.json());
+
+      if (instaRes.instagram_business_account?.id) {
+
+        const instaInfo = await fetch(
+          `https://graph.facebook.com/v19.0/${instaRes.instagram_business_account.id}?fields=username,profile_picture_url&access_token=${token}`
+        ).then(r => r.json());
+
+        instagram = instaInfo;
+      }
+    }
+
+    // 🔥 MÉTRICAS
+
+    const campanhasCount = await client.query(
+      `
+      SELECT COUNT(*) as total
+      FROM campanhas
+      WHERE usuario_id = $1
+      `,
+      [usuario_id]
+    );
+
+    const campanhasAtivas = await client.query(
+      `
+      SELECT COUNT(*) as total
+      FROM campanhas
+      WHERE usuario_id = $1
+      AND status = 'ACTIVE'
+      `,
+      [usuario_id]
+    );
+
+    const leadsHoje = await client.query(
+      `
+      SELECT COUNT(*) as total
+      FROM leads
+      WHERE usuario_id = $1
+      AND DATE(criado_em) = CURRENT_DATE
+      `,
+      [usuario_id]
+    );
+
+    // 🔥 STATUS FINAL
+    return c.json({
+
+      conectado: true,
+
+      possui_conta_anuncios: true,
+
+      usuario_meta: me,
+
+      conta_anuncios: {
+        existe: true,
+        id: conta.id,
+        nome: conta.name,
+        status: conta.account_status,
+        ativa: conta.account_status === 1,
+        possui_pagamento: !!conta.funding_source
+      },
+
+      paginas: pages.data || [],
+
+      instagram,
+
+      metricas: {
+        campanhas: campanhasCount.rows[0].total,
+        campanhas_ativas: campanhasAtivas.rows[0].total,
+        leads_hoje: leadsHoje.rows[0].total,
+        gasto_hoje: "R$ 0,00",
+        ultimo_sync:
+          conn.rows[0].ultimo_sync || null
+      },
+
+      pronto_para_anunciar:
+        conta.account_status === 1 &&
+        !!conta.funding_source
+    });
+
+  } catch (err: any) {
+  
+      console.error(
+        "STATUS META ERRO COMPLETO:",
+        err
+      );
+    
+      return c.json({
+        erro: "Erro ao validar Meta",
+        detalhe: err?.message || err
+      }, 500);
+    }
+});
+
+
+// 🔥 WEBHOOK META VERIFY
+app.get("/webhook/meta", async (c) => {
+
+  const mode = c.req.query("hub.mode");
+
+  const token = c.req.query("hub.verify_token");
+
+  const challenge = c.req.query("hub.challenge");
+
+  console.log("VERIFY META");
+
+  // 🔐 TOKEN FIXO
+  const VERIFY_TOKEN =
+    Bun.env.META_VERIFY_TOKEN;
+
+  if (
+    mode === "subscribe" &&
+    token === VERIFY_TOKEN
+  ) {
+
+    console.log("WEBHOOK VALIDADO");
+
+    return c.text(challenge);
+  }
+
+  return c.text("Erro verify", 403);
+});
+
+
+
+// 🔥 RECEBER LEADS META
+app.post("/webhook/meta", async (c) => {
+
+  try {
+
+    const body = await c.req.json();
+
+    console.log(
+      "LEAD RECEBIDO:",
+      JSON.stringify(body, null, 2)
+    );
+
+    // 🔥 EVENTOS
+    if (body.entry) {
+
+      for (const entry of body.entry) {
+
+        for (const change of entry.changes || []) {
+
+          // 🔥 LEADGEN
+          if (change.field === "leadgen") {
+
+            const lead = change.value;
+
+            console.log("NOVO LEAD:", lead);
+            
+            const leadgen_id = lead.leadgen_id;
+            
+            const page_id = lead.page_id;
+            
+            
+            // 🔐 BUSCA TOKEN DA PÁGINA
+            const conn = await client.query(
+              `
+              SELECT access_token
+              FROM meta_conexoes
+              ORDER BY id DESC
+              LIMIT 1
+              `
+            );
+            
+            if (conn.rows.length === 0) {
+            
+              console.log("SEM TOKEN META");
+            
+              continue;
+            }
+            
+            const token = conn.rows[0].access_token;
+            
+            
+            // 🔥 BUSCA DADOS REAIS DO LEAD
+            const leadData = await fetch(
+              `https://graph.facebook.com/v19.0/${leadgen_id}?access_token=${token}`
+            ).then(r => r.json());
+            
+            console.log(
+              "LEAD DATA:",
+              JSON.stringify(leadData, null, 2)
+            );
+            
+            
+            // 🔥 CAMPOS
+            let nome = null;
+            let email = null;
+            let telefone = null;
+            
+            for (const field of leadData.field_data || []) {
+            
+              if (
+                field.name === "full_name"
+              ) {
+            
+                nome = field.values?.[0];
+              }
+            
+              if (
+                field.name === "email"
+              ) {
+            
+                email = field.values?.[0];
+              }
+            
+              if (
+                field.name === "phone_number"
+              ) {
+            
+                telefone = field.values?.[0];
+              }
+            }
+            
+            
+            // 💾 SALVA LEAD REAL
+            await client.query(
+              `
+              INSERT INTO leads (
+                nome,
+                email,
+                telefone,
+                origem
+              )
+              VALUES ($1,$2,$3,$4)
+              `,
+              [
+                nome || "Lead Facebook",
+                email,
+                telefone,
+                "meta"
+              ]
+            );
+          }
+        }
+      }
+    }
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("WEBHOOK META:", err);
+
+    return c.json({
+      error: "Erro webhook"
+    }, 500);
+  }
+});
+
+
+
+// 🔌 banco
+const client = new Client({
+  connectionString: Bun.env.DATABASE_URL,
+});
+
+try {
+  await client.connect();
+  console.log("Banco conectado ✅");
+} catch (err) {
+  console.error("Erro ao conectar banco ❌", err);
+}
+
+// 🗄️ tabelas
+await client.query(`
+  CREATE TABLE IF NOT EXISTS usuarios (
+    id SERIAL PRIMARY KEY,
+    email TEXT UNIQUE,
+    senha TEXT,
+    tipo TEXT DEFAULT 'cliente'
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS leads (
+    id SERIAL PRIMARY KEY,
+    nome TEXT,
+    telefone TEXT,
+    email TEXT,
+    usuario_id INTEGER,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_conexoes (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER,
+    access_token TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas (
+
+    id SERIAL PRIMARY KEY,
+
+    usuario_id INTEGER,
+
+    campaign_id TEXT,
+    adset_id TEXT,
+    ad_id TEXT,
+    form_id TEXT,
+
+    page_id TEXT,
+
+    nome TEXT,
+
+    status TEXT DEFAULT 'PAUSED',
+
+    origem TEXT DEFAULT 'plataforma',
+
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+/* =========================
+   🔐 LOGIN
+========================= */
+
+app.get("/login-test", async (c) => {
+  try {
+    const email = c.req.query("email");
+    const senha = c.req.query("senha");
+
+    if (!email || !senha) {
+      return c.json({ error: "Email e senha obrigatórios" }, 400);
+    }
+
+    const result = await client.query(
+      "SELECT id, email, tipo FROM usuarios WHERE email=$1 AND senha=$2",
+      [email, senha]
+    );
+
+    if (result.rows.length === 0) {
+      return c.json({ error: "Login inválido" }, 401);
+    }
+
+    const user = result.rows[0];
+
+    // 🔥 TOKEN SIMPLES (base64)
+    const token = btoa(`${user.id}:${user.email}:${user.tipo}`);
+
+    return c.json({
+      message: "Login OK",
+      token,
+    });
+
+  } catch (err) {
+    console.error("LOGIN ERROR:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+app.post("/login", async (c) => {
+  const { email, senha } = await c.req.json();
+
+  const result = await client.query(
+    "SELECT id, email, tipo, nome FROM usuarios WHERE email=$1 AND senha=$2 AND COALESCE(ativo, true) = true",
+    [email, senha]
+  );
+
+  if (result.rows.length === 0) {
+    return c.json({ error: "Login inválido" }, 401);
+  }
+
+  const user = result.rows[0];
+
+  const token = btoa(
+    [
+      user.id,
+      user.email,
+      user.tipo,
+      user.nome || "",
+      user.sobrenome || ""
+    ].join(":")
+  );
+
+  return c.json({
+    message: "Login OK",
+    token
+  });
+});
+
+app.put("/usuarios/me/senha", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const { senha_atual, nova_senha } =
+      await c.req.json();
+
+    if (!senha_atual || !nova_senha) {
+      return c.json({
+        error: "Senha atual e nova senha são obrigatórias"
+      }, 400);
+    }
+
+    const senhaForte =
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
+
+    if (!senhaForte.test(nova_senha)) {
+      return c.json({
+        error: "A nova senha precisa ter no mínimo 8 caracteres, letra maiúscula, minúscula, número e símbolo."
+      }, 400);
+    }
+
+    const atual = await client.query(
+      `
+      SELECT id
+      FROM usuarios
+      WHERE id = $1
+      AND senha = $2
+      `,
+      [user.id, senha_atual]
+    );
+
+    if (atual.rows.length === 0) {
+      return c.json({
+        error: "Senha atual incorreta"
+      }, 400);
+    }
+
+    await client.query(
+      `
+      UPDATE usuarios
+      SET senha = $1
+      WHERE id = $2
+      `,
+      [nova_senha, user.id]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO TROCAR SENHA:", err);
+
+    return c.json({
+      error: "Erro ao trocar senha"
+    }, 500);
+  }
+});
+
+
+/* =========================
+   📊 LEADS
+========================= */
+
+/* =========================
+   📢 CAMPANHAS
+========================= */
+
+// 🔹 listar campanhas
+app.get("/campanhas", authMiddleware, async (c) => {
+
+  try {
+
+    const user = c.get("user");
+
+    console.log("USER:", user.id);
+
+    const campanhas = await client.query(
+      `
+      SELECT *
+      FROM campanhas
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      `,
+      [user.id]
+    );
+
+    console.log("CAMPANHAS:", campanhas.rows);
+
+    return c.json(campanhas.rows);
+
+  } catch (err) {
+
+    console.error("ERRO CAMPANHAS:", err);
+
+    return c.json({
+      error: "Erro ao buscar campanhas"
+    }, 500);
+  }
+});
+
+// 📊 métricas reais das campanhas
+app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    if (conn.rows.length === 0) {
+      return c.json({ error: "Meta não conectada" }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    const campanhas = await client.query(
+      `
+      SELECT *
+      FROM campanhas
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      `,
+      [user.id]
+    );
+
+    const metricas = [];
+
+    for (const campanha of campanhas.rows) {
+
+      if (!campanha.campaign_id) {
+        continue;
+      }
+
+      const insights = await fetch(
+        `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&time_increment=1&date_preset=last_7d&access_token=${token}`
+      ).then(r => r.json());
+
+      console.log("INSIGHTS:", insights);
+
+      const dados = insights.data?.[0] || {};
+
+      const grafico =
+        insights.data?.map((d: any) => ({
+          data: d.date_start,
+          clicks: Number(d.clicks || 0),
+          ctr: Number(d.ctr || 0),
+          gasto: Number(d.spend || 0),
+          impressoes: Number(d.impressions || 0)
+        })) || [];
+
+      // ✅ LEADS REAIS DO BANCO
+      const leadsBanco = await client.query(
+        `
+        SELECT COUNT(*) AS total
+        FROM leads
+        WHERE usuario_id = $1
+        AND campanha = $2
+        `,
+        [
+          user.id,
+          campanha.nome
+        ]
+      );
+
+      const totalLeadsBanco =
+        Number(leadsBanco.rows[0]?.total || 0);
+
+      metricas.push({
+        id: campanha.id,
+        nome: campanha.nome,
+        status: campanha.status,
+        origem: campanha.origem,
+        campaign_id: campanha.campaign_id,
+
+        impressoes: dados.impressions || 0,
+        cliques: dados.clicks || 0,
+        alcance: dados.reach || 0,
+        gasto: dados.spend || 0,
+        cpc: dados.cpc || 0,
+        ctr: dados.ctr || 0,
+
+        // 🔥 agora vem da sua plataforma
+        leads: totalLeadsBanco,
+
+        grafico,
+        criado_em: campanha.criado_em
+      });
+    }
+
+    return c.json(metricas);
+
+  } catch (err) {
+
+    console.error("ERRO MÉTRICAS:", err);
+
+    return c.json({
+      error: "Erro ao buscar métricas"
+    }, 500);
+  }
+});
+
+// 🔄 sincroniza campanhas + leads da Meta
+app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
+
+  try {
+
+    console.log("USER AUTH:", c.get("user"));
+
+    const user: any = c.get("user");
+
+    console.log("USER LOGADO:", user);
+
+    // 🔐 TOKEN META
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    console.log("CONN:", conn.rows);
+
+    if (conn.rows.length === 0) {
+
+      return c.json({
+        error: "Meta não conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    // 🔥 CONTA DE ANÚNCIOS
+    const contaAds =
+      await obterContaAnuncios(token);
+    
+    if (!contaAds) {
+    
+      return c.json({
+        error: "Nenhuma conta de anúncios encontrada"
+      }, 400);
+    }
+    
+    const adAccountId = contaAds.id;
+
+    // 🔥 BUSCA CAMPANHAS
+    const campanhasMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?fields=id,name,status,effective_status,objective&limit=500&access_token=${token}`
+    ).then(r => r.json());
+
+    console.log(
+      "META CAMPANHAS:",
+      JSON.stringify(campanhasMeta, null, 2)
+    );
+
+    console.log("TOTAL META:", campanhasMeta.data?.length);
+
+    if (!campanhasMeta.data) {
+
+      return c.json({
+        error: "Nenhuma campanha encontrada",
+        detalhe: campanhasMeta
+      }, 400);
+    }
+
+    // 🔄 SALVA / ATUALIZA CAMPANHAS
+    for (const campanha of campanhasMeta.data) {
+
+      const statusFinal =
+        campanha.effective_status ||
+        campanha.status ||
+        "PAUSED";
+
+      const existe = await client.query(
+        `
+        SELECT id
+        FROM campanhas
+        WHERE campaign_id = $1
+        `,
+        [campanha.id]
+      );
+
+      if (existe.rows.length > 0) {
+
+        await client.query(
+          `
+          UPDATE campanhas
+          SET
+            nome = $1,
+            status = $2,
+            atualizado_em = NOW()
+          WHERE campaign_id = $3
+          `,
+          [
+            campanha.name,
+            statusFinal,
+            campanha.id
+          ]
+        );
+
+        console.log(
+          "♻️ Atualizada:",
+          campanha.name
+        );
+
+      } else {
+
+        await client.query(
+          `
+          INSERT INTO campanhas (
+            usuario_id,
+            campaign_id,
+            nome,
+            status,
+            origem,
+            atualizado_em
+          )
+          VALUES ($1,$2,$3,$4,$5,NOW())
+          `,
+          [
+            user.id,
+            campanha.id,
+            campanha.name,
+            statusFinal,
+            "meta"
+          ]
+        );
+
+        console.log(
+          "✅ Nova:",
+          campanha.name
+        );
+      }
+    }
+
+    // =====================================================
+    // 🔥 SINCRONIZA LEADS
+    // =====================================================
+
+    // 🔥 BUSCA PÁGINAS
+    const paginas = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+    ).then(r => r.json());
+
+    console.log(
+      "PAGINAS META:",
+      JSON.stringify(paginas, null, 2)
+    );
+
+    for (const pagina of paginas.data || []) {
+
+      console.log("PAGINA:", pagina.name);
+
+      // 🔥 BUSCA FORMULÁRIOS
+      const pageToken =
+        pagina.access_token;
+      
+      const forms = await fetch(
+        `https://graph.facebook.com/v19.0/${pagina.id}/leadgen_forms?access_token=${pageToken}`
+      ).then(r => r.json());
+
+      console.log(
+        "FORMS META:",
+        JSON.stringify(forms, null, 2)
+      );
+
+      for (const form of forms.data || []) {
+
+        // 🔥 BUSCA CAMPANHA PELO FORM
+        const campanhaBanco = await client.query(
+          `
+          SELECT nome
+          FROM campanhas
+          WHERE form_id = $1
+          LIMIT 1
+          `,
+          [form.id]
+        );
+        
+        const nomeCampanha =
+          campanhaBanco.rows[0]?.nome ||
+          "Campanha sem vínculo";
+        
+        console.log("FORM:", form.name);
+
+        // 🔥 BUSCA LEADS
+        const leadsMeta = await fetch(
+          `https://graph.facebook.com/v19.0/${form.id}/leads?access_token=${pageToken}`
+        ).then(r => r.json());
+
+        console.log(
+          "LEADS META:",
+          JSON.stringify(leadsMeta, null, 2)
+        );
+
+        for (const lead of leadsMeta.data || []) {
+
+          // 🔥 evita duplicar lead
+          const leadExiste = await client.query(
+            `
+            SELECT id
+            FROM leads
+            WHERE lead_id = $1
+            `,
+            [lead.id]
+          );
+
+          if (leadExiste.rows.length > 0) {
+
+            await client.query(
+              `
+              UPDATE leads
+              SET campanha = $1
+              WHERE lead_id = $2
+              AND usuario_id = $3
+              `,
+              [
+                nomeCampanha,
+                lead.id,
+                user.id
+              ]
+            );
+          
+            console.log(
+              "♻️ Lead atualizado:",
+              lead.id,
+              nomeCampanha
+            );
+          
+            continue;
+          }
+
+          // 🔥 transforma fields
+          const fields: any = {};
+
+          for (const field of lead.field_data || []) {
+
+            fields[field.name] =
+              field.values?.[0] || "";
+          }
+
+          console.log("FIELDS:", fields);
+
+          // 🔥 salva lead
+          await client.query(
+            `
+            INSERT INTO leads (
+              usuario_id,
+              lead_id,
+              nome,
+              email,
+              telefone,
+              campanha,
+              origem,
+              status,
+              criado_em
+            )
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,NOW()
+            )
+            `,
+            [
+              user.id,
+              lead.id,
+              fields.full_name || "",
+              fields.email || "",
+              fields.phone_number || "",
+              nomeCampanha,
+              "meta",
+              "novo"
+            ]
+          );
+
+          console.log(
+            "✅ LEAD SALVO:",
+            lead.id
+          );
+        }
+      }
+    }
+
+    // 🔥 UPDATE ÚLTIMO SYNC
+    await client.query(
+      `
+      UPDATE meta_conexoes
+      SET ultimo_sync = NOW()
+      WHERE usuario_id = $1
+      `,
+      [user.id]
+    );
+    
+    return c.json({
+      sucesso: true,
+      total: campanhasMeta.data.length
+    });
+
+  } catch (err) {
+
+    console.error("ERRO SINCRONIZAR:", err);
+
+    return c.json({
+      error: "Erro ao sincronizar campanhas"
+    }, 500);
+  }
+});
+
+app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const {
+      campaign_id,
+      status
+    } = await c.req.json();
+
+
+    const campanhaBanco = await client.query(
+      `
+      SELECT adset_id, ad_id
+      FROM campanhas
+      WHERE campaign_id = $1
+      LIMIT 1
+      `,
+      [campaign_id]
+    );
+    
+    const adset_id =
+      campanhaBanco.rows[0]?.adset_id;
+    
+    const ad_id =
+      campanhaBanco.rows[0]?.ad_id;
+    
+    console.log("ADSET:", adset_id);
+    
+    console.log("AD:", ad_id);
+
+    
+
+    // 🔐 TOKEN
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    if (conn.rows.length === 0) {
+
+      return c.json({
+        error: "Meta não conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    // 🔥 ALTERA STATUS NA META
+    const metaRes = await fetch(
+      `https://graph.facebook.com/v19.0/${campaign_id}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          status,
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+
+    // 🔥 TOGGLE ADSET
+    if (adset_id) {
+    
+      const adsetRes = await fetch(
+        `https://graph.facebook.com/v19.0/${adset_id}`,
+        {
+          method: "POST",
+    
+          headers: {
+            "Content-Type": "application/json"
+          },
+    
+          body: JSON.stringify({
+            status,
+            access_token: token
+          })
+        }
+      ).then(r => r.json());
+    
+      console.log(
+        "TOGGLE ADSET:",
+        adsetRes
+      );
+    }
+
+    // 🔥 TOGGLE ANÚNCIO
+    if (ad_id) {
+    
+      const adRes = await fetch(
+        `https://graph.facebook.com/v19.0/${ad_id}`,
+        {
+          method: "POST",
+    
+          headers: {
+            "Content-Type": "application/json"
+          },
+    
+          body: JSON.stringify({
+            status,
+            access_token: token
+          })
+        }
+      ).then(r => r.json());
+    
+      console.log(
+        "TOGGLE AD:",
+        adRes
+      );
+    }
+
+    
+
+    
+
+    console.log("TOGGLE META:", metaRes);
+
+    if (metaRes.error) {
+
+      return c.json({
+        error: metaRes.error.message
+      }, 400);
+    }
+
+    // 💾 UPDATE LOCAL
+    await client.query(
+      `
+      UPDATE campanhas
+      SET status = $1
+      WHERE campaign_id = $2
+      `,
+      [status, campaign_id]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("TOGGLE:", err);
+
+    return c.json({
+      error: "Erro ao alterar campanha"
+    }, 500);
+  }
+});
+
+
+app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const {
+      campaign_id
+    } = await c.req.json();
+
+    // 🔐 TOKEN
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    if (conn.rows.length === 0) {
+
+      return c.json({
+        error: "Meta não conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    // 🔥 DELETA NA META
+    const metaRes = await fetch(
+      `https://graph.facebook.com/v19.0/${campaign_id}`,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+          status: "DELETED",
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    console.log("DELETE META:", metaRes);
+
+    if (metaRes.error) {
+
+      return c.json({
+        error: metaRes.error.message
+      }, 400);
+    }
+
+    // 💾 REMOVE LOCAL
+    await client.query(
+      `
+      UPDATE campanhas
+      SET status = 'DELETED'
+      WHERE campaign_id = $1
+      `,
+      [campaign_id]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("EXCLUIR CAMPANHA:", err);
+
+    return c.json({
+      error: "Erro ao excluir campanha"
+    }, 500);
+  }
+});
+
+
+// 🔹 criar lead
+app.post("/leads", authMiddleware, async (c) => {
+  try {
+    const body = await c.req.json();
+    const user: any = c.get("user");
+
+
+    if (!body.nome) {
+      return c.json({ error: "Nome obrigatório" }, 400);
+    }
+
+    await client.query(
+      "INSERT INTO leads (nome, telefone, email, usuario_id) VALUES ($1,$2,$3,$4)",
+      [body.nome, body.telefone, body.email, user.id]
+    );
+
+    return c.json({ message: "Lead salvo com sucesso" });
+  } catch (err) {
+    console.error("LEAD ERROR:", err);
+    return c.json({ error: "Erro ao salvar lead" }, 500);
+  }
+});
+
+// 🔹 listar leads
+app.get("/leads", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    console.log("USER AUTH:", user);
+
+    const result = await client.query(
+      `
+      SELECT
+        id,
+        nome,
+        telefone,
+        email,
+        status,
+        origem,
+        campanha,
+        observacao,
+        score,
+        score_manual,
+        motivo_perda,
+        criado_em
+      FROM leads
+      WHERE usuario_id = $1
+      ORDER BY criado_em DESC
+      `,
+      [user.id]
+    );
+
+    // 🔥 separa por status
+    const leads = {
+      novos: [],
+      primeiro_contato: [],
+      em_conversa: [],
+      fechado: [],
+      perdido: []
+    };
+    
+    for (const lead of result.rows) {
+
+      // 🔥 SCORE AUTOMÁTICO
+      const scoreData =
+        calcularScoreLead(lead);
+      
+      lead.score =
+        scoreData.score;
+      
+      lead.score_base =
+        scoreData.base;
+
+      lead.score_pontos =
+        scoreData.pontos;
+    
+      if (
+        lead.status === "novo" ||
+        !lead.status
+      ) {
+    
+        leads.novos.push(lead);
+    
+      } else if (lead.status === "primeiro_contato") {
+    
+        leads.primeiro_contato.push(lead);
+    
+      } else if (lead.status === "em_conversa") {
+    
+        leads.em_conversa.push(lead);
+    
+      } else if (lead.status === "fechado") {
+    
+        leads.fechado.push(lead);
+        
+      } else if (lead.status === "perdido") {
+
+          leads.perdido.push(lead);
+        }
+    }
+
+    return c.json(leads);
+
+  } catch (err) {
+
+    console.error("LIST ERROR:", err);
+
+    return c.json({
+      error: "Erro ao buscar leads"
+    }, 500);
+  }
+});
+
+
+
+
+// 🔥 atualizar lead
+app.put("/leads/:id", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const id = c.req.param("id");
+
+    const {
+      observacao,
+      status,
+      motivo_perda,
+      score_manual
+    } = await c.req.json();
+
+    // 🔥 busca lead atual
+    const leadAtual = await client.query(
+      `
+      SELECT
+        status,
+        observacao
+      FROM leads
+      WHERE id = $1
+      AND usuario_id = $2
+      `,
+      [id, user.id]
+    );
+
+    const statusAntigo =
+      leadAtual.rows[0]?.status || "";
+    
+    const observacaoAntiga =
+      leadAtual.rows[0]?.observacao || "";
+
+    const result = await client.query(
+      `
+      UPDATE leads
+      SET
+        observacao = $1,
+        status = $2,
+        motivo_perda = $3,
+        score_manual = $4
+      WHERE
+        id = $5
+      AND usuario_id = $6
+      RETURNING *
+      `,
+      [
+        observacao,
+        status,
+        motivo_perda,
+        score_manual,
+        id,
+        user.id
+      ]
+    );
+
+    // 🔥 HISTÓRICO STATUS
+    if (status !== statusAntigo) {
+    
+      let descricao =
+        `Lead movido de "${statusAntigo}" para "${status}"`;
+    
+      // perdido
+      if (
+        status === "perdido" &&
+        motivo_perda
+      ) {
+    
+        descricao =
+          `Lead perdido: ${motivo_perda}`;
+      }
+    
+      // fechado
+      if (status === "fechado") {
+    
+        descricao =
+          "Lead marcado como FECHADO";
+      }
+    
+      await client.query(
+        `
+        INSERT INTO lead_historico (
+          lead_id,
+          usuario_id,
+          tipo,
+          descricao
+        )
+        VALUES ($1,$2,$3,$4)
+        `,
+        [
+          id,
+          user.id,
+          "status",
+          descricao
+        ]
+      );
+    }
+    
+    // 🔥 HISTÓRICO OBS
+    if (
+      observacao &&
+      observacao !== observacaoAntiga
+    ) {
+    
+      await client.query(
+        `
+        INSERT INTO lead_historico (
+          lead_id,
+          usuario_id,
+          tipo,
+          descricao
+        )
+        VALUES ($1,$2,$3,$4)
+        `,
+        [
+          id,
+          user.id,
+          "observacao",
+          observacao
+        ]
+      );
+    }
+
+    return c.json({
+      success: true,
+      lead: result.rows[0]
+    });
+
+  } catch (err) {
+
+    console.error("UPDATE LEAD ERROR:", err);
+
+    return c.json({
+      error: "Erro ao atualizar lead"
+    }, 500);
+  }
+});
+
+
+
+// 🔹 histórico lead
+app.get(
+  "/leads/:id/historico",
+  authMiddleware,
+  async (c) => {
+
+    try {
+
+      const user: any =
+        c.get("user");
+
+      const id =
+        c.req.param("id");
+
+      const result =
+        await client.query(
+          `
+          SELECT
+            id,
+            tipo,
+            descricao,
+            criado_em
+          FROM lead_historico
+          WHERE lead_id = $1
+          AND usuario_id = $2
+          ORDER BY criado_em DESC
+          `,
+          [id, user.id]
+        );
+
+      return c.json(result.rows);
+
+    } catch (err) {
+
+      console.error(
+        "HIST ERROR:",
+        err
+      );
+
+      return c.json({
+        error:
+          "Erro ao buscar histórico"
+      }, 500);
+    }
+  }
+);
+
+
+
+app.get("/admin/usuarios", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const result = await client.query(`
+      SELECT
+        u.id,
+        u.email,
+        u.tipo,
+        u.admin_id,
+        admin.email AS admin_email,
+        COALESCE(u.ativo, true) AS ativo,
+        COUNT(DISTINCT c.id) AS campanhas,
+        COUNT(DISTINCT l.id) AS leads
+      FROM usuarios u
+      LEFT JOIN usuarios admin
+        ON admin.id = u.admin_id
+      LEFT JOIN campanhas c
+        ON c.usuario_id = u.id
+      LEFT JOIN leads l
+        ON l.usuario_id = u.id
+      GROUP BY
+        u.id,
+        u.email,
+        u.tipo,
+        u.admin_id,
+        admin.email,
+        u.ativo
+      ORDER BY u.id ASC
+    `);
+
+    const resumo = await client.query(`
+      SELECT
+        COUNT(*) AS total_usuarios,
+        COUNT(*) FILTER (
+          WHERE COALESCE(ativo, true) = true
+        ) AS contas_ativas
+      FROM usuarios
+    `);
+
+    const totais = await client.query(`
+      SELECT
+        (SELECT COUNT(*) FROM campanhas) AS total_campanhas,
+        (SELECT COUNT(*) FROM leads) AS total_leads
+    `);
+
+    return c.json({
+      usuarios: result.rows,
+      total_usuarios: resumo.rows[0].total_usuarios,
+      contas_ativas: resumo.rows[0].contas_ativas,
+      total_campanhas: totais.rows[0].total_campanhas,
+      total_leads: totais.rows[0].total_leads
+    });
+
+  } catch (err) {
+
+    console.error("ERRO ADMIN USUARIOS:", err);
+
+    return c.json({
+      error: "Erro ao carregar painel admin"
+    }, 500);
+  }
+});
+
+
+
+app.get("/admin/recursos", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const memoria = process.memoryUsage();
+
+    return c.json({
+      uptime_segundos: Math.floor(process.uptime()),
+      memoria: {
+        rss_mb: Math.round(memoria.rss / 1024 / 1024),
+        heap_total_mb: Math.round(memoria.heapTotal / 1024 / 1024),
+        heap_usado_mb: Math.round(memoria.heapUsed / 1024 / 1024),
+        externo_mb: Math.round(memoria.external / 1024 / 1024)
+      },
+      node_env: process.env.NODE_ENV || "development",
+      plataforma: process.platform,
+      versao_node: process.version
+    });
+
+  } catch (err) {
+
+    console.error("ERRO ADMIN RECURSOS:", err);
+
+    return c.json({
+      error: "Erro ao buscar recursos"
+    }, 500);
+  }
+});
+
+
+app.put("/admin/usuarios/:id/status", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = c.req.param("id");
+
+    const { ativo } = await c.req.json();
+
+    await client.query(
+      `
+      UPDATE usuarios
+      SET ativo = $1
+      WHERE id = $2
+      `,
+      [ativo, id]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO STATUS USUARIO:", err);
+
+    return c.json({
+      error: "Erro ao alterar status do usuário"
+    }, 500);
+  }
+});
+
+
+// 🛡️ ADMIN - CRIAR USUÁRIO
+app.post("/admin/usuarios", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (
+      user.tipo !== "super_admin" &&
+      user.tipo !== "master"
+    ) {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const {
+      nome,
+      sobrenome,
+      email,
+      senha,
+      tipo,
+      admin_id
+    } = await c.req.json();
+
+    if (
+      !nome ||
+      !sobrenome ||
+      !email ||
+      !senha
+    ) {
+      return c.json({
+        error: "Nome, sobrenome, email e senha são obrigatórios"
+      }, 400);
+    }
+
+    const senhaForte =
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
+
+    if (!senhaForte.test(senha)) {
+      return c.json({
+        error: "Senha fraca. Use maiúscula, minúscula, número e símbolo."
+      }, 400);
+    }
+
+    const existe = await client.query(
+      `
+      SELECT id
+      FROM usuarios
+      WHERE email = $1
+      `,
+      [email]
+    );
+
+    if (existe.rows.length > 0) {
+      return c.json({
+        error: "Email já cadastrado"
+      }, 400);
+    }
+
+    await client.query(
+      `
+      INSERT INTO usuarios (
+        nome,
+        sobrenome,
+        email,
+        senha,
+        tipo,
+        ativo,
+        admin_id
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,true,$6
+      )
+      `,
+      [
+        nome,
+        sobrenome,
+        email,
+        senha,
+        tipo || "corretor",
+        admin_id || null
+      ]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO CRIAR USUARIO:", err);
+
+    return c.json({
+      error: "Erro ao criar usuário"
+    }, 500);
+  }
+});
+
+// 🛡️ ADMIN - TROCAR SENHA
+app.put("/admin/usuarios/:id/senha", authMiddleware, async (c) => {
+
+  const user: any = c.get("user");
+
+  if (user.tipo !== "super_admin") {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const id = c.req.param("id");
+
+  const { senha } = await c.req.json();
+
+  if (!senha) {
+    return c.json({ error: "Senha obrigatória" }, 400);
+  }
+
+  await client.query(
+    `
+    UPDATE usuarios
+    SET senha = $1
+    WHERE id = $2
+    `,
+    [senha, id]
+  );
+
+  return c.json({ sucesso: true });
+});
+
+
+// 🛡️ ADMIN - ALTERAR TIPO
+app.put("/admin/usuarios/:id/tipo", authMiddleware, async (c) => {
+
+  const user: any = c.get("user");
+
+  if (user.tipo !== "super_admin") {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const id = c.req.param("id");
+
+  const { tipo } = await c.req.json();
+
+  await client.query(
+    `
+    UPDATE usuarios
+    SET tipo = $1
+    WHERE id = $2
+    `,
+    [tipo, id]
+  );
+
+  return c.json({ sucesso: true });
+});
+
+
+// 🔐 ALTERAR SENHA
+app.post("/admin/trocar-senha", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const body = await c.req.json();
+
+    const {
+      usuario_id,
+      nova_senha
+    } = body;
+
+    // 🔒 senha forte
+    const senhaForte =
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+
+    if (!senhaForte.test(nova_senha)) {
+
+      return c.json({
+        error:
+          "Senha fraca. Use maiúscula, minúscula, número e mínimo 8 caracteres."
+      }, 400);
+    }
+
+    // 🔥 busca usuário alvo
+    const alvo = await client.query(
+      `
+      SELECT *
+      FROM usuarios
+      WHERE id = $1
+      `,
+      [usuario_id]
+    );
+
+    if (alvo.rows.length === 0) {
+
+      return c.json({
+        error: "Usuário não encontrado"
+      }, 404);
+    }
+
+    const usuarioAlvo = alvo.rows[0];
+
+    // 🔐 permissões
+    const permitido =
+      user.tipo === "super_admin" ||
+      Number(user.id) === Number(usuario_id) ||
+      (
+        user.tipo === "admin_corretor" &&
+        Number(usuarioAlvo.admin_id) === Number(user.id)
+      );
+
+    if (!permitido) {
+
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    // 🔥 hash senha
+    await client.query(
+      `
+      UPDATE usuarios
+      SET senha = $1
+      WHERE id = $2
+      `,
+      [
+        nova_senha,
+        usuario_id
+      ]
+    );
+
+    return c.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error(
+      "ERRO TROCAR SENHA:",
+      err
+    );
+
+    return c.json({
+      error: "Erro ao trocar senha"
+    }, 500);
+  }
+});
+
+
+
+// 🔄 AUTO SYNC A CADA 5 MIN
+//setInterval(() => {
+
+//  sincronizarTodasCampanhas();
+
+//}, 1000 * 60 * 5);
+
+
+/* =========================
+   🔍 HEALTH
+========================= */
+
+app.get("/api/health", (c) => c.json({ status: "ok" }));
+
+/* =========================
+   🚀 START
+========================= */
+
+Bun.serve({
+  port: Number(Bun.env.PORT) || 3000,
+  fetch: app.fetch,
+});
+
+
+
+
+
