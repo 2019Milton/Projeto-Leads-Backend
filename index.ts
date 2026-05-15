@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { Client } from "pg";
 import bcrypt from "bcryptjs";
 import { Buffer } from "node:buffer";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 const app = new Hono();
 
@@ -18,6 +18,18 @@ const TOKEN_SECRET =
 const TOKEN_TTL_SECONDS =
   Number(Bun.env.TOKEN_TTL_SECONDS) ||
   60 * 60 * 24 * 7;
+
+const RESET_PASSWORD_TTL_MINUTES =
+  Number(Bun.env.RESET_PASSWORD_TTL_MINUTES) ||
+  30;
+
+const RESEND_FROM_EMAIL =
+  Bun.env.RESEND_FROM_EMAIL ||
+  Bun.env.RESEND_FROM ||
+  "Plataforma de Leads <onboarding@resend.dev>";
+
+const SENHA_FORTE =
+  /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
 
 if (TOKEN_SECRET === DEFAULT_TOKEN_SECRET) {
   console.warn(
@@ -151,6 +163,66 @@ function senhaPareceHash(senhaSalva: string | null | undefined) {
 
 async function gerarHashSenha(senha: string) {
   return bcrypt.hash(senha, 12);
+}
+
+function gerarTokenResetSenha() {
+  return base64Url(randomBytes(32));
+}
+
+function hashTokenResetSenha(token: string) {
+  return assinarPayload(`password-reset:${token}`);
+}
+
+function obterFrontendUrl() {
+  return (
+    Bun.env.FRONTEND_URL ||
+    "https://projeto-leads-snowy.vercel.app"
+  ).replace(/\/+$/g, "");
+}
+
+async function enviarEmailResetSenha(
+  email: string,
+  nome: string | null,
+  resetUrl: string
+) {
+  if (!Bun.env.RESEND_API_KEY) {
+    throw new Error("RESEND_API_KEY nao configurada");
+  }
+
+  const primeiroNome =
+    nome?.trim() || "tudo bem";
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_EMAIL,
+      to: email,
+      subject: "Troca de senha - Plataforma de Leads",
+      html: `
+        <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827">
+          <h2>Troca de senha</h2>
+          <p>Olá, ${primeiroNome}.</p>
+          <p>Recebemos uma solicitação para trocar a senha da sua conta.</p>
+          <p>
+            <a href="${resetUrl}" style="display:inline-block;background:#2563eb;color:white;padding:12px 18px;border-radius:8px;text-decoration:none">
+              Criar nova senha
+            </a>
+          </p>
+          <p>Esse link expira em ${RESET_PASSWORD_TTL_MINUTES} minutos.</p>
+          <p>Se você não solicitou essa troca, ignore este email.</p>
+        </div>
+      `
+    })
+  });
+
+  if (!res.ok) {
+    const detalhe = await res.text();
+    throw new Error(`Erro Resend: ${detalhe}`);
+  }
 }
 
 async function senhaConfere(
@@ -1878,6 +1950,17 @@ await client.query(`
 `);
 
 await client.query(`
+  CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expira_em TIMESTAMP NOT NULL,
+    usado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
   ALTER TABLE usuarios
     ADD COLUMN IF NOT EXISTS nome TEXT,
     ADD COLUMN IF NOT EXISTS sobrenome TEXT,
@@ -1923,11 +2006,179 @@ await client.query(`
     ON campanhas(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_meta_conexoes_usuario_id
     ON meta_conexoes(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash
+    ON password_reset_tokens(token_hash);
+  CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_usuario
+    ON password_reset_tokens(usuario_id);
 `);
 
 /* =========================
    🔐 LOGIN
 ========================= */
+
+app.post("/auth/solicitar-reset-senha", async (c) => {
+  try {
+    const { email } = await c.req.json();
+
+    if (!email) {
+      return c.json({
+        error: "Email obrigatorio"
+      }, 400);
+    }
+
+    const usuario = await client.query(
+      `
+      SELECT id, email, nome
+      FROM usuarios
+      WHERE LOWER(email) = LOWER($1)
+      AND COALESCE(ativo, true) = true
+      LIMIT 1
+      `,
+      [email]
+    );
+
+    const user = usuario.rows[0];
+
+    if (user) {
+      const token = gerarTokenResetSenha();
+      const tokenHash = hashTokenResetSenha(token);
+      const resetUrl =
+        `${obterFrontendUrl()}/?reset_token=${encodeURIComponent(token)}`;
+
+      await client.query(
+        `
+        UPDATE password_reset_tokens
+        SET usado_em = NOW()
+        WHERE usuario_id = $1
+        AND usado_em IS NULL
+        `,
+        [user.id]
+      );
+
+      await client.query(
+        `
+        INSERT INTO password_reset_tokens (
+          usuario_id,
+          token_hash,
+          expira_em
+        )
+        VALUES (
+          $1,
+          $2,
+          NOW() + ($3 || ' minutes')::interval
+        )
+        `,
+        [
+          user.id,
+          tokenHash,
+          RESET_PASSWORD_TTL_MINUTES
+        ]
+      );
+
+      await enviarEmailResetSenha(
+        user.email,
+        user.nome,
+        resetUrl
+      );
+    }
+
+    return c.json({
+      success: true,
+      message: "Se o email estiver cadastrado, enviaremos um link para troca de senha."
+    });
+
+  } catch (err) {
+    console.error("RESET REQUEST ERROR:", err);
+
+    return c.json({
+      error: "Erro ao solicitar troca de senha"
+    }, 500);
+  }
+});
+
+app.post("/auth/reset-senha", async (c) => {
+  try {
+    const { token, nova_senha } = await c.req.json();
+
+    if (!token || !nova_senha) {
+      return c.json({
+        error: "Token e nova senha sao obrigatorios"
+      }, 400);
+    }
+
+    if (!SENHA_FORTE.test(nova_senha)) {
+      return c.json({
+        error: "Senha fraca. Use maiuscula, minuscula, numero e simbolo."
+      }, 400);
+    }
+
+    const tokenHash = hashTokenResetSenha(token);
+
+    const reset = await client.query(
+      `
+      SELECT
+        prt.id,
+        prt.usuario_id
+      FROM password_reset_tokens prt
+      INNER JOIN usuarios u
+        ON u.id = prt.usuario_id
+      WHERE prt.token_hash = $1
+      AND prt.usado_em IS NULL
+      AND prt.expira_em > NOW()
+      AND COALESCE(u.ativo, true) = true
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    const resetToken = reset.rows[0];
+
+    if (!resetToken) {
+      return c.json({
+        error: "Link invalido ou expirado"
+      }, 400);
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `
+      UPDATE usuarios
+      SET senha = $1
+      WHERE id = $2
+      `,
+      [
+        await gerarHashSenha(nova_senha),
+        resetToken.usuario_id
+      ]
+    );
+
+    await client.query(
+      `
+      UPDATE password_reset_tokens
+      SET usado_em = NOW()
+      WHERE id = $1
+      `,
+      [resetToken.id]
+    );
+
+    await client.query("COMMIT");
+
+    return c.json({
+      success: true,
+      message: "Senha alterada com sucesso"
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+
+    console.error("RESET PASSWORD ERROR:", err);
+
+    return c.json({
+      error: "Erro ao alterar senha"
+    }, 500);
+  }
+});
 
 app.get("/login-test", async (c) => {
   try {
