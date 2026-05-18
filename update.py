@@ -23,6 +23,31 @@ for repo in REPOSITORIOS:
 
     os.chdir(repo["caminho"])
 
+    # 🔄 Atualiza repositório antes
+    print("\n⬇ Executando: git pull")
+
+    pull = subprocess.run(
+        "git pull",
+        shell=True,
+        text=True
+    )
+
+    if pull.returncode != 0:
+        print("❌ Erro no git pull")
+        continue
+
+    # 🔍 Verifica alterações
+    status = subprocess.run(
+        "git status --porcelain",
+        shell=True,
+        text=True,
+        capture_output=True
+    )
+
+    if not status.stdout.strip():
+        print("✅ Nada para commitar.")
+        continue
+
     comandos = [
         "git add .",
         f'git commit -m "{mensagem_commit}"',
@@ -41,5 +66,6 @@ for repo in REPOSITORIOS:
 
         if resultado.returncode != 0:
             print(f"❌ Erro ao executar: {comando}")
+            break
 
 print("\n✅ Processo finalizado.")
