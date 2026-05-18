@@ -1,6 +1,6 @@
 import { Hono } from "hono@4";
 import { cors } from "hono/cors";
-import { Client } from "pg";
+import { Pool } from "pg";
 import bcrypt from "bcryptjs";
 import { Buffer } from "node:buffer";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -8,6 +8,8 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 const app = new Hono();
 
 const DEFAULT_TOKEN_SECRET = "troque-esta-chave-em-producao";
+
+const syncEmAndamento = new Set<number>();
 
 const TOKEN_SECRET =
   Bun.env.JWT_SECRET ||
@@ -1873,16 +1875,13 @@ app.post("/webhook/meta", async (c) => {
 
 
 // 🔌 banco
-const client = new Client({
+const client = new Pool({
   connectionString: Bun.env.DATABASE_URL,
+  max: Number(Bun.env.PG_POOL_MAX || 10),
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
-try {
-  await client.connect();
-  console.log("Banco conectado ✅");
-} catch (err) {
-  console.error("Erro ao conectar banco ❌", err);
-}
 
 // 🗄️ tabelas
 await client.query(`
@@ -2481,13 +2480,22 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 // 🔄 sincroniza campanhas + leads da Meta
 app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
+  const user: any = c.get("user");
+
   try {
 
-    console.log("USER AUTH:", c.get("user"));
+    console.log("USER AUTH:", user);
 
-    const user: any = c.get("user");
+    if (syncEmAndamento.has(user.id)) {
+      return c.json({
+        error: "Já existe uma sincronização em andamento para este usuário."
+      }, 429);
+    }
+
+    syncEmAndamento.add(user.id);
 
     console.log("USER LOGADO:", user);
+
 
     // 🔐 TOKEN META
     const conn = await client.query(
@@ -2776,13 +2784,17 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
       total: campanhasMeta.data.length
     });
 
-  } catch (err) {
+    } catch (err) {
 
     console.error("ERRO SINCRONIZAR:", err);
 
     return c.json({
       error: "Erro ao sincronizar campanhas"
     }, 500);
+
+  } finally {
+
+    syncEmAndamento.delete(user.id);
   }
 });
 
