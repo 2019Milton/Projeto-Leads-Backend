@@ -1138,16 +1138,18 @@ app.post("/meta/campanha", async (c) => {
         campaign_id,
         nome,
         status,
-        origem
+        origem,
+        configuracoes_avancadas
       )
-      VALUES ($1,$2,$3,$4,$5)
+      VALUES ($1,$2,$3,$4,$5,$6)
       `,
       [
         usuario_id,
         campanha.id,
         nome || "Campanha Plataforma",
         "PAUSED",
-        "plataforma"
+        "plataforma",
+        JSON.stringify(configuracoes_avancadas || {})
       ]
     );
 
@@ -2283,7 +2285,8 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS observacao TEXT,
     ADD COLUMN IF NOT EXISTS score TEXT,
     ADD COLUMN IF NOT EXISTS score_manual TEXT,
-    ADD COLUMN IF NOT EXISTS motivo_perda TEXT;
+    ADD COLUMN IF NOT EXISTS motivo_perda TEXT,
+    ADD COLUMN IF NOT EXISTS respostas_qualificacao JSONB;
 `);
 
 await client.query(`
@@ -2297,7 +2300,8 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS ad_id TEXT,
     ADD COLUMN IF NOT EXISTS form_id TEXT,
     ADD COLUMN IF NOT EXISTS page_id TEXT,
-    ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP;
+    ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS configuracoes_avancadas JSONB;
 `);
 
 await client.query(`
@@ -2755,6 +2759,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         status: campanha.status,
         origem: campanha.origem,
         campaign_id: campanha.campaign_id,
+        configuracoes_avancadas:
+          campanha.configuracoes_avancadas || {},
 
         impressoes: dados.impressions || 0,
         cliques: dados.clicks || 0,
@@ -2991,6 +2997,29 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
         for (const lead of leadsMeta.data || []) {
 
+          // 🔥 transforma fields
+          const fields: any = {};
+          const respostasQualificacao: any[] = [];
+
+          for (const field of lead.field_data || []) {
+
+            fields[field.name] =
+              field.values?.[0] || "";
+
+            if (
+              ![
+                "full_name",
+                "email",
+                "phone_number"
+              ].includes(field.name)
+            ) {
+              respostasQualificacao.push({
+                pergunta: field.name,
+                resposta: field.values?.[0] || ""
+              });
+            }
+          }
+
           // 🔥 evita duplicar lead
           const leadExiste = await client.query(
             `
@@ -3006,12 +3035,15 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             await client.query(
               `
               UPDATE leads
-              SET campanha = $1
-              WHERE lead_id = $2
-              AND usuario_id = $3
+              SET
+                campanha = $1,
+                respostas_qualificacao = $2
+              WHERE lead_id = $3
+              AND usuario_id = $4
               `,
               [
                 nomeCampanha,
+                JSON.stringify(respostasQualificacao),
                 lead.id,
                 user.id
               ]
@@ -3024,15 +3056,6 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             );
           
             continue;
-          }
-
-          // 🔥 transforma fields
-          const fields: any = {};
-
-          for (const field of lead.field_data || []) {
-
-            fields[field.name] =
-              field.values?.[0] || "";
           }
 
           console.log("FIELDS:", fields);
@@ -3049,10 +3072,11 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               campanha,
               origem,
               status,
+              respostas_qualificacao,
               criado_em
             )
             VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,NOW()
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()
             )
             `,
             [
@@ -3063,7 +3087,8 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               fields.phone_number || "",
               nomeCampanha,
               "meta",
-              "novo"
+              "novo",
+              JSON.stringify(respostasQualificacao)
             ]
           );
 
@@ -3391,6 +3416,7 @@ app.get("/leads", authMiddleware, async (c) => {
         score,
         score_manual,
         motivo_perda,
+        respostas_qualificacao,
         criado_em
       FROM leads
       WHERE usuario_id = $1
