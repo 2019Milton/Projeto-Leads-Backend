@@ -182,6 +182,159 @@ function obterFrontendUrl() {
   ).replace(/\/+$/g, "");
 }
 
+function textoOpcional(value: unknown) {
+  return String(value ?? "").trim();
+}
+
+function numeroOpcional(value: unknown) {
+  const numero = Number(value);
+
+  return Number.isFinite(numero)
+    ? numero
+    : null;
+}
+
+function listaOpcional(value: unknown) {
+  return Array.isArray(value)
+    ? value
+        .map(item => textoOpcional(item))
+        .filter(Boolean)
+    : [];
+}
+
+function urlOpcional(value: unknown, fallback: string) {
+  const url = textoOpcional(value);
+
+  if (!url) {
+    return fallback;
+  }
+
+  try {
+    const parsed = new URL(url);
+
+    if (
+      parsed.protocol === "http:" ||
+      parsed.protocol === "https:"
+    ) {
+      return url;
+    }
+  } catch {}
+
+  return fallback;
+}
+
+function montarTargetingMeta(avancadas: any) {
+  const pais =
+    textoOpcional(avancadas?.pais)
+      .toUpperCase()
+      .slice(0, 2) || "BR";
+
+  const latitude =
+    numeroOpcional(avancadas?.latitude);
+
+  const longitude =
+    numeroOpcional(avancadas?.longitude);
+
+  const raio =
+    numeroOpcional(avancadas?.raio);
+
+  const targeting: any = {
+    geo_locations: {
+      countries: [pais]
+    }
+  };
+
+  if (
+    latitude !== null &&
+    longitude !== null &&
+    raio !== null
+  ) {
+    targeting.geo_locations = {
+      custom_locations: [
+        {
+          latitude,
+          longitude,
+          radius: raio,
+          distance_unit: "kilometer"
+        }
+      ]
+    };
+  }
+
+  const idadeMin =
+    numeroOpcional(avancadas?.idade_min);
+
+  const idadeMax =
+    numeroOpcional(avancadas?.idade_max);
+
+  if (idadeMin !== null) {
+    targeting.age_min =
+      Math.max(18, Math.min(65, idadeMin));
+  }
+
+  if (idadeMax !== null) {
+    targeting.age_max =
+      Math.max(18, Math.min(65, idadeMax));
+  }
+
+  const genero =
+    numeroOpcional(avancadas?.genero);
+
+  if (genero === 1 || genero === 2) {
+    targeting.genders = [genero];
+  }
+
+  const plataformas =
+    listaOpcional(avancadas?.plataformas);
+
+  const facebookPositions =
+    listaOpcional(avancadas?.facebook_positions);
+
+  if (
+    facebookPositions.length &&
+    !plataformas.includes("facebook")
+  ) {
+    plataformas.push("facebook");
+  }
+
+  if (facebookPositions.length) {
+    targeting.facebook_positions = facebookPositions;
+  }
+
+  const instagramPositions =
+    listaOpcional(avancadas?.instagram_positions);
+
+  if (
+    instagramPositions.length &&
+    !plataformas.includes("instagram")
+  ) {
+    plataformas.push("instagram");
+  }
+
+  if (instagramPositions.length) {
+    targeting.instagram_positions = instagramPositions;
+  }
+
+  if (plataformas.length) {
+    targeting.publisher_platforms = plataformas;
+  }
+
+  const dispositivos =
+    listaOpcional(avancadas?.dispositivos);
+
+  if (dispositivos.length) {
+    targeting.device_platforms = dispositivos;
+  }
+
+  if (avancadas?.advantage_audience) {
+    targeting.targeting_automation = {
+      advantage_audience: 1
+    };
+  }
+
+  return targeting;
+}
+
 async function enviarEmailResetSenha(
   email: string,
   nome: string | null,
@@ -921,7 +1074,8 @@ app.post("/meta/campanha", async (c) => {
     const {
       usuario_id,
       nome,
-      objetivo
+      objetivo,
+      configuracoes_avancadas
     } = await c.req.json();
 
     const conn = await client.query(
@@ -942,6 +1096,16 @@ app.post("/meta/campanha", async (c) => {
     }
     
     const adAccountId = contaAds.id;
+
+    const categoriaEspecial =
+      textoOpcional(
+        configuracoes_avancadas?.categoria_especial
+      );
+
+    const specialAdCategories =
+      categoriaEspecial
+        ? [categoriaEspecial]
+        : [];
     
     const campanha = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/campaigns`,
@@ -952,7 +1116,7 @@ app.post("/meta/campanha", async (c) => {
           name: nome || "Campanha Leads Plataforma",
           objective: objetivo || "OUTCOME_LEADS",
           status: "PAUSED",
-          special_ad_categories: [],
+          special_ad_categories: specialAdCategories,
           is_adset_budget_sharing_enabled: false,
           access_token: token
         })
@@ -1009,7 +1173,8 @@ app.post("/meta/adset", async (c) => {
       campaign_id,
       page_id,
       form_id,
-      daily_budget
+      daily_budget,
+      configuracoes_avancadas
     } = await c.req.json();
 
     const conn = await client.query(
@@ -1031,42 +1196,89 @@ app.post("/meta/adset", async (c) => {
     
     const adAccountId = contaAds.id;
 
+    const avancadas =
+      configuracoes_avancadas || {};
+
+    const targeting =
+      montarTargetingMeta(avancadas);
+
+    const categoriaEspecial =
+      textoOpcional(avancadas.categoria_especial);
+
+    if (
+      [
+        "HOUSING",
+        "CREDIT",
+        "EMPLOYMENT"
+      ].includes(categoriaEspecial)
+    ) {
+      delete targeting.age_min;
+      delete targeting.age_max;
+      delete targeting.genders;
+    }
+
+    const inicio =
+      textoOpcional(avancadas.inicio);
+
+    const fim =
+      textoOpcional(avancadas.fim);
+
+    const bidStrategy =
+      textoOpcional(avancadas.bid_strategy) ||
+      "LOWEST_COST_WITHOUT_CAP";
+
+    const bidAmount =
+      numeroOpcional(avancadas.bid_amount);
+
+    const payloadAdset: any = {
+      name: `AdSet Leads ${Date.now()}`,
+
+      campaign_id,
+
+      billing_event: "IMPRESSIONS",
+
+      optimization_goal: "LEAD_GENERATION",
+
+      destination_type: "ON_AD",
+
+      bid_strategy: bidStrategy,
+
+      daily_budget: daily_budget || 2000,
+
+      start_time: inicio
+        ? new Date(inicio).toISOString()
+        : new Date(Date.now() + 60000).toISOString(),
+
+      targeting,
+
+      promoted_object: {
+        page_id
+      },
+
+      status: "PAUSED",
+
+      access_token: token
+    };
+
+    if (fim) {
+      payloadAdset.end_time =
+        new Date(fim).toISOString();
+    }
+
+    if (
+      bidAmount !== null &&
+      bidStrategy !== "LOWEST_COST_WITHOUT_CAP"
+    ) {
+      payloadAdset.bid_amount =
+        Math.round(bidAmount * 100);
+    }
+
     const adset = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: `AdSet Leads ${Date.now()}`,
-        
-          campaign_id,
-        
-          billing_event: "IMPRESSIONS",
-        
-          optimization_goal: "LEAD_GENERATION",
-          
-          destination_type: "ON_AD",
-        
-          bid_strategy: "LOWEST_COST_WITHOUT_CAP",
-        
-          daily_budget: daily_budget || 2000,
-        
-          start_time: new Date(Date.now() + 60000).toISOString(),
-        
-          targeting: {
-            geo_locations: {
-              countries: ["BR"]
-            }
-          },
-        
-          promoted_object: {
-            page_id
-          },
-        
-          status: "PAUSED",
-        
-          access_token: token
-        })
+        body: JSON.stringify(payloadAdset)
       }
     ).then(r => r.json());
 
@@ -1089,7 +1301,8 @@ app.post("/meta/formulario", async (c) => {
       page_id,
       form_id,
       texto,
-      cta
+      cta,
+      configuracoes_avancadas
     } = await c.req.json();
 
     // 🔐 pega token salvo
@@ -1117,33 +1330,80 @@ app.post("/meta/formulario", async (c) => {
 
     const pageToken = page.access_token;
 
+    const avancadas =
+      configuracoes_avancadas || {};
+
+    const perguntasBase: any[] = [
+      { type: "FULL_NAME" },
+      { type: "EMAIL" },
+      { type: "PHONE" }
+    ];
+
+    const perguntasExtras =
+      listaOpcional(avancadas.perguntas)
+        .slice(0, 10)
+        .map((pergunta, index) => ({
+          type: "CUSTOM",
+          key: `qualificacao_${index + 1}`,
+          label: pergunta
+        }));
+
+    const linkPrivacidade =
+      urlOpcional(
+        avancadas.privacidade_url,
+        "https://google.com"
+      );
+
+    const obrigadoUrl =
+      urlOpcional(
+        avancadas.obrigado_url,
+        "https://google.com"
+      );
+
+    const payloadFormulario: any = {
+      name: `Form Leads ${Date.now()}`,
+      locale: "pt_BR",
+      questions: [
+        ...perguntasBase,
+        ...perguntasExtras
+      ],
+      privacy_policy: {
+        url: linkPrivacidade,
+        link_text:
+          textoOpcional(
+            avancadas.privacidade_texto
+          ) || "Política de Privacidade"
+      },
+      thank_you_page: {
+        title:
+          textoOpcional(
+            avancadas.obrigado_titulo
+          ) || "Obrigado!",
+        body:
+          textoOpcional(
+            avancadas.obrigado_texto
+          ) || "Recebemos seus dados 🚀",
+        button_type: "VIEW_WEBSITE",
+        button_text:
+          textoOpcional(
+            avancadas.obrigado_botao
+          ) || "Ver mais",
+        website_url: obrigadoUrl
+      },
+      access_token: pageToken
+    };
+
+    if (avancadas.formulario_qualidade) {
+      payloadFormulario.is_optimized_for_quality = true;
+    }
+
     // 🚀 cria formulário
     const form = await fetch(
       `https://graph.facebook.com/v19.0/${page_id}/leadgen_forms`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: `Form Leads ${Date.now()}`,
-          locale: "pt_BR",
-          questions: [
-            { type: "FULL_NAME" },
-            { type: "EMAIL" },
-            { type: "PHONE" }
-          ],
-          privacy_policy: {
-            url: "https://google.com",
-            link_text: "Política de Privacidade"
-          },
-          thank_you_page: {
-            title: "Obrigado!",
-            body: "Recebemos seus dados 🚀",
-            button_type: "VIEW_WEBSITE",
-            button_text: "Ver mais",
-            website_url: "https://google.com"
-          },
-            access_token: pageToken
-        })
+        body: JSON.stringify(payloadFormulario)
       }
     ).then(r => r.json());
 
@@ -1315,6 +1575,7 @@ app.post("/meta/anuncio", async (c) => {
       texto,
       cta,
       campanha_nome,
+      configuracoes_avancadas,
       imageHash
     } = await c.req.json();
 
@@ -1369,6 +1630,23 @@ app.post("/meta/anuncio", async (c) => {
 
     const adAccountId = contaAds.id;
 
+    const avancadas =
+      configuracoes_avancadas || {};
+
+    const linkDestino =
+      urlOpcional(
+        avancadas.link,
+        "https://google.com"
+      );
+
+    const tituloAnuncio =
+      textoOpcional(avancadas.titulo) ||
+      "Saiba mais";
+
+    const descricaoAnuncio =
+      textoOpcional(avancadas.descricao) ||
+      "Entre em contato agora";
+
     // 🔥 CRIATIVO
     const creative = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
@@ -1389,7 +1667,7 @@ app.post("/meta/anuncio", async (c) => {
 
             link_data: {
 
-              link: "https://google.com",
+              link: linkDestino,
 
               image_hash: imageHash,
 
@@ -1397,10 +1675,9 @@ app.post("/meta/anuncio", async (c) => {
                 texto ||
                 "Quer mais clientes? 🚀",
 
-              name: "Saiba mais",
+              name: tituloAnuncio,
 
-              description:
-                "Entre em contato agora",
+              description: descricaoAnuncio,
 
               call_to_action: {
 
