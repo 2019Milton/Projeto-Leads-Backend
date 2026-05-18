@@ -1662,6 +1662,34 @@ app.get(
       [usuario_id]
     );
 
+    let gastoHoje = 0;
+
+    try {
+
+      const insightsHoje = await fetch(
+        `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend&date_preset=today&access_token=${token}`
+      ).then(r => r.json());
+
+      gastoHoje =
+        Number(insightsHoje.data?.[0]?.spend || 0);
+
+    } catch (err) {
+
+      console.error(
+        "ERRO GASTO HOJE:",
+        err
+      );
+    }
+
+    const gastoHojeFormatado =
+      new Intl.NumberFormat(
+        "pt-BR",
+        {
+          style: "currency",
+          currency: "BRL"
+        }
+      ).format(gastoHoje);
+
     // 🔥 STATUS FINAL
     return c.json({
 
@@ -1688,7 +1716,8 @@ app.get(
         campanhas: campanhasCount.rows[0].total,
         campanhas_ativas: campanhasAtivas.rows[0].total,
         leads_hoje: leadsHoje.rows[0].total,
-        gasto_hoje: "R$ 0,00",
+        gasto_hoje: gastoHoje,
+        gasto_hoje_formatado: gastoHojeFormatado,
         ultimo_sync:
           conn.rows[0].ultimo_sync || null
       },
