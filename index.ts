@@ -175,6 +175,30 @@ function hashTokenResetSenha(token: string) {
   return assinarPayload(`password-reset:${token}`);
 }
 
+async function buscarResetTokenValido(token: string) {
+  const tokenHash = hashTokenResetSenha(token);
+
+  const reset = await client.query(
+    `
+    SELECT
+      prt.id,
+      prt.usuario_id,
+      prt.expira_em
+    FROM password_reset_tokens prt
+    INNER JOIN usuarios u
+      ON u.id = prt.usuario_id
+    WHERE prt.token_hash = $1
+    AND prt.usado_em IS NULL
+    AND prt.expira_em > NOW()
+    AND COALESCE(u.ativo, true) = true
+    LIMIT 1
+    `,
+    [tokenHash]
+  );
+
+  return reset.rows[0] || null;
+}
+
 function obterFrontendUrl() {
   return (
     Bun.env.FRONTEND_URL ||
@@ -376,7 +400,12 @@ async function enviarEmailResetSenha(
 
   if (!res.ok) {
     const detalhe = await res.text();
-    throw new Error(`Erro Resend: ${detalhe}`);
+    console.error(
+      "RESEND RESET EMAIL ERROR:",
+      detalhe
+    );
+
+    throw new Error("RESEND_EMAIL_SEND_FAILED");
   }
 }
 
@@ -2349,6 +2378,8 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
     const user = usuario.rows[0];
 
     if (user) {
+      await client.query("BEGIN");
+
       const token = gerarTokenResetSenha();
       const tokenHash = hashTokenResetSenha(token);
       const resetUrl =
@@ -2389,6 +2420,8 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
         user.nome,
         resetUrl
       );
+
+      await client.query("COMMIT");
     }
 
     return c.json({
@@ -2397,10 +2430,60 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
     });
 
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+
     console.error("RESET REQUEST ERROR:", err);
 
+    const mensagem =
+      err instanceof Error &&
+      err.message === "RESEND_API_KEY nao configurada"
+        ? "Serviço de email não configurado. Configure RESEND_API_KEY no Railway."
+        : err instanceof Error &&
+          err.message === "RESEND_EMAIL_SEND_FAILED"
+        ? "Não foi possível enviar o email de troca de senha. Verifique RESEND_FROM_EMAIL e o domínio no Resend."
+        : "Erro ao solicitar troca de senha";
+
     return c.json({
-      error: "Erro ao solicitar troca de senha"
+      error: mensagem
+    }, 500);
+  }
+});
+
+app.get("/auth/validar-reset-senha", async (c) => {
+  try {
+    const token = c.req.query("token");
+
+    if (!token) {
+      return c.json({
+        valido: false,
+        error: "Token obrigatorio"
+      }, 400);
+    }
+
+    const resetToken =
+      await buscarResetTokenValido(token);
+
+    if (!resetToken) {
+      return c.json({
+        valido: false,
+        error: "Link invalido ou expirado"
+      }, 400);
+    }
+
+    return c.json({
+      valido: true,
+      expira_em: resetToken.expira_em
+    });
+
+  } catch (err) {
+    console.error(
+      "VALIDATE RESET PASSWORD ERROR:",
+      err
+    );
+
+    return c.json({
+      valido: false,
+      error: "Erro ao validar link"
     }, 500);
   }
 });
@@ -2421,26 +2504,8 @@ app.post("/auth/reset-senha", async (c) => {
       }, 400);
     }
 
-    const tokenHash = hashTokenResetSenha(token);
-
-    const reset = await client.query(
-      `
-      SELECT
-        prt.id,
-        prt.usuario_id
-      FROM password_reset_tokens prt
-      INNER JOIN usuarios u
-        ON u.id = prt.usuario_id
-      WHERE prt.token_hash = $1
-      AND prt.usado_em IS NULL
-      AND prt.expira_em > NOW()
-      AND COALESCE(u.ativo, true) = true
-      LIMIT 1
-      `,
-      [tokenHash]
-    );
-
-    const resetToken = reset.rows[0];
+    const resetToken =
+      await buscarResetTokenValido(token);
 
     if (!resetToken) {
       return c.json({
@@ -2466,9 +2531,10 @@ app.post("/auth/reset-senha", async (c) => {
       `
       UPDATE password_reset_tokens
       SET usado_em = NOW()
-      WHERE id = $1
+      WHERE usuario_id = $1
+      AND usado_em IS NULL
       `,
-      [resetToken.id]
+      [resetToken.usuario_id]
     );
 
     await client.query("COMMIT");
