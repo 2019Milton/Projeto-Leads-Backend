@@ -2049,6 +2049,68 @@ app.get(
     }
 });
 
+app.post("/meta/desconectar", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    const token =
+      conn.rows[0]?.access_token;
+
+    if (token) {
+
+      try {
+        await fetch(
+          `https://graph.facebook.com/v19.0/me/permissions?access_token=${token}`,
+          {
+            method: "DELETE"
+          }
+        );
+      } catch (err) {
+        console.error(
+          "ERRO REVOGAR META:",
+          err
+        );
+      }
+    }
+
+    await client.query(
+      `
+      DELETE FROM meta_conexoes
+      WHERE usuario_id = $1
+      `,
+      [user.id]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error(
+      "ERRO DESCONECTAR META:",
+      err
+    );
+
+    return c.json({
+      error: "Erro ao desconectar Meta"
+    }, 500);
+  }
+});
+
 
 // 🔥 WEBHOOK META VERIFY
 app.get("/webhook/meta", async (c) => {
