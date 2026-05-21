@@ -33,6 +33,66 @@ const RESEND_FROM_EMAIL =
 const SENHA_FORTE =
   /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
 
+const PLANOS_PLATAFORMA = [
+  "bronze",
+  "prata",
+  "ouro"
+] as const;
+
+type PlanoPlataforma =
+  typeof PLANOS_PLATAFORMA[number];
+
+const RECURSOS_POR_PLANO = {
+  bronze: {
+    machine_learning_leads: false,
+    ia_leads: false
+  },
+  prata: {
+    machine_learning_leads: true,
+    ia_leads: false
+  },
+  ouro: {
+    machine_learning_leads: true,
+    ia_leads: true
+  }
+} satisfies Record<PlanoPlataforma, Record<string, boolean>>;
+
+function normalizarPlano(value: unknown): PlanoPlataforma {
+  const plano =
+    String(value ?? "")
+      .trim()
+      .toLowerCase() as PlanoPlataforma;
+
+  return PLANOS_PLATAFORMA.includes(plano)
+    ? plano
+    : "bronze";
+}
+
+function obterRecursosPlano(
+  planoInformado: unknown,
+  tipoUsuario = ""
+) {
+  const plano = normalizarPlano(planoInformado);
+  const acessoTotal = tipoUsuario === "super_admin";
+
+  return Object.fromEntries(
+    Object.entries(RECURSOS_POR_PLANO[plano])
+      .map(([recurso, habilitado]) => [
+        recurso,
+        acessoTotal || habilitado
+      ])
+  );
+}
+
+function usuarioTemRecurso(
+  user: any,
+  recurso: keyof typeof RECURSOS_POR_PLANO.bronze
+) {
+  return Boolean(
+    obterRecursosPlano(user?.plano, user?.tipo)[recurso]
+  );
+}
+
 if (TOKEN_SECRET === DEFAULT_TOKEN_SECRET) {
   console.warn(
     "JWT_SECRET nao configurado. Defina essa variavel no Railway em producao."
@@ -105,6 +165,7 @@ function criarTokenUsuario(user: any) {
     user.tipo,
     user.nome || "",
     user.sobrenome || "",
+    normalizarPlano(user.plano),
     expiraEm
   ].map(limparCampoToken).join(":");
 
@@ -127,10 +188,28 @@ function decodificarTokenUsuario(token: string) {
     return null;
   }
 
-  if (partes.length >= 7) {
-    const payload = partes.slice(0, 6).join(":");
-    const expiraEm = Number(partes[5]);
-    const assinatura = partes[6];
+  const tokenAssinadoNovo =
+    partes.length >= 8;
+
+  const tokenAssinadoLegado =
+    partes.length >= 7;
+
+  if (tokenAssinadoNovo || tokenAssinadoLegado) {
+    const indiceExpiracao =
+      tokenAssinadoNovo ? 6 : 5;
+
+    const indiceAssinatura =
+      tokenAssinadoNovo ? 7 : 6;
+
+    const payload =
+      partes.slice(0, indiceExpiracao + 1).join(":");
+
+    const expiraEm =
+      Number(partes[indiceExpiracao]);
+
+    const assinatura =
+      partes[indiceAssinatura];
+
     const assinaturaEsperada = assinarPayload(payload);
 
     if (
@@ -152,7 +231,10 @@ function decodificarTokenUsuario(token: string) {
     email,
     tipo,
     nome: partes[3] || "",
-    sobrenome: partes[4] || ""
+    sobrenome: partes[4] || "",
+    plano: tokenAssinadoNovo
+      ? normalizarPlano(partes[5])
+      : "bronze"
   };
 }
 
@@ -643,7 +725,41 @@ const authMiddleware = async (c: any, next: any) => {
       return c.json({ error: "Token inválido" }, 401);
     }
 
-    c.set("user", user);
+    const usuarioAtual = await client.query(
+      `
+      SELECT
+        id,
+        email,
+        tipo,
+        nome,
+        sobrenome,
+        plano,
+        COALESCE(ativo, true) AS ativo
+      FROM usuarios
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    const userBanco =
+      usuarioAtual.rows[0];
+
+    if (!userBanco || !userBanco.ativo) {
+      return c.json({ error: "Usuário inativo ou não encontrado" }, 401);
+    }
+
+    const userAutenticado = {
+      ...user,
+      ...userBanco,
+      plano: normalizarPlano(userBanco.plano),
+      recursos: obterRecursosPlano(
+        userBanco.plano,
+        userBanco.tipo
+      )
+    };
+
+    c.set("user", userAutenticado);
 
     await next();
   } catch (err) {
@@ -2392,7 +2508,19 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS sobrenome TEXT,
     ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT true,
     ADD COLUMN IF NOT EXISTS admin_id INTEGER,
+    ADD COLUMN IF NOT EXISTS plano TEXT DEFAULT 'bronze',
     ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+`);
+
+await client.query(`
+  UPDATE usuarios
+  SET plano = CASE
+    WHEN LOWER(plano) IN ('bronze', 'prata', 'ouro') THEN LOWER(plano)
+    ELSE 'bronze'
+  END
+  WHERE plano IS NULL
+  OR plano <> LOWER(plano)
+  OR LOWER(plano) NOT IN ('bronze', 'prata', 'ouro');
 `);
 
 await client.query(`
@@ -2660,7 +2788,7 @@ app.get("/login-test", async (c) => {
 
     const result = await client.query(
       `
-      SELECT id, email, senha, tipo, nome, sobrenome
+      SELECT id, email, senha, tipo, nome, sobrenome, plano
       FROM usuarios
       WHERE email=$1
       AND COALESCE(ativo, true) = true
@@ -2698,7 +2826,7 @@ app.post("/login", async (c) => {
 
   const result = await client.query(
     `
-    SELECT id, email, senha, tipo, nome, sobrenome
+    SELECT id, email, senha, tipo, nome, sobrenome, plano
     FROM usuarios
     WHERE email=$1
     AND COALESCE(ativo, true) = true
@@ -2723,6 +2851,17 @@ app.post("/login", async (c) => {
   return c.json({
     message: "Login OK",
     token
+  });
+});
+
+app.get("/usuarios/me/plano", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+
+  return c.json({
+    plano: normalizarPlano(user.plano),
+    tipo: user.tipo,
+    acesso_total: user.tipo === "super_admin",
+    recursos: obterRecursosPlano(user.plano, user.tipo)
   });
 });
 
@@ -4099,6 +4238,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.id,
         u.email,
         u.tipo,
+        u.plano,
         u.admin_id,
         admin.email AS admin_email,
         COALESCE(u.ativo, true) AS ativo,
@@ -4115,6 +4255,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.id,
         u.email,
         u.tipo,
+        u.plano,
         u.admin_id,
         admin.email,
         u.ativo
@@ -4231,6 +4372,65 @@ app.put("/admin/usuarios/:id/status", authMiddleware, async (c) => {
 
 
 // 🛡️ ADMIN - CRIAR USUÁRIO
+app.put("/admin/usuarios/:id/plano", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = c.req.param("id");
+    const { plano } = await c.req.json();
+    const planoFinal = normalizarPlano(plano);
+
+    const alvo = await client.query(
+      `
+      SELECT id, tipo
+      FROM usuarios
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [id]
+    );
+
+    if (!alvo.rows.length) {
+      return c.json({ error: "Usuário não encontrado" }, 404);
+    }
+
+    if (alvo.rows[0].tipo === "super_admin") {
+      return c.json({
+        error: "Super Admin já possui acesso total"
+      }, 400);
+    }
+
+    await client.query(
+      `
+      UPDATE usuarios
+      SET plano = $1
+      WHERE id = $2
+      `,
+      [planoFinal, id]
+    );
+
+    return c.json({
+      sucesso: true,
+      plano: planoFinal,
+      recursos: obterRecursosPlano(planoFinal)
+    });
+
+  } catch (err) {
+
+    console.error("ERRO PLANO USUARIO:", err);
+
+    return c.json({
+      error: "Erro ao alterar plano do usuário"
+    }, 500);
+  }
+});
+
 app.post("/admin/usuarios", authMiddleware, async (c) => {
 
   try {
@@ -4252,7 +4452,8 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       email,
       senha,
       tipo,
-      admin_id
+      admin_id,
+      plano
     } = await c.req.json();
 
     if (
@@ -4301,10 +4502,11 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         senha,
         tipo,
         ativo,
-        admin_id
+        admin_id,
+        plano
       )
       VALUES (
-        $1,$2,$3,$4,$5,true,$6
+        $1,$2,$3,$4,$5,true,$6,$7
       )
       `,
       [
@@ -4313,7 +4515,8 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         email,
         senhaHash,
         tipo || "corretor",
-        admin_id || null
+        admin_id || null,
+        normalizarPlano(plano)
       ]
     );
 
