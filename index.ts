@@ -44,7 +44,7 @@ type PlanoPlataforma =
 
 const RECURSOS_POR_PLANO = {
   bronze: {
-    machine_learning_leads: false,
+    machine_learning_leads: true,
     ia_leads: false
   },
   prata: {
@@ -681,6 +681,347 @@ function calcularScoreLead(
   return {
     score,
     pontos,
+    base
+  };
+}
+
+const ML_LEADS_MIN_AMOSTRAS = 4;
+const ML_LEADS_MIN_AMOSTRAS_POR_CLASSE = 2;
+
+const STOPWORDS_ML_LEADS = new Set([
+  "a",
+  "ao",
+  "aos",
+  "as",
+  "com",
+  "da",
+  "das",
+  "de",
+  "do",
+  "dos",
+  "e",
+  "em",
+  "na",
+  "nas",
+  "no",
+  "nos",
+  "o",
+  "os",
+  "para",
+  "por",
+  "que",
+  "sem",
+  "um",
+  "uma"
+]);
+
+function normalizarTextoMLLead(value: unknown) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function idadeLeadEmDias(lead: any) {
+  const criadoEm =
+    new Date(lead?.criado_em).getTime();
+
+  if (!Number.isFinite(criadoEm)) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    Math.floor(
+      (Date.now() - criadoEm) /
+      (1000 * 60 * 60 * 24)
+    )
+  );
+}
+
+function textoRespostasQualificacao(lead: any) {
+  const respostas =
+    Array.isArray(lead?.respostas_qualificacao)
+      ? lead.respostas_qualificacao
+      : [];
+
+  return respostas
+    .map((item: any) => [
+      item?.pergunta,
+      item?.resposta
+    ].filter(Boolean).join(" "))
+    .join(" ");
+}
+
+function adicionarTokensTextoMLLead(
+  features: Set<string>,
+  value: unknown
+) {
+  normalizarTextoMLLead(value)
+    .split(/[^a-z0-9]+/g)
+    .filter(token =>
+      token.length >= 3 &&
+      !STOPWORDS_ML_LEADS.has(token)
+    )
+    .slice(0, 36)
+    .forEach(token => {
+      features.add(`texto:${token}`);
+    });
+}
+
+function extrairFeaturesMLLead(lead: any) {
+  const features = new Set<string>();
+  const origem =
+    normalizarTextoMLLead(lead?.origem) || "manual";
+  const dias =
+    idadeLeadEmDias(lead);
+
+  features.add(`origem:${origem}`);
+
+  if (textoOpcional(lead?.email)) {
+    features.add("contato:email");
+  }
+
+  if (textoOpcional(lead?.telefone)) {
+    features.add("contato:telefone");
+  }
+
+  if (dias <= 2) {
+    features.add("idade:novo");
+  } else if (dias <= 7) {
+    features.add("idade:semana");
+  } else if (dias <= 14) {
+    features.add("idade:duas_semanas");
+  } else {
+    features.add("idade:parado");
+  }
+
+  adicionarTokensTextoMLLead(
+    features,
+    lead?.campanha
+  );
+
+  adicionarTokensTextoMLLead(
+    features,
+    lead?.observacao
+  );
+
+  adicionarTokensTextoMLLead(
+    features,
+    textoRespostasQualificacao(lead)
+  );
+
+  return [...features];
+}
+
+function incrementarFeatureMLLead(
+  mapa: Map<string, number>,
+  feature: string
+) {
+  mapa.set(
+    feature,
+    (mapa.get(feature) || 0) + 1
+  );
+}
+
+function treinarModeloMLLeads(leads: any[]) {
+  const rotulados =
+    leads.filter(lead =>
+      lead.status === "fechado" ||
+      lead.status === "perdido"
+    );
+
+  const positivos =
+    rotulados.filter(lead =>
+      lead.status === "fechado"
+    );
+
+  const negativos =
+    rotulados.filter(lead =>
+      lead.status === "perdido"
+    );
+
+  const modelo = {
+    amostras: rotulados.length,
+    fechados: positivos.length,
+    perdidos: negativos.length,
+    positivo: new Map<string, number>(),
+    negativo: new Map<string, number>()
+  };
+
+  positivos.forEach(lead => {
+    extrairFeaturesMLLead(lead)
+      .forEach(feature => {
+        incrementarFeatureMLLead(
+          modelo.positivo,
+          feature
+        );
+      });
+  });
+
+  negativos.forEach(lead => {
+    extrairFeaturesMLLead(lead)
+      .forEach(feature => {
+        incrementarFeatureMLLead(
+          modelo.negativo,
+          feature
+        );
+      });
+  });
+
+  return modelo;
+}
+
+function descreverFeatureMLLead(feature: string) {
+  const descricoes: Record<string, string> = {
+    "contato:email": "email informado",
+    "contato:telefone": "telefone informado",
+    "idade:novo": "lead recente",
+    "idade:semana": "lead com ate 7 dias",
+    "idade:duas_semanas": "lead com ate 14 dias",
+    "idade:parado": "lead com mais de 14 dias",
+    "origem:meta": "origem Meta",
+    "origem:manual": "origem manual"
+  };
+
+  if (descricoes[feature]) {
+    return descricoes[feature];
+  }
+
+  if (feature.startsWith("texto:")) {
+    return `termo "${feature.replace("texto:", "")}"`;
+  }
+
+  if (feature.startsWith("origem:")) {
+    return `origem ${feature.replace("origem:", "")}`;
+  }
+
+  return feature;
+}
+
+function preverConversaoMLLead(
+  modelo: ReturnType<typeof treinarModeloMLLeads>,
+  lead: any
+) {
+  if (
+    modelo.amostras < ML_LEADS_MIN_AMOSTRAS ||
+    modelo.fechados < ML_LEADS_MIN_AMOSTRAS_POR_CLASSE ||
+    modelo.perdidos < ML_LEADS_MIN_AMOSTRAS_POR_CLASSE
+  ) {
+    return {
+      disponivel: false,
+      status: "aprendendo",
+      amostras: modelo.amostras,
+      minimo_amostras: ML_LEADS_MIN_AMOSTRAS,
+      fechados: modelo.fechados,
+      perdidos: modelo.perdidos,
+      base: [
+        "Marque leads como fechado e perdido para treinar o modelo."
+      ]
+    };
+  }
+
+  const features =
+    extrairFeaturesMLLead(lead);
+
+  let logPositivo =
+    Math.log((modelo.fechados + 1) / (modelo.amostras + 2));
+
+  let logNegativo =
+    Math.log((modelo.perdidos + 1) / (modelo.amostras + 2));
+
+  const sinais: Array<{
+    feature: string;
+    impacto: number;
+  }> = [];
+
+  features.forEach(feature => {
+    const ocorrenciasPositivas =
+      modelo.positivo.get(feature) || 0;
+
+    const ocorrenciasNegativas =
+      modelo.negativo.get(feature) || 0;
+
+    if (
+      !ocorrenciasPositivas &&
+      !ocorrenciasNegativas
+    ) {
+      return;
+    }
+
+    const probPositiva =
+      (ocorrenciasPositivas + 1) /
+      (modelo.fechados + 2);
+
+    const probNegativa =
+      (ocorrenciasNegativas + 1) /
+      (modelo.perdidos + 2);
+
+    logPositivo += Math.log(probPositiva);
+    logNegativo += Math.log(probNegativa);
+
+    sinais.push({
+      feature,
+      impacto:
+        Math.log(probPositiva) -
+        Math.log(probNegativa)
+    });
+  });
+
+  const diferenca =
+    Math.max(-20, Math.min(20, logPositivo - logNegativo));
+
+  const probabilidade =
+    1 / (1 + Math.exp(-diferenca));
+
+  const probabilidadeConversao =
+    Math.round(probabilidade * 100);
+
+  const sinaisOrdenados =
+    sinais.sort(
+      (a, b) =>
+        Math.abs(b.impacto) -
+        Math.abs(a.impacto)
+    );
+
+  const confianca =
+    Math.min(
+      95,
+      Math.round(
+        35 +
+        Math.min(35, modelo.amostras * 2) +
+        Math.min(25, sinais.length * 5)
+      )
+    );
+
+  const base = [
+    `Treinado com ${modelo.fechados} fechados e ${modelo.perdidos} perdidos.`,
+    ...sinaisOrdenados
+      .slice(0, 3)
+      .map(sinal =>
+        `${descreverFeatureMLLead(sinal.feature)} puxou a previsao para ${
+          sinal.impacto >= 0
+            ? "conversao"
+            : "perda"
+        }.`
+      )
+  ];
+
+  return {
+    disponivel: true,
+    status: "pronto",
+    probabilidade_conversao: probabilidadeConversao,
+    confianca,
+    faixa:
+      probabilidadeConversao >= 70
+        ? "alta"
+        : probabilidadeConversao >= 40
+        ? "media"
+        : "baixa",
+    amostras: modelo.amostras,
+    fechados: modelo.fechados,
+    perdidos: modelo.perdidos,
+    sinais_considerados: sinais.length,
     base
   };
 }
@@ -3974,6 +4315,14 @@ app.get("/leads", authMiddleware, async (c) => {
       fechado: [],
       perdido: []
     };
+
+    const modeloMLLeads =
+      usuarioTemRecurso(
+        user,
+        "machine_learning_leads"
+      )
+        ? treinarModeloMLLeads(result.rows)
+        : null;
     
     for (const lead of result.rows) {
 
@@ -3989,6 +4338,14 @@ app.get("/leads", authMiddleware, async (c) => {
 
       lead.score_pontos =
         scoreData.pontos;
+
+      if (modeloMLLeads) {
+        lead.ml_leads =
+          preverConversaoMLLead(
+            modeloMLLeads,
+            lead
+          );
+      }
     
       if (
         lead.status === "novo" ||
