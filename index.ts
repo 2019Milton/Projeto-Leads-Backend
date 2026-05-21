@@ -670,7 +670,7 @@ const masterMiddleware = async (c: any, next: any) => {
 async function obterContaAnuncios(token: string) {
 
   const adAccounts = await fetch(
-    `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,funding_source&access_token=${token}`
+    `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account&access_token=${token}`
   ).then(r => r.json());
 
   console.log(
@@ -1998,6 +1998,26 @@ app.get(
         }
       ).format(gastoHoje);
 
+    const contaAtiva =
+      conta.account_status === 1;
+
+    const pagamentoAutomatico =
+      Boolean(conta.funding_source);
+
+    const pagamentoManual =
+      conta.is_prepay_account === true;
+
+    const pagamentoHabilitado =
+      pagamentoAutomatico ||
+      pagamentoManual;
+
+    const tipoPagamento =
+      pagamentoAutomatico
+        ? "automatico"
+        : pagamentoManual
+        ? "manual_pre_pago"
+        : "nao_identificado";
+
     // 🔥 STATUS FINAL
     return c.json({
 
@@ -2012,8 +2032,16 @@ app.get(
         id: conta.id,
         nome: conta.name,
         status: conta.account_status,
-        ativa: conta.account_status === 1,
-        possui_pagamento: !!conta.funding_source
+        motivo_desativacao: conta.disable_reason || null,
+        moeda: conta.currency || null,
+        saldo: conta.balance ?? null,
+        pre_pago: pagamentoManual,
+        ativa: contaAtiva,
+        tipo_pagamento: tipoPagamento,
+        pagamento_automatico: pagamentoAutomatico,
+        pagamento_manual: pagamentoManual,
+        pagamento_habilitado: pagamentoHabilitado,
+        possui_pagamento: pagamentoHabilitado
       },
 
       paginas: pages.data || [],
@@ -2031,8 +2059,8 @@ app.get(
       },
 
       pronto_para_anunciar:
-        conta.account_status === 1 &&
-        !!conta.funding_source
+        contaAtiva &&
+        pagamentoHabilitado
     });
 
   } catch (err: any) {
