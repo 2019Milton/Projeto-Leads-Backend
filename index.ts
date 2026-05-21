@@ -2818,6 +2818,8 @@ app.get("/campanhas", authMiddleware, async (c) => {
       SELECT
         c.*,
         dono.email AS criado_por_email,
+        dono.nome AS criado_por_nome,
+        dono.sobrenome AS criado_por_sobrenome,
         corretor.email AS corretor_encaminhado_email,
         corretor.nome AS corretor_encaminhado_nome,
         corretor.sobrenome AS corretor_encaminhado_sobrenome
@@ -3047,6 +3049,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       SELECT
         c.*,
         dono.email AS criado_por_email,
+        dono.nome AS criado_por_nome,
+        dono.sobrenome AS criado_por_sobrenome,
         corretor.email AS corretor_encaminhado_email,
         corretor.nome AS corretor_encaminhado_nome,
         corretor.sobrenome AS corretor_encaminhado_sobrenome
@@ -3113,6 +3117,11 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         campaign_id: campanha.campaign_id,
         criada_por_usuario_id: campanha.usuario_id,
         criada_por_email: campanha.criado_por_email,
+        criada_por_nome:
+          [
+            campanha.criado_por_nome,
+            campanha.criado_por_sobrenome
+          ].filter(Boolean).join(" ") || null,
         encaminhada_para_usuario_id:
           campanha.encaminhada_para_usuario_id || null,
         corretor_encaminhado_email:
