@@ -44,7 +44,7 @@ type PlanoPlataforma =
 
 const RECURSOS_POR_PLANO = {
   bronze: {
-    machine_learning_leads: true,
+    machine_learning_leads: false,
     ia_leads: false
   },
   prata: {
