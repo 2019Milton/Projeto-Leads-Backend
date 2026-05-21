@@ -89,7 +89,9 @@ function usuarioTemRecurso(
   recurso: keyof typeof RECURSOS_POR_PLANO.bronze
 ) {
   return Boolean(
-    obterRecursosPlano(user?.plano, user?.tipo)[recurso]
+    RECURSOS_POR_PLANO[
+      normalizarPlano(user?.plano)
+    ][recurso]
   );
 }
 
