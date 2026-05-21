@@ -2420,7 +2420,9 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS form_id TEXT,
     ADD COLUMN IF NOT EXISTS page_id TEXT,
     ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS configuracoes_avancadas JSONB;
+    ADD COLUMN IF NOT EXISTS configuracoes_avancadas JSONB,
+    ADD COLUMN IF NOT EXISTS encaminhada_para_usuario_id INTEGER,
+    ADD COLUMN IF NOT EXISTS encaminhada_em TIMESTAMP;
 `);
 
 await client.query(`
@@ -2432,6 +2434,8 @@ await client.query(`
     ON leads(lead_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_usuario_id
     ON campanhas(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_campanhas_encaminhada_usuario_id
+    ON campanhas(encaminhada_para_usuario_id);
   CREATE INDEX IF NOT EXISTS idx_meta_conexoes_usuario_id
     ON meta_conexoes(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash
@@ -2811,10 +2815,21 @@ app.get("/campanhas", authMiddleware, async (c) => {
 
     const campanhas = await client.query(
       `
-      SELECT *
-      FROM campanhas
-      WHERE usuario_id = $1
-      ORDER BY id DESC
+      SELECT
+        c.*,
+        dono.email AS criado_por_email,
+        corretor.email AS corretor_encaminhado_email,
+        corretor.nome AS corretor_encaminhado_nome,
+        corretor.sobrenome AS corretor_encaminhado_sobrenome
+      FROM campanhas c
+      INNER JOIN usuarios dono
+        ON dono.id = c.usuario_id
+      LEFT JOIN usuarios corretor
+        ON corretor.id = c.encaminhada_para_usuario_id
+      WHERE
+        c.usuario_id = $1
+        OR c.encaminhada_para_usuario_id = $1
+      ORDER BY c.id DESC
       `,
       [user.id]
     );
@@ -2829,6 +2844,147 @@ app.get("/campanhas", authMiddleware, async (c) => {
 
     return c.json({
       error: "Erro ao buscar campanhas"
+    }, 500);
+  }
+});
+
+app.get("/campanhas/corretores-vinculados", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "admin_corretor") {
+      return c.json({
+        error: "Acesso restrito ao Admin Corretor"
+      }, 403);
+    }
+
+    const result = await client.query(
+      `
+      SELECT
+        id,
+        email,
+        nome,
+        sobrenome
+      FROM usuarios
+      WHERE admin_id = $1
+      AND tipo = 'corretor'
+      AND COALESCE(ativo, true) = true
+      ORDER BY nome NULLS LAST, email ASC
+      `,
+      [user.id]
+    );
+
+    return c.json({
+      corretores: result.rows
+    });
+
+  } catch (err) {
+
+    console.error(
+      "ERRO CORRETORES CAMPANHA:",
+      err
+    );
+
+    return c.json({
+      error: "Erro ao buscar corretores vinculados"
+    }, 500);
+  }
+});
+
+app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "admin_corretor") {
+      return c.json({
+        error: "Apenas Admin Corretor pode encaminhar campanhas"
+      }, 403);
+    }
+
+    const campanhaId =
+      Number(c.req.param("id"));
+
+    const body =
+      await c.req.json();
+
+    const corretorId =
+      body.corretor_id
+        ? Number(body.corretor_id)
+        : null;
+
+    const campanha = await client.query(
+      `
+      SELECT id
+      FROM campanhas
+      WHERE id = $1
+      AND usuario_id = $2
+      LIMIT 1
+      `,
+      [campanhaId, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({
+        error: "Campanha não encontrada para este Admin Corretor"
+      }, 404);
+    }
+
+    if (corretorId) {
+
+      const corretor = await client.query(
+        `
+        SELECT id
+        FROM usuarios
+        WHERE id = $1
+        AND admin_id = $2
+        AND tipo = 'corretor'
+        AND COALESCE(ativo, true) = true
+        LIMIT 1
+        `,
+        [corretorId, user.id]
+      );
+
+      if (!corretor.rows.length) {
+        return c.json({
+          error: "Selecione um corretor vinculado e ativo"
+        }, 400);
+      }
+    }
+
+    const update = await client.query(
+      `
+      UPDATE campanhas
+      SET
+        encaminhada_para_usuario_id = $1,
+        encaminhada_em = CASE
+          WHEN $1::integer IS NULL THEN NULL
+          ELSE NOW()
+        END
+      WHERE id = $2
+      AND usuario_id = $3
+      RETURNING id, encaminhada_para_usuario_id
+      `,
+      [corretorId, campanhaId, user.id]
+    );
+
+    return c.json({
+      sucesso: true,
+      campanha: update.rows[0]
+    });
+
+  } catch (err) {
+
+    console.error(
+      "ERRO ENCAMINHAR CAMPANHA:",
+      err
+    );
+
+    return c.json({
+      error: "Erro ao encaminhar campanha"
     }, 500);
   }
 });
@@ -2859,10 +3015,21 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
     const campanhas = await client.query(
       `
-      SELECT *
-      FROM campanhas
-      WHERE usuario_id = $1
-      ORDER BY id DESC
+      SELECT
+        c.*,
+        dono.email AS criado_por_email,
+        corretor.email AS corretor_encaminhado_email,
+        corretor.nome AS corretor_encaminhado_nome,
+        corretor.sobrenome AS corretor_encaminhado_sobrenome
+      FROM campanhas c
+      INNER JOIN usuarios dono
+        ON dono.id = c.usuario_id
+      LEFT JOIN usuarios corretor
+        ON corretor.id = c.encaminhada_para_usuario_id
+      WHERE
+        c.usuario_id = $1
+        OR c.encaminhada_para_usuario_id = $1
+      ORDER BY c.id DESC
       `,
       [user.id]
     );
@@ -2915,6 +3082,20 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         status: campanha.status,
         origem: campanha.origem,
         campaign_id: campanha.campaign_id,
+        criada_por_usuario_id: campanha.usuario_id,
+        criada_por_email: campanha.criado_por_email,
+        encaminhada_para_usuario_id:
+          campanha.encaminhada_para_usuario_id || null,
+        corretor_encaminhado_email:
+          campanha.corretor_encaminhado_email || null,
+        corretor_encaminhado_nome:
+          [
+            campanha.corretor_encaminhado_nome,
+            campanha.corretor_encaminhado_sobrenome
+          ].filter(Boolean).join(" ") || null,
+        recebida_por_encaminhamento:
+          Number(campanha.encaminhada_para_usuario_id) ===
+          Number(user.id),
         configuracoes_avancadas:
           campanha.configuracoes_avancadas || {},
 
@@ -3299,13 +3480,23 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
 
     const campanhaBanco = await client.query(
       `
-      SELECT adset_id, ad_id
+      SELECT id, adset_id, ad_id
       FROM campanhas
       WHERE campaign_id = $1
+      AND (
+        usuario_id = $2
+        OR encaminhada_para_usuario_id = $2
+      )
       LIMIT 1
       `,
-      [campaign_id]
+      [campaign_id, user.id]
     );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({
+        error: "Campanha não disponível para este usuário"
+      }, 404);
+    }
     
     const adset_id =
       campanhaBanco.rows[0]?.adset_id;
@@ -3424,9 +3615,9 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       `
       UPDATE campanhas
       SET status = $1
-      WHERE campaign_id = $2
+      WHERE id = $2
       `,
-      [status, campaign_id]
+      [status, campanhaBanco.rows[0].id]
     );
 
     return c.json({
@@ -3453,6 +3644,23 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
     const {
       campaign_id
     } = await c.req.json();
+
+    const campanha = await client.query(
+      `
+      SELECT id
+      FROM campanhas
+      WHERE campaign_id = $1
+      AND usuario_id = $2
+      LIMIT 1
+      `,
+      [campaign_id, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({
+        error: "Apenas o dono da campanha pode excluí-la"
+      }, 403);
+    }
 
     // 🔐 TOKEN
     const conn = await client.query(
@@ -3506,9 +3714,9 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
       `
       UPDATE campanhas
       SET status = 'DELETED'
-      WHERE campaign_id = $1
+      WHERE id = $1
       `,
-      [campaign_id]
+      [campanha.rows[0].id]
     );
 
     return c.json({
