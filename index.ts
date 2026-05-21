@@ -2854,11 +2854,24 @@ app.get("/campanhas/corretores-vinculados", authMiddleware, async (c) => {
 
     const user: any = c.get("user");
 
-    if (user.tipo !== "admin_corretor") {
+    if (
+      user.tipo !== "admin_corretor" &&
+      user.tipo !== "super_admin"
+    ) {
       return c.json({
-        error: "Acesso restrito ao Admin Corretor"
+        error: "Acesso restrito a administradores"
       }, 403);
     }
+
+    const filtroVinculo =
+      user.tipo === "admin_corretor"
+        ? "AND admin_id = $1"
+        : "";
+
+    const valores =
+      user.tipo === "admin_corretor"
+        ? [user.id]
+        : [];
 
     const result = await client.query(
       `
@@ -2868,12 +2881,12 @@ app.get("/campanhas/corretores-vinculados", authMiddleware, async (c) => {
         nome,
         sobrenome
       FROM usuarios
-      WHERE admin_id = $1
-      AND tipo = 'corretor'
+      WHERE tipo = 'corretor'
+      ${filtroVinculo}
       AND COALESCE(ativo, true) = true
       ORDER BY nome NULLS LAST, email ASC
       `,
-      [user.id]
+      valores
     );
 
     return c.json({
@@ -2899,9 +2912,12 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
 
     const user: any = c.get("user");
 
-    if (user.tipo !== "admin_corretor") {
+    if (
+      user.tipo !== "admin_corretor" &&
+      user.tipo !== "super_admin"
+    ) {
       return c.json({
-        error: "Apenas Admin Corretor pode encaminhar campanhas"
+        error: "Apenas administradores podem encaminhar campanhas"
       }, 403);
     }
 
@@ -2935,18 +2951,31 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
 
     if (corretorId) {
 
-      const corretor = await client.query(
-        `
-        SELECT id
-        FROM usuarios
-        WHERE id = $1
-        AND admin_id = $2
-        AND tipo = 'corretor'
-        AND COALESCE(ativo, true) = true
-        LIMIT 1
-        `,
-        [corretorId, user.id]
-      );
+      const corretor =
+        user.tipo === "admin_corretor"
+          ? await client.query(
+              `
+              SELECT id
+              FROM usuarios
+              WHERE id = $1
+              AND admin_id = $2
+              AND tipo = 'corretor'
+              AND COALESCE(ativo, true) = true
+              LIMIT 1
+              `,
+              [corretorId, user.id]
+            )
+          : await client.query(
+              `
+              SELECT id
+              FROM usuarios
+              WHERE id = $1
+              AND tipo = 'corretor'
+              AND COALESCE(ativo, true) = true
+              LIMIT 1
+              `,
+              [corretorId]
+            );
 
       if (!corretor.rows.length) {
         return c.json({
