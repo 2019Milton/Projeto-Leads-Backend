@@ -4757,12 +4757,6 @@ app.put("/admin/usuarios/:id/plano", authMiddleware, async (c) => {
       return c.json({ error: "Usuário não encontrado" }, 404);
     }
 
-    if (alvo.rows[0].tipo === "super_admin") {
-      return c.json({
-        error: "Super Admin já possui acesso total"
-      }, 400);
-    }
-
     await client.query(
       `
       UPDATE usuarios
@@ -4775,7 +4769,12 @@ app.put("/admin/usuarios/:id/plano", authMiddleware, async (c) => {
     return c.json({
       sucesso: true,
       plano: planoFinal,
-      recursos: obterRecursosPlano(planoFinal)
+      acesso_total:
+        alvo.rows[0].tipo === "super_admin",
+      recursos: obterRecursosPlano(
+        planoFinal,
+        alvo.rows[0].tipo
+      )
     });
 
   } catch (err) {
