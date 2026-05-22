@@ -295,6 +295,14 @@ function textoOpcional(value: unknown) {
 }
 
 function numeroOpcional(value: unknown) {
+  if (
+    value === null ||
+    value === undefined ||
+    String(value).trim() === ""
+  ) {
+    return null;
+  }
+
   const numero = Number(value);
 
   return Number.isFinite(numero)
