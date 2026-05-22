@@ -1126,7 +1126,7 @@ const masterMiddleware = async (c: any, next: any) => {
   await next();
 };
 
-async function obterContaAnuncios(token: string) {
+async function listarContasAnuncios(token: string) {
 
   const adAccounts = await fetch(
     `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account&access_token=${token}`
@@ -1151,10 +1151,36 @@ async function obterContaAnuncios(token: string) {
     adAccounts.data.length === 0
   ) {
 
+    return [];
+  }
+
+  return adAccounts.data;
+}
+
+async function obterContaAnuncios(
+  token: string,
+  contaSelecionadaId?: string | null
+) {
+
+  const contas = await listarContasAnuncios(token);
+
+  if (contas.length === 0) {
     return null;
   }
 
-  return adAccounts.data[0];
+  if (contaSelecionadaId) {
+    return contas.find(
+      (conta: any) => conta.id === contaSelecionadaId
+    ) || null;
+  }
+
+  if (contas.length === 1) {
+    return contas[0];
+  }
+
+  throw new Error(
+    "Selecione a conta de anuncios Meta que deseja usar."
+  );
 }
 
 
@@ -1167,8 +1193,12 @@ async function sincronizarTodasCampanhas() {
 
     // 🔥 BUSCA TODOS USUÁRIOS COM META
     const usuarios = await client.query(`
-      SELECT DISTINCT usuario_id, access_token
+      SELECT DISTINCT ON (usuario_id)
+        usuario_id,
+        access_token,
+        conta_anuncios_id
       FROM meta_conexoes
+      ORDER BY usuario_id, id DESC
     `);
 
     for (const user of usuarios.rows) {
@@ -1179,7 +1209,10 @@ async function sincronizarTodasCampanhas() {
 
         // 🔥 CONTAS
         const contaAds =
-          await obterContaAnuncios(token);
+          await obterContaAnuncios(
+            token,
+            user.conta_anuncios_id
+          );
         
         if (!contaAds) {
 
@@ -1556,6 +1589,77 @@ app.get("/meta/teste", async (c) => {
   }
 });
 
+app.post("/meta/conta-anuncios", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.json();
+    const contaAnunciosId =
+      String(body.conta_anuncios_id || "").trim();
+
+    if (!contaAnunciosId) {
+      return c.json({
+        error: "Selecione uma conta de anuncios Meta."
+      }, 400);
+    }
+
+    const conn = await client.query(
+      `
+      SELECT id, access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    if (conn.rows.length === 0) {
+      return c.json({
+        error: "Meta nao conectada"
+      }, 400);
+    }
+
+    const contas =
+      await listarContasAnuncios(conn.rows[0].access_token);
+
+    const conta = contas.find(
+      (item: any) => item.id === contaAnunciosId
+    );
+
+    if (!conta) {
+      return c.json({
+        error: "Conta de anuncios nao disponivel nesta conexao Meta."
+      }, 400);
+    }
+
+    await client.query(
+      `
+      UPDATE meta_conexoes
+      SET conta_anuncios_id = $1
+      WHERE id = $2
+      `,
+      [conta.id, conn.rows[0].id]
+    );
+
+    return c.json({
+      sucesso: true,
+      conta_anuncios: {
+        id: conta.id,
+        nome: conta.name
+      }
+    });
+
+  } catch (err: any) {
+    console.error("SELECIONAR CONTA META:", err);
+
+    return c.json({
+      error:
+        err?.message ||
+        "Erro ao selecionar conta de anuncios Meta"
+    }, 500);
+  }
+});
+
 
 app.post("/meta/campanha", async (c) => {
   try {
@@ -1567,14 +1671,17 @@ app.post("/meta/campanha", async (c) => {
     } = await c.req.json();
 
     const conn = await client.query(
-      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
       [usuario_id]
     );
 
     const token = conn.rows[0].access_token;
 
     const contaAds =
-      await obterContaAnuncios(token);
+      await obterContaAnuncios(
+        token,
+        conn.rows[0].conta_anuncios_id
+      );
     
     if (!contaAds) {
     
@@ -1668,14 +1775,17 @@ app.post("/meta/adset", async (c) => {
     } = await c.req.json();
 
     const conn = await client.query(
-      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
       [usuario_id]
     );
 
     const token = conn.rows[0].access_token;
 
     const contaAds =
-      await obterContaAnuncios(token);
+      await obterContaAnuncios(
+        token,
+        conn.rows[0].conta_anuncios_id
+      );
     
     if (!contaAds) {
     
@@ -1940,7 +2050,7 @@ app.post("/meta/upload-imagem", async (c) => {
     // 🔐 TOKEN META
     const conn = await client.query(
       `
-      SELECT access_token
+      SELECT access_token, conta_anuncios_id
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -1960,7 +2070,10 @@ app.post("/meta/upload-imagem", async (c) => {
 
     // 🔥 CONTA DE ANÚNCIOS
     const contaAds =
-      await obterContaAnuncios(token);
+      await obterContaAnuncios(
+        token,
+        conn.rows[0].conta_anuncios_id
+      );
 
     if (!contaAds) {
 
@@ -2089,7 +2202,7 @@ app.post("/meta/anuncio", async (c) => {
     // 🔐 TOKEN META
     const conn = await client.query(
       `
-      SELECT access_token
+      SELECT access_token, conta_anuncios_id
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -2109,7 +2222,10 @@ app.post("/meta/anuncio", async (c) => {
 
     // 🔥 CONTA ADS
     const contaAds =
-      await obterContaAnuncios(token);
+      await obterContaAnuncios(
+        token,
+        conn.rows[0].conta_anuncios_id
+      );
 
     if (!contaAds) {
 
@@ -2333,7 +2449,7 @@ app.get(
     // 🔐 TOKEN
     const conn = await client.query(
       `
-      SELECT access_token, ultimo_sync
+      SELECT access_token, ultimo_sync, conta_anuncios_id
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -2358,8 +2474,55 @@ app.get(
     ).then(r => r.json());
 
     // 🔥 CONTAS DE ANÚNCIOS
+    const contasAds =
+      await listarContasAnuncios(token);
+
     const contaAds =
-      await obterContaAnuncios(token);
+      conn.rows[0].conta_anuncios_id
+        ? await obterContaAnuncios(
+            token,
+            conn.rows[0].conta_anuncios_id
+          )
+        : contasAds.length === 1
+        ? contasAds[0]
+        : null;
+
+    if (contasAds.length === 0) {
+      return c.json({
+        error: "Nenhuma conta de anuncios encontrada"
+      }, 400);
+    }
+
+    if (!contaAds) {
+      const pagesSemConta = await fetch(
+        `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+      ).then(r => r.json());
+
+      return c.json({
+        conectado: true,
+        possui_conta_anuncios: true,
+        selecao_conta_anuncios_pendente: true,
+        usuario_meta: me,
+        conta_anuncios: null,
+        contas_anuncios: contasAds.map((conta: any) => ({
+          id: conta.id,
+          nome: conta.name,
+          status: conta.account_status,
+          moeda: conta.currency || null
+        })),
+        paginas: pagesSemConta.data || [],
+        instagram: null,
+        metricas: {
+          campanhas: 0,
+          campanhas_ativas: 0,
+          leads_hoje: 0,
+          gasto_hoje: 0,
+          gasto_hoje_formatado: "R$ 0,00",
+          ultimo_sync: conn.rows[0].ultimo_sync || null
+        },
+        pronto_para_anunciar: false
+      });
+    }
     
     if (!contaAds) {
     
@@ -2503,6 +2666,13 @@ app.get(
         possui_pagamento: pagamentoHabilitado
       },
 
+      contas_anuncios: contasAds.map((conta: any) => ({
+        id: conta.id,
+        nome: conta.name,
+        status: conta.account_status,
+        moeda: conta.currency || null
+      })),
+
       paginas: pages.data || [],
 
       instagram,
@@ -2544,7 +2714,7 @@ app.post("/meta/desconectar", authMiddleware, async (c) => {
 
     const conn = await client.query(
       `
-      SELECT access_token
+      SELECT access_token, conta_anuncios_id
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -2881,7 +3051,8 @@ await client.query(`
 
 await client.query(`
   ALTER TABLE meta_conexoes
-    ADD COLUMN IF NOT EXISTS ultimo_sync TIMESTAMP;
+    ADD COLUMN IF NOT EXISTS ultimo_sync TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS conta_anuncios_id TEXT;
 `);
 
 await client.query(`
@@ -3511,7 +3682,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
     const conn = await client.query(
       `
-      SELECT access_token
+      SELECT access_token, conta_anuncios_id
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -3669,7 +3840,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
     // 🔐 TOKEN META
     const conn = await client.query(
       `
-      SELECT access_token
+      SELECT access_token, conta_anuncios_id
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -3691,7 +3862,10 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
     // 🔥 CONTA DE ANÚNCIOS
     const contaAds =
-      await obterContaAnuncios(token);
+      await obterContaAnuncios(
+        token,
+        conn.rows[0].conta_anuncios_id
+      );
     
     if (!contaAds) {
     
