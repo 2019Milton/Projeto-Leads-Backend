@@ -318,6 +318,34 @@ function listaOpcional(value: unknown) {
     : [];
 }
 
+async function listarPaginasComInstagram(
+  token: string
+) {
+  const pages = await fetch(
+    `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,instagram_business_account{id,username,profile_picture_url}&access_token=${token}`
+  ).then(r => r.json());
+
+  return Array.isArray(pages.data)
+    ? pages.data.map((pagina: any) => ({
+        ...pagina,
+        instagram:
+          pagina.instagram_business_account
+            ? {
+                id:
+                  pagina.instagram_business_account.id ||
+                  null,
+                username:
+                  pagina.instagram_business_account.username ||
+                  null,
+                profile_picture_url:
+                  pagina.instagram_business_account.profile_picture_url ||
+                  null
+              }
+            : null
+      }))
+    : [];
+}
+
 function urlOpcional(value: unknown, fallback: string) {
   const url = textoOpcional(value);
 
@@ -2585,9 +2613,8 @@ app.get(
     }
 
     if (!contaAds) {
-      const pagesSemConta = await fetch(
-        `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
-      ).then(r => r.json());
+      const paginasSemConta =
+        await listarPaginasComInstagram(token);
 
       return c.json({
         conectado: true,
@@ -2601,7 +2628,7 @@ app.get(
           status: conta.account_status,
           moeda: conta.currency || null
         })),
-        paginas: pagesSemConta.data || [],
+        paginas: paginasSemConta,
         instagram: null,
         metricas: {
           campanhas: 0,
@@ -2627,16 +2654,18 @@ app.get(
     const conta = contaAds;
 
     // 🔥 PÁGINAS
-    const pages = await fetch(
-      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
-    ).then(r => r.json());
+    const paginas =
+      await listarPaginasComInstagram(token);
 
-    const primeiraPagina = pages.data?.[0];
+    const primeiraPagina = paginas[0];
 
     // 🔥 INSTAGRAM
-    let instagram = null;
+    let instagram =
+      paginas.find((pagina: any) =>
+        pagina.instagram?.id
+      )?.instagram || null;
 
-    if (primeiraPagina?.id) {
+    if (!instagram && primeiraPagina?.id) {
 
       const instaRes = await fetch(
         `https://graph.facebook.com/v19.0/${primeiraPagina.id}?fields=instagram_business_account&access_token=${token}`
@@ -2770,7 +2799,7 @@ app.get(
         moeda: conta.currency || null
       })),
 
-      paginas: pages.data || [],
+      paginas,
 
       instagram,
 
