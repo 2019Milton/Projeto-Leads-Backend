@@ -348,7 +348,11 @@ function montarTargetingMeta(avancadas: any) {
 
   const targeting: any = {
     geo_locations: {
-      countries: [pais]
+      countries: [pais],
+      location_types: [
+        "home",
+        "recent"
+      ]
     }
   };
 
@@ -365,6 +369,10 @@ function montarTargetingMeta(avancadas: any) {
           radius: raio,
           distance_unit: "kilometer"
         }
+      ],
+      location_types: [
+        "home",
+        "recent"
       ]
     };
   }
@@ -1904,6 +1912,11 @@ app.post("/meta/adset", async (c) => {
         body: JSON.stringify(payloadAdset)
       }
     ).then(r => r.json());
+
+    console.log(
+      "ADSET PAYLOAD:",
+      JSON.stringify(payloadAdset, null, 2)
+    );
 
     console.log("ADSET RESPONSE:", adset);
 
