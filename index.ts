@@ -1920,6 +1920,13 @@ app.post("/meta/adset", async (c) => {
 
     console.log("ADSET RESPONSE:", adset);
 
+    if (adset.error) {
+      return c.json({
+        error: adset.error,
+        targeting_enviado: targeting
+      }, 400);
+    }
+
     return c.json(adset);
 
   } catch (err) {
