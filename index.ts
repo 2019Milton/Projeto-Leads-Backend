@@ -1183,6 +1183,23 @@ async function obterContaAnuncios(
   );
 }
 
+async function obterContaAnunciosSelecionadaIdUsuario(
+  usuarioId: number
+) {
+  const conn = await client.query(
+    `
+    SELECT conta_anuncios_id
+    FROM meta_conexoes
+    WHERE usuario_id = $1
+    ORDER BY id DESC
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+
+  return conn.rows[0]?.conta_anuncios_id || null;
+}
+
 
 
 async function sincronizarTodasCampanhas() {
@@ -1258,12 +1275,14 @@ async function sincronizarTodasCampanhas() {
               SET
                 nome = $1,
                 status = $2,
+                conta_anuncios_id = $3,
                 atualizado_em = NOW()
-              WHERE campaign_id = $3
+              WHERE campaign_id = $4
               `,
               [
                 campanha.name,
                 statusFinal,
+                adAccountId,
                 campanha.id
               ]
             );
@@ -1275,16 +1294,18 @@ async function sincronizarTodasCampanhas() {
               INSERT INTO campanhas (
                 usuario_id,
                 campaign_id,
+                conta_anuncios_id,
                 nome,
                 status,
                 origem,
                 atualizado_em
               )
-              VALUES ($1,$2,$3,$4,$5,NOW())
+              VALUES ($1,$2,$3,$4,$5,$6,NOW())
               `,
               [
                 user.usuario_id,
                 campanha.id,
+                adAccountId,
                 campanha.name,
                 statusFinal,
                 "meta"
@@ -1731,16 +1752,18 @@ app.post("/meta/campanha", async (c) => {
       INSERT INTO campanhas (
         usuario_id,
         campaign_id,
+        conta_anuncios_id,
         nome,
         status,
         origem,
         configuracoes_avancadas
       )
-      VALUES ($1,$2,$3,$4,$5,$6)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
       `,
       [
         usuario_id,
         campanha.id,
+        adAccountId,
         nome || "Campanha Plataforma",
         "PAUSED",
         "plataforma",
@@ -2487,6 +2510,27 @@ app.get(
         ? contasAds[0]
         : null;
 
+    if (
+      !conn.rows[0].conta_anuncios_id &&
+      contasAds.length === 1
+    ) {
+      await client.query(
+        `
+        UPDATE meta_conexoes
+        SET conta_anuncios_id = $1
+        WHERE usuario_id = $2
+        AND id = (
+          SELECT id
+          FROM meta_conexoes
+          WHERE usuario_id = $2
+          ORDER BY id DESC
+          LIMIT 1
+        )
+        `,
+        [contasAds[0].id, usuario_id]
+      );
+    }
+
     if (contasAds.length === 0) {
       return c.json({
         error: "Nenhuma conta de anuncios encontrada"
@@ -2568,8 +2612,9 @@ app.get(
       SELECT COUNT(*) as total
       FROM campanhas
       WHERE usuario_id = $1
+      AND conta_anuncios_id = $2
       `,
-      [usuario_id]
+      [usuario_id, adAccountId]
     );
 
     const campanhasAtivas = await client.query(
@@ -2577,9 +2622,10 @@ app.get(
       SELECT COUNT(*) as total
       FROM campanhas
       WHERE usuario_id = $1
+      AND conta_anuncios_id = $2
       AND status = 'ACTIVE'
       `,
-      [usuario_id]
+      [usuario_id, adAccountId]
     );
 
     const leadsHoje = await client.query(
@@ -2587,9 +2633,13 @@ app.get(
       SELECT COUNT(*) as total
       FROM leads
       WHERE usuario_id = $1
+      AND (
+        COALESCE(origem, 'manual') <> 'meta'
+        OR conta_anuncios_id = $2
+      )
       AND DATE(criado_em) = CURRENT_DATE
       `,
-      [usuario_id]
+      [usuario_id, adAccountId]
     );
 
     let gastoHoje = 0;
@@ -2634,10 +2684,10 @@ app.get(
       pagamentoManual;
 
     const tipoPagamento =
-      pagamentoAutomatico
-        ? "automatico"
-        : pagamentoManual
+      pagamentoManual
         ? "manual_pre_pago"
+        : pagamentoAutomatico
+        ? "metodo_detectado"
         : "nao_identificado";
 
     // 🔥 STATUS FINAL
@@ -3039,6 +3089,7 @@ await client.query(`
 await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS lead_id TEXT,
+    ADD COLUMN IF NOT EXISTS conta_anuncios_id TEXT,
     ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'novo',
     ADD COLUMN IF NOT EXISTS origem TEXT DEFAULT 'manual',
     ADD COLUMN IF NOT EXISTS campanha TEXT,
@@ -3061,6 +3112,7 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS ad_id TEXT,
     ADD COLUMN IF NOT EXISTS form_id TEXT,
     ADD COLUMN IF NOT EXISTS page_id TEXT,
+    ADD COLUMN IF NOT EXISTS conta_anuncios_id TEXT,
     ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP,
     ADD COLUMN IF NOT EXISTS configuracoes_avancadas JSONB,
     ADD COLUMN IF NOT EXISTS encaminhada_para_usuario_id INTEGER,
@@ -3076,10 +3128,14 @@ await client.query(`
     ON leads(lead_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_usuario_id
     ON campanhas(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_campanhas_conta_anuncios_id
+    ON campanhas(conta_anuncios_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_encaminhada_usuario_id
     ON campanhas(encaminhada_para_usuario_id);
   CREATE INDEX IF NOT EXISTS idx_meta_conexoes_usuario_id
     ON meta_conexoes(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_leads_conta_anuncios_id
+    ON leads(conta_anuncios_id);
   CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash
     ON password_reset_tokens(token_hash);
   CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_usuario
@@ -3466,6 +3522,15 @@ app.get("/campanhas", authMiddleware, async (c) => {
 
     console.log("USER:", user.id);
 
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(
+        user.id
+      );
+
+    if (!contaAnunciosId) {
+      return c.json([]);
+    }
+
     const campanhas = await client.query(
       `
       SELECT
@@ -3482,11 +3547,14 @@ app.get("/campanhas", authMiddleware, async (c) => {
       LEFT JOIN usuarios corretor
         ON corretor.id = c.encaminhada_para_usuario_id
       WHERE
-        c.usuario_id = $1
-        OR c.encaminhada_para_usuario_id = $1
+        (
+          c.usuario_id = $1
+          OR c.encaminhada_para_usuario_id = $1
+        )
+        AND c.conta_anuncios_id = $2
       ORDER BY c.id DESC
       `,
-      [user.id]
+      [user.id, contaAnunciosId]
     );
 
     console.log("CAMPANHAS:", campanhas.rows);
@@ -3713,11 +3781,14 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       LEFT JOIN usuarios corretor
         ON corretor.id = c.encaminhada_para_usuario_id
       WHERE
-        c.usuario_id = $1
-        OR c.encaminhada_para_usuario_id = $1
+        (
+          c.usuario_id = $1
+          OR c.encaminhada_para_usuario_id = $1
+        )
+        AND c.conta_anuncios_id = $2
       ORDER BY c.id DESC
       `,
-      [user.id]
+      [user.id, conn.rows[0].conta_anuncios_id]
     );
 
     const metricas = [];
@@ -3752,10 +3823,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         FROM leads
         WHERE usuario_id = $1
         AND campanha = $2
+        AND conta_anuncios_id = $3
         `,
         [
           user.id,
-          campanha.nome
+          campanha.nome,
+          conn.rows[0].conta_anuncios_id
         ]
       );
 
@@ -3921,12 +3994,14 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
           SET
             nome = $1,
             status = $2,
+            conta_anuncios_id = $3,
             atualizado_em = NOW()
-          WHERE campaign_id = $3
+          WHERE campaign_id = $4
           `,
           [
             campanha.name,
             statusFinal,
+            adAccountId,
             campanha.id
           ]
         );
@@ -3943,16 +4018,18 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
           INSERT INTO campanhas (
             usuario_id,
             campaign_id,
+            conta_anuncios_id,
             nome,
             status,
             origem,
             atualizado_em
           )
-          VALUES ($1,$2,$3,$4,$5,NOW())
+          VALUES ($1,$2,$3,$4,$5,$6,NOW())
           `,
           [
             user.id,
             campanha.id,
+            adAccountId,
             campanha.name,
             statusFinal,
             "meta"
@@ -4005,10 +4082,19 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
           SELECT nome
           FROM campanhas
           WHERE form_id = $1
+          AND conta_anuncios_id = $2
           LIMIT 1
           `,
-          [form.id]
+          [form.id, adAccountId]
         );
+
+        if (!campanhaBanco.rows.length) {
+          console.log(
+            "FORMULARIO SEM CAMPANHA DA CONTA SELECIONADA:",
+            form.id
+          );
+          continue;
+        }
         
         const nomeCampanha =
           campanhaBanco.rows[0]?.nome ||
@@ -4068,13 +4154,15 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               UPDATE leads
               SET
                 campanha = $1,
-                respostas_qualificacao = $2
-              WHERE lead_id = $3
-              AND usuario_id = $4
+                respostas_qualificacao = $2,
+                conta_anuncios_id = $3
+              WHERE lead_id = $4
+              AND usuario_id = $5
               `,
               [
                 nomeCampanha,
                 JSON.stringify(respostasQualificacao),
+                adAccountId,
                 lead.id,
                 user.id
               ]
@@ -4101,13 +4189,14 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               email,
               telefone,
               campanha,
+              conta_anuncios_id,
               origem,
               status,
               respostas_qualificacao,
               criado_em
             )
             VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()
             )
             `,
             [
@@ -4117,6 +4206,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               fields.email || "",
               fields.phone_number || "",
               nomeCampanha,
+              adAccountId,
               "meta",
               "novo",
               JSON.stringify(respostasQualificacao)
@@ -4171,6 +4261,10 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       status
     } = await c.req.json();
 
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(
+        user.id
+      );
 
     const campanhaBanco = await client.query(
       `
@@ -4181,9 +4275,10 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
         usuario_id = $2
         OR encaminhada_para_usuario_id = $2
       )
+      AND conta_anuncios_id = $3
       LIMIT 1
       `,
-      [campaign_id, user.id]
+      [campaign_id, user.id, contaAnunciosId]
     );
 
     if (!campanhaBanco.rows.length) {
@@ -4339,15 +4434,21 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
       campaign_id
     } = await c.req.json();
 
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(
+        user.id
+      );
+
     const campanha = await client.query(
       `
       SELECT id
       FROM campanhas
       WHERE campaign_id = $1
       AND usuario_id = $2
+      AND conta_anuncios_id = $3
       LIMIT 1
       `,
-      [campaign_id, user.id]
+      [campaign_id, user.id, contaAnunciosId]
     );
 
     if (!campanha.rows.length) {
@@ -4460,6 +4561,11 @@ app.get("/leads", authMiddleware, async (c) => {
 
     console.log("USER AUTH:", user);
 
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(
+        user.id
+      );
+
     const result = await client.query(
       `
       SELECT
@@ -4478,9 +4584,13 @@ app.get("/leads", authMiddleware, async (c) => {
         criado_em
       FROM leads
       WHERE usuario_id = $1
+      AND (
+        COALESCE(origem, 'manual') <> 'meta'
+        OR conta_anuncios_id = $2
+      )
       ORDER BY criado_em DESC
       `,
-      [user.id]
+      [user.id, contaAnunciosId]
     );
 
     // 🔥 separa por status
