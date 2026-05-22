@@ -408,6 +408,25 @@ function montarTargetingMeta(avancadas: any) {
     targeting.genders = [genero];
   }
 
+  const interesses =
+    Array.isArray(avancadas?.interesses_detalhados)
+      ? avancadas.interesses_detalhados
+          .map((interesse: any) => ({
+            id: textoOpcional(interesse?.id),
+            name: textoOpcional(interesse?.nome || interesse?.name)
+          }))
+          .filter((interesse: any) => interesse.id && interesse.name)
+          .slice(0, 25)
+      : [];
+
+  if (interesses.length) {
+    targeting.flexible_spec = [
+      {
+        interests: interesses
+      }
+    ];
+  }
+
   const plataformas =
     listaOpcional(avancadas?.plataformas);
 
@@ -2782,6 +2801,77 @@ app.get(
         detalhe: err?.message || err
       }, 500);
     }
+});
+
+app.post("/meta/direcionamento/interesses", async (c) => {
+  try {
+    const {
+      usuario_id,
+      busca
+    } = await c.req.json();
+
+    const termo =
+      textoOpcional(busca)
+        .slice(0, 80);
+
+    if (termo.length < 2) {
+      return c.json({ data: [] });
+    }
+
+    const conn = await client.query(
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuario_id]
+    );
+
+    if (!conn.rows.length) {
+      return c.json({
+        error: "Conecte a Meta antes de buscar interesses"
+      }, 400);
+    }
+
+    const params =
+      new URLSearchParams({
+        type: "adinterest",
+        q: termo,
+        limit: "12",
+        access_token: conn.rows[0].access_token
+      });
+
+    const resposta = await fetch(
+      `https://graph.facebook.com/v19.0/search?${params}`
+    ).then(r => r.json());
+
+    if (resposta.error) {
+      return c.json({
+        error:
+          resposta.error?.error_user_msg ||
+          resposta.error?.message ||
+          "Erro ao buscar interesses na Meta",
+        detalhe: resposta.error
+      }, 400);
+    }
+
+    return c.json({
+      data: Array.isArray(resposta.data)
+        ? resposta.data
+            .map((interesse: any) => ({
+              id: textoOpcional(interesse.id),
+              nome: textoOpcional(interesse.name),
+              caminho: listaOpcional(interesse.path)
+            }))
+            .filter((interesse: any) =>
+              interesse.id &&
+              interesse.nome
+            )
+        : []
+    });
+  } catch (err) {
+    console.error("ERRO BUSCA INTERESSES:", err);
+
+    return c.json({
+      error: "Erro ao buscar interesses Meta"
+    }, 500);
+  }
 });
 
 app.post("/meta/desconectar", authMiddleware, async (c) => {
