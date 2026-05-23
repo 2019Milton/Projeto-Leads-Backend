@@ -2775,7 +2775,7 @@ app.get(
       FROM campanhas
       WHERE usuario_id = $1
       AND conta_anuncios_id = $2
-      AND status = 'ACTIVE'
+      AND UPPER(status) IN ('ACTIVE', 'ENABLED')
       `,
       [usuario_id, adAccountId]
     );
