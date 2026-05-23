@@ -1264,6 +1264,38 @@ function normalizarValorMonetarioMeta(
     : numero / 100;
 }
 
+function extrairLeadsActionsMeta(actions: any[] = []) {
+  const prioridade = [
+    "onsite_conversion.lead_grouped",
+    "onsite_conversion.lead",
+    "lead",
+    "offsite_conversion.fb_pixel_lead"
+  ];
+
+  for (const tipo of prioridade) {
+    const item = actions.find(
+      (action: any) =>
+        String(action.action_type || "").toLowerCase() === tipo
+    );
+
+    if (item) {
+      return Number(item.value || 0);
+    }
+  }
+
+  return actions
+    .filter((action: any) =>
+      String(action.action_type || "")
+        .toLowerCase()
+        .includes("lead")
+    )
+    .reduce(
+      (total: number, action: any) =>
+        total + Number(action.value || 0),
+      0
+    );
+}
+
 async function obterContaAnuncios(
   token: string,
   contaSelecionadaId?: string | null
@@ -2748,7 +2780,7 @@ app.get(
       [usuario_id, adAccountId]
     );
 
-    const leadsHoje = await client.query(
+    const leadsHojeBanco = await client.query(
       `
       SELECT COUNT(*) as total
       FROM leads
@@ -2763,15 +2795,20 @@ app.get(
     );
 
     let gastoHoje = 0;
+    let leadsHojeMeta = 0;
 
     try {
 
       const insightsHoje = await fetch(
-        `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend&date_preset=today&access_token=${token}`
+        `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend,actions&date_preset=today&access_token=${token}`
       ).then(r => r.json());
 
       gastoHoje =
         Number(insightsHoje.data?.[0]?.spend || 0);
+      leadsHojeMeta =
+        extrairLeadsActionsMeta(
+          insightsHoje.data?.[0]?.actions || []
+        );
 
     } catch (err) {
 
@@ -2780,6 +2817,9 @@ app.get(
         err
       );
     }
+
+    const leadsHojeFinal =
+      leadsHojeMeta;
 
     const gastoHojeFormatado =
       new Intl.NumberFormat(
@@ -2867,7 +2907,10 @@ app.get(
       metricas: {
         campanhas: campanhasCount.rows[0].total,
         campanhas_ativas: campanhasAtivas.rows[0].total,
-        leads_hoje: leadsHoje.rows[0].total,
+        leads_hoje: leadsHojeFinal,
+        leads_hoje_meta: leadsHojeMeta,
+        leads_hoje_plataforma:
+          Number(leadsHojeBanco.rows[0]?.total || 0),
         gasto_hoje: gastoHoje,
         gasto_hoje_formatado: gastoHojeFormatado,
         ultimo_sync:
@@ -4099,6 +4142,238 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 });
 
 // 🔄 sincroniza campanhas + leads da Meta
+app.get("/meta/performance-diaria", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const diasParam =
+      Number(c.req.query("dias") || 7);
+
+    const dias =
+      Math.min(
+        Math.max(diasParam, 1),
+        30
+      );
+
+    const conn = await client.query(
+      `
+      SELECT access_token, conta_anuncios_id
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    if (conn.rows.length === 0) {
+      return c.json({
+        error: "Meta nao conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    const contaAds =
+      await obterContaAnuncios(
+        token,
+        conn.rows[0].conta_anuncios_id
+      );
+
+    if (!contaAds) {
+      return c.json({
+        error: "Nenhuma conta de anuncios encontrada"
+      }, 400);
+    }
+
+    const adAccountId = contaAds.id;
+
+    const datePreset =
+      dias <= 7
+        ? "last_7d"
+        : dias <= 14
+        ? "last_14d"
+        : "last_30d";
+
+    const insights = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend,actions,impressions,clicks,reach&time_increment=1&date_preset=${datePreset}&access_token=${token}`
+    ).then(r => r.json());
+
+    if (insights.error) {
+      return c.json({
+        error: "Erro ao buscar performance na Meta",
+        detalhe: insights.error
+      }, 400);
+    }
+
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - (dias - 1));
+    inicio.setHours(0, 0, 0, 0);
+
+    const leadsBanco = await client.query(
+      `
+      SELECT
+        DATE(criado_em) AS dia,
+        COUNT(*) AS total
+      FROM leads
+      WHERE usuario_id = $1
+      AND conta_anuncios_id = $2
+      AND criado_em >= $3
+      GROUP BY DATE(criado_em)
+      `,
+      [
+        user.id,
+        adAccountId,
+        inicio
+      ]
+    );
+
+    const leadsBancoPorDia = new Map(
+      leadsBanco.rows.map((row: any) => [
+        new Date(row.dia)
+          .toISOString()
+          .slice(0, 10),
+        Number(row.total || 0)
+      ])
+    );
+
+    const metaPorDia = new Map(
+      (insights.data || []).map((linha: any) => [
+        linha.date_start,
+        linha
+      ])
+    );
+
+    const datasPeriodo = Array.from(
+      { length: dias },
+      (_, index) => {
+        const data = new Date(inicio);
+        data.setDate(inicio.getDate() + index);
+        return data.toISOString().slice(0, 10);
+      }
+    );
+
+    const diasPerformance = datasPeriodo
+      .map((data) => {
+        const linha: any =
+          metaPorDia.get(data) || {};
+        const gasto =
+          Number(linha.spend || 0);
+        const leadsMeta =
+          extrairLeadsActionsMeta(linha.actions || []);
+        const leadsPlataforma =
+          leadsBancoPorDia.get(data) || 0;
+        const leads =
+          leadsMeta;
+
+        return {
+          data,
+          gasto,
+          leads,
+          leads_meta: leadsMeta,
+          leads_plataforma: leadsPlataforma,
+          custo_por_lead:
+            leads > 0
+              ? gasto / leads
+              : null,
+          cliques: Number(linha.clicks || 0),
+          impressoes: Number(linha.impressions || 0),
+          alcance: Number(linha.reach || 0)
+        };
+      });
+
+    const totalGasto =
+      diasPerformance.reduce(
+        (total: number, dia: any) =>
+          total + dia.gasto,
+        0
+      );
+
+    const totalLeads =
+      diasPerformance.reduce(
+        (total: number, dia: any) =>
+          total + dia.leads,
+        0
+      );
+
+    const hoje =
+      diasPerformance[diasPerformance.length - 1] || null;
+
+    const diasAnteriores =
+      diasPerformance.slice(0, -1);
+
+    const gastoAnterior =
+      diasAnteriores.reduce(
+        (total: number, dia: any) =>
+          total + dia.gasto,
+        0
+      );
+
+    const leadsAnteriores =
+      diasAnteriores.reduce(
+        (total: number, dia: any) =>
+          total + dia.leads,
+        0
+      );
+
+    const mediaCplAnterior =
+      leadsAnteriores > 0
+        ? gastoAnterior / leadsAnteriores
+        : null;
+
+    const cplHoje =
+      hoje?.custo_por_lead ?? null;
+
+    const economiaPercentual =
+      mediaCplAnterior &&
+      cplHoje &&
+      cplHoje > 0
+        ? ((mediaCplAnterior - cplHoje) / mediaCplAnterior) * 100
+        : null;
+
+    return c.json({
+      conta_anuncios: {
+        id: contaAds.id,
+        nome: contaAds.name,
+        moeda: contaAds.currency || "BRL"
+      },
+      periodo_dias: dias,
+      resumo: {
+        gasto_total: totalGasto,
+        leads_total: totalLeads,
+        custo_por_lead_medio:
+          totalLeads > 0
+            ? totalGasto / totalLeads
+            : null,
+        hoje,
+        media_cpl_anterior: mediaCplAnterior,
+        economia_percentual: economiaPercentual,
+        status:
+          economiaPercentual === null
+            ? "dados_insuficientes"
+            : economiaPercentual >= 0
+            ? "melhor_que_media"
+            : "acima_da_media"
+      },
+      dias: diasPerformance
+    });
+
+  } catch (err: any) {
+
+    console.error(
+      "ERRO PERFORMANCE DIARIA:",
+      err
+    );
+
+    return c.json({
+      error: "Erro ao buscar performance diaria",
+      detalhe: err?.message || err
+    }, 500);
+  }
+});
+
 app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
   const user: any = c.get("user");
