@@ -2796,6 +2796,8 @@ app.get(
 
     let gastoHoje = 0;
     let leadsHojeMeta = 0;
+    let campanhasMetaTotal: number | null = null;
+    let campanhasMetaAtivas: number | null = null;
 
     try {
 
@@ -2814,6 +2816,40 @@ app.get(
 
       console.error(
         "ERRO GASTO HOJE:",
+        err
+      );
+    }
+
+    try {
+
+      const campanhasMetaStatus = await fetch(
+        `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?fields=id,status,effective_status&limit=500&access_token=${token}`
+      ).then(r => r.json());
+
+      if (campanhasMetaStatus.data) {
+        campanhasMetaTotal =
+          campanhasMetaStatus.data.length;
+        campanhasMetaAtivas =
+          campanhasMetaStatus.data.filter((campanha: any) =>
+            [
+              campanha.effective_status,
+              campanha.status
+            ]
+              .filter(Boolean)
+              .map((status: string) =>
+                status.toUpperCase()
+              )
+              .some((status: string) =>
+                status === "ACTIVE" ||
+                status === "ENABLED"
+              )
+          ).length;
+      }
+
+    } catch (err) {
+
+      console.error(
+        "ERRO CAMPANHAS STATUS META:",
         err
       );
     }
@@ -2905,8 +2941,16 @@ app.get(
       instagram,
 
       metricas: {
-        campanhas: campanhasCount.rows[0].total,
-        campanhas_ativas: campanhasAtivas.rows[0].total,
+        campanhas:
+          campanhasMetaTotal ??
+          Number(campanhasCount.rows[0].total || 0),
+        campanhas_ativas:
+          campanhasMetaAtivas ??
+          Number(campanhasAtivas.rows[0].total || 0),
+        campanhas_origem:
+          campanhasMetaTotal === null
+            ? "banco"
+            : "meta",
         leads_hoje: leadsHojeFinal,
         leads_hoje_meta: leadsHojeMeta,
         leads_hoje_plataforma:
