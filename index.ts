@@ -1220,6 +1220,50 @@ async function listarContasAnuncios(token: string) {
   return adAccounts.data;
 }
 
+function normalizarValorMonetarioMeta(
+  valor: any,
+  moeda?: string | null
+) {
+  if (
+    valor === null ||
+    valor === undefined ||
+    valor === ""
+  ) {
+    return null;
+  }
+
+  const numero = Number(valor);
+
+  if (!Number.isFinite(numero)) {
+    return null;
+  }
+
+  const moedasSemCentavos = new Set([
+    "BIF",
+    "CLP",
+    "DJF",
+    "GNF",
+    "JPY",
+    "KMF",
+    "KRW",
+    "MGA",
+    "PYG",
+    "RWF",
+    "UGX",
+    "VND",
+    "VUV",
+    "XAF",
+    "XOF",
+    "XPF"
+  ]);
+
+  return moedasSemCentavos.has(
+    String(moeda || "").toUpperCase()
+  )
+    ? numero
+    : numero / 100;
+}
+
 async function obterContaAnuncios(
   token: string,
   contaSelecionadaId?: string | null
@@ -2759,6 +2803,17 @@ app.get(
       pagamentoAutomatico ||
       pagamentoManual;
 
+    const saldoApi =
+      normalizarValorMonetarioMeta(
+        conta.balance,
+        conta.currency
+      );
+
+    const saldoPrePago =
+      pagamentoManual
+        ? 0
+        : null;
+
     const tipoPagamento =
       pagamentoManual
         ? "manual_pre_pago"
@@ -2782,7 +2837,13 @@ app.get(
         status: conta.account_status,
         motivo_desativacao: conta.disable_reason || null,
         moeda: conta.currency || null,
-        saldo: conta.balance ?? null,
+        saldo:
+          pagamentoManual
+            ? saldoPrePago
+            : saldoApi,
+        saldo_pre_pago: saldoPrePago,
+        saldo_pendente_api: saldoApi,
+        saldo_bruto_api: conta.balance ?? null,
         pre_pago: pagamentoManual,
         ativa: contaAtiva,
         tipo_pagamento: tipoPagamento,
