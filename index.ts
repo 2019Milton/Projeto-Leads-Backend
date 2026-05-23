@@ -620,16 +620,6 @@ function calcularScoreLead(
     base.push("+15 Veio de campanha Meta");
   }
 
-  // 📈 CTR da campanha
-  const ctr =
-    Number(lead.ctr || 0);
-
-  if (ctr >= 4) {
-
-    pontos += 10;
-    base.push("+10 Campanha com CTR acima de 4%");
-  }
-
   // 🎯 Campanha de intenção forte
   const campanha =
     (lead.campanha || "").toLowerCase();
@@ -750,8 +740,8 @@ function calcularScoreLead(
   };
 }
 
-const ML_LEADS_MIN_AMOSTRAS = 4;
-const ML_LEADS_MIN_AMOSTRAS_POR_CLASSE = 2;
+const ML_LEADS_MIN_AMOSTRAS = 10;
+const ML_LEADS_MIN_AMOSTRAS_POR_CLASSE = 4;
 
 const STOPWORDS_ML_LEADS = new Set([
   "a",
@@ -3156,103 +3146,174 @@ app.post("/webhook/meta", async (c) => {
       JSON.stringify(body, null, 2)
     );
 
-    // 🔥 EVENTOS
     if (body.entry) {
 
       for (const entry of body.entry) {
 
         for (const change of entry.changes || []) {
 
-          // 🔥 LEADGEN
           if (change.field === "leadgen") {
 
             const lead = change.value;
 
             console.log("NOVO LEAD:", lead);
-            
+
             const leadgen_id = lead.leadgen_id;
-            
             const page_id = lead.page_id;
-            
-            
-            // 🔐 BUSCA TOKEN DA PÁGINA
+            const form_id = lead.form_id;
+
+            // 🔍 IDENTIFICA USUÁRIO PELO FORMULÁRIO OU PÁGINA
+            let usuarioId: number | null = null;
+            let nomeCampanha = "Campanha Meta";
+            let contaAnunciosId: string | null = null;
+
+            if (form_id) {
+              const campanhaByForm = await client.query(
+                `
+                SELECT usuario_id, nome, conta_anuncios_id
+                FROM campanhas
+                WHERE form_id = $1
+                LIMIT 1
+                `,
+                [form_id]
+              );
+
+              if (campanhaByForm.rows.length > 0) {
+                usuarioId = campanhaByForm.rows[0].usuario_id;
+                nomeCampanha = campanhaByForm.rows[0].nome;
+                contaAnunciosId = campanhaByForm.rows[0].conta_anuncios_id;
+              }
+            }
+
+            if (!usuarioId && page_id) {
+              const campanhaByPage = await client.query(
+                `
+                SELECT usuario_id, nome, conta_anuncios_id
+                FROM campanhas
+                WHERE page_id = $1
+                ORDER BY id DESC
+                LIMIT 1
+                `,
+                [page_id]
+              );
+
+              if (campanhaByPage.rows.length > 0) {
+                usuarioId = campanhaByPage.rows[0].usuario_id;
+                nomeCampanha = campanhaByPage.rows[0].nome;
+                contaAnunciosId = campanhaByPage.rows[0].conta_anuncios_id;
+              }
+            }
+
+            if (!usuarioId) {
+              console.log(
+                "Usuário não identificado para lead",
+                leadgen_id,
+                "page",
+                page_id,
+                "form",
+                form_id
+              );
+              continue;
+            }
+
+            // 🔐 BUSCA TOKEN DO USUÁRIO CORRETO
             const conn = await client.query(
               `
               SELECT access_token
               FROM meta_conexoes
+              WHERE usuario_id = $1
               ORDER BY id DESC
               LIMIT 1
-              `
+              `,
+              [usuarioId]
             );
-            
+
             if (conn.rows.length === 0) {
-            
-              console.log("SEM TOKEN META");
-            
+              console.log("Sem token para usuário", usuarioId);
               continue;
             }
-            
+
             const token = conn.rows[0].access_token;
-            
-            
+
+            // 🔄 EVITA DUPLICATA
+            const leadExiste = await client.query(
+              `SELECT id FROM leads WHERE lead_id = $1`,
+              [leadgen_id]
+            );
+
+            if (leadExiste.rows.length > 0) {
+              console.log("Lead já existe:", leadgen_id);
+              continue;
+            }
+
             // 🔥 BUSCA DADOS REAIS DO LEAD
             const leadData = await fetch(
               `https://graph.facebook.com/v19.0/${leadgen_id}?access_token=${token}`
             ).then(r => r.json());
-            
+
             console.log(
               "LEAD DATA:",
               JSON.stringify(leadData, null, 2)
             );
-            
-            
+
             // 🔥 CAMPOS
             let nome = null;
             let email = null;
             let telefone = null;
-            
+            const respostasQualificacao: any[] = [];
+
             for (const field of leadData.field_data || []) {
-            
-              if (
-                field.name === "full_name"
-              ) {
-            
+              if (field.name === "full_name") {
                 nome = field.values?.[0];
-              }
-            
-              if (
-                field.name === "email"
-              ) {
-            
+              } else if (field.name === "email") {
                 email = field.values?.[0];
-              }
-            
-              if (
-                field.name === "phone_number"
-              ) {
-            
+              } else if (field.name === "phone_number") {
                 telefone = field.values?.[0];
+              } else {
+                respostasQualificacao.push({
+                  pergunta: field.name,
+                  resposta: field.values?.[0] || ""
+                });
               }
             }
-            
-            
-            // 💾 SALVA LEAD REAL
+
+            // 💾 SALVA LEAD VINCULADO AO USUÁRIO CORRETO
             await client.query(
               `
               INSERT INTO leads (
+                usuario_id,
+                lead_id,
                 nome,
                 email,
                 telefone,
-                origem
+                origem,
+                status,
+                campanha,
+                conta_anuncios_id,
+                respostas_qualificacao,
+                criado_em
               )
-              VALUES ($1,$2,$3,$4)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
               `,
               [
+                usuarioId,
+                leadgen_id,
                 nome || "Lead Facebook",
                 email,
                 telefone,
-                "meta"
+                "meta",
+                "novo",
+                nomeCampanha,
+                contaAnunciosId,
+                JSON.stringify(respostasQualificacao)
               ]
+            );
+
+            console.log(
+              "✅ LEAD SALVO:",
+              leadgen_id,
+              "usuário:",
+              usuarioId
             );
           }
         }
