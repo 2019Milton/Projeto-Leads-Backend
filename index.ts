@@ -3422,6 +3422,28 @@ await client.query(`
 `);
 
 await client.query(`
+  CREATE TABLE IF NOT EXISTS chat_conversas (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    status TEXT DEFAULT 'aberta',
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS chat_mensagens (
+    id SERIAL PRIMARY KEY,
+    conversa_id INTEGER NOT NULL REFERENCES chat_conversas(id) ON DELETE CASCADE,
+    remetente_id INTEGER,
+    remetente_tipo TEXT NOT NULL,
+    conteudo TEXT NOT NULL,
+    lido BOOLEAN DEFAULT FALSE,
+    enviado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
   ALTER TABLE usuarios
     ADD COLUMN IF NOT EXISTS nome TEXT,
     ADD COLUMN IF NOT EXISTS sobrenome TEXT,
@@ -5972,6 +5994,208 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
 
 //}, 1000 * 60 * 5);
 
+
+/* =========================
+   💬 CHAT DE SUPORTE
+========================= */
+
+function isSuporte(tipo: string) {
+  return tipo === "suporte" || tipo === "super_admin";
+}
+
+// Usuário envia mensagem (cria conversa se não existir)
+app.post("/chat/mensagem", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+  const { conteudo } = await c.req.json();
+
+  if (!conteudo?.trim()) {
+    return c.json({ error: "Mensagem vazia" }, 400);
+  }
+
+  const conversa = await client.query(
+    `SELECT id FROM chat_conversas WHERE usuario_id = $1 AND status = 'aberta' ORDER BY id DESC LIMIT 1`,
+    [user.id]
+  );
+
+  let conversaId: number;
+
+  if (conversa.rows.length === 0) {
+    const nova = await client.query(
+      `INSERT INTO chat_conversas (usuario_id) VALUES ($1) RETURNING id`,
+      [user.id]
+    );
+    conversaId = nova.rows[0].id;
+  } else {
+    conversaId = conversa.rows[0].id;
+  }
+
+  await client.query(
+    `INSERT INTO chat_mensagens (conversa_id, remetente_id, remetente_tipo, conteudo)
+     VALUES ($1, $2, 'usuario', $3)`,
+    [conversaId, user.id, conteudo.trim()]
+  );
+
+  await client.query(
+    `UPDATE chat_conversas SET atualizado_em = NOW() WHERE id = $1`,
+    [conversaId]
+  );
+
+  return c.json({ sucesso: true, conversa_id: conversaId });
+});
+
+// Usuário busca mensagens da sua conversa
+app.get("/chat/mensagens", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  const conversa = await client.query(
+    `SELECT id FROM chat_conversas WHERE usuario_id = $1 AND status = 'aberta' ORDER BY id DESC LIMIT 1`,
+    [user.id]
+  );
+
+  if (conversa.rows.length === 0) {
+    return c.json({ mensagens: [], conversa_id: null });
+  }
+
+  const conversaId = conversa.rows[0].id;
+
+  // Marcar mensagens do suporte como lidas
+  await client.query(
+    `UPDATE chat_mensagens SET lido = TRUE
+     WHERE conversa_id = $1 AND remetente_tipo = 'suporte' AND lido = FALSE`,
+    [conversaId]
+  );
+
+  const msgs = await client.query(
+    `SELECT id, remetente_tipo, conteudo, lido, enviado_em
+     FROM chat_mensagens WHERE conversa_id = $1 ORDER BY enviado_em ASC`,
+    [conversaId]
+  );
+
+  return c.json({ mensagens: msgs.rows, conversa_id: conversaId });
+});
+
+// Contagem de mensagens não lidas do suporte (para badge)
+app.get("/chat/nao-lidas", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  const result = await client.query(
+    `SELECT COUNT(*) AS total
+     FROM chat_mensagens m
+     JOIN chat_conversas cv ON cv.id = m.conversa_id
+     WHERE cv.usuario_id = $1
+       AND m.remetente_tipo = 'suporte'
+       AND m.lido = FALSE`,
+    [user.id]
+  );
+
+  return c.json({ nao_lidas: Number(result.rows[0].total) });
+});
+
+// Suporte: lista todas as conversas abertas
+app.get("/chat/conversas", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const result = await client.query(
+    `SELECT cv.id, cv.status, cv.criado_em, cv.atualizado_em,
+            u.email AS usuario_email, u.nome AS usuario_nome,
+            (SELECT COUNT(*) FROM chat_mensagens m
+             WHERE m.conversa_id = cv.id
+               AND m.remetente_tipo = 'usuario'
+               AND m.lido = FALSE) AS nao_lidas
+     FROM chat_conversas cv
+     JOIN usuarios u ON u.id = cv.usuario_id
+     ORDER BY cv.atualizado_em DESC`
+  );
+
+  return c.json({ conversas: result.rows });
+});
+
+// Suporte: mensagens de uma conversa específica
+app.get("/chat/conversas/:id/mensagens", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const id = Number(c.req.param("id"));
+
+  // Marcar mensagens do usuário como lidas
+  await client.query(
+    `UPDATE chat_mensagens SET lido = TRUE
+     WHERE conversa_id = $1 AND remetente_tipo = 'usuario' AND lido = FALSE`,
+    [id]
+  );
+
+  const msgs = await client.query(
+    `SELECT m.id, m.remetente_tipo, m.conteudo, m.lido, m.enviado_em,
+            u.email AS remetente_email, u.nome AS remetente_nome
+     FROM chat_mensagens m
+     LEFT JOIN usuarios u ON u.id = m.remetente_id
+     WHERE m.conversa_id = $1
+     ORDER BY m.enviado_em ASC`,
+    [id]
+  );
+
+  const conv = await client.query(
+    `SELECT cv.id, cv.status, u.email AS usuario_email, u.nome AS usuario_nome
+     FROM chat_conversas cv JOIN usuarios u ON u.id = cv.usuario_id WHERE cv.id = $1`,
+    [id]
+  );
+
+  return c.json({ mensagens: msgs.rows, conversa: conv.rows[0] || null });
+});
+
+// Suporte: responde em uma conversa
+app.post("/chat/conversas/:id/responder", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const id = Number(c.req.param("id"));
+  const { conteudo } = await c.req.json();
+
+  if (!conteudo?.trim()) {
+    return c.json({ error: "Mensagem vazia" }, 400);
+  }
+
+  await client.query(
+    `INSERT INTO chat_mensagens (conversa_id, remetente_id, remetente_tipo, conteudo)
+     VALUES ($1, $2, 'suporte', $3)`,
+    [id, user.id, conteudo.trim()]
+  );
+
+  await client.query(
+    `UPDATE chat_conversas SET atualizado_em = NOW() WHERE id = $1`,
+    [id]
+  );
+
+  return c.json({ sucesso: true });
+});
+
+// Suporte: fecha uma conversa
+app.put("/chat/conversas/:id/fechar", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const id = Number(c.req.param("id"));
+
+  await client.query(
+    `UPDATE chat_conversas SET status = 'fechada' WHERE id = $1`,
+    [id]
+  );
+
+  return c.json({ sucesso: true });
+});
 
 /* =========================
    🔍 HEALTH
