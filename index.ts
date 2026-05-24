@@ -4520,6 +4520,66 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
   }
 });
 
+app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: any) => {
+  try {
+    const user: any = c.get("user");
+    const data = c.req.param("data");
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+      return c.json({ error: "Data invalida. Use YYYY-MM-DD" }, 400);
+    }
+
+    const conn = await client.query(
+      `SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+      [user.id]
+    );
+
+    if (conn.rows.length === 0) {
+      return c.json({ error: "Meta nao conectada" }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+    const contaAds = await obterContaAnuncios(token, conn.rows[0].conta_anuncios_id);
+
+    if (!contaAds) {
+      return c.json({ error: "Conta de anuncios nao encontrada" }, 400);
+    }
+
+    const adAccountId = contaAds.id;
+    const timeRange = encodeURIComponent(JSON.stringify({ since: data, until: data }));
+
+    const insights = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=campaign_name,campaign_id,spend,actions,clicks,impressions&level=campaign&time_range=${timeRange}&access_token=${token}`
+    ).then(r => r.json());
+
+    if (insights.error) {
+      return c.json({ error: "Erro ao buscar dados da Meta", detalhe: insights.error }, 400);
+    }
+
+    const campanhas = (insights.data || []).map((item: any) => {
+      const gasto = Number(item.spend || 0);
+      const leads = extrairLeadsActionsMeta(item.actions || []);
+      return {
+        campaign_id: item.campaign_id,
+        nome: item.campaign_name || "Campanha sem nome",
+        gasto,
+        leads,
+        cliques: Number(item.clicks || 0),
+        impressoes: Number(item.impressions || 0),
+        custo_por_lead: leads > 0 ? gasto / leads : null
+      };
+    });
+
+    campanhas.sort((a: any, b: any) => b.gasto - a.gasto);
+
+    return c.json({ data, campanhas });
+
+  } catch (err: any) {
+    console.error("ERRO CAMPANHAS DIA:", err);
+    return c.json({ error: "Erro ao buscar campanhas do dia", detalhe: err?.message }, 500);
+  }
+});
+
 app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
   const user: any = c.get("user");
