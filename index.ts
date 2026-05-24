@@ -3525,6 +3525,7 @@ await client.query(`
 ========================= */
 
 app.post("/auth/solicitar-reset-senha", async (c) => {
+  const conn = await client.connect();
   try {
     const { email } = await c.req.json();
 
@@ -3534,7 +3535,7 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
       }, 400);
     }
 
-    const usuario = await client.query(
+    const usuario = await conn.query(
       `
       SELECT id, email, nome
       FROM usuarios
@@ -3548,14 +3549,16 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
     const user = usuario.rows[0];
 
     if (user) {
-      await client.query("BEGIN");
-
       const token = gerarTokenResetSenha();
       const tokenHash = hashTokenResetSenha(token);
       const resetUrl =
-        `${obterFrontendUrl()}/?reset_token=${encodeURIComponent(token)}`;
+        `${obterFrontendUrl()}/?reset_token=${token}`;
 
-      await client.query(
+      console.log("[RESET] gerando token para usuario", user.id, "hash:", tokenHash.slice(0, 12) + "...");
+
+      await conn.query("BEGIN");
+
+      await conn.query(
         `
         UPDATE password_reset_tokens
         SET usado_em = NOW()
@@ -3565,7 +3568,7 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
         [user.id]
       );
 
-      await client.query(
+      await conn.query(
         `
         INSERT INTO password_reset_tokens (
           usuario_id,
@@ -3585,13 +3588,15 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
         ]
       );
 
+      await conn.query("COMMIT");
+
       await enviarEmailResetSenha(
         user.email,
         user.nome,
         resetUrl
       );
 
-      await client.query("COMMIT");
+      console.log("[RESET] email enviado para", user.email);
     }
 
     return c.json({
@@ -3600,7 +3605,7 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
     });
 
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
+    await conn.query("ROLLBACK").catch(() => {});
 
     console.error("RESET REQUEST ERROR:", err);
 
@@ -3616,6 +3621,8 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
     return c.json({
       error: mensagem
     }, 500);
+  } finally {
+    conn.release();
   }
 });
 
@@ -3630,10 +3637,22 @@ app.get("/auth/validar-reset-senha", async (c) => {
       }, 400);
     }
 
+    const tokenHash = hashTokenResetSenha(token);
+    console.log("[RESET VALIDAR] token recebido (primeiros 12):", token.slice(0, 12), "hash:", tokenHash.slice(0, 12) + "...");
+
     const resetToken =
       await buscarResetTokenValido(token);
 
     if (!resetToken) {
+      const dbCheck = await client.query(
+        `SELECT id, token_hash, usado_em, expira_em FROM password_reset_tokens ORDER BY id DESC LIMIT 3`
+      );
+      console.error("[RESET VALIDAR] token NAO encontrado. Ultimos tokens no banco:", dbCheck.rows.map((r: any) => ({
+        id: r.id,
+        hash_inicio: String(r.token_hash).slice(0, 12),
+        usado_em: r.usado_em,
+        expira_em: r.expira_em
+      })));
       return c.json({
         valido: false,
         error: "Link invalido ou expirado"
