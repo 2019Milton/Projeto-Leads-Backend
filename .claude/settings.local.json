@@ -4,7 +4,10 @@
       "Bash(start \"\" \"index.html\")",
       "Bash(npx --yes playwright@latest screenshot --browser chromium \"file:///c:/Users/perei/Projeto-Leads/index.html\" /tmp/tema_escuro.png)",
       "Bash(start \"\" \"C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe\" --headless --screenshot=\"C:\\\\Users\\\\perei\\\\preview_dark_v2.png\" --window-size=500,700 \"C:\\\\Users\\\\perei\\\\preview_dark_v2.html\")",
-      "Bash(start \"\" \"C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe\" --headless --screenshot=\"C:\\\\Users\\\\perei\\\\preview_claro_v2.png\" --window-size=500,700 \"C:\\\\Users\\\\perei\\\\preview_claro_v2.html\")"
+      "Bash(start \"\" \"C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe\" --headless --screenshot=\"C:\\\\Users\\\\perei\\\\preview_claro_v2.png\" --window-size=500,700 \"C:\\\\Users\\\\perei\\\\preview_claro_v2.html\")",
+      "Bash(bun add *)",
+      "PowerShell(Get-Command bun -ErrorAction SilentlyContinue; Get-Command node -ErrorAction SilentlyContinue; $env:PATH -split \";\" | Where-Object { $_ -match \"bun|node\" })",
+      "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\.bun\\\\bin\" -ErrorAction SilentlyContinue; Get-ChildItem \"C:\\\\Users\\\\perei\\\\.bun\\\\bin\" -ErrorAction SilentlyContinue)"
     ]
   }
 }

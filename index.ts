@@ -5996,6 +5996,61 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
 
 
 /* =========================
+   📝 FEEDBACK
+========================= */
+
+app.post("/feedback", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+  const { tipo, mensagem } = await c.req.json();
+
+  if (!mensagem?.trim()) {
+    return c.json({ error: "Mensagem vazia" }, 400);
+  }
+
+  if (!Bun.env.RESEND_API_KEY) {
+    return c.json({ error: "Serviço de email não configurado" }, 500);
+  }
+
+  const tiposValidos: Record<string, string> = {
+    elogio: "⭐ Elogio",
+    sugestao: "💡 Sugestão",
+    reclamacao: "⚠️ Reclamação"
+  };
+
+  const tipoLabel = tiposValidos[tipo] || "📩 Mensagem";
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_EMAIL,
+      to: "pereira.notlim@gmail.com",
+      subject: `${tipoLabel} — Plataforma de Leads`,
+      html: `
+        <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:560px;">
+          <h2 style="margin-bottom:4px;">${tipoLabel}</h2>
+          <p style="color:#6b7280;font-size:13px;margin-top:0;">Plataforma de Leads</p>
+          <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;">
+          <p><strong>De:</strong> ${user.email}</p>
+          <p><strong>Tipo:</strong> ${tipoLabel}</p>
+          <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;">
+          <p style="white-space:pre-wrap;">${mensagem.trim().replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>
+        </div>
+      `
+    })
+  });
+
+  if (!res.ok) {
+    return c.json({ error: "Erro ao enviar feedback" }, 500);
+  }
+
+  return c.json({ sucesso: true });
+});
+
+/* =========================
    💬 CHAT DE SUPORTE
 ========================= */
 
