@@ -3326,6 +3326,7 @@ app.post("/webhook/meta", async (c) => {
             let email = null;
             let telefone = null;
             const respostasQualificacao: any[] = [];
+            const criadoEmMeta = leadData.created_time ? new Date(leadData.created_time).toISOString() : null;
 
             for (const field of leadData.field_data || []) {
               if (field.name === "full_name") {
@@ -3358,7 +3359,7 @@ app.post("/webhook/meta", async (c) => {
                 respostas_qualificacao,
                 criado_em
               )
-              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE($11::timestamptz, NOW()))
               `,
               [
                 usuarioId,
@@ -3370,7 +3371,8 @@ app.post("/webhook/meta", async (c) => {
                 "novo",
                 nomeCampanha,
                 contaAnunciosId,
-                JSON.stringify(respostasQualificacao)
+                JSON.stringify(respostasQualificacao),
+                criadoEmMeta
               ]
             );
 
