@@ -6720,6 +6720,63 @@ app.get("/api/version", (c) => c.json({
   delete_user_route: true
 }));
 
+// Corrige criado_em dos leads Meta usando created_time real da API
+app.post("/admin/corrigir-datas-leads", authMiddleware, masterMiddleware, async (c: any) => {
+  try {
+    const leadsRes = await client.query(`
+      SELECT l.id, l.lead_id, l.usuario_id, l.criado_em
+      FROM leads l
+      WHERE l.origem = 'meta'
+        AND l.lead_id IS NOT NULL
+      ORDER BY l.id DESC
+    `);
+
+    const leads = leadsRes.rows;
+    let atualizados = 0;
+    let erros = 0;
+    const detalhes: any[] = [];
+
+    for (const lead of leads) {
+      try {
+        const tokenRes = await client.query(`
+          SELECT access_token FROM meta_conexoes
+          WHERE usuario_id = $1
+          ORDER BY id DESC LIMIT 1
+        `, [lead.usuario_id]);
+
+        if (tokenRes.rows.length === 0) continue;
+
+        const token = tokenRes.rows[0].access_token;
+        const resp = await fetch(
+          `https://graph.facebook.com/v19.0/${lead.lead_id}?fields=created_time&access_token=${token}`
+        );
+        const data: any = await resp.json();
+
+        if (!data.created_time) {
+          erros++;
+          detalhes.push({ lead_id: lead.lead_id, erro: "sem created_time" });
+          continue;
+        }
+
+        const novaData = new Date(data.created_time).toISOString();
+        await client.query(
+          `UPDATE leads SET criado_em = $1 WHERE id = $2`,
+          [novaData, lead.id]
+        );
+        atualizados++;
+        detalhes.push({ lead_id: lead.lead_id, de: lead.criado_em, para: novaData });
+      } catch (err: any) {
+        erros++;
+        detalhes.push({ lead_id: lead.lead_id, erro: err.message });
+      }
+    }
+
+    return c.json({ total: leads.length, atualizados, erros, detalhes });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
 /* =========================
    🚀 START
 ========================= */
