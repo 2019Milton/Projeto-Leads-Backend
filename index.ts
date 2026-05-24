@@ -5907,15 +5907,11 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
       nova_senha
     } = body;
 
-    // 🔒 senha forte
-    const senhaForte =
-      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
-
-    if (!senhaForte.test(nova_senha)) {
+    if (!SENHA_FORTE.test(nova_senha)) {
 
       return c.json({
         error:
-          "Senha fraca. Use maiúscula, minúscula, número e mínimo 8 caracteres."
+          "Senha fraca. Use maiúscula, minúscula, número e símbolo (@$!%*?&#._-)."
       }, 400);
     }
 
