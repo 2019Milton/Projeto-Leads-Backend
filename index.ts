@@ -588,6 +588,71 @@ async function atualizarSenhaLegadaSePreciso(
   }
 }
 
+async function senhaJaFoiUsadaRecentemente(
+  usuarioId: number,
+  novaSenha: string
+) {
+  const result = await client.query(
+    `
+    SELECT senha_hash
+    FROM (
+      SELECT senha AS senha_hash, NOW() AS criado_em
+      FROM usuarios
+      WHERE id = $1
+      AND senha IS NOT NULL
+
+      UNION ALL
+
+      SELECT senha_hash, criado_em
+      FROM password_history
+      WHERE usuario_id = $1
+    ) senhas
+    WHERE senha_hash IS NOT NULL
+    ORDER BY criado_em DESC
+    LIMIT 10
+    `,
+    [usuarioId]
+  );
+
+  for (const row of result.rows) {
+    if (await senhaConfere(novaSenha, row.senha_hash)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function registrarSenhaAnterior(
+  db: any,
+  usuarioId: number,
+  senhaHash: string | null | undefined
+) {
+  if (!senhaHash) return;
+
+  await db.query(
+    `
+    INSERT INTO password_history (usuario_id, senha_hash)
+    VALUES ($1, $2)
+    `,
+    [usuarioId, senhaHash]
+  );
+
+  await db.query(
+    `
+    DELETE FROM password_history
+    WHERE id IN (
+      SELECT id
+      FROM password_history
+      WHERE usuario_id = $1
+      ORDER BY criado_em DESC, id DESC
+      OFFSET 10
+    )
+    `,
+    [usuarioId]
+  );
+}
+
 // 🔥 SCORE AUTOMÁTICO
 function calcularScoreLead(
   lead: any
@@ -3422,6 +3487,15 @@ await client.query(`
 `);
 
 await client.query(`
+  CREATE TABLE IF NOT EXISTS password_history (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    senha_hash TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
   CREATE TABLE IF NOT EXISTS chat_conversas (
     id SERIAL PRIMARY KEY,
     usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -3518,6 +3592,8 @@ await client.query(`
     ON password_reset_tokens(token_hash);
   CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_usuario
     ON password_reset_tokens(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_password_history_usuario
+    ON password_history(usuario_id, criado_em DESC);
 `);
 
 /* =========================
@@ -3677,7 +3753,55 @@ app.get("/auth/validar-reset-senha", async (c) => {
   }
 });
 
+app.post("/auth/verificar-reset-senha", async (c) => {
+  try {
+    const { token, nova_senha } = await c.req.json();
+
+    if (!token || !nova_senha) {
+      return c.json({
+        forte: false,
+        historico_ok: false,
+        error: "Token e nova senha sao obrigatorios"
+      }, 400);
+    }
+
+    const resetToken =
+      await buscarResetTokenValido(token);
+
+    if (!resetToken) {
+      return c.json({
+        forte: false,
+        historico_ok: false,
+        error: "Link invalido ou expirado"
+      }, 400);
+    }
+
+    const forte = SENHA_FORTE.test(nova_senha);
+    const reutilizada =
+      await senhaJaFoiUsadaRecentemente(
+        resetToken.usuario_id,
+        nova_senha
+      );
+
+    return c.json({
+      forte,
+      historico_ok: !reutilizada,
+      reutilizada
+    });
+
+  } catch (err) {
+    console.error("VERIFY RESET PASSWORD ERROR:", err);
+
+    return c.json({
+      forte: false,
+      historico_ok: false,
+      error: "Erro ao verificar senha"
+    }, 500);
+  }
+});
+
 app.post("/auth/reset-senha", async (c) => {
+  const conn = await client.connect();
   try {
     const { token, nova_senha } = await c.req.json();
 
@@ -3702,9 +3826,36 @@ app.post("/auth/reset-senha", async (c) => {
       }, 400);
     }
 
-    await client.query("BEGIN");
+    if (
+      await senhaJaFoiUsadaRecentemente(
+        resetToken.usuario_id,
+        nova_senha
+      )
+    ) {
+      return c.json({
+        error: "Esta senha ja foi usada recentemente. Escolha uma senha diferente das ultimas 10."
+      }, 400);
+    }
 
-    await client.query(
+    await conn.query("BEGIN");
+
+    const usuarioAtual = await conn.query(
+      `
+      SELECT senha
+      FROM usuarios
+      WHERE id = $1
+      FOR UPDATE
+      `,
+      [resetToken.usuario_id]
+    );
+
+    await registrarSenhaAnterior(
+      conn,
+      resetToken.usuario_id,
+      usuarioAtual.rows[0]?.senha
+    );
+
+    await conn.query(
       `
       UPDATE usuarios
       SET senha = $1
@@ -3716,7 +3867,7 @@ app.post("/auth/reset-senha", async (c) => {
       ]
     );
 
-    await client.query(
+    await conn.query(
       `
       UPDATE password_reset_tokens
       SET usado_em = NOW()
@@ -3726,7 +3877,7 @@ app.post("/auth/reset-senha", async (c) => {
       [resetToken.usuario_id]
     );
 
-    await client.query("COMMIT");
+    await conn.query("COMMIT");
 
     return c.json({
       success: true,
@@ -3734,13 +3885,15 @@ app.post("/auth/reset-senha", async (c) => {
     });
 
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
+    await conn.query("ROLLBACK").catch(() => {});
 
     console.error("RESET PASSWORD ERROR:", err);
 
     return c.json({
       error: "Erro ao alterar senha"
     }, 500);
+  } finally {
+    conn.release();
   }
 });
 
@@ -3833,6 +3986,7 @@ app.get("/usuarios/me/plano", authMiddleware, async (c) => {
 });
 
 app.put("/usuarios/me/senha", authMiddleware, async (c) => {
+  const conn = await client.connect();
 
   try {
 
@@ -3876,9 +4030,28 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
       }, 400);
     }
 
+    if (
+      await senhaJaFoiUsadaRecentemente(
+        user.id,
+        nova_senha
+      )
+    ) {
+      return c.json({
+        error: "Esta senha ja foi usada recentemente. Escolha uma senha diferente das ultimas 10."
+      }, 400);
+    }
+
     const novaSenhaHash = await gerarHashSenha(nova_senha);
 
-    await client.query(
+    await conn.query("BEGIN");
+
+    await registrarSenhaAnterior(
+      conn,
+      user.id,
+      usuarioAtual.senha
+    );
+
+    await conn.query(
       `
       UPDATE usuarios
       SET senha = $1
@@ -3887,17 +4060,22 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
       [novaSenhaHash, user.id]
     );
 
+    await conn.query("COMMIT");
+
     return c.json({
       sucesso: true
     });
 
   } catch (err) {
+    await conn.query("ROLLBACK").catch(() => {});
 
     console.error("ERRO TROCAR SENHA:", err);
 
     return c.json({
       error: "Erro ao trocar senha"
     }, 500);
+  } finally {
+    conn.release();
   }
 });
 
