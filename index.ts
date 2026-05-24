@@ -6134,6 +6134,95 @@ function isSuporte(tipo: string) {
 }
 
 // Usuário envia mensagem (cria conversa se não existir)
+async function obterOuCriarConversaUsuario(usuarioId: number) {
+  const aberta = await client.query(
+    `SELECT id
+     FROM chat_conversas
+     WHERE usuario_id = $1
+     AND status = 'aberta'
+     ORDER BY id DESC
+     LIMIT 1`,
+    [usuarioId]
+  );
+
+  if (aberta.rows.length > 0) {
+    return aberta.rows[0].id;
+  }
+
+  const fechada = await client.query(
+    `SELECT id
+     FROM chat_conversas
+     WHERE usuario_id = $1
+     ORDER BY atualizado_em DESC
+     LIMIT 1`,
+    [usuarioId]
+  );
+
+  if (fechada.rows.length > 0) {
+    await client.query(
+      `UPDATE chat_conversas
+       SET status = 'aberta',
+           atualizado_em = NOW()
+       WHERE id = $1`,
+      [fechada.rows[0].id]
+    );
+
+    return fechada.rows[0].id;
+  }
+
+  const nova = await client.query(
+    `INSERT INTO chat_conversas (usuario_id)
+     VALUES ($1)
+     RETURNING id`,
+    [usuarioId]
+  );
+
+  return nova.rows[0].id;
+}
+
+async function enviarMensagemSuporteParaUsuario(
+  suporteId: number,
+  usuarioId: number,
+  conteudo: string
+) {
+  const conversaId =
+    await obterOuCriarConversaUsuario(usuarioId);
+
+  await client.query(
+    `INSERT INTO chat_mensagens (conversa_id, remetente_id, remetente_tipo, conteudo)
+     VALUES ($1, $2, 'suporte', $3)`,
+    [conversaId, suporteId, conteudo.trim()]
+  );
+
+  await client.query(
+    `UPDATE chat_conversas
+     SET status = 'aberta',
+         atualizado_em = NOW()
+     WHERE id = $1`,
+    [conversaId]
+  );
+
+  return conversaId;
+}
+
+app.get("/chat/usuarios", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const result = await client.query(
+    `SELECT id, email, nome, sobrenome, tipo, COALESCE(ativo, true) AS ativo
+     FROM usuarios
+     WHERE COALESCE(ativo, true) = true
+     AND tipo NOT IN ('suporte', 'super_admin', 'master')
+     ORDER BY nome NULLS LAST, email ASC`
+  );
+
+  return c.json({ usuarios: result.rows });
+});
+
 app.post("/chat/mensagem", authMiddleware, async (c: any) => {
   const user: any = c.get("user");
   const { conteudo } = await c.req.json();
@@ -6295,6 +6384,24 @@ app.post("/chat/conversas/:id/responder", authMiddleware, async (c: any) => {
     return c.json({ error: "Mensagem vazia" }, 400);
   }
 
+  const conversa = await client.query(
+    `SELECT status
+     FROM chat_conversas
+     WHERE id = $1
+     LIMIT 1`,
+    [id]
+  );
+
+  if (!conversa.rows.length) {
+    return c.json({ error: "Conversa nao encontrada" }, 404);
+  }
+
+  if (conversa.rows[0].status === "fechada") {
+    return c.json({
+      error: "Reabra a conversa antes de responder"
+    }, 409);
+  }
+
   await client.query(
     `INSERT INTO chat_mensagens (conversa_id, remetente_id, remetente_tipo, conteudo)
      VALUES ($1, $2, 'suporte', $3)`,
@@ -6309,6 +6416,81 @@ app.post("/chat/conversas/:id/responder", authMiddleware, async (c: any) => {
   return c.json({ sucesso: true });
 });
 
+app.post("/chat/usuarios/:id/mensagem", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const usuarioId = Number(c.req.param("id"));
+  const { conteudo } = await c.req.json();
+
+  if (!conteudo?.trim()) {
+    return c.json({ error: "Mensagem vazia" }, 400);
+  }
+
+  const alvo = await client.query(
+    `SELECT id
+     FROM usuarios
+     WHERE id = $1
+     AND COALESCE(ativo, true) = true
+     AND tipo NOT IN ('suporte', 'super_admin', 'master')
+     LIMIT 1`,
+    [usuarioId]
+  );
+
+  if (!alvo.rows.length) {
+    return c.json({ error: "Usuario nao encontrado" }, 404);
+  }
+
+  const conversaId =
+    await enviarMensagemSuporteParaUsuario(
+      user.id,
+      usuarioId,
+      conteudo
+    );
+
+  return c.json({
+    sucesso: true,
+    conversa_id: conversaId
+  });
+});
+
+app.post("/chat/broadcast", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const { conteudo } = await c.req.json();
+
+  if (!conteudo?.trim()) {
+    return c.json({ error: "Mensagem vazia" }, 400);
+  }
+
+  const usuarios = await client.query(
+    `SELECT id
+     FROM usuarios
+     WHERE COALESCE(ativo, true) = true
+     AND tipo NOT IN ('suporte', 'super_admin', 'master')`
+  );
+
+  for (const usuario of usuarios.rows) {
+    await enviarMensagemSuporteParaUsuario(
+      user.id,
+      usuario.id,
+      conteudo
+    );
+  }
+
+  return c.json({
+    sucesso: true,
+    total: usuarios.rows.length
+  });
+});
+
 // Suporte: fecha uma conversa
 app.put("/chat/conversas/:id/fechar", authMiddleware, async (c: any) => {
   const user: any = c.get("user");
@@ -6321,6 +6503,26 @@ app.put("/chat/conversas/:id/fechar", authMiddleware, async (c: any) => {
 
   await client.query(
     `UPDATE chat_conversas SET status = 'fechada' WHERE id = $1`,
+    [id]
+  );
+
+  return c.json({ sucesso: true });
+});
+
+app.put("/chat/conversas/:id/reabrir", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  if (!isSuporte(user.tipo)) {
+    return c.json({ error: "Acesso negado" }, 403);
+  }
+
+  const id = Number(c.req.param("id"));
+
+  await client.query(
+    `UPDATE chat_conversas
+     SET status = 'aberta',
+         atualizado_em = NOW()
+     WHERE id = $1`,
     [id]
   );
 
