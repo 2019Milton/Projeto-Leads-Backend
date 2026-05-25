@@ -6029,8 +6029,7 @@ app.post("/meta/restaurar-campanha", authMiddleware, async (c) => {
 
         if (metaRes.error && !aviso) {
           aviso =
-            metaRes.error.message ||
-            "A Meta não permitiu restaurar a campanha original";
+            "A Meta não permitiu recuperar a campanha original. Ela ficou restaurada apenas na plataforma.";
         }
       }
     } else {
