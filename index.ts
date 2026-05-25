@@ -3884,6 +3884,22 @@ await client.query(`
 `);
 
 await client.query(`
+  CREATE TABLE IF NOT EXISTS railway_billing_historico (
+    id SERIAL PRIMARY KEY,
+    ciclo_mes DATE NOT NULL UNIQUE,
+    plano TEXT DEFAULT 'pro',
+    moeda TEXT DEFAULT 'USD',
+    ultimo_pagamento_valor NUMERIC(12, 2) DEFAULT 0,
+    ultimo_pagamento_data DATE,
+    proxima_fatura_base NUMERIC(12, 2) DEFAULT 20,
+    proxima_fatura_data DATE,
+    observacoes TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
   ALTER TABLE usuarios
     ADD COLUMN IF NOT EXISTS nome TEXT,
     ADD COLUMN IF NOT EXISTS sobrenome TEXT,
@@ -6527,6 +6543,14 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
     const billing = await client.query(
       `SELECT * FROM railway_billing_config WHERE id = 1 LIMIT 1`
     );
+    const billingHistorico = await client.query(
+      `
+      SELECT *
+      FROM railway_billing_historico
+      ORDER BY ciclo_mes DESC
+      LIMIT 12
+      `
+    );
 
     return c.json({
       uptime_segundos: Math.floor(process.uptime()),
@@ -6539,7 +6563,8 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
       node_env: process.env.NODE_ENV || "development",
       plataforma: process.platform,
       versao_node: process.version,
-      railway_billing: billing.rows[0] || null
+      railway_billing: billing.rows[0] || null,
+      railway_billing_historico: billingHistorico.rows
     });
 
   } catch (err) {
@@ -6561,6 +6586,13 @@ app.put("/admin/railway-billing", authMiddleware, async (c) => {
     }
 
     const body = await c.req.json();
+    const dataReferencia =
+      body.proxima_fatura_data ||
+      body.ultimo_pagamento_data ||
+      new Date().toISOString().slice(0, 10);
+
+    const cicloMes =
+      `${String(dataReferencia).slice(0, 7)}-01`;
 
     const result = await client.query(
       `
@@ -6586,6 +6618,46 @@ app.put("/admin/railway-billing", authMiddleware, async (c) => {
         body.ultimo_pagamento_data || null,
         body.proxima_fatura_base === undefined
           ? null
+          : Number(body.proxima_fatura_base),
+        body.proxima_fatura_data || null,
+        body.observacoes ?? null
+      ]
+    );
+
+    await client.query(
+      `
+      INSERT INTO railway_billing_historico (
+        ciclo_mes,
+        plano,
+        moeda,
+        ultimo_pagamento_valor,
+        ultimo_pagamento_data,
+        proxima_fatura_base,
+        proxima_fatura_data,
+        observacoes
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (ciclo_mes)
+      DO UPDATE SET
+        plano = EXCLUDED.plano,
+        moeda = EXCLUDED.moeda,
+        ultimo_pagamento_valor = EXCLUDED.ultimo_pagamento_valor,
+        ultimo_pagamento_data = EXCLUDED.ultimo_pagamento_data,
+        proxima_fatura_base = EXCLUDED.proxima_fatura_base,
+        proxima_fatura_data = EXCLUDED.proxima_fatura_data,
+        observacoes = EXCLUDED.observacoes,
+        atualizado_em = CURRENT_TIMESTAMP
+      `,
+      [
+        cicloMes,
+        body.plano || "pro",
+        body.moeda || "USD",
+        body.ultimo_pagamento_valor === undefined
+          ? 0
+          : Number(body.ultimo_pagamento_valor),
+        body.ultimo_pagamento_data || null,
+        body.proxima_fatura_base === undefined
+          ? 20
           : Number(body.proxima_fatura_base),
         body.proxima_fatura_data || null,
         body.observacoes ?? null
