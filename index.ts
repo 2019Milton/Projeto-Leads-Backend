@@ -3330,8 +3330,17 @@ app.get(
       );
     }
 
+    const campanhasBancoTotal =
+      Number(campanhasCount.rows[0].total || 0);
+
+    const campanhasBancoAtivas =
+      Number(campanhasAtivas.rows[0].total || 0);
+
+    const leadsHojePlataforma =
+      Number(leadsHojeBanco.rows[0]?.total || 0);
+
     const leadsHojeFinal =
-      leadsHojeMeta;
+      leadsHojePlataforma;
 
     const gastoHojeFormatado =
       new Intl.NumberFormat(
@@ -3361,10 +3370,7 @@ app.get(
         conta.currency
       );
 
-    const saldoPrePago =
-      pagamentoManual
-        ? 0
-        : null;
+    const saldoPrePago = null;
 
     const tipoPagamento =
       pagamentoManual
@@ -3417,20 +3423,16 @@ app.get(
       instagram,
 
       metricas: {
-        campanhas:
-          campanhasMetaTotal ??
-          Number(campanhasCount.rows[0].total || 0),
-        campanhas_ativas:
-          campanhasMetaAtivas ??
-          Number(campanhasAtivas.rows[0].total || 0),
-        campanhas_origem:
-          campanhasMetaTotal === null
-            ? "banco"
-            : "meta",
+        campanhas: campanhasBancoTotal,
+        campanhas_ativas: campanhasBancoAtivas,
+        campanhas_meta:
+          campanhasMetaTotal,
+        campanhas_ativas_meta:
+          campanhasMetaAtivas,
+        campanhas_origem: "banco",
         leads_hoje: leadsHojeFinal,
         leads_hoje_meta: leadsHojeMeta,
-        leads_hoje_plataforma:
-          Number(leadsHojeBanco.rows[0]?.total || 0),
+        leads_hoje_plataforma: leadsHojePlataforma,
         gasto_hoje: gastoHoje,
         gasto_hoje_formatado: gastoHojeFormatado,
         ultimo_sync:
