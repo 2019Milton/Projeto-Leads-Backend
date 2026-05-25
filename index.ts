@@ -787,13 +787,6 @@ function calcularScoreLead(
     base.push("+5 Email informado");
   }
 
-  // 📢 Origem Meta
-  if (lead.origem === "meta") {
-
-    pontos += 15;
-    base.push("+15 Veio de campanha Meta");
-  }
-
   if (
     textoComercial.includes("visita") ||
     textoComercial.includes("agendar") ||
