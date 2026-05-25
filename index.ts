@@ -78,17 +78,15 @@ function normalizarPlano(value: unknown): PlanoPlataforma {
 }
 
 function obterRecursosPlano(
-  planoInformado: unknown,
-  tipoUsuario = ""
+  planoInformado: unknown
 ) {
   const plano = normalizarPlano(planoInformado);
-  const acessoTotal = tipoUsuario === "super_admin";
 
   return Object.fromEntries(
     Object.entries(RECURSOS_POR_PLANO[plano])
       .map(([recurso, habilitado]) => [
         recurso,
-        acessoTotal || habilitado
+        habilitado
       ])
   );
 }
@@ -97,10 +95,6 @@ function usuarioTemRecurso(
   user: any,
   recurso: keyof typeof RECURSOS_POR_PLANO.bronze
 ) {
-  if (user?.tipo === "super_admin") {
-    return true;
-  }
-
   return Boolean(
     RECURSOS_POR_PLANO[
       normalizarPlano(user?.plano)
@@ -1529,8 +1523,7 @@ const authMiddleware = async (c: any, next: any) => {
       ...userBanco,
       plano: normalizarPlano(userBanco.plano),
       recursos: obterRecursosPlano(
-        userBanco.plano,
-        userBanco.tipo
+        userBanco.plano
       )
     };
 
@@ -4352,8 +4345,8 @@ app.get("/usuarios/me/plano", authMiddleware, async (c) => {
   return c.json({
     plano: normalizarPlano(user.plano),
     tipo: user.tipo,
-    acesso_total: user.tipo === "super_admin",
-    recursos: obterRecursosPlano(user.plano, user.tipo),
+    acesso_total: false,
+    recursos: obterRecursosPlano(user.plano),
     ia: {
       uso_mes: Number(uso.rows[0]?.uso_mes || 0),
       custo_mes: Number(uso.rows[0]?.custo_mes || 0),
@@ -6637,11 +6630,9 @@ app.put("/admin/usuarios/:id/plano", authMiddleware, async (c) => {
     return c.json({
       sucesso: true,
       plano: planoFinal,
-      acesso_total:
-        alvo.rows[0].tipo === "super_admin",
+      acesso_total: false,
       recursos: obterRecursosPlano(
-        planoFinal,
-        alvo.rows[0].tipo
+        planoFinal
       )
     });
 
