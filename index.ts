@@ -45,15 +45,24 @@ type PlanoPlataforma =
 const RECURSOS_POR_PLANO = {
   bronze: {
     machine_learning_leads: false,
-    ia_leads: false
+    ia_leads: false,
+    ia_assistente_comercial: false,
+    ia_analise_campanhas: false,
+    ia_whatsapp: false
   },
   prata: {
     machine_learning_leads: true,
-    ia_leads: false
+    ia_leads: false,
+    ia_assistente_comercial: false,
+    ia_analise_campanhas: false,
+    ia_whatsapp: false
   },
   ouro: {
     machine_learning_leads: true,
-    ia_leads: true
+    ia_leads: true,
+    ia_assistente_comercial: true,
+    ia_analise_campanhas: true,
+    ia_whatsapp: true
   }
 } satisfies Record<PlanoPlataforma, Record<string, boolean>>;
 
@@ -1146,6 +1155,213 @@ function preverConversaoMLLead(
   };
 }
 
+type TipoUsoIA =
+  | "analise_lead"
+  | "mensagem_whatsapp"
+  | "proxima_acao"
+  | "analise_campanha"
+  | "relatorio";
+
+const IA_CUSTO_ESTIMADO_PADRAO = 0.08;
+
+function usuarioTemIA(user: any) {
+  return usuarioTemRecurso(user, "ia_leads");
+}
+
+function textoLeadIA(lead: any) {
+  return [
+    lead?.nome,
+    lead?.origem,
+    lead?.campanha,
+    lead?.observacao,
+    ...(Array.isArray(lead?.respostas_qualificacao)
+      ? lead.respostas_qualificacao.map((item: any) =>
+          `${item?.pergunta || ""} ${item?.resposta || ""}`
+        )
+      : [])
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function detectarSinaisIA(lead: any, ml: any) {
+  const texto = textoLeadIA(lead);
+  const sinais: string[] = [];
+  const riscos: string[] = [];
+
+  if (texto.includes("visita") || texto.includes("agendar")) {
+    sinais.push("demonstrou interesse em visita");
+  }
+
+  if (texto.includes("financiamento") || texto.includes("entrada")) {
+    sinais.push("mencionou financiamento ou entrada");
+  }
+
+  if (texto.includes("urgente") || texto.includes("rapido") || texto.includes("rápido")) {
+    sinais.push("indicou urgencia de atendimento");
+  }
+
+  if (lead?.telefone) {
+    sinais.push("tem telefone para contato imediato");
+  }
+
+  if (ml?.disponivel) {
+    sinais.push(`ML estima ${ml.probabilidade_conversao || 0}% de conversao`);
+  }
+
+  if (texto.includes("sem interesse") || texto.includes("nao quero") || texto.includes("não quero")) {
+    riscos.push("sinalizou baixo interesse");
+  }
+
+  if (!lead?.telefone) {
+    riscos.push("telefone nao informado");
+  }
+
+  if (!lead?.observacao) {
+    riscos.push("ainda nao tem observacoes do atendimento");
+  }
+
+  return { sinais, riscos };
+}
+
+function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
+  const scoreData =
+    lead?.score_pontos !== undefined
+      ? {
+          score: lead.score,
+          pontos: lead.score_pontos,
+          base: lead.score_base || []
+        }
+      : calcularScoreLead(lead);
+
+  const score = scoreData.score || "morno";
+  const { sinais, riscos } = detectarSinaisIA(lead, ml);
+
+  const prioridade =
+    ml?.disponivel && ml.probabilidade_conversao >= 70
+      ? "alta"
+      : score === "quente"
+      ? "alta"
+      : score === "frio"
+      ? "baixa"
+      : "media";
+
+  const proximaAcao =
+    prioridade === "alta"
+      ? "Chamar no WhatsApp hoje e tentar agendar uma visita ou conversa objetiva."
+      : prioridade === "media"
+      ? "Enviar uma mensagem curta de qualificacao e confirmar faixa de valor, regiao e prazo."
+      : "Nutrir com uma abordagem leve antes de insistir em visita ou proposta.";
+
+  const mensagemWhatsapp =
+    prioridade === "alta"
+      ? `Oi ${lead?.nome || "tudo bem"}! Vi seu interesse e queria te ajudar a avancar. Qual melhor horario para falarmos hoje sobre o imovel e uma possivel visita?`
+      : prioridade === "media"
+      ? `Oi ${lead?.nome || "tudo bem"}! Recebi seu interesse e queria entender melhor o que voce procura. Qual regiao, faixa de valor e prazo ideal para voce?`
+      : `Oi ${lead?.nome || "tudo bem"}! Passando para confirmar se ainda faz sentido eu te enviar algumas opcoes de imoveis dentro do que voce procura.`;
+
+  const perguntas = [
+    "Voce pretende comprar, alugar ou apenas pesquisar por enquanto?",
+    "Qual faixa de valor ou parcela mensal fica confortavel?",
+    "Tem uma regiao preferida ou bairros que deseja evitar?",
+    "Pretende usar financiamento, entrada propria ou outro formato?",
+    "Qual prazo ideal para visitar ou decidir?"
+  ];
+
+  return {
+    disponivel: true,
+    nivel: "ouro",
+    titulo: "IA Ouro",
+    prioridade,
+    resumo:
+      prioridade === "alta"
+        ? "Lead com bons sinais comerciais e recomendacao de contato rapido."
+        : prioridade === "media"
+        ? "Lead com potencial, mas ainda precisa de qualificacao antes da abordagem forte."
+        : "Lead com baixa prioridade no momento; melhor nutrir ou validar interesse.",
+    proxima_acao: proximaAcao,
+    mensagem_whatsapp: mensagemWhatsapp,
+    perguntas_qualificacao: perguntas,
+    sinais: sinais.length ? sinais : ["dados ainda limitados para uma analise profunda"],
+    riscos,
+    explicacao:
+      "A IA Ouro cruza a classificacao Frio/Morno/Quente, sinais do cadastro, respostas do formulario, historico do lead e previsao do ML quando disponivel. Ela entrega resumo, prioridade, proxima acao e mensagem pronta para reduzir tempo de atendimento.",
+    score_regras: score,
+    pontos_regras: scoreData.pontos || 0,
+    ml
+  };
+}
+
+async function registrarUsoIA(
+  usuarioId: number,
+  tipo: TipoUsoIA,
+  referenciaTipo: string,
+  referenciaId: string | number | null,
+  custoEstimado = IA_CUSTO_ESTIMADO_PADRAO
+) {
+  await client.query(
+    `
+    INSERT INTO ia_usos (
+      usuario_id,
+      tipo,
+      referencia_tipo,
+      referencia_id,
+      custo_estimado
+    )
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [
+      usuarioId,
+      tipo,
+      referenciaTipo,
+      referenciaId ? String(referenciaId) : null,
+      custoEstimado
+    ]
+  );
+}
+
+async function validarLimiteIAUsuario(user: any) {
+  const uso = await client.query(
+    `
+    SELECT
+      COUNT(*) AS chamadas_mes,
+      COALESCE(SUM(custo_estimado), 0) AS custo_mes
+    FROM ia_usos
+    WHERE usuario_id = $1
+    AND criado_em >= date_trunc('month', CURRENT_DATE)
+    `,
+    [user.id]
+  );
+
+  const chamadasMes = Number(uso.rows[0]?.chamadas_mes || 0);
+  const custoMes = Number(uso.rows[0]?.custo_mes || 0);
+  const limiteChamadas = Number(user.ia_limite_mensal || 300);
+  const limiteCusto = Number(user.ia_custo_limite_mensal || 120);
+
+  if (limiteChamadas > 0 && chamadasMes >= limiteChamadas) {
+    return {
+      permitido: false,
+      motivo: "Limite mensal de chamadas de IA atingido."
+    };
+  }
+
+  if (limiteCusto > 0 && custoMes >= limiteCusto) {
+    return {
+      permitido: false,
+      motivo: "Limite mensal de custo estimado de IA atingido."
+    };
+  }
+
+  return {
+    permitido: true,
+    chamadas_mes: chamadasMes,
+    custo_mes: custoMes,
+    limite_chamadas: limiteChamadas,
+    limite_custo: limiteCusto
+  };
+}
+
 
 app.use("/*", cors({
   origin: resolverOrigemCors,
@@ -1195,6 +1411,8 @@ const authMiddleware = async (c: any, next: any) => {
         nome,
         sobrenome,
         plano,
+        ia_limite_mensal,
+        ia_custo_limite_mensal,
         COALESCE(ativo, true) AS ativo
       FROM usuarios
       WHERE id = $1
@@ -3520,12 +3738,54 @@ await client.query(`
 `);
 
 await client.query(`
+  CREATE TABLE IF NOT EXISTS ia_usos (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    tipo TEXT NOT NULL,
+    referencia_tipo TEXT,
+    referencia_id TEXT,
+    tokens_entrada INTEGER DEFAULT 0,
+    tokens_saida INTEGER DEFAULT 0,
+    custo_estimado NUMERIC(12, 4) DEFAULT 0,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ia_config (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    provedor TEXT DEFAULT 'openai',
+    modelo TEXT DEFAULT 'gpt-4.1-mini',
+    status TEXT DEFAULT 'nao_contratado',
+    assinatura_status TEXT DEFAULT 'pendente',
+    plano_api TEXT DEFAULT 'sob_demanda',
+    limite_mensal_requisicoes INTEGER DEFAULT 1000,
+    limite_mensal_custo NUMERIC(12, 2) DEFAULT 300,
+    custo_mensal_contratado NUMERIC(12, 2) DEFAULT 0,
+    ciclo_inicio DATE DEFAULT CURRENT_DATE,
+    observacoes TEXT,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  INSERT INTO ia_config (id)
+  VALUES (1)
+  ON CONFLICT (id) DO NOTHING;
+`);
+
+await client.query(`
   ALTER TABLE usuarios
     ADD COLUMN IF NOT EXISTS nome TEXT,
     ADD COLUMN IF NOT EXISTS sobrenome TEXT,
     ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT true,
     ADD COLUMN IF NOT EXISTS admin_id INTEGER,
     ADD COLUMN IF NOT EXISTS plano TEXT DEFAULT 'bronze',
+    ADD COLUMN IF NOT EXISTS plano_ativado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS assinatura_status TEXT DEFAULT 'manual',
+    ADD COLUMN IF NOT EXISTS assinatura_inicio TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS ia_limite_mensal INTEGER DEFAULT 300,
+    ADD COLUMN IF NOT EXISTS ia_custo_limite_mensal NUMERIC(12, 2) DEFAULT 120,
     ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 `);
 
@@ -3596,6 +3856,8 @@ await client.query(`
     ON password_reset_tokens(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_password_history_usuario
     ON password_history(usuario_id, criado_em DESC);
+  CREATE INDEX IF NOT EXISTS idx_ia_usos_usuario_data
+    ON ia_usos(usuario_id, criado_em DESC);
 `);
 
 /* =========================
@@ -3979,11 +4241,29 @@ app.post("/login", async (c) => {
 app.get("/usuarios/me/plano", authMiddleware, async (c) => {
   const user: any = c.get("user");
 
+  const uso = await client.query(
+    `
+    SELECT
+      COUNT(*) AS uso_mes,
+      COALESCE(SUM(custo_estimado), 0) AS custo_mes
+    FROM ia_usos
+    WHERE usuario_id = $1
+    AND criado_em >= date_trunc('month', CURRENT_DATE)
+    `,
+    [user.id]
+  );
+
   return c.json({
     plano: normalizarPlano(user.plano),
     tipo: user.tipo,
     acesso_total: user.tipo === "super_admin",
-    recursos: obterRecursosPlano(user.plano, user.tipo)
+    recursos: obterRecursosPlano(user.plano, user.tipo),
+    ia: {
+      uso_mes: Number(uso.rows[0]?.uso_mes || 0),
+      custo_mes: Number(uso.rows[0]?.custo_mes || 0),
+      limite_mensal: Number(user.ia_limite_mensal || 300),
+      custo_limite_mensal: Number(user.ia_custo_limite_mensal || 120)
+    }
   });
 });
 
@@ -5501,6 +5781,14 @@ app.get("/leads", authMiddleware, async (c) => {
             lead
           );
       }
+
+      if (usuarioTemIA(user)) {
+        lead.ia_leads =
+          gerarAnaliseIAOuroLead(
+            lead,
+            lead.ml_leads || null
+          );
+      }
     
       if (
         lead.status === "novo" ||
@@ -5543,6 +5831,112 @@ app.get("/leads", authMiddleware, async (c) => {
 
 
 // 🔥 atualizar lead
+app.get("/ia/leads/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (!usuarioTemIA(user)) {
+      return c.json({
+        error: "IA disponivel apenas no plano Ouro"
+      }, 403);
+    }
+
+    const limiteIA = await validarLimiteIAUsuario(user);
+
+    if (!limiteIA.permitido) {
+      return c.json({
+        error: limiteIA.motivo
+      }, 429);
+    }
+
+    const id = c.req.param("id");
+
+    const leadResult = await client.query(
+      `
+      SELECT
+        id,
+        nome,
+        telefone,
+        email,
+        status,
+        origem,
+        campanha,
+        observacao,
+        score,
+        score_manual,
+        motivo_perda,
+        respostas_qualificacao,
+        criado_em
+      FROM leads
+      WHERE id = $1
+      AND usuario_id = $2
+      LIMIT 1
+      `,
+      [id, user.id]
+    );
+
+    const lead = leadResult.rows[0];
+
+    if (!lead) {
+      return c.json({ error: "Lead nao encontrado" }, 404);
+    }
+
+    const todosLeads = await client.query(
+      `
+      SELECT
+        id,
+        nome,
+        telefone,
+        email,
+        status,
+        origem,
+        campanha,
+        observacao,
+        score,
+        score_manual,
+        motivo_perda,
+        respostas_qualificacao,
+        criado_em
+      FROM leads
+      WHERE usuario_id = $1
+      `,
+      [user.id]
+    );
+
+    const modeloML =
+      usuarioTemRecurso(user, "machine_learning_leads")
+        ? treinarModeloMLLeads(todosLeads.rows)
+        : null;
+
+    const scoreData = calcularScoreLead(lead);
+    lead.score = scoreData.score;
+    lead.score_base = scoreData.base;
+    lead.score_pontos = scoreData.pontos;
+
+    const ml =
+      modeloML
+        ? preverConversaoMLLead(modeloML, lead)
+        : null;
+
+    const analise = gerarAnaliseIAOuroLead(lead, ml);
+
+    await registrarUsoIA(
+      Number(user.id),
+      "analise_lead",
+      "lead",
+      lead.id
+    );
+
+    return c.json({ analise });
+
+  } catch (err) {
+    console.error("ERRO IA LEAD:", err);
+    return c.json({
+      error: "Erro ao gerar analise de IA"
+    }, 500);
+  }
+});
+
 app.put("/leads/:id", authMiddleware, async (c) => {
 
   try {
@@ -5733,6 +6127,177 @@ app.get(
 
 
 
+app.get("/admin/ia", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const config = await client.query(
+      `SELECT * FROM ia_config WHERE id = 1 LIMIT 1`
+    );
+
+    const resumo = await client.query(`
+      SELECT
+        COUNT(DISTINCT u.id) FILTER (WHERE u.plano = 'ouro') AS usuarios_ouro,
+        COUNT(DISTINCT u.id) FILTER (
+          WHERE u.plano = 'ouro'
+          AND COALESCE(u.ativo, true) = true
+        ) AS usuarios_ouro_ativos,
+        COALESCE(SUM(iu.custo_estimado), 0) AS custo_mes,
+        COUNT(iu.id) AS chamadas_mes
+      FROM usuarios u
+      LEFT JOIN ia_usos iu
+        ON iu.usuario_id = u.id
+        AND iu.criado_em >= date_trunc('month', CURRENT_DATE)
+    `);
+
+    const usuarios = await client.query(`
+      SELECT
+        u.id,
+        u.email,
+        u.nome,
+        u.sobrenome,
+        u.tipo,
+        u.plano,
+        u.plano_ativado_em,
+        u.assinatura_status,
+        u.assinatura_inicio,
+        u.ia_limite_mensal,
+        u.ia_custo_limite_mensal,
+        COALESCE(COUNT(iu.id), 0) AS chamadas_mes,
+        COALESCE(SUM(iu.custo_estimado), 0) AS custo_mes,
+        MAX(iu.criado_em) AS ultimo_uso
+      FROM usuarios u
+      LEFT JOIN ia_usos iu
+        ON iu.usuario_id = u.id
+        AND iu.criado_em >= date_trunc('month', CURRENT_DATE)
+      WHERE u.plano = 'ouro'
+      GROUP BY
+        u.id,
+        u.email,
+        u.nome,
+        u.sobrenome,
+        u.tipo,
+        u.plano,
+        u.plano_ativado_em,
+        u.assinatura_status,
+        u.assinatura_inicio,
+        u.ia_limite_mensal,
+        u.ia_custo_limite_mensal
+      ORDER BY u.plano_ativado_em DESC NULLS LAST, u.id ASC
+    `);
+
+    return c.json({
+      config: {
+        ...config.rows[0],
+        chave_configurada: Boolean(Bun.env.OPENAI_API_KEY)
+      },
+      resumo: resumo.rows[0],
+      usuarios: usuarios.rows
+    });
+
+  } catch (err) {
+    console.error("ERRO ADMIN IA:", err);
+    return c.json({ error: "Erro ao carregar painel de IA" }, 500);
+  }
+});
+
+app.put("/admin/ia/config", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const body = await c.req.json();
+
+    const result = await client.query(
+      `
+      UPDATE ia_config
+      SET
+        provedor = COALESCE($1, provedor),
+        modelo = COALESCE($2, modelo),
+        status = COALESCE($3, status),
+        assinatura_status = COALESCE($4, assinatura_status),
+        plano_api = COALESCE($5, plano_api),
+        limite_mensal_requisicoes = COALESCE($6, limite_mensal_requisicoes),
+        limite_mensal_custo = COALESCE($7, limite_mensal_custo),
+        custo_mensal_contratado = COALESCE($8, custo_mensal_contratado),
+        observacoes = COALESCE($9, observacoes),
+        atualizado_em = NOW()
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        body.provedor || null,
+        body.modelo || null,
+        body.status || null,
+        body.assinatura_status || null,
+        body.plano_api || null,
+        Number.isFinite(Number(body.limite_mensal_requisicoes))
+          ? Number(body.limite_mensal_requisicoes)
+          : null,
+        Number.isFinite(Number(body.limite_mensal_custo))
+          ? Number(body.limite_mensal_custo)
+          : null,
+        Number.isFinite(Number(body.custo_mensal_contratado))
+          ? Number(body.custo_mensal_contratado)
+          : null,
+        body.observacoes || null
+      ]
+    );
+
+    return c.json({
+      sucesso: true,
+      config: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error("ERRO ADMIN IA CONFIG:", err);
+    return c.json({ error: "Erro ao salvar configuracao de IA" }, 500);
+  }
+});
+
+app.put("/admin/usuarios/:id/ia-limites", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = c.req.param("id");
+    const body = await c.req.json();
+
+    await client.query(
+      `
+      UPDATE usuarios
+      SET
+        ia_limite_mensal = $1,
+        ia_custo_limite_mensal = $2,
+        assinatura_status = COALESCE($3, assinatura_status)
+      WHERE id = $4
+      `,
+      [
+        Math.max(0, Number(body.ia_limite_mensal || 0)),
+        Math.max(0, Number(body.ia_custo_limite_mensal || 0)),
+        body.assinatura_status || null,
+        id
+      ]
+    );
+
+    return c.json({ sucesso: true });
+
+  } catch (err) {
+    console.error("ERRO LIMITES IA USUARIO:", err);
+    return c.json({ error: "Erro ao atualizar limites de IA" }, 500);
+  }
+});
+
 app.get("/admin/usuarios", authMiddleware, async (c) => {
 
   try {
@@ -5751,14 +6316,31 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.email,
         u.tipo,
         u.plano,
+        u.plano_ativado_em,
+        u.assinatura_status,
+        u.assinatura_inicio,
+        u.ia_limite_mensal,
+        u.ia_custo_limite_mensal,
         u.admin_id,
         admin.email AS admin_email,
         COALESCE(u.ativo, true) AS ativo,
+        COALESCE(ia.uso_mes, 0) AS ia_uso_mes,
+        COALESCE(ia.custo_mes, 0) AS ia_custo_mes,
         COUNT(DISTINCT c.id) AS campanhas,
         COUNT(DISTINCT l.id) AS leads
       FROM usuarios u
       LEFT JOIN usuarios admin
         ON admin.id = u.admin_id
+      LEFT JOIN (
+        SELECT
+          usuario_id,
+          COUNT(*) AS uso_mes,
+          COALESCE(SUM(custo_estimado), 0) AS custo_mes
+        FROM ia_usos
+        WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+        GROUP BY usuario_id
+      ) ia
+        ON ia.usuario_id = u.id
       LEFT JOIN campanhas c
         ON c.usuario_id = u.id
       LEFT JOIN leads l
@@ -5768,9 +6350,16 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.email,
         u.tipo,
         u.plano,
+        u.plano_ativado_em,
+        u.assinatura_status,
+        u.assinatura_inicio,
+        u.ia_limite_mensal,
+        u.ia_custo_limite_mensal,
         u.admin_id,
         admin.email,
-        u.ativo
+        u.ativo,
+        ia.uso_mes,
+        ia.custo_mes
       ORDER BY u.id ASC
     `);
 
@@ -5915,7 +6504,29 @@ app.put("/admin/usuarios/:id/plano", authMiddleware, async (c) => {
     await client.query(
       `
       UPDATE usuarios
-      SET plano = $1
+      SET
+        plano = $1,
+        plano_ativado_em = CASE
+          WHEN $1 = 'ouro'
+          AND COALESCE(plano, 'bronze') <> 'ouro'
+            THEN NOW()
+          WHEN $1 <> 'ouro'
+            THEN NULL
+          ELSE plano_ativado_em
+        END,
+        assinatura_inicio = CASE
+          WHEN $1 = 'ouro'
+          AND assinatura_inicio IS NULL
+            THEN NOW()
+          WHEN $1 <> 'ouro'
+            THEN NULL
+          ELSE assinatura_inicio
+        END,
+        assinatura_status = CASE
+          WHEN $1 = 'ouro'
+            THEN COALESCE(NULLIF(assinatura_status, ''), 'manual')
+          ELSE 'manual'
+        END
       WHERE id = $2
       `,
       [planoFinal, id]
@@ -6003,6 +6614,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
     }
 
     const senhaHash = await gerarHashSenha(senha);
+    const planoFinal = normalizarPlano(plano);
 
     await client.query(
       `
@@ -6014,10 +6626,16 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         tipo,
         ativo,
         admin_id,
-        plano
+        plano,
+        plano_ativado_em,
+        assinatura_inicio,
+        assinatura_status
       )
       VALUES (
-        $1,$2,$3,$4,$5,true,$6,$7
+        $1,$2,$3,$4,$5,true,$6,$7,
+        CASE WHEN $7 = 'ouro' THEN NOW() ELSE NULL END,
+        CASE WHEN $7 = 'ouro' THEN NOW() ELSE NULL END,
+        CASE WHEN $7 = 'ouro' THEN 'manual' ELSE 'manual' END
       )
       `,
       [
@@ -6027,7 +6645,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         senhaHash,
         tipo || "corretor",
         admin_id || null,
-        normalizarPlano(plano)
+        planoFinal
       ]
     );
 
