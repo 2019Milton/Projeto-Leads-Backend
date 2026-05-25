@@ -97,6 +97,10 @@ function usuarioTemRecurso(
   user: any,
   recurso: keyof typeof RECURSOS_POR_PLANO.bronze
 ) {
+  if (user?.tipo === "super_admin") {
+    return true;
+  }
+
   return Boolean(
     RECURSOS_POR_PLANO[
       normalizarPlano(user?.plano)
