@@ -764,6 +764,15 @@ function calcularScoreLead(
       .join(" ")
       .toLowerCase();
 
+  const textoQualificacao =
+    [
+      lead.observacao,
+      respostasTexto
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
   // 🆕 Lead novo
   pontos += 10;
   base.push("+10 Lead recém capturado");
@@ -830,12 +839,12 @@ function calcularScoreLead(
   }
 
   if (
-    textoComercial.includes("n�o responde") ||
-    textoComercial.includes("nao responde") ||
-    textoComercial.includes("sem interesse") ||
-    textoComercial.includes("desistiu") ||
-    textoComercial.includes("curioso") ||
-    textoComercial.includes("pesquisando")
+    textoQualificacao.includes("n�o responde") ||
+    textoQualificacao.includes("nao responde") ||
+    textoQualificacao.includes("sem interesse") ||
+    textoQualificacao.includes("desistiu") ||
+    textoQualificacao.includes("curioso") ||
+    textoQualificacao.includes("pesquisando")
   ) {
 
     pontos -= 30;
@@ -846,55 +855,6 @@ function calcularScoreLead(
 
     pontos += 20;
     base.push("+20 Lead retornou novamente");
-  }
-
-  // ⏳ Tempo parado
-  const criado =
-    new Date(lead.criado_em);
-
-  const agora =
-    new Date();
-
-  const dias =
-    Math.floor(
-      (agora.getTime() - criado.getTime()) /
-      (1000 * 60 * 60 * 24)
-    );
-
-  if (dias >= 15) {
-
-    pontos -= 40;
-    base.push("-40 Lead parado há mais de 15 dias");
-
-  } else if (dias >= 7) {
-
-    pontos -= 20;
-    base.push("-20 Lead parado há mais de 7 dias");
-  }
-
-  // ✅ Status atual
-  if (lead.status === "primeiro_contato") {
-
-    pontos += 10;
-    base.push("+10 Primeiro contato realizado");
-  }
-
-  if (lead.status === "em_conversa") {
-
-    pontos += 30;
-    base.push("+30 Lead em conversa");
-  }
-
-  if (lead.status === "fechado") {
-
-    pontos += 50;
-    base.push("+50 Lead fechado");
-  }
-
-  if (lead.status === "perdido") {
-
-    pontos -= 60;
-    base.push("-60 Lead perdido");
   }
 
   // 🔥 Classificação final
@@ -982,6 +942,64 @@ function textoRespostasQualificacao(lead: any) {
       item?.resposta
     ].filter(Boolean).join(" "))
     .join(" ");
+}
+
+function normalizarContatoLead(valor: unknown) {
+  return String(valor || "")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizarTelefoneLead(valor: unknown) {
+  return String(valor || "")
+    .replace(/\D/g, "");
+}
+
+function marcarLeadsRecorrentes(leads: any[]) {
+  const telefones = new Map<string, number>();
+  const emails = new Map<string, number>();
+
+  leads.forEach(lead => {
+    const telefone =
+      normalizarTelefoneLead(lead.telefone);
+
+    const email =
+      normalizarContatoLead(lead.email);
+
+    if (telefone.length >= 8) {
+      telefones.set(
+        telefone,
+        (telefones.get(telefone) || 0) + 1
+      );
+    }
+
+    if (email) {
+      emails.set(
+        email,
+        (emails.get(email) || 0) + 1
+      );
+    }
+  });
+
+  leads.forEach(lead => {
+    const telefone =
+      normalizarTelefoneLead(lead.telefone);
+
+    const email =
+      normalizarContatoLead(lead.email);
+
+    lead.repetido =
+      (
+        telefone.length >= 8 &&
+        (telefones.get(telefone) || 0) > 1
+      ) ||
+      (
+        Boolean(email) &&
+        (emails.get(email) || 0) > 1
+      );
+  });
+
+  return leads;
 }
 
 function adicionarTokensTextoMLLead(
@@ -6127,6 +6145,8 @@ app.get("/leads", authMiddleware, async (c) => {
       [user.id, contaAnunciosId]
     );
 
+    marcarLeadsRecorrentes(result.rows);
+
     // 🔥 separa por status
     const leads = {
       novos: [],
@@ -6288,6 +6308,17 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
       `,
       [user.id]
     );
+
+    marcarLeadsRecorrentes(todosLeads.rows);
+
+    const leadRecorrente =
+      todosLeads.rows.find((item: any) =>
+        Number(item.id) === Number(lead.id)
+      );
+
+    if (leadRecorrente) {
+      lead.repetido = leadRecorrente.repetido;
+    }
 
     const modeloML =
       usuarioTemRecurso(user, "machine_learning_leads")
