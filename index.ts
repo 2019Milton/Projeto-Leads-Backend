@@ -102,6 +102,72 @@ function usuarioTemRecurso(
   );
 }
 
+function usuarioPodeOperarConta(
+  user: any,
+  usuarioId: unknown
+) {
+  return (
+    user?.tipo === "super_admin" ||
+    Number(user?.id) === Number(usuarioId)
+  );
+}
+
+function resolverUsuarioIdOperacao(
+  user: any,
+  usuarioIdInformado: unknown
+) {
+  const usuarioId =
+    Number(usuarioIdInformado || user?.id);
+
+  if (
+    !Number.isFinite(usuarioId) ||
+    usuarioId <= 0 ||
+    !usuarioPodeOperarConta(user, usuarioId)
+  ) {
+    return null;
+  }
+
+  return usuarioId;
+}
+
+function negarAcessoConta(c: any) {
+  return c.json({
+    error: "Acesso negado para esta conta"
+  }, 403);
+}
+
+function validarAssinaturaMetaWebhook(
+  assinatura: string | null,
+  corpo: string
+) {
+  const appSecret = Bun.env.META_APP_SECRET;
+
+  if (!appSecret) {
+    return true;
+  }
+
+  if (!assinatura?.startsWith("sha256=")) {
+    return false;
+  }
+
+  const esperada =
+    "sha256=" +
+    createHmac("sha256", appSecret)
+      .update(corpo)
+      .digest("hex");
+
+  const recebidaBuffer =
+    Buffer.from(assinatura);
+
+  const esperadaBuffer =
+    Buffer.from(esperada);
+
+  return (
+    recebidaBuffer.length === esperadaBuffer.length &&
+    timingSafeEqual(recebidaBuffer, esperadaBuffer)
+  );
+}
+
 if (TOKEN_SECRET === DEFAULT_TOKEN_SECRET) {
   console.warn(
     "JWT_SECRET nao configurado. Defina essa variavel no Railway em producao."
@@ -123,7 +189,10 @@ function resolverOrigemCors(origin: string) {
 
   if (
     allowedOrigins.has(origin) ||
-    origin.endsWith(".vercel.app")
+    (
+      Bun.env.ALLOW_VERCEL_PREVIEWS === "true" &&
+      origin.endsWith(".vercel.app")
+    )
   ) {
     return origin;
   }
@@ -1993,6 +2062,10 @@ app.get("/auth/meta/login", (c) => {
     return c.text("Token não enviado");
   }
 
+  if (!decodificarTokenUsuario(token)) {
+    return c.text("Token invalido ou expirado", 401);
+  }
+
   const clientId = Bun.env.META_APP_ID;
   const redirectUri = Bun.env.META_REDIRECT_URI;
 
@@ -2043,7 +2116,7 @@ app.get("/auth/meta/callback", async (c) => {
     const tokenData = await tokenRes.json();
     const access_token = tokenData.access_token;
 
-    console.log("TOKEN META:", tokenData);
+    console.log("META conectada com sucesso");
 
     // 🔐 pega token do state
     const state = c.req.query("state");
@@ -2053,18 +2126,17 @@ app.get("/auth/meta/callback", async (c) => {
     }
     
     // 🔓 decodifica token login
-    const decoded = atob(state);
-    
-    const [usuario_id] = decoded.split(":");
-    
-    if (!usuario_id) {
-      return c.text("Usuário inválido");
+    const usuarioState =
+      decodificarTokenUsuario(state);
+
+    if (!usuarioState?.id) {
+      return c.text("Usuário inválido", 401);
     }
 
     // 💾 salva no banco
     await client.query(
       "INSERT INTO meta_conexoes (usuario_id, access_token) VALUES ($1, $2)",
-      [usuario_id, access_token]
+      [usuarioState.id, access_token]
     );
 
     return c.html(`
@@ -2085,10 +2157,13 @@ app.get("/auth/meta/callback", async (c) => {
    🧪 TESTE META
 ========================= */
 
-app.get("/meta/teste", async (c) => {
+app.get("/meta/teste", authMiddleware, async (c) => {
   try {
+    const user: any = c.get("user");
+
     const result = await client.query(
-      "SELECT access_token FROM meta_conexoes ORDER BY id DESC LIMIT 1"
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [user.id]
     );
 
     if (result.rows.length === 0) {
@@ -2183,8 +2258,9 @@ app.post("/meta/conta-anuncios", authMiddleware, async (c) => {
 });
 
 
-app.post("/meta/campanha", async (c) => {
+app.post("/meta/campanha", authMiddleware, async (c) => {
   try {
+    const user: any = c.get("user");
     const {
       usuario_id,
       nome,
@@ -2192,9 +2268,16 @@ app.post("/meta/campanha", async (c) => {
       configuracoes_avancadas
     } = await c.req.json();
 
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
     const conn = await client.query(
       "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
-      [usuario_id]
+      [usuarioId]
     );
 
     const token = conn.rows[0].access_token;
@@ -2262,7 +2345,7 @@ app.post("/meta/campanha", async (c) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7)
       `,
       [
-        usuario_id,
+        usuarioId,
         campanha.id,
         adAccountId,
         nome || "Campanha Plataforma",
@@ -2287,8 +2370,9 @@ app.post("/meta/campanha", async (c) => {
   }
 });
 
-app.post("/meta/adset", async (c) => {
+app.post("/meta/adset", authMiddleware, async (c) => {
   try {
+    const user: any = c.get("user");
     const {
       usuario_id,
       campaign_id,
@@ -2298,9 +2382,16 @@ app.post("/meta/adset", async (c) => {
       configuracoes_avancadas
     } = await c.req.json();
 
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
     const conn = await client.query(
       "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
-      [usuario_id]
+      [usuarioId]
     );
 
     const token = conn.rows[0].access_token;
@@ -2429,8 +2520,9 @@ app.post("/meta/adset", async (c) => {
 });
 
 
-app.post("/meta/formulario", async (c) => {
+app.post("/meta/formulario", authMiddleware, async (c) => {
   try {
+    const user: any = c.get("user");
     const {
       usuario_id,
       adset_id,
@@ -2441,10 +2533,17 @@ app.post("/meta/formulario", async (c) => {
       configuracoes_avancadas
     } = await c.req.json();
 
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
     // 🔐 pega token salvo
     const conn = await client.query(
       "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
-      [usuario_id]
+      [usuarioId]
     );
 
     if (conn.rows.length === 0) {
@@ -2552,9 +2651,10 @@ app.post("/meta/formulario", async (c) => {
 });
 
 
-app.post("/meta/upload-imagem", async (c) => {
+app.post("/meta/upload-imagem", authMiddleware, async (c) => {
 
   try {
+    const user: any = c.get("user");
 
     const body = await c.req.formData();
 
@@ -2570,6 +2670,12 @@ app.post("/meta/upload-imagem", async (c) => {
     );
 
     const usuario_id = body.get("usuario_id");
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
 
     console.log(
       "USUARIO:",
@@ -2592,7 +2698,7 @@ app.post("/meta/upload-imagem", async (c) => {
       ORDER BY id DESC
       LIMIT 1
       `,
-      [usuario_id]
+      [usuarioId]
     );
 
     if (conn.rows.length === 0) {
@@ -2701,9 +2807,10 @@ app.post("/meta/upload-imagem", async (c) => {
 
 
 
-app.post("/meta/anuncio", async (c) => {
+app.post("/meta/anuncio", authMiddleware, async (c) => {
 
   try {
+    const user: any = c.get("user");
 
     const {
       usuario_id,
@@ -2717,6 +2824,13 @@ app.post("/meta/anuncio", async (c) => {
       configuracoes_avancadas,
       imageHash
     } = await c.req.json();
+
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
 
     console.log("IMAGE HASH:", imageHash);
 
@@ -2744,7 +2858,7 @@ app.post("/meta/anuncio", async (c) => {
       ORDER BY id DESC
       LIMIT 1
       `,
-      [usuario_id]
+      [usuarioId]
     );
 
     if (conn.rows.length === 0) {
@@ -3342,12 +3456,20 @@ app.get(
     }
 });
 
-app.post("/meta/direcionamento/interesses", async (c) => {
+app.post("/meta/direcionamento/interesses", authMiddleware, async (c) => {
   try {
+    const user: any = c.get("user");
     const {
       usuario_id,
       busca
     } = await c.req.json();
+
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
 
     const termo =
       textoOpcional(busca)
@@ -3359,7 +3481,7 @@ app.post("/meta/direcionamento/interesses", async (c) => {
 
     const conn = await client.query(
       "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
-      [usuario_id]
+      [usuarioId]
     );
 
     if (!conn.rows.length) {
@@ -3510,13 +3632,21 @@ app.get("/webhook/meta", async (c) => {
 app.post("/webhook/meta", async (c) => {
 
   try {
+    const corpoRaw =
+      await c.req.text();
 
-    const body = await c.req.json();
+    const assinatura =
+      c.req.header("x-hub-signature-256") ||
+      c.req.header("X-Hub-Signature-256") ||
+      null;
 
-    console.log(
-      "LEAD RECEBIDO:",
-      JSON.stringify(body, null, 2)
-    );
+    if (!validarAssinaturaMetaWebhook(assinatura, corpoRaw)) {
+      return c.json({ error: "Assinatura Meta invalida" }, 401);
+    }
+
+    const body = JSON.parse(corpoRaw || "{}");
+
+    console.log("WEBHOOK META RECEBIDO");
 
     if (body.entry) {
 
@@ -4287,6 +4417,10 @@ app.post("/auth/reset-senha", async (c) => {
 });
 
 app.get("/login-test", async (c) => {
+  if (Bun.env.ALLOW_LOGIN_TEST !== "true") {
+    return c.json({ error: "Rota desativada" }, 404);
+  }
+
   try {
     const email = c.req.query("email");
     const senha = c.req.query("senha");
@@ -5345,7 +5479,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
       console.log(
         "FORMS META:",
-        JSON.stringify(forms, null, 2)
+        Array.isArray(forms.data) ? forms.data.length : 0
       );
 
       for (const form of forms.data || []) {
@@ -5383,7 +5517,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
         console.log(
           "LEADS META:",
-          JSON.stringify(leadsMeta, null, 2)
+          Array.isArray(leadsMeta.data) ? leadsMeta.data.length : 0
         );
 
         for (const lead of leadsMeta.data || []) {
