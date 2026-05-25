@@ -4875,11 +4875,11 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       [user.id]
     );
 
-    if (conn.rows.length === 0) {
-      return c.json({ error: "Meta não conectada" }, 400);
-    }
+    const token =
+      conn.rows[0]?.access_token || null;
 
-    const token = conn.rows[0].access_token;
+    const contaAnunciosId =
+      conn.rows[0]?.conta_anuncios_id || null;
 
     const campanhas = await client.query(
       `
@@ -4901,36 +4901,56 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           c.usuario_id = $1
           OR c.encaminhada_para_usuario_id = $1
         )
-        AND c.conta_anuncios_id = $2
+        AND (
+          $2::text IS NULL
+          OR c.conta_anuncios_id = $2
+        )
       ORDER BY c.id DESC
       `,
-      [user.id, conn.rows[0].conta_anuncios_id]
+      [user.id, contaAnunciosId]
     );
 
     const metricas = [];
 
     for (const campanha of campanhas.rows) {
 
-      if (!campanha.campaign_id) {
-        continue;
+      let dados: any = {};
+      let grafico: any[] = [];
+      let metaDisponivel = false;
+      let erroMeta: string | null = null;
+
+      if (
+        token &&
+        campanha.campaign_id &&
+        String(campanha.status || "").toUpperCase() !== "DELETED"
+      ) {
+        try {
+          const insights = await fetch(
+            `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&time_increment=1&date_preset=last_7d&access_token=${token}`
+          ).then(r => r.json());
+
+          if (insights.error) {
+            erroMeta =
+              insights.error.message ||
+              "Métricas indisponíveis na Meta";
+          } else {
+            dados = insights.data?.[0] || {};
+
+            grafico =
+              insights.data?.map((d: any) => ({
+                data: d.date_start,
+                clicks: Number(d.clicks || 0),
+                ctr: Number(d.ctr || 0),
+                gasto: Number(d.spend || 0),
+                impressoes: Number(d.impressions || 0)
+              })) || [];
+
+            metaDisponivel = true;
+          }
+        } catch {
+          erroMeta = "Métricas indisponíveis na Meta";
+        }
       }
-
-      const insights = await fetch(
-        `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&time_increment=1&date_preset=last_7d&access_token=${token}`
-      ).then(r => r.json());
-
-      console.log("INSIGHTS:", insights);
-
-      const dados = insights.data?.[0] || {};
-
-      const grafico =
-        insights.data?.map((d: any) => ({
-          data: d.date_start,
-          clicks: Number(d.clicks || 0),
-          ctr: Number(d.ctr || 0),
-          gasto: Number(d.spend || 0),
-          impressoes: Number(d.impressions || 0)
-        })) || [];
 
       // ✅ LEADS REAIS DO BANCO
       const leadsBanco = await client.query(
@@ -4944,7 +4964,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         [
           user.id,
           campanha.nome,
-          conn.rows[0].conta_anuncios_id
+          campanha.conta_anuncios_id
         ]
       );
 
@@ -4990,7 +5010,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         leads: totalLeadsBanco,
 
         grafico,
-        criado_em: campanha.criado_em
+        criado_em: campanha.criado_em,
+        metricas_origem: metaDisponivel ? "meta" : "local",
+        meta_disponivel: metaDisponivel,
+        erro_meta: erroMeta
       });
     }
 
@@ -5936,6 +5959,108 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
   }
 });
 
+
+// 🔹 restaurar campanha excluída no histórico local
+app.post("/meta/restaurar-campanha", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const {
+      campaign_id
+    } = await c.req.json();
+
+    const campanha = await client.query(
+      `
+      SELECT id, adset_id, ad_id
+      FROM campanhas
+      WHERE campaign_id = $1
+      AND usuario_id = $2
+      AND UPPER(status) = 'DELETED'
+      LIMIT 1
+      `,
+      [campaign_id, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({
+        error: "Campanha excluída não encontrada para este usuário"
+      }, 404);
+    }
+
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    const token =
+      conn.rows[0]?.access_token || null;
+
+    let aviso: string | null = null;
+
+    if (token) {
+      const idsMeta = [
+        campaign_id,
+        campanha.rows[0].adset_id,
+        campanha.rows[0].ad_id
+      ].filter(Boolean);
+
+      for (const idMeta of idsMeta) {
+        const metaRes = await fetch(
+          `https://graph.facebook.com/v19.0/${idMeta}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              status: "PAUSED",
+              access_token: token
+            })
+          }
+        ).then(r => r.json());
+
+        if (metaRes.error && !aviso) {
+          aviso =
+            metaRes.error.message ||
+            "A Meta não permitiu restaurar a campanha original";
+        }
+      }
+    } else {
+      aviso =
+        "Meta não conectada. A campanha foi restaurada apenas no histórico local.";
+    }
+
+    await client.query(
+      `
+      UPDATE campanhas
+      SET status = 'PAUSED'
+      WHERE id = $1
+      `,
+      [campanha.rows[0].id]
+    );
+
+    return c.json({
+      sucesso: true,
+      aviso
+    });
+
+  } catch (err) {
+
+    console.error("RESTAURAR CAMPANHA:", err);
+
+    return c.json({
+      error: "Erro ao restaurar campanha"
+    }, 500);
+  }
+});
 
 // 🔹 criar lead
 app.post("/leads", authMiddleware, async (c) => {
