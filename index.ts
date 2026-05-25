@@ -6543,7 +6543,8 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
     const billing = await client.query(
       `SELECT * FROM railway_billing_config WHERE id = 1 LIMIT 1`
     );
-    const billingHistorico = await client.query(
+    const billingAtual = billing.rows[0] || null;
+    let billingHistorico = await client.query(
       `
       SELECT *
       FROM railway_billing_historico
@@ -6551,6 +6552,59 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
       LIMIT 12
       `
     );
+
+    if (
+      billingAtual &&
+      !billingHistorico.rows.length &&
+      (
+        Number(billingAtual.ultimo_pagamento_valor || 0) > 0 ||
+        Number(billingAtual.proxima_fatura_base || 0) > 0
+      )
+    ) {
+      const dataReferencia =
+        billingAtual.proxima_fatura_data ||
+        billingAtual.ultimo_pagamento_data ||
+        new Date().toISOString().slice(0, 10);
+
+      const cicloMes =
+        `${String(dataReferencia).slice(0, 7)}-01`;
+
+      await client.query(
+        `
+        INSERT INTO railway_billing_historico (
+          ciclo_mes,
+          plano,
+          moeda,
+          ultimo_pagamento_valor,
+          ultimo_pagamento_data,
+          proxima_fatura_base,
+          proxima_fatura_data,
+          observacoes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (ciclo_mes) DO NOTHING
+        `,
+        [
+          cicloMes,
+          billingAtual.plano || "pro",
+          billingAtual.moeda || "USD",
+          Number(billingAtual.ultimo_pagamento_valor || 0),
+          billingAtual.ultimo_pagamento_data || null,
+          Number(billingAtual.proxima_fatura_base || 20),
+          billingAtual.proxima_fatura_data || null,
+          billingAtual.observacoes || null
+        ]
+      );
+
+      billingHistorico = await client.query(
+        `
+        SELECT *
+        FROM railway_billing_historico
+        ORDER BY ciclo_mes DESC
+        LIMIT 12
+        `
+      );
+    }
 
     return c.json({
       uptime_segundos: Math.floor(process.uptime()),
@@ -6563,7 +6617,7 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
       node_env: process.env.NODE_ENV || "development",
       plataforma: process.platform,
       versao_node: process.version,
-      railway_billing: billing.rows[0] || null,
+      railway_billing: billingAtual,
       railway_billing_historico: billingHistorico.rows
     });
 
