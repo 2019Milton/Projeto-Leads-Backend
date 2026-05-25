@@ -683,9 +683,33 @@ function calcularScoreLead(
 
   const base = [];
 
+  const respostasTexto =
+    textoRespostasQualificacao(lead)
+      .toLowerCase();
+
+  const textoComercial =
+    [
+      lead.campanha,
+      lead.observacao,
+      respostasTexto
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
   // 🆕 Lead novo
   pontos += 10;
   base.push("+10 Lead recém capturado");
+
+  if (lead.telefone) {
+    pontos += 10;
+    base.push("+10 Telefone informado");
+  }
+
+  if (lead.email) {
+    pontos += 5;
+    base.push("+5 Email informado");
+  }
 
   // 📢 Origem Meta
   if (lead.origem === "meta") {
@@ -694,51 +718,62 @@ function calcularScoreLead(
     base.push("+15 Veio de campanha Meta");
   }
 
-  // 🎯 Campanha de intenção forte
-  const campanha =
-    (lead.campanha || "").toLowerCase();
-
   if (
-    campanha.includes("visita") ||
-    campanha.includes("agendar") ||
-    campanha.includes("financiamento") ||
-    campanha.includes("simulação") ||
-    campanha.includes("simulacao") ||
-    campanha.includes("entrada")
+    textoComercial.includes("visita") ||
+    textoComercial.includes("agendar") ||
+    textoComercial.includes("financiamento") ||
+    textoComercial.includes("simula��o") ||
+    textoComercial.includes("simulacao") ||
+    textoComercial.includes("entrada") ||
+    textoComercial.includes("comprar") ||
+    textoComercial.includes("compra") ||
+    textoComercial.includes("orcamento") ||
+    textoComercial.includes("or�amento") ||
+    textoComercial.includes("valor") ||
+    textoComercial.includes("parcela")
   ) {
 
     pontos += 30;
-    base.push("+30 Campanha indica intenção forte");
+    base.push("+30 Dados indicam inten��o forte");
   }
 
-  // 💬 Observações do corretor
-  const obs =
-    (lead.observacao || "").toLowerCase();
-
   if (
-    obs.includes("visita") ||
-    obs.includes("interesse") ||
-    obs.includes("entrada") ||
-    obs.includes("financiamento") ||
-    obs.includes("proposta") ||
-    obs.includes("fotos")
+    textoComercial.includes("urgente") ||
+    textoComercial.includes("rapido") ||
+    textoComercial.includes("r�pido") ||
+    textoComercial.includes("hoje") ||
+    textoComercial.includes("essa semana")
   ) {
 
-    pontos += 30;
-    base.push("+30 Observação indica interesse forte");
+    pontos += 20;
+    base.push("+20 Lead demonstra urg�ncia");
   }
 
   if (
-    obs.includes("não responde") ||
-    obs.includes("nao responde") ||
-    obs.includes("sem interesse") ||
-    obs.includes("desistiu")
+    respostasTexto.includes("renda") ||
+    respostasTexto.includes("credito") ||
+    respostasTexto.includes("cr�dito") ||
+    respostasTexto.includes("fgts") ||
+    respostasTexto.includes("pre aprovado") ||
+    respostasTexto.includes("pr� aprovado")
+  ) {
+
+    pontos += 15;
+    base.push("+15 Respostas qualificadoras indicam preparo financeiro");
+  }
+
+  if (
+    textoComercial.includes("n�o responde") ||
+    textoComercial.includes("nao responde") ||
+    textoComercial.includes("sem interesse") ||
+    textoComercial.includes("desistiu") ||
+    textoComercial.includes("curioso") ||
+    textoComercial.includes("pesquisando")
   ) {
 
     pontos -= 30;
-    base.push("-30 Observação indica baixo interesse");
+    base.push("-30 Dados indicam baixo interesse");
   }
-
   // 🔄 Lead repetido
   if (lead.repetido) {
 
@@ -1202,6 +1237,10 @@ function detectarSinaisIA(lead: any, ml: any) {
     sinais.push("indicou urgencia de atendimento");
   }
 
+  if (texto.includes("hoje") || texto.includes("essa semana")) {
+    sinais.push("tem indicio de prazo curto");
+  }
+
   if (lead?.telefone) {
     sinais.push("tem telefone para contato imediato");
   }
@@ -1212,6 +1251,18 @@ function detectarSinaisIA(lead: any, ml: any) {
 
   if (texto.includes("sem interesse") || texto.includes("nao quero") || texto.includes("não quero")) {
     riscos.push("sinalizou baixo interesse");
+  }
+
+  if (texto.includes("caro") || texto.includes("preco") || texto.includes("preço") || texto.includes("valor alto")) {
+    riscos.push("possivel objecao de preco");
+  }
+
+  if (texto.includes("sem entrada") || texto.includes("sem credito") || texto.includes("sem crédito")) {
+    riscos.push("possivel objecao financeira");
+  }
+
+  if (texto.includes("longe") || texto.includes("bairro") || texto.includes("localizacao") || texto.includes("localização")) {
+    riscos.push("possivel objecao de localizacao");
   }
 
   if (!lead?.telefone) {
@@ -1291,6 +1342,47 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
     pontos_regras: scoreData.pontos || 0,
     ml
   };
+}
+
+function aplicarMLAoScoreLead(lead: any) {
+  const ml = lead?.ml_leads;
+
+  if (!ml?.disponivel) {
+    return;
+  }
+
+  const probabilidade =
+    Number(ml.probabilidade_conversao || 0);
+
+  if (probabilidade >= 75 && lead.score !== "quente") {
+    lead.score = "quente";
+    lead.score_base = [
+      ...(lead.score_base || []),
+      `ML elevou para quente com ${probabilidade}% de conversao.`
+    ];
+    return;
+  }
+
+  if (probabilidade <= 25 && lead.score !== "frio") {
+    lead.score = "frio";
+    lead.score_base = [
+      ...(lead.score_base || []),
+      `ML reduziu para frio com ${probabilidade}% de conversao.`
+    ];
+    return;
+  }
+
+  if (
+    probabilidade >= 55 &&
+    probabilidade < 75 &&
+    lead.score === "frio"
+  ) {
+    lead.score = "morno";
+    lead.score_base = [
+      ...(lead.score_base || []),
+      `ML elevou para morno com ${probabilidade}% de conversao.`
+    ];
+  }
 }
 
 async function registrarUsoIA(
@@ -5780,6 +5872,7 @@ app.get("/leads", authMiddleware, async (c) => {
             modeloMLLeads,
             lead
           );
+        aplicarMLAoScoreLead(lead);
       }
 
       if (usuarioTemIA(user)) {
@@ -5918,7 +6011,12 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
         ? preverConversaoMLLead(modeloML, lead)
         : null;
 
-    const analise = gerarAnaliseIAOuroLead(lead, ml);
+    if (ml) {
+      lead.ml_leads = ml;
+      aplicarMLAoScoreLead(lead);
+    }
+
+    const analise = gerarAnaliseIAOuroLead(lead, lead.ml_leads || null);
 
     await registrarUsoIA(
       Number(user.id),
