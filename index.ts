@@ -3864,6 +3864,26 @@ await client.query(`
 `);
 
 await client.query(`
+  CREATE TABLE IF NOT EXISTS railway_billing_config (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    plano TEXT DEFAULT 'pro',
+    moeda TEXT DEFAULT 'USD',
+    ultimo_pagamento_valor NUMERIC(12, 2) DEFAULT 0,
+    ultimo_pagamento_data DATE,
+    proxima_fatura_base NUMERIC(12, 2) DEFAULT 20,
+    proxima_fatura_data DATE,
+    observacoes TEXT,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  INSERT INTO railway_billing_config (id)
+  VALUES (1)
+  ON CONFLICT (id) DO NOTHING;
+`);
+
+await client.query(`
   ALTER TABLE usuarios
     ADD COLUMN IF NOT EXISTS nome TEXT,
     ADD COLUMN IF NOT EXISTS sobrenome TEXT,
@@ -6504,6 +6524,9 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
     }
 
     const memoria = process.memoryUsage();
+    const billing = await client.query(
+      `SELECT * FROM railway_billing_config WHERE id = 1 LIMIT 1`
+    );
 
     return c.json({
       uptime_segundos: Math.floor(process.uptime()),
@@ -6515,7 +6538,8 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
       },
       node_env: process.env.NODE_ENV || "development",
       plataforma: process.platform,
-      versao_node: process.version
+      versao_node: process.version,
+      railway_billing: billing.rows[0] || null
     });
 
   } catch (err) {
@@ -6524,6 +6548,59 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
 
     return c.json({
       error: "Erro ao buscar recursos"
+    }, 500);
+  }
+});
+
+app.put("/admin/railway-billing", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const body = await c.req.json();
+
+    const result = await client.query(
+      `
+      UPDATE railway_billing_config
+      SET
+        plano = COALESCE($1, plano),
+        moeda = COALESCE($2, moeda),
+        ultimo_pagamento_valor = COALESCE($3, ultimo_pagamento_valor),
+        ultimo_pagamento_data = COALESCE($4, ultimo_pagamento_data),
+        proxima_fatura_base = COALESCE($5, proxima_fatura_base),
+        proxima_fatura_data = COALESCE($6, proxima_fatura_data),
+        observacoes = COALESCE($7, observacoes),
+        atualizado_em = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        body.plano || null,
+        body.moeda || null,
+        body.ultimo_pagamento_valor === undefined
+          ? null
+          : Number(body.ultimo_pagamento_valor),
+        body.ultimo_pagamento_data || null,
+        body.proxima_fatura_base === undefined
+          ? null
+          : Number(body.proxima_fatura_base),
+        body.proxima_fatura_data || null,
+        body.observacoes ?? null
+      ]
+    );
+
+    return c.json({
+      sucesso: true,
+      railway_billing: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error("ERRO RAILWAY BILLING:", err);
+    return c.json({
+      error: "Erro ao salvar dados de cobranca Railway"
     }, 500);
   }
 });
