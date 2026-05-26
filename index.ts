@@ -178,6 +178,8 @@ const allowedOrigins = new Set(
   [
     Bun.env.FRONTEND_URL,
     Bun.env.VERCEL_URL ? `https://${Bun.env.VERCEL_URL}` : null,
+    "https://plataformadeleads.com.br",
+    "https://www.plataformadeleads.com.br",
     "https://projeto-leads-snowy.vercel.app"
   ].filter(Boolean) as string[]
 );
@@ -362,7 +364,7 @@ async function buscarResetTokenValido(token: string) {
 function obterFrontendUrl() {
   return (
     Bun.env.FRONTEND_URL ||
-    "https://projeto-leads-snowy.vercel.app"
+    "https://plataformadeleads.com.br"
   ).replace(/\/+$/g, "");
 }
 
