@@ -5049,14 +5049,21 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
 
     const user: any = c.get("user");
 
-    const diasParam =
-      Number(c.req.query("dias") || 7);
+    const periodoParam =
+      String(c.req.query("periodo") || "semanal")
+        .toLowerCase();
+
+    const periodo =
+      ["semanal", "mensal", "anual"].includes(periodoParam)
+        ? periodoParam
+        : "semanal";
 
     const dias =
-      Math.min(
-        Math.max(diasParam, 1),
-        30
-      );
+      periodo === "anual"
+        ? 365
+        : periodo === "mensal"
+        ? 30
+        : 7;
 
     const conn = await client.query(
       `
@@ -5091,15 +5098,29 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
 
     const adAccountId = contaAds.id;
 
-    const datePreset =
-      dias <= 7
-        ? "last_7d"
-        : dias <= 14
-        ? "last_14d"
-        : "last_30d";
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - (dias - 1));
+    inicio.setHours(0, 0, 0, 0);
+
+    const fim = new Date();
+    fim.setHours(23, 59, 59, 999);
+
+    const since =
+      inicio.toISOString().slice(0, 10);
+
+    const until =
+      fim.toISOString().slice(0, 10);
+
+    const timeRange =
+      encodeURIComponent(
+        JSON.stringify({
+          since,
+          until
+        })
+      );
 
     const insights = await fetch(
-      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend,actions,impressions,clicks,reach&time_increment=1&date_preset=${datePreset}&access_token=${token}`
+      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend,actions,impressions,clicks,reach&time_increment=1&time_range=${timeRange}&access_token=${token}`
     ).then(r => r.json());
 
     if (insights.error) {
@@ -5108,10 +5129,6 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         detalhe: insights.error
       }, 400);
     }
-
-    const inicio = new Date();
-    inicio.setDate(inicio.getDate() - (dias - 1));
-    inicio.setHours(0, 0, 0, 0);
 
     const leadsBanco = await client.query(
       `
@@ -5234,13 +5251,59 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         ? ((mediaCplAnterior - cplHoje) / mediaCplAnterior) * 100
         : null;
 
+    const registros =
+      periodo === "anual"
+        ? Object.values(
+            diasPerformance.reduce((acc: any, dia: any) => {
+              const chave =
+                dia.data.slice(0, 7);
+
+              if (!acc[chave]) {
+                acc[chave] = {
+                  periodo: chave,
+                  data: chave,
+                  gasto: 0,
+                  leads: 0,
+                  leads_meta: 0,
+                  leads_plataforma: 0,
+                  cliques: 0,
+                  impressoes: 0,
+                  alcance: 0,
+                  custo_por_lead: null
+                };
+              }
+
+              acc[chave].gasto += dia.gasto;
+              acc[chave].leads += dia.leads;
+              acc[chave].leads_meta += dia.leads_meta;
+              acc[chave].leads_plataforma += dia.leads_plataforma;
+              acc[chave].cliques += dia.cliques;
+              acc[chave].impressoes += dia.impressoes;
+              acc[chave].alcance += dia.alcance;
+              acc[chave].custo_por_lead =
+                acc[chave].leads > 0
+                  ? acc[chave].gasto / acc[chave].leads
+                  : null;
+
+              return acc;
+            }, {})
+          )
+        : diasPerformance;
+
     return c.json({
       conta_anuncios: {
         id: contaAds.id,
         nome: contaAds.name,
         moeda: contaAds.currency || "BRL"
       },
+      periodo,
       periodo_dias: dias,
+      periodo_inicio: since,
+      periodo_fim: until,
+      agrupamento:
+        periodo === "anual"
+          ? "mensal"
+          : "diario",
       resumo: {
         gasto_total: totalGasto,
         leads_total: totalLeads,
@@ -5258,7 +5321,8 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
             ? "melhor_que_media"
             : "acima_da_media"
       },
-      dias: diasPerformance
+      dias: diasPerformance,
+      registros
     });
 
   } catch (err: any) {
