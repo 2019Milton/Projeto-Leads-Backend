@@ -1622,12 +1622,8 @@ async function gerarAnaliseIAOpenAI(
     return null;
   }
 
-  const config =
-    await buscarConfigIA();
-
   const modelo =
     textoOpcional(Bun.env.OPENAI_MODEL) ||
-    textoOpcional(config?.modelo) ||
     "gpt-5-mini";
 
   const fallback =
@@ -7098,9 +7094,17 @@ app.get("/admin/ia", authMiddleware, async (c) => {
       ORDER BY u.plano_ativado_em DESC NULLS LAST, u.id ASC
     `);
 
+    const configAtual =
+      config.rows[0] || {};
+    const modeloAtivo =
+      textoOpcional(Bun.env.OPENAI_MODEL) ||
+      "gpt-5-mini";
+
     return c.json({
       config: {
-        ...config.rows[0],
+        ...configAtual,
+        modelo: modeloAtivo,
+        modelo_origem: "railway",
         chave_configurada: Boolean(Bun.env.OPENAI_API_KEY)
       },
       resumo: resumo.rows[0],
@@ -7128,21 +7132,20 @@ app.put("/admin/ia/config", authMiddleware, async (c) => {
       UPDATE ia_config
       SET
         provedor = COALESCE($1, provedor),
-        modelo = COALESCE($2, modelo),
-        status = COALESCE($3, status),
-        assinatura_status = COALESCE($4, assinatura_status),
-        plano_api = COALESCE($5, plano_api),
-        limite_mensal_requisicoes = COALESCE($6, limite_mensal_requisicoes),
-        limite_mensal_custo = COALESCE($7, limite_mensal_custo),
-        custo_mensal_contratado = COALESCE($8, custo_mensal_contratado),
-        observacoes = COALESCE($9, observacoes),
+        modelo = modelo,
+        status = COALESCE($2, status),
+        assinatura_status = COALESCE($3, assinatura_status),
+        plano_api = COALESCE($4, plano_api),
+        limite_mensal_requisicoes = COALESCE($5, limite_mensal_requisicoes),
+        limite_mensal_custo = COALESCE($6, limite_mensal_custo),
+        custo_mensal_contratado = COALESCE($7, custo_mensal_contratado),
+        observacoes = COALESCE($8, observacoes),
         atualizado_em = NOW()
       WHERE id = 1
       RETURNING *
       `,
       [
         body.provedor || null,
-        body.modelo || null,
         body.status || null,
         body.assinatura_status || null,
         body.plano_api || null,
