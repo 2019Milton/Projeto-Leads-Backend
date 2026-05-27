@@ -1278,6 +1278,8 @@ type TipoUsoIA =
   | "relatorio";
 
 const IA_CUSTO_ESTIMADO_PADRAO = 0.08;
+const OPENAI_RESPONSES_URL =
+  "https://api.openai.com/v1/responses";
 
 function usuarioTemIA(user: any) {
   return usuarioTemRecurso(user, "ia_leads");
@@ -1485,6 +1487,312 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
   };
 }
 
+function extrairTextoRespostaOpenAI(data: any) {
+  if (typeof data?.output_text === "string") {
+    return data.output_text;
+  }
+
+  const partes: string[] = [];
+
+  for (const item of data?.output || []) {
+    for (const content of item?.content || []) {
+      if (typeof content?.text === "string") {
+        partes.push(content.text);
+      }
+    }
+  }
+
+  return partes.join("\n").trim();
+}
+
+function calcularCustoEstimadoOpenAI(usage: any) {
+  const inputTokens =
+    Number(usage?.input_tokens || 0);
+
+  const outputTokens =
+    Number(usage?.output_tokens || 0);
+
+  const custoEntradaPorMilhao =
+    Number(Bun.env.OPENAI_INPUT_1M_BRL || 0);
+
+  const custoSaidaPorMilhao =
+    Number(Bun.env.OPENAI_OUTPUT_1M_BRL || 0);
+
+  if (
+    custoEntradaPorMilhao > 0 ||
+    custoSaidaPorMilhao > 0
+  ) {
+    return Number(
+      (
+        (inputTokens / 1_000_000) *
+        custoEntradaPorMilhao +
+        (outputTokens / 1_000_000) *
+        custoSaidaPorMilhao
+      ).toFixed(4)
+    );
+  }
+
+  return IA_CUSTO_ESTIMADO_PADRAO;
+}
+
+function normalizarAnaliseOpenAI(
+  analise: any,
+  fallback: any
+) {
+  return {
+    disponivel: true,
+    nivel: "ouro",
+    origem: "openai",
+    titulo: "IA Ouro",
+    prioridade:
+      ["alta", "media", "baixa"].includes(
+        analise?.prioridade
+      )
+        ? analise.prioridade
+        : fallback.prioridade,
+    resumo:
+      textoOpcional(analise?.resumo) ||
+      fallback.resumo,
+    proxima_acao:
+      textoOpcional(analise?.proxima_acao) ||
+      fallback.proxima_acao,
+    mensagem_whatsapp:
+      textoOpcional(analise?.mensagem_whatsapp) ||
+      fallback.mensagem_whatsapp,
+    perguntas_qualificacao:
+      listaOpcional(analise?.perguntas_qualificacao)
+        .slice(0, 6),
+    sinais:
+      listaOpcional(analise?.sinais),
+    riscos:
+      listaOpcional(analise?.riscos),
+    explicacao:
+      textoOpcional(analise?.explicacao) ||
+      "Analise gerada pela API da OpenAI com base nos dados do lead.",
+    score_regras:
+      fallback.score_regras,
+    pontos_regras:
+      fallback.pontos_regras,
+    recuperacao:
+      analise?.recuperacao &&
+      typeof analise.recuperacao === "object" &&
+      analise.recuperacao.chance !== "nao_aplicavel"
+        ? {
+            chance:
+              textoOpcional(
+                analise.recuperacao.chance
+              ) ||
+              fallback.recuperacao?.chance ||
+              "",
+            motivo_perda:
+              textoOpcional(
+                analise.recuperacao.motivo_perda
+              ) ||
+              fallback.recuperacao?.motivo_perda ||
+              null,
+            recomendacao:
+              textoOpcional(
+                analise.recuperacao.recomendacao
+              ) ||
+              fallback.recuperacao?.recomendacao ||
+              ""
+          }
+        : fallback.recuperacao || null,
+    ml: fallback.ml || null
+  };
+}
+
+async function buscarConfigIA() {
+  const config =
+    await client.query(
+      `SELECT * FROM ia_config WHERE id = 1 LIMIT 1`
+    );
+
+  return config.rows[0] || null;
+}
+
+async function gerarAnaliseIAOpenAI(
+  lead: any,
+  ml: any = null
+) {
+  const apiKey =
+    Bun.env.OPENAI_API_KEY;
+
+  if (!apiKey) {
+    return null;
+  }
+
+  const config =
+    await buscarConfigIA();
+
+  const modelo =
+    textoOpcional(Bun.env.OPENAI_MODEL) ||
+    textoOpcional(config?.modelo) ||
+    "gpt-5-mini";
+
+  const fallback =
+    gerarAnaliseIAOuroLead(lead, ml);
+
+  const payloadLead = {
+    id: lead?.id,
+    nome: lead?.nome || null,
+    telefone: lead?.telefone || null,
+    email: lead?.email || null,
+    status: lead?.status || "novo",
+    motivo_perda: lead?.motivo_perda || null,
+    origem: lead?.origem || null,
+    campanha: lead?.campanha || null,
+    observacao: lead?.observacao || null,
+    score: lead?.score || null,
+    score_pontos: lead?.score_pontos || 0,
+    score_base: lead?.score_base || [],
+    respostas_qualificacao:
+      Array.isArray(lead?.respostas_qualificacao)
+        ? lead.respostas_qualificacao
+        : [],
+    criado_em: lead?.criado_em || null,
+    ml
+  };
+
+  const response = await fetch(
+    OPENAI_RESPONSES_URL,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: modelo,
+        instructions:
+          "Voce e uma IA comercial para uma plataforma imobiliaria. Analise o lead, priorize a acao do corretor e, quando o status for perdido, foque em recuperacao. Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso.",
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: JSON.stringify({
+                  lead: payloadLead,
+                  objetivo:
+                    "Gerar analise comercial, proxima acao, mensagem de WhatsApp e recuperacao quando aplicavel."
+                })
+              }
+            ]
+          }
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "analise_ia_lead",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: [
+                "prioridade",
+                "resumo",
+                "proxima_acao",
+                "mensagem_whatsapp",
+                "perguntas_qualificacao",
+                "sinais",
+                "riscos",
+                "explicacao",
+                "recuperacao"
+              ],
+              properties: {
+                prioridade: {
+                  type: "string",
+                  enum: ["alta", "media", "baixa"]
+                },
+                resumo: {
+                  type: "string"
+                },
+                proxima_acao: {
+                  type: "string"
+                },
+                mensagem_whatsapp: {
+                  type: "string"
+                },
+                perguntas_qualificacao: {
+                  type: "array",
+                  items: { type: "string" }
+                },
+                sinais: {
+                  type: "array",
+                  items: { type: "string" }
+                },
+                riscos: {
+                  type: "array",
+                  items: { type: "string" }
+                },
+                explicacao: {
+                  type: "string"
+                },
+                recuperacao: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: [
+                    "chance",
+                    "motivo_perda",
+                    "recomendacao"
+                  ],
+                  properties: {
+                    chance: {
+                      type: "string",
+                      enum: [
+                        "alta",
+                        "media",
+                        "baixa",
+                        "nao_aplicavel"
+                      ]
+                    },
+                    motivo_perda: {
+                      type: "string"
+                    },
+                    recomendacao: {
+                      type: "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        max_output_tokens: 1200
+      })
+    }
+  );
+
+  const data =
+    await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data?.error?.message ||
+      "Erro ao chamar OpenAI"
+    );
+  }
+
+  const texto =
+    extrairTextoRespostaOpenAI(data);
+
+  const analiseModelo =
+    JSON.parse(texto);
+
+  return {
+    analise:
+      normalizarAnaliseOpenAI(
+        analiseModelo,
+        fallback
+      ),
+    usage: data?.usage || {},
+    custo_estimado:
+      calcularCustoEstimadoOpenAI(data?.usage),
+    modelo
+  };
+}
+
 function aplicarMLAoScoreLead(lead: any) {
   const ml = lead?.ml_leads;
 
@@ -1531,7 +1839,9 @@ async function registrarUsoIA(
   tipo: TipoUsoIA,
   referenciaTipo: string,
   referenciaId: string | number | null,
-  custoEstimado = IA_CUSTO_ESTIMADO_PADRAO
+  custoEstimado = IA_CUSTO_ESTIMADO_PADRAO,
+  tokensEntrada = 0,
+  tokensSaida = 0
 ) {
   await client.query(
     `
@@ -1540,15 +1850,19 @@ async function registrarUsoIA(
       tipo,
       referencia_tipo,
       referencia_id,
+      tokens_entrada,
+      tokens_saida,
       custo_estimado
     )
-    VALUES ($1, $2, $3, $4, $5)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     `,
     [
       usuarioId,
       tipo,
       referenciaTipo,
       referenciaId ? String(referenciaId) : null,
+      tokensEntrada,
+      tokensSaida,
       custoEstimado
     ]
   );
@@ -4050,7 +4364,7 @@ await client.query(`
   CREATE TABLE IF NOT EXISTS ia_config (
     id INTEGER PRIMARY KEY DEFAULT 1,
     provedor TEXT DEFAULT 'openai',
-    modelo TEXT DEFAULT 'gpt-4.1-mini',
+    modelo TEXT DEFAULT 'gpt-5-mini',
     status TEXT DEFAULT 'nao_contratado',
     assinatura_status TEXT DEFAULT 'pendente',
     plano_api TEXT DEFAULT 'sob_demanda',
@@ -6460,13 +6774,40 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
       aplicarMLAoScoreLead(lead);
     }
 
-    const analise = gerarAnaliseIAOuroLead(lead, lead.ml_leads || null);
+    let analise =
+      gerarAnaliseIAOuroLead(
+        lead,
+        lead.ml_leads || null
+      );
+
+    let usoIA: any = null;
+
+    try {
+      usoIA =
+        await gerarAnaliseIAOpenAI(
+          lead,
+          lead.ml_leads || null
+        );
+
+      if (usoIA?.analise) {
+        analise = usoIA.analise;
+      }
+    } catch (err) {
+      console.error(
+        "OPENAI IA LEAD FALLBACK:",
+        err
+      );
+    }
 
     await registrarUsoIA(
       Number(user.id),
       "analise_lead",
       "lead",
-      lead.id
+      lead.id,
+      usoIA?.custo_estimado ||
+        IA_CUSTO_ESTIMADO_PADRAO,
+      Number(usoIA?.usage?.input_tokens || 0),
+      Number(usoIA?.usage?.output_tokens || 0)
     );
 
     return c.json({ analise });
