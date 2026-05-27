@@ -6692,9 +6692,11 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
     const configIA =
       await buscarConfigIA();
 
-    if (configIA?.status === "pausado") {
+    if (configIA?.status !== "contratado") {
       return c.json({
-        error: "Uso da IA pausado pelo administrador."
+        error: configIA?.status === "pausado"
+          ? "Uso da IA pausado pelo administrador."
+          : "IA nao configurada pelo administrador."
       }, 403);
     }
 
