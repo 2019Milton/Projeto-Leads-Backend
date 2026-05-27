@@ -1275,6 +1275,11 @@ type TipoUsoIA =
   | "mensagem_whatsapp"
   | "proxima_acao"
   | "analise_campanha"
+  | "followup_lead"
+  | "motivo_perda"
+  | "reativacao_lote"
+  | "criador_campanha"
+  | "resumo_diario"
   | "relatorio";
 
 const IA_CUSTO_ESTIMADO_PADRAO = 0.08;
@@ -1903,6 +1908,194 @@ async function validarLimiteIAUsuario(user: any) {
     limite_chamadas: limiteChamadas,
     limite_custo: limiteCusto
   };
+}
+
+async function motivoBloqueioIA(user: any) {
+  if (!usuarioTemIA(user)) {
+    return "IA disponivel apenas no plano Ouro";
+  }
+
+  if (!user.ia_ativo) {
+    return "IA desativada para este usuario.";
+  }
+
+  const configIA =
+    await buscarConfigIA();
+
+  if (configIA?.status !== "contratado") {
+    return configIA?.status === "pausado"
+      ? "Uso da IA pausado pelo administrador."
+      : "IA nao configurada pelo administrador.";
+  }
+
+  const limiteIA =
+    await validarLimiteIAUsuario(user);
+
+  if (!limiteIA.permitido) {
+    return limiteIA.motivo;
+  }
+
+  return null;
+}
+
+function sugestaoIAFallback(
+  titulo: string,
+  resumo: string,
+  acaoPrincipal: string,
+  mensagens: string[] = [],
+  motivos: string[] = [],
+  campos: any[] = [],
+  recomendacoes: string[] = []
+) {
+  return {
+    disponivel: true,
+    origem: "interna",
+    titulo,
+    resumo,
+    acao_principal: acaoPrincipal,
+    mensagens,
+    motivos,
+    campos,
+    recomendacoes
+  };
+}
+
+async function gerarSugestaoComercialOpenAI(
+  objetivo: string,
+  dados: any,
+  fallback: any
+) {
+  const apiKey =
+    Bun.env.OPENAI_API_KEY;
+
+  if (!apiKey) {
+    return {
+      sugestao: fallback,
+      usage: null,
+      custo_estimado: IA_CUSTO_ESTIMADO_PADRAO
+    };
+  }
+
+  const modelo =
+    textoOpcional(Bun.env.OPENAI_MODEL) ||
+    "gpt-5-mini";
+
+  try {
+    const response = await fetch(
+      OPENAI_RESPONSES_URL,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: modelo,
+          instructions:
+            "Voce e uma IA comercial para corretores imobiliarios. Gere respostas curtas, naturais, praticas e prontas para uso. Responda somente no JSON solicitado, em portugues do Brasil.",
+          input: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: JSON.stringify({
+                    objetivo,
+                    dados
+                  })
+                }
+              ]
+            }
+          ],
+          text: {
+            format: {
+              type: "json_schema",
+              name: "sugestao_comercial_ia",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                required: [
+                  "titulo",
+                  "resumo",
+                  "acao_principal",
+                  "mensagens",
+                  "motivos",
+                  "campos",
+                  "recomendacoes"
+                ],
+                properties: {
+                  titulo: { type: "string" },
+                  resumo: { type: "string" },
+                  acao_principal: { type: "string" },
+                  mensagens: {
+                    type: "array",
+                    items: { type: "string" }
+                  },
+                  motivos: {
+                    type: "array",
+                    items: { type: "string" }
+                  },
+                  campos: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["chave", "valor"],
+                      properties: {
+                        chave: { type: "string" },
+                        valor: { type: "string" }
+                      }
+                    }
+                  },
+                  recomendacoes: {
+                    type: "array",
+                    items: { type: "string" }
+                  }
+                }
+              }
+            }
+          }
+        })
+      }
+    );
+
+    const data: any =
+      await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data?.error?.message ||
+        "Erro ao chamar OpenAI"
+      );
+    }
+
+    const texto =
+      extrairTextoRespostaOpenAI(data);
+
+    if (!texto) {
+      throw new Error("Resposta vazia da OpenAI");
+    }
+
+    return {
+      sugestao: {
+        ...fallback,
+        ...JSON.parse(texto),
+        disponivel: true,
+        origem: "openai"
+      },
+      usage: data?.usage || null,
+      custo_estimado:
+        calcularCustoEstimadoOpenAI(data?.usage)
+    };
+  } catch (err) {
+    console.error("OPENAI SUGESTAO FALLBACK:", err);
+    return {
+      sugestao: fallback,
+      usage: null,
+      custo_estimado: IA_CUSTO_ESTIMADO_PADRAO
+    };
+  }
 }
 
 
@@ -7414,6 +7607,430 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
     return c.json({
       error: "Erro ao buscar recursos"
     }, 500);
+  }
+});
+
+app.post("/ia/leads/:id/sugestao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const bloqueio =
+      await motivoBloqueioIA(user);
+
+    if (bloqueio) {
+      return c.json({ error: bloqueio }, 403);
+    }
+
+    const body =
+      await c.req.json().catch(() => ({}));
+    const tipo =
+      textoOpcional(body.tipo) ||
+      "resposta_chat";
+    const id =
+      c.req.param("id");
+
+    const leadResult = await client.query(
+      `
+      SELECT
+        id,
+        nome,
+        telefone,
+        email,
+        status,
+        origem,
+        campanha,
+        observacao,
+        score,
+        motivo_perda,
+        respostas_qualificacao,
+        criado_em
+      FROM leads
+      WHERE id = $1
+      AND usuario_id = $2
+      LIMIT 1
+      `,
+      [id, user.id]
+    );
+
+    const lead =
+      leadResult.rows[0];
+
+    if (!lead) {
+      return c.json({ error: "Lead nao encontrado" }, 404);
+    }
+
+    const dias =
+      idadeLeadEmDias(lead);
+    const nome =
+      lead.nome || "tudo bem";
+
+    let objetivo =
+      "Gerar resposta curta para atendimento comercial do lead.";
+    let tipoUso: TipoUsoIA =
+      "mensagem_whatsapp";
+    let fallback =
+      sugestaoIAFallback(
+        "Resposta sugerida",
+        "Mensagem curta para retomar ou continuar o atendimento.",
+        "Enviar mensagem e tentar qualificar necessidade, regiao, valor e prazo.",
+        [
+          `Oi ${nome}! Vi seu interesse e queria te ajudar com opcoes mais alinhadas. Qual regiao e faixa de valor fazem mais sentido para voce hoje?`
+        ],
+        [],
+        [],
+        [
+          "Use tom direto e humano.",
+          "Evite mensagem longa no primeiro contato."
+        ]
+      );
+
+    if (tipo === "followup") {
+      tipoUso = "followup_lead";
+      objetivo =
+        "Gerar follow-up inteligente conforme tempo parado do lead: 1 dia, 3 dias, 7 dias, 30 dias ou mais.";
+      fallback =
+        sugestaoIAFallback(
+          "Follow-up inteligente",
+          `Lead parado ha ${dias ?? "alguns"} dia(s).`,
+          "Retomar com uma pergunta simples e uma oferta de ajuda objetiva.",
+          [
+            `Oi ${nome}! Passando para saber se ainda faz sentido eu te ajudar com opcoes de imoveis. Quer que eu te envie algumas alternativas atualizadas?`
+          ],
+          [],
+          [
+            { chave: "tempo_parado", valor: String(dias ?? "-") }
+          ],
+          [
+            "Se nao responder, tente uma ultima mensagem mais curta depois."
+          ]
+        );
+    }
+
+    if (tipo === "motivo_perda") {
+      tipoUso = "motivo_perda";
+      objetivo =
+        "Classificar o motivo provavel de perda do lead entre preco, demora no atendimento, sem financiamento, regiao errada, curiosidade, concorrente ou sem perfil.";
+      fallback =
+        sugestaoIAFallback(
+          "Motivo provavel de perda",
+          "A plataforma encontrou poucos dados para cravar o motivo.",
+          "Registrar motivo como sem resposta e tentar uma reativacao curta.",
+          [
+            `Oi ${nome}! So para eu entender melhor: voce deixou de procurar por preco, regiao, financiamento ou encontrou outra opcao?`
+          ],
+          [
+            lead.motivo_perda || "sem resposta"
+          ],
+          [
+            { chave: "motivo_provavel", valor: lead.motivo_perda || "sem resposta" }
+          ],
+          [
+            "Use esse motivo para filtrar recuperacoes futuras."
+          ]
+        );
+    }
+
+    const usoIA =
+      await gerarSugestaoComercialOpenAI(
+        objetivo,
+        {
+          lead,
+          dias_parado: dias,
+          tipo
+        },
+        fallback
+      );
+
+    await registrarUsoIA(
+      Number(user.id),
+      tipoUso,
+      "lead",
+      lead.id,
+      usoIA.custo_estimado,
+      Number(usoIA.usage?.input_tokens || 0),
+      Number(usoIA.usage?.output_tokens || 0)
+    );
+
+    return c.json({
+      sugestao: usoIA.sugestao
+    });
+  } catch (err) {
+    console.error("ERRO IA SUGESTAO LEAD:", err);
+    return c.json({ error: "Erro ao gerar sugestao de IA" }, 500);
+  }
+});
+
+app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const bloqueio =
+      await motivoBloqueioIA(user);
+
+    if (bloqueio) {
+      return c.json({ error: bloqueio }, 403);
+    }
+
+    const body =
+      await c.req.json().catch(() => ({}));
+    const ids =
+      Array.isArray(body.ids)
+        ? body.ids.slice(0, 10).map((id: any) => Number(id)).filter(Boolean)
+        : [];
+
+    if (!ids.length) {
+      return c.json({ error: "Selecione leads para reativar" }, 400);
+    }
+
+    const leadsResult =
+      await client.query(
+        `
+        SELECT
+          id,
+          nome,
+          telefone,
+          status,
+          campanha,
+          observacao,
+          motivo_perda,
+          criado_em
+        FROM leads
+        WHERE usuario_id = $1
+        AND id = ANY($2::int[])
+        ORDER BY criado_em ASC
+        LIMIT 10
+        `,
+        [user.id, ids]
+      );
+
+    const leads =
+      leadsResult.rows;
+
+    const fallback =
+      sugestaoIAFallback(
+        "Reativacao em lote",
+        `Campanha criada para ${leads.length} lead(s) perdido(s) ou parados.`,
+        "Comece pelos leads com telefone e motivo de perda menos definitivo.",
+        leads.map((lead: any) =>
+          `${lead.nome || "Lead"}: Oi ${lead.nome || "tudo bem"}! Vi que nosso contato ficou parado, mas talvez ainda faca sentido te ajudar. Quer receber opcoes atualizadas dentro do que voce buscava?`
+        ),
+        [],
+        [],
+        [
+          "Envie em horarios comerciais.",
+          "Nao mande textos identicos para todos se houver contexto diferente."
+        ]
+      );
+
+    const usoIA =
+      await gerarSugestaoComercialOpenAI(
+        "Criar uma campanha de reativacao em lote com mensagens diferentes por perfil.",
+        { leads },
+        fallback
+      );
+
+    await registrarUsoIA(
+      Number(user.id),
+      "reativacao_lote",
+      "lead_lote",
+      ids.join(","),
+      usoIA.custo_estimado,
+      Number(usoIA.usage?.input_tokens || 0),
+      Number(usoIA.usage?.output_tokens || 0)
+    );
+
+    return c.json({ sugestao: usoIA.sugestao });
+  } catch (err) {
+    console.error("ERRO IA REATIVACAO:", err);
+    return c.json({ error: "Erro ao gerar reativacao com IA" }, 500);
+  }
+});
+
+app.get("/ia/resumo-diario", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const bloqueio =
+      await motivoBloqueioIA(user);
+
+    if (bloqueio) {
+      return c.json({ error: bloqueio }, 403);
+    }
+
+    const leadsResult =
+      await client.query(
+        `
+        SELECT
+          id,
+          nome,
+          telefone,
+          status,
+          campanha,
+          observacao,
+          score,
+          motivo_perda,
+          criado_em
+        FROM leads
+        WHERE usuario_id = $1
+        ORDER BY criado_em DESC
+        LIMIT 80
+        `,
+        [user.id]
+      );
+
+    const leads =
+      leadsResult.rows;
+    const fallback =
+      sugestaoIAFallback(
+        "Resumo diario IA Ouro",
+        "Priorize leads recentes, quentes e parados ha mais tempo.",
+        "Focar nos 5 leads com maior chance de conversa hoje.",
+        [],
+        [],
+        leads.slice(0, 5).map((lead: any) => ({
+          chave: lead.nome || `Lead ${lead.id}`,
+          valor: `${lead.status || "novo"} - ${lead.score || "sem score"}`
+        })),
+        [
+          "Comece pelos leads novos e quentes.",
+          "Depois recupere os perdidos com telefone."
+        ]
+      );
+
+    const usoIA =
+      await gerarSugestaoComercialOpenAI(
+        "Gerar resumo diario do corretor com os 5 leads que ele deve focar hoje e o motivo.",
+        { leads },
+        fallback
+      );
+
+    await registrarUsoIA(
+      Number(user.id),
+      "resumo_diario",
+      "usuario",
+      user.id,
+      usoIA.custo_estimado,
+      Number(usoIA.usage?.input_tokens || 0),
+      Number(usoIA.usage?.output_tokens || 0)
+    );
+
+    return c.json({ sugestao: usoIA.sugestao });
+  } catch (err) {
+    console.error("ERRO IA RESUMO DIARIO:", err);
+    return c.json({ error: "Erro ao gerar resumo diario com IA" }, 500);
+  }
+});
+
+app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const bloqueio =
+      await motivoBloqueioIA(user);
+
+    if (bloqueio) {
+      return c.json({ error: bloqueio }, 403);
+    }
+
+    const body =
+      await c.req.json().catch(() => ({}));
+    const campanha =
+      body.campanha || {};
+    const nome =
+      textoOpcional(campanha.nome) ||
+      "Campanha imobiliaria";
+
+    const fallback =
+      sugestaoIAFallback(
+        "Criador de anuncio IA",
+        "Sugestao inicial para campanha de captacao de leads.",
+        "Preencher os campos do anuncio e revisar antes de publicar.",
+        [],
+        [],
+        [
+          { chave: "titulo", valor: nome },
+          { chave: "texto", valor: "Encontre o imovel ideal com atendimento rapido e opcoes alinhadas ao seu perfil. Cadastre-se para receber mais informacoes." },
+          { chave: "descricao", valor: "Atendimento rapido pelo corretor." },
+          { chave: "perguntas", valor: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?" },
+          { chave: "interesses", valor: "imoveis, financiamento imobiliario, apartamento" }
+        ],
+        [
+          "Use imagem real do imovel ou empreendimento.",
+          "Mantenha o texto objetivo."
+        ]
+      );
+
+    const usoIA =
+      await gerarSugestaoComercialOpenAI(
+        "Criar sugestoes para anuncio Meta: titulo, texto principal, descricao, perguntas do formulario e interesses.",
+        { campanha },
+        fallback
+      );
+
+    await registrarUsoIA(
+      Number(user.id),
+      "criador_campanha",
+      "campanha",
+      null,
+      usoIA.custo_estimado,
+      Number(usoIA.usage?.input_tokens || 0),
+      Number(usoIA.usage?.output_tokens || 0)
+    );
+
+    return c.json({ sugestao: usoIA.sugestao });
+  } catch (err) {
+    console.error("ERRO IA CRIADOR CAMPANHA:", err);
+    return c.json({ error: "Erro ao gerar campanha com IA" }, 500);
+  }
+});
+
+app.post("/ia/campanhas/analise", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const bloqueio =
+      await motivoBloqueioIA(user);
+
+    if (bloqueio) {
+      return c.json({ error: bloqueio }, 403);
+    }
+
+    const body =
+      await c.req.json().catch(() => ({}));
+    const campanha =
+      body.campanha || {};
+
+    const fallback =
+      sugestaoIAFallback(
+        "Analise de campanha IA",
+        "Analise baseada em gasto, leads, CPL, CTR e status da campanha.",
+        "Acompanhar CPL e ajustar criativo, publico ou orcamento se a campanha estiver cara.",
+        [],
+        [],
+        [],
+        [
+          "Se gerou leads com CPL aceitavel, mantenha ou aumente aos poucos.",
+          "Se teve gasto sem leads, revise publico e criativo.",
+          "Se CTR estiver baixo, teste outro texto ou imagem."
+        ]
+      );
+
+    const usoIA =
+      await gerarSugestaoComercialOpenAI(
+        "Analisar campanha e recomendar aumentar orcamento, pausar, trocar criativo, mudar publico ou ajustar chamada.",
+        { campanha },
+        fallback
+      );
+
+    await registrarUsoIA(
+      Number(user.id),
+      "analise_campanha",
+      "campanha",
+      campanha.id || campanha.campaign_id || null,
+      usoIA.custo_estimado,
+      Number(usoIA.usage?.input_tokens || 0),
+      Number(usoIA.usage?.output_tokens || 0)
+    );
+
+    return c.json({ sugestao: usoIA.sugestao });
+  } catch (err) {
+    console.error("ERRO IA ANALISE CAMPANHA:", err);
+    return c.json({ error: "Erro ao analisar campanha com IA" }, 500);
   }
 });
 
