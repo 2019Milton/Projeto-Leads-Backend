@@ -1960,6 +1960,7 @@ const authMiddleware = async (c: any, next: any) => {
         plano,
         ia_limite_mensal,
         ia_custo_limite_mensal,
+        COALESCE(ia_ativo, true) AS ia_ativo,
         COALESCE(ativo, true) AS ativo
       FROM usuarios
       WHERE id = $1
@@ -4431,6 +4432,7 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS assinatura_inicio TIMESTAMP,
     ADD COLUMN IF NOT EXISTS ia_limite_mensal INTEGER DEFAULT 300,
     ADD COLUMN IF NOT EXISTS ia_custo_limite_mensal NUMERIC(12, 2) DEFAULT 120,
+    ADD COLUMN IF NOT EXISTS ia_ativo BOOLEAN DEFAULT true,
     ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 `);
 
@@ -6681,6 +6683,21 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
       }, 403);
     }
 
+    if (!user.ia_ativo) {
+      return c.json({
+        error: "IA desativada para este usuario."
+      }, 403);
+    }
+
+    const configIA =
+      await buscarConfigIA();
+
+    if (configIA?.status === "pausado") {
+      return c.json({
+        error: "Uso da IA pausado pelo administrador."
+      }, 403);
+    }
+
     const limiteIA = await validarLimiteIAUsuario(user);
 
     if (!limiteIA.permitido) {
@@ -7030,6 +7047,8 @@ app.get("/admin/ia", authMiddleware, async (c) => {
           AND COALESCE(u.ativo, true) = true
         ) AS usuarios_ouro_ativos,
         COALESCE(SUM(iu.custo_estimado), 0) AS custo_mes,
+        COALESCE(SUM(iu.tokens_entrada), 0) AS tokens_entrada_mes,
+        COALESCE(SUM(iu.tokens_saida), 0) AS tokens_saida_mes,
         COUNT(iu.id) AS chamadas_mes
       FROM usuarios u
       LEFT JOIN ia_usos iu
@@ -7050,8 +7069,11 @@ app.get("/admin/ia", authMiddleware, async (c) => {
         u.assinatura_inicio,
         u.ia_limite_mensal,
         u.ia_custo_limite_mensal,
+        COALESCE(u.ia_ativo, true) AS ia_ativo,
         COALESCE(COUNT(iu.id), 0) AS chamadas_mes,
         COALESCE(SUM(iu.custo_estimado), 0) AS custo_mes,
+        COALESCE(SUM(iu.tokens_entrada), 0) AS tokens_entrada_mes,
+        COALESCE(SUM(iu.tokens_saida), 0) AS tokens_saida_mes,
         MAX(iu.criado_em) AS ultimo_uso
       FROM usuarios u
       LEFT JOIN ia_usos iu
@@ -7069,7 +7091,8 @@ app.get("/admin/ia", authMiddleware, async (c) => {
         u.assinatura_status,
         u.assinatura_inicio,
         u.ia_limite_mensal,
-        u.ia_custo_limite_mensal
+        u.ia_custo_limite_mensal,
+        u.ia_ativo
       ORDER BY u.plano_ativado_em DESC NULLS LAST, u.id ASC
     `);
 
@@ -7162,13 +7185,17 @@ app.put("/admin/usuarios/:id/ia-limites", authMiddleware, async (c) => {
       SET
         ia_limite_mensal = $1,
         ia_custo_limite_mensal = $2,
-        assinatura_status = COALESCE($3, assinatura_status)
-      WHERE id = $4
+        assinatura_status = COALESCE($3, assinatura_status),
+        ia_ativo = COALESCE($4, ia_ativo)
+      WHERE id = $5
       `,
       [
         Math.max(0, Number(body.ia_limite_mensal || 0)),
         Math.max(0, Number(body.ia_custo_limite_mensal || 0)),
         body.assinatura_status || null,
+        typeof body.ia_ativo === "boolean"
+          ? body.ia_ativo
+          : null,
         id
       ]
     );
@@ -7204,6 +7231,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.assinatura_inicio,
         u.ia_limite_mensal,
         u.ia_custo_limite_mensal,
+        COALESCE(u.ia_ativo, true) AS ia_ativo,
         u.admin_id,
         admin.email AS admin_email,
         COALESCE(u.ativo, true) AS ativo,
@@ -7238,6 +7266,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.assinatura_inicio,
         u.ia_limite_mensal,
         u.ia_custo_limite_mensal,
+        u.ia_ativo,
         u.admin_id,
         admin.email,
         u.ativo,
