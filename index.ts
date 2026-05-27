@@ -1392,6 +1392,54 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
       ? `Oi ${lead?.nome || "tudo bem"}! Recebi seu interesse e queria entender melhor o que voce procura. Qual regiao, faixa de valor e prazo ideal para voce?`
       : `Oi ${lead?.nome || "tudo bem"}! Passando para confirmar se ainda faz sentido eu te enviar algumas opcoes de imoveis dentro do que voce procura.`;
 
+  const leadPerdido =
+    lead?.status === "perdido";
+
+  const motivoPerda =
+    String(lead?.motivo_perda || "")
+      .trim()
+      .toLowerCase();
+
+  const motivoBaixaRecuperacao =
+    [
+      "numero_invalido",
+      "fake_lead",
+      "sem_credito",
+      "concorrente"
+    ].includes(motivoPerda);
+
+  const chanceRecuperacao =
+    !leadPerdido
+      ? null
+      : motivoBaixaRecuperacao
+      ? "baixa"
+      : prioridade === "alta" ||
+        motivoPerda === "nao_respondeu"
+      ? "alta"
+      : prioridade === "media" ||
+        motivoPerda === "desistiu" ||
+        !motivoPerda
+      ? "media"
+      : "baixa";
+
+  const proximaAcaoFinal =
+    !leadPerdido
+      ? proximaAcao
+      : chanceRecuperacao === "alta"
+      ? "Reabrir a conversa hoje com uma mensagem curta, personalizada e sem pressao."
+      : chanceRecuperacao === "media"
+      ? "Fazer uma tentativa leve de retomada e validar se ainda existe interesse."
+      : "Manter no historico ou arquivar depois de revisar o motivo da perda.";
+
+  const mensagemWhatsappFinal =
+    !leadPerdido
+      ? mensagemWhatsapp
+      : chanceRecuperacao === "alta"
+      ? `Oi ${lead?.nome || "tudo bem"}! Vi que nosso contato ficou parado, mas talvez ainda faca sentido te ajudar. Quer que eu te envie opcoes atualizadas dentro do que voce estava buscando?`
+      : chanceRecuperacao === "media"
+      ? `Oi ${lead?.nome || "tudo bem"}! Passando para confirmar se ainda existe interesse. Se fizer sentido, posso retomar com opcoes mais alinhadas para voce.`
+      : `Oi ${lead?.nome || "tudo bem"}! So confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades?`;
+
   const perguntas = [
     "Voce pretende comprar, alugar ou apenas pesquisar por enquanto?",
     "Qual faixa de valor ou parcela mensal fica confortavel?",
@@ -1406,13 +1454,19 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
     titulo: "IA Ouro",
     prioridade,
     resumo:
-      prioridade === "alta"
+      leadPerdido && chanceRecuperacao === "alta"
+        ? "Lead perdido com boa chance de recuperacao; vale retomar com abordagem curta."
+        : leadPerdido && chanceRecuperacao === "media"
+        ? "Lead perdido com chance moderada; tente validar interesse antes de insistir."
+        : leadPerdido
+        ? "Lead perdido com baixa chance; melhor manter historico organizado ou arquivar."
+        : prioridade === "alta"
         ? "Lead com bons sinais comerciais e recomendacao de contato rapido."
         : prioridade === "media"
         ? "Lead com potencial, mas ainda precisa de qualificacao antes da abordagem forte."
         : "Lead com baixa prioridade no momento; melhor nutrir ou validar interesse.",
-    proxima_acao: proximaAcao,
-    mensagem_whatsapp: mensagemWhatsapp,
+    proxima_acao: proximaAcaoFinal,
+    mensagem_whatsapp: mensagemWhatsappFinal,
     perguntas_qualificacao: perguntas,
     sinais: sinais.length ? sinais : ["dados ainda limitados para uma analise profunda"],
     riscos,
@@ -1420,6 +1474,13 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
       "A IA Ouro cruza a classificacao Frio/Morno/Quente, sinais do cadastro, respostas do formulario, historico do lead e previsao do ML quando disponivel. Ela entrega resumo, prioridade, proxima acao e mensagem pronta para reduzir tempo de atendimento.",
     score_regras: score,
     pontos_regras: scoreData.pontos || 0,
+    recuperacao: leadPerdido
+      ? {
+          chance: chanceRecuperacao,
+          motivo_perda: motivoPerda || null,
+          recomendacao: proximaAcaoFinal
+        }
+      : null,
     ml
   };
 }
