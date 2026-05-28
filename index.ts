@@ -17,6 +17,10 @@ const TOKEN_SECRET =
   Bun.env.SESSION_SECRET ||
   DEFAULT_TOKEN_SECRET;
 
+const EXECUCAO_PRODUCAO =
+  Bun.env.NODE_ENV === "production" ||
+  Boolean(Bun.env.RAILWAY_ENVIRONMENT);
+
 const TOKEN_TTL_SECONDS =
   Number(Bun.env.TOKEN_TTL_SECONDS) ||
   60 * 60 * 24 * 7;
@@ -168,6 +172,12 @@ function validarAssinaturaMetaWebhook(
   );
 }
 
+if (TOKEN_SECRET === DEFAULT_TOKEN_SECRET && EXECUCAO_PRODUCAO) {
+  throw new Error(
+    "JWT_SECRET nao configurado em producao. Defina uma chave forte no Railway."
+  );
+}
+
 if (TOKEN_SECRET === DEFAULT_TOKEN_SECRET) {
   console.warn(
     "JWT_SECRET nao configurado. Defina essa variavel no Railway em producao."
@@ -274,35 +284,35 @@ function decodificarTokenUsuario(token: string) {
   const tokenAssinadoLegado =
     partes.length >= 7;
 
-  if (tokenAssinadoNovo || tokenAssinadoLegado) {
-    const indiceExpiracao =
-      tokenAssinadoNovo ? 6 : 5;
+  if (!tokenAssinadoNovo && !tokenAssinadoLegado) {
+    return null;
+  }
 
-    const indiceAssinatura =
-      tokenAssinadoNovo ? 7 : 6;
+  const indiceExpiracao =
+    tokenAssinadoNovo ? 6 : 5;
 
-    const payload =
-      partes.slice(0, indiceExpiracao + 1).join(":");
+  const indiceAssinatura =
+    tokenAssinadoNovo ? 7 : 6;
 
-    const expiraEm =
-      Number(partes[indiceExpiracao]);
+  const payload =
+    partes.slice(0, indiceExpiracao + 1).join(":");
 
-    const assinatura =
-      partes[indiceAssinatura];
+  const expiraEm =
+    Number(partes[indiceExpiracao]);
 
-    const assinaturaEsperada = assinarPayload(payload);
+  const assinatura =
+    partes[indiceAssinatura];
 
-    if (
-      !assinatura ||
-      !compararAssinatura(assinatura, assinaturaEsperada)
-    ) {
-      return null;
-    }
+  const assinaturaEsperada = assinarPayload(payload);
 
-    if (!Number.isFinite(expiraEm) || expiraEm < Date.now() / 1000) {
-      return null;
-    }
-  } else if (Bun.env.REJECT_LEGACY_TOKENS === "true") {
+  if (
+    !assinatura ||
+    !compararAssinatura(assinatura, assinaturaEsperada)
+  ) {
+    return null;
+  }
+
+  if (!Number.isFinite(expiraEm) || expiraEm < Date.now() / 1000) {
     return null;
   }
 
