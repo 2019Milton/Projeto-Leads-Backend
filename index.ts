@@ -151,6 +151,16 @@ function validarAssinaturaMetaWebhook(
   const appSecret = Bun.env.META_APP_SECRET;
 
   if (!appSecret) {
+    if (EXECUCAO_PRODUCAO) {
+      console.error(
+        "META_APP_SECRET nao configurado; webhook Meta rejeitado."
+      );
+      return false;
+    }
+
+    console.warn(
+      "META_APP_SECRET nao configurado; webhook Meta aceito apenas fora de producao."
+    );
     return true;
   }
 
