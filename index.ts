@@ -29,6 +29,10 @@ const RESET_PASSWORD_TTL_MINUTES =
   Number(Bun.env.RESET_PASSWORD_TTL_MINUTES) ||
   30;
 
+const META_OAUTH_STATE_TTL_MINUTES =
+  Number(Bun.env.META_OAUTH_STATE_TTL_MINUTES) ||
+  10;
+
 const RESEND_FROM_EMAIL =
   Bun.env.RESEND_FROM_EMAIL ||
   Bun.env.RESEND_FROM ||
@@ -345,6 +349,14 @@ function gerarTokenResetSenha() {
 
 function hashTokenResetSenha(token: string) {
   return assinarPayload(`password-reset:${token}`);
+}
+
+function gerarMetaOAuthState() {
+  return base64Url(randomBytes(32));
+}
+
+function hashMetaOAuthState(state: string) {
+  return assinarPayload(`meta-oauth-state:${state}`);
 }
 
 async function buscarResetTokenValido(token: string) {
@@ -2642,7 +2654,8 @@ app.put("/usuarios/:id", authMiddleware, masterMiddleware, async (c) => {
 ========================= */
 
 // 🔹 REDIRECIONA PARA LOGIN META
-app.get("/auth/meta/login", (c) => {
+app.get("/auth/meta/login", async (c) => {
+  try {
 
   const token = c.req.query("token");
 
@@ -2650,15 +2663,51 @@ app.get("/auth/meta/login", (c) => {
     return c.text("Token não enviado");
   }
 
-  if (!decodificarTokenUsuario(token)) {
+  const usuario =
+    decodificarTokenUsuario(token);
+
+  if (!usuario?.id) {
     return c.text("Token invalido ou expirado", 401);
   }
 
   const clientId = Bun.env.META_APP_ID;
   const redirectUri = Bun.env.META_REDIRECT_URI;
 
-  // 🔥 repassa token no state
-  const state = encodeURIComponent(token);
+  if (!clientId || !redirectUri) {
+    return c.text("Configuracao Meta incompleta", 500);
+  }
+
+  // State temporario de uso unico para o OAuth da Meta.
+  const state = gerarMetaOAuthState();
+  const stateHash = hashMetaOAuthState(state);
+
+  await client.query(
+    `
+    DELETE FROM meta_oauth_states
+    WHERE expira_em <= NOW()
+    OR usado_em IS NOT NULL
+    `
+  );
+
+  await client.query(
+    `
+    INSERT INTO meta_oauth_states (
+      state_hash,
+      usuario_id,
+      expira_em
+    )
+    VALUES (
+      $1,
+      $2,
+      NOW() + ($3 || ' minutes')::interval
+    )
+    `,
+    [
+      stateHash,
+      usuario.id,
+      META_OAUTH_STATE_TTL_MINUTES
+    ]
+  );
 
   const scopes = [
 
@@ -2672,14 +2721,22 @@ app.get("/auth/meta/login", (c) => {
 
   ].join(",");
 
+  const params =
+    new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      scope: scopes,
+      state
+    });
+
   const url =
-    `https://www.facebook.com/v19.0/dialog/oauth` +
-    `?client_id=${clientId}` +
-    `&redirect_uri=${redirectUri}` +
-    `&scope=${scopes}` +
-    `&state=${state}`;
+    `https://www.facebook.com/v19.0/dialog/oauth?${params.toString()}`;
 
   return c.redirect(url);
+  } catch (err) {
+    console.error("ERRO LOGIN META:", err);
+    return c.text("Erro ao iniciar conexao Meta", 500);
+  }
 });
 
 
@@ -2687,6 +2744,11 @@ app.get("/auth/meta/login", (c) => {
 app.get("/auth/meta/callback", async (c) => {
   try {
     const code = c.req.query("code");
+    const state = c.req.query("state");
+
+    if (!state) {
+      return c.text("State nao recebido");
+    }
 
     if (!code) {
       return c.text("Erro: code não recebido");
@@ -2696,35 +2758,85 @@ app.get("/auth/meta/callback", async (c) => {
     const clientSecret = Bun.env.META_APP_SECRET;
     const redirectUri = Bun.env.META_REDIRECT_URI;
 
+    if (!clientId || !clientSecret || !redirectUri) {
+      return c.text("Configuracao Meta incompleta", 500);
+    }
+
     // 🔥 troca code por token
+    const stateHash = hashMetaOAuthState(state);
+    const db = await client.connect();
+    let usuarioId: number | null = null;
+
+    try {
+      await db.query("BEGIN");
+
+      const stateResult = await db.query(
+        `
+        SELECT id, usuario_id
+        FROM meta_oauth_states
+        WHERE state_hash = $1
+        AND usado_em IS NULL
+        AND expira_em > NOW()
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [stateHash]
+      );
+
+      if (stateResult.rows.length === 0) {
+        await db.query("ROLLBACK");
+        return c.text("State invalido ou expirado", 401);
+      }
+
+      usuarioId = Number(stateResult.rows[0].usuario_id);
+
+      await db.query(
+        `
+        UPDATE meta_oauth_states
+        SET usado_em = NOW()
+        WHERE id = $1
+        `,
+        [stateResult.rows[0].id]
+      );
+
+      await db.query("COMMIT");
+    } catch (err) {
+      await db.query("ROLLBACK");
+      throw err;
+    } finally {
+      db.release();
+    }
+
+    const params =
+      new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        client_secret: clientSecret,
+        code
+      });
+
     const tokenRes = await fetch(
-      `https://graph.facebook.com/v19.0/oauth/access_token?client_id=${clientId}&redirect_uri=${redirectUri}&client_secret=${clientSecret}&code=${code}`
+      `https://graph.facebook.com/v19.0/oauth/access_token?${params.toString()}`
     );
 
     const tokenData = await tokenRes.json();
     const access_token = tokenData.access_token;
 
+    if (!tokenRes.ok || !access_token) {
+      console.error("ERRO TOKEN META:", tokenData);
+      return c.text("Erro ao obter token Meta", 502);
+    }
+
     console.log("META conectada com sucesso");
 
-    // 🔐 pega token do state
-    const state = c.req.query("state");
-    
-    if (!state) {
-      return c.text("State não recebido");
-    }
-    
-    // 🔓 decodifica token login
-    const usuarioState =
-      decodificarTokenUsuario(state);
-
-    if (!usuarioState?.id) {
+    if (!usuarioId) {
       return c.text("Usuário inválido", 401);
     }
 
     // 💾 salva no banco
     await client.query(
       "INSERT INTO meta_conexoes (usuario_id, access_token) VALUES ($1, $2)",
-      [usuarioState.id, access_token]
+      [usuarioId, access_token]
     );
 
     return c.html(`
@@ -4467,6 +4579,22 @@ await client.query(`
     access_token TEXT,
     criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_oauth_states (
+    id SERIAL PRIMARY KEY,
+    state_hash TEXT NOT NULL UNIQUE,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    expira_em TIMESTAMP NOT NULL,
+    usado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_meta_oauth_states_hash
+  ON meta_oauth_states (state_hash);
 `);
 
 await client.query(`
