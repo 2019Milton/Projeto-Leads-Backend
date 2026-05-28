@@ -144,6 +144,90 @@ function negarAcessoConta(c: any) {
   }, 403);
 }
 
+const rateLimitMemoria =
+  new Map<string, { total: number; expiraEm: number }>();
+
+function obterIpRequisicao(c: any) {
+  return String(
+    c.req.header("cf-connecting-ip") ||
+    c.req.header("x-real-ip") ||
+    c.req.header("x-forwarded-for") ||
+    "ip-desconhecido"
+  )
+    .split(",")[0]
+    .trim();
+}
+
+function verificarRateLimit(
+  chave: string,
+  limite: number,
+  janelaMs: number
+) {
+  const agora = Date.now();
+  const atual =
+    rateLimitMemoria.get(chave);
+
+  if (!atual || atual.expiraEm <= agora) {
+    rateLimitMemoria.set(chave, {
+      total: 1,
+      expiraEm: agora + janelaMs
+    });
+    return {
+      permitido: true,
+      retryAfter: 0
+    };
+  }
+
+  if (atual.total >= limite) {
+    return {
+      permitido: false,
+      retryAfter: Math.ceil((atual.expiraEm - agora) / 1000)
+    };
+  }
+
+  atual.total += 1;
+  rateLimitMemoria.set(chave, atual);
+
+  if (rateLimitMemoria.size > 5000) {
+    for (const [itemChave, item] of rateLimitMemoria.entries()) {
+      if (item.expiraEm <= agora) {
+        rateLimitMemoria.delete(itemChave);
+      }
+    }
+  }
+
+  return {
+    permitido: true,
+    retryAfter: 0
+  };
+}
+
+function limitarRequisicao(
+  c: any,
+  escopo: string,
+  limite: number,
+  janelaMs: number
+) {
+  const rateLimit = verificarRateLimit(
+    `${escopo}:${obterIpRequisicao(c)}`,
+    limite,
+    janelaMs
+  );
+
+  if (rateLimit.permitido) {
+    return null;
+  }
+
+  c.header(
+    "Retry-After",
+    String(rateLimit.retryAfter)
+  );
+
+  return c.json({
+    error: "Muitas tentativas. Tente novamente em instantes."
+  }, 429);
+}
+
 function validarAssinaturaMetaWebhook(
   assinatura: string | null,
   corpo: string
@@ -4849,6 +4933,11 @@ await client.query(`
 ========================= */
 
 app.post("/auth/solicitar-reset-senha", async (c) => {
+  const limite =
+    limitarRequisicao(c, "reset-solicitar", 5, 60 * 60 * 1000);
+
+  if (limite) return limite;
+
   const conn = await client.connect();
   try {
     const { email } = await c.req.json();
@@ -4952,6 +5041,11 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
 
 app.get("/auth/validar-reset-senha", async (c) => {
   try {
+    const limite =
+      limitarRequisicao(c, "reset-validar", 60, 60 * 1000);
+
+    if (limite) return limite;
+
     const token = c.req.query("token");
 
     if (!token) {
@@ -5003,6 +5097,11 @@ app.get("/auth/validar-reset-senha", async (c) => {
 
 app.post("/auth/verificar-reset-senha", async (c) => {
   try {
+    const limite =
+      limitarRequisicao(c, "reset-verificar", 20, 15 * 60 * 1000);
+
+    if (limite) return limite;
+
     const { token, nova_senha } = await c.req.json();
 
     if (!token || !nova_senha) {
@@ -5049,6 +5148,11 @@ app.post("/auth/verificar-reset-senha", async (c) => {
 });
 
 app.post("/auth/reset-senha", async (c) => {
+  const limite =
+    limitarRequisicao(c, "reset-confirmar", 10, 15 * 60 * 1000);
+
+  if (limite) return limite;
+
   const conn = await client.connect();
   try {
     const { token, nova_senha } = await c.req.json();
@@ -5194,6 +5298,11 @@ app.get("/login-test", async (c) => {
 });
 
 app.post("/login", async (c) => {
+  const limite =
+    limitarRequisicao(c, "login", 10, 15 * 60 * 1000);
+
+  if (limite) return limite;
+
   const { email, senha } = await c.req.json();
 
   const result = await client.query(
@@ -7013,6 +7122,10 @@ app.get("/leads", authMiddleware, async (c) => {
 app.get("/ia/leads/:id", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const limite =
+      limitarRequisicao(c, `ia:${user.id}`, 30, 60 * 1000);
+
+    if (limite) return limite;
 
     if (!usuarioTemIA(user)) {
       return c.json({
@@ -7761,6 +7874,11 @@ app.get("/admin/recursos", authMiddleware, async (c) => {
 app.post("/ia/leads/:id/sugestao", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const limite =
+      limitarRequisicao(c, `ia:${user.id}`, 30, 60 * 1000);
+
+    if (limite) return limite;
+
     const bloqueio =
       await motivoBloqueioIA(user);
 
@@ -7910,6 +8028,11 @@ app.post("/ia/leads/:id/sugestao", authMiddleware, async (c) => {
 app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const limite =
+      limitarRequisicao(c, `ia:${user.id}`, 20, 60 * 1000);
+
+    if (limite) return limite;
+
     const bloqueio =
       await motivoBloqueioIA(user);
 
@@ -7995,6 +8118,11 @@ app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
 app.get("/ia/resumo-diario", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const limite =
+      limitarRequisicao(c, `ia:${user.id}`, 20, 60 * 1000);
+
+    if (limite) return limite;
+
     const bloqueio =
       await motivoBloqueioIA(user);
 
@@ -8069,6 +8197,11 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const limite =
+      limitarRequisicao(c, `ia:${user.id}`, 20, 60 * 1000);
+
+    if (limite) return limite;
+
     const bloqueio =
       await motivoBloqueioIA(user);
 
@@ -8131,6 +8264,11 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
 app.post("/ia/campanhas/analise", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const limite =
+      limitarRequisicao(c, `ia:${user.id}`, 20, 60 * 1000);
+
+    if (limite) return limite;
+
     const bloqueio =
       await motivoBloqueioIA(user);
 
