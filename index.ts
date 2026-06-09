@@ -7567,7 +7567,8 @@ app.get("/admin/ia", authMiddleware, async (c) => {
       textoOpcional(configAtual.modelo) || modeloRailway;
 
     const modelosDisponiveisRaw =
-      textoOpcional(Bun.env.OPENAI_MODELOS_DISPONIVEIS) || modeloRailway;
+      textoOpcional(Bun.env.OPENAI_MODELOS_DISPONIVEIS) ||
+      "gpt-5-mini,gpt-4o-mini,gpt-4o";
     const modelos_disponiveis = modelosDisponiveisRaw
       .split(",")
       .map((m: string) => m.trim())
