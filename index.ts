@@ -2983,7 +2983,9 @@ app.get("/auth/meta/callback", async (c) => {
 
     return c.html(`
       <script>
-        alert("Conta conectada e salva com sucesso 🚀");
+        if (window.opener) {
+          window.opener.postMessage({ type: "meta_conectado" }, "*");
+        }
         window.close();
       </script>
     `);
