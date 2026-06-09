@@ -8254,177 +8254,112 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     const modelo =
       textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-4o-mini";
 
-    const schemaAnuncio = {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "titulo", "resumo", "acao_principal",
-        "mensagens", "motivos", "campos", "recomendacoes"
-      ],
-      properties: {
-        titulo: { type: "string" },
-        resumo: { type: "string" },
-        acao_principal: { type: "string" },
-        mensagens: { type: "array", items: { type: "string" } },
-        motivos: { type: "array", items: { type: "string" } },
-        campos: {
-          type: "array",
-          items: {
-            type: "object",
-            additionalProperties: false,
-            required: ["chave", "valor"],
-            properties: {
-              chave: { type: "string" },
-              valor: { type: "string" }
-            }
-          }
-        },
-        recomendacoes: { type: "array", items: { type: "string" } }
-      }
-    };
+    const prompt =
+      `Crie 3 campanhas de Meta Ads completamente diferentes para captar leads do seguinte produto ou empreendimento:\n\n` +
+      `"${topico}"\n\n` +
+      `Variacao 1 - URGENCIA: use escassez, medo de perder a oportunidade, senso de urgencia.\n` +
+      `Variacao 2 - EMOCIONAL: foque no sonho realizado, qualidade de vida, conquista pessoal.\n` +
+      `Variacao 3 - RACIONAL: destaque beneficios concretos, diferenciais especificos do produto.\n\n` +
+      `Para cada variacao crie:\n` +
+      `- nome_campanha: nome interno (ex: "Leads Urgencia - [produto]")\n` +
+      `- titulo: headline do anuncio, max 40 caracteres. IMPORTANTE: nao repita o nome do produto como titulo. Crie uma frase de impacto.\n` +
+      `- texto: corpo do anuncio com 2 ou 3 frases que usem os detalhes especificos do produto acima\n` +
+      `- descricao: frase de apoio curta e persuasiva\n` +
+      `- cta: use SIGN_UP para variacao 1, LEARN_MORE para variacao 2, APPLY_NOW para variacao 3\n` +
+      `- perguntas: 3 perguntas qualificadoras separadas por \\n, relevantes para o produto\n` +
+      `- interesses: palavras-chave do publico ideal, separadas por virgula\n` +
+      `- localidade: cidade ou regiao mencionada no produto (deixe vazio se nao houver)\n` +
+      `- genero: deixe vazio\n` +
+      `- idade_min e idade_max: faixa etaria do publico ideal como numeros em string\n` +
+      `- obrigado_titulo: titulo da pagina de confirmacao pos-cadastro\n` +
+      `- obrigado_botao: texto do botao pos-cadastro\n` +
+      `- obrigado_texto: mensagem personalizada mencionando o produto\n\n` +
+      `Retorne SOMENTE um JSON valido com esta estrutura exata, sem texto antes ou depois:\n` +
+      `{"v1":{nome_campanha,titulo,texto,descricao,cta,perguntas,interesses,localidade,genero,idade_min,idade_max,obrigado_titulo,obrigado_botao,obrigado_texto},"v2":{...},"v3":{...}}`;
 
-    const abordagens = [
-      {
-        label: "URGENCIA",
-        instrucao:
-          "Crie um anuncio com URGENCIA e ESCASSEZ. " +
-          "O titulo deve ser uma frase de impacto que provoque medo de perder a oportunidade. " +
-          "Exemplo de bom titulo (NAO copie): 'Ultimas unidades disponiveis!'",
-        cta: "SIGN_UP"
+    const resp = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
       },
-      {
-        label: "EMOCIONAL",
-        instrucao:
-          "Crie um anuncio ASPIRACIONAL e EMOCIONAL. " +
-          "O titulo deve evocar o sonho realizado, a vida melhor. " +
-          "Exemplo de bom titulo (NAO copie): 'Imagine acordar assim todo dia'",
-        cta: "LEARN_MORE"
-      },
-      {
-        label: "RACIONAL",
-        instrucao:
-          "Crie um anuncio com BENEFICIOS CONCRETOS e linguagem direta. " +
-          "O titulo deve destacar um diferencial especifico e mensuravel. " +
-          "Exemplo de bom titulo (NAO copie): '3 quartos, 2 vagas, pronto pra morar'",
-        cta: "APPLY_NOW"
-      }
-    ];
+      body: JSON.stringify({
+        model: modelo,
+        temperature: 0.85,
+        instructions:
+          "Voce e um redator publicitario especialista em campanhas de imoveis para Meta Ads no Brasil. " +
+          "Gere conteudo criativo e especifico baseado no contexto fornecido. " +
+          "Retorne SOMENTE JSON valido, sem markdown, sem texto adicional.",
+        input: [{
+          role: "user",
+          content: [{ type: "input_text", text: prompt }]
+        }]
+      })
+    });
 
-    const getCampo = (campos: any[], chave: string) =>
-      (campos || []).find(
-        (c: any) => String(c?.chave || "").toLowerCase() === chave.toLowerCase()
-      )?.valor || "";
+    const data: any = await resp.json();
 
-    const resultados = [];
-    let totalCusto = 0;
-    let totalInput = 0;
-    let totalOutput = 0;
-
-    for (const ab of abordagens) {
-      try {
-        const userText =
-          `Produto/contexto do anuncio: "${topico}"\n\n` +
-          `Abordagem: ${ab.label}\n` +
-          `${ab.instrucao}\n\n` +
-          `Preencha o JSON assim:\n` +
-          `- titulo: headline criativa do anuncio (max 40 chars). NAO pode ser apenas o nome do produto.\n` +
-          `- resumo: texto do anuncio (2-3 frases persuasivas usando detalhes especificos do contexto acima)\n` +
-          `- acao_principal: frase de apoio curta e convincente (max 90 chars)\n` +
-          `- mensagens: array com 3 perguntas qualificadoras especificas para este produto\n` +
-          `- motivos: array com 2 motivos de compra relevantes\n` +
-          `- campos: array com objetos chave/valor para: ` +
-          `cta="${ab.cta}", interesses="lista de keywords do publico ideal", ` +
-          `localidade="regiao do contexto ou vazio", genero="", ` +
-          `idade_min="faixa etaria minima", idade_max="faixa etaria maxima", ` +
-          `nome_campanha="nome interno da campanha"\n` +
-          `- recomendacoes: array vazio`;
-
-        const resp = await fetch(OPENAI_RESPONSES_URL, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: modelo,
-            temperature: 0.9,
-            instructions:
-              "Voce e um redator publicitario especialista em anuncios de imoveis para Meta Ads no Brasil. " +
-              "Crie headlines e textos criativos, especificos e persuasivos baseados no contexto fornecido. " +
-              "NUNCA use textos genericos como 'Atendimento rapido e personalizado' ou 'Conheca nosso produto'. " +
-              "Use os detalhes do contexto para criar copy unico e relevante. " +
-              "Responda somente no JSON solicitado, em portugues do Brasil.",
-            input: [{
-              role: "user",
-              content: [{ type: "input_text", text: userText }]
-            }],
-            text: {
-              format: {
-                type: "json_schema",
-                name: "sugestao_comercial_ia",
-                strict: true,
-                schema: schemaAnuncio
-              }
-            }
-          })
-        });
-
-        const data: any = await resp.json();
-
-        if (!resp.ok) {
-          console.error(`CRIADOR CAMPANHA OPENAI [${ab.label}]:`, data?.error?.message);
-          resultados.push({ campos: [], titulo: "", resumo: "", acao_principal: "", mensagens: [], cta: ab.cta, origem: "api_error" });
-          continue;
-        }
-
-        const texto = extrairTextoRespostaOpenAI(data);
-        if (!texto) {
-          resultados.push({ campos: [], titulo: "", resumo: "", acao_principal: "", mensagens: [], cta: ab.cta, origem: "vazio" });
-          continue;
-        }
-
-        const parsed = JSON.parse(texto);
-        totalCusto += calcularCustoEstimadoOpenAI(data?.usage);
-        totalInput += Number(data?.usage?.input_tokens || 0);
-        totalOutput += Number(data?.usage?.output_tokens || 0);
-        resultados.push({ ...parsed, cta: ab.cta, origem: "openai" });
-      } catch (err) {
-        console.error(`CRIADOR CAMPANHA ERRO [${ab.label}]:`, err);
-        resultados.push({ campos: [], titulo: "", resumo: "", acao_principal: "", mensagens: [], cta: ab.cta, origem: "erro" });
-      }
+    if (!resp.ok) {
+      console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+      return c.json({
+        sugestoes: fallbackVariacoes(topico),
+        _origem: "api_error",
+        _erro: data?.error?.message
+      });
     }
 
+    const textoResposta = extrairTextoRespostaOpenAI(data);
+    if (!textoResposta) {
+      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "resposta_vazia" });
+    }
+
+    let parsed: any;
+    try {
+      const jsonStr = textoResposta
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim();
+      parsed = JSON.parse(jsonStr);
+    } catch {
+      console.error("CRIADOR CAMPANHA JSON PARSE ERROR:", textoResposta.slice(0, 300));
+      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "json_invalido" });
+    }
+
+    const norm = (v: any, ctaDefault: string) => ({
+      nome_campanha: v?.nome_campanha || topico.slice(0, 50),
+      titulo: v?.titulo || topico.slice(0, 40),
+      texto: v?.texto || "",
+      descricao: v?.descricao || "",
+      cta: v?.cta || ctaDefault,
+      perguntas: v?.perguntas || "",
+      interesses: v?.interesses || "",
+      localidade: v?.localidade || "",
+      genero: v?.genero || "",
+      idade_min: String(v?.idade_min || "25"),
+      idade_max: String(v?.idade_max || "55"),
+      obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
+      obrigado_botao: v?.obrigado_botao || "Ver mais",
+      obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
+    });
+
+    const sugestoes = [
+      norm(parsed.v1 || parsed.variacao_1, "SIGN_UP"),
+      norm(parsed.v2 || parsed.variacao_2, "LEARN_MORE"),
+      norm(parsed.v3 || parsed.variacao_3, "APPLY_NOW")
+    ];
+
+    const custo = calcularCustoEstimadoOpenAI(data?.usage);
     await registrarUsoIA(
       Number(user.id),
       "criador_campanha",
       "campanha",
       null,
-      totalCusto,
-      totalInput,
-      totalOutput
+      custo,
+      Number(data?.usage?.input_tokens || 0),
+      Number(data?.usage?.output_tokens || 0)
     );
 
-    const sugestoes = resultados.map(r => ({
-      nome_campanha:
-        getCampo(r.campos, "nome_campanha") ||
-        String(r.titulo || "").slice(0, 50) ||
-        topico.slice(0, 50),
-      titulo: r.titulo || topico.slice(0, 40),
-      texto: r.resumo || "",
-      descricao: r.acao_principal || "",
-      cta: getCampo(r.campos, "cta") || r.cta || "SIGN_UP",
-      perguntas: (r.mensagens || []).slice(0, 3).join("\n"),
-      interesses: getCampo(r.campos, "interesses") || "",
-      localidade: getCampo(r.campos, "localidade") || "",
-      genero: getCampo(r.campos, "genero") || "",
-      idade_min: getCampo(r.campos, "idade_min") || "25",
-      idade_max: getCampo(r.campos, "idade_max") || "55",
-      obrigado_titulo: "Recebemos seu contato!",
-      obrigado_botao: "Ver mais",
-      obrigado_texto: `Em breve entraremos em contato sobre ${topico}.`
-    }));
-
-    return c.json({ sugestoes, _origem: resultados.map(r => r.origem) });
+    return c.json({ sugestoes, _origem: "openai" });
   } catch (err) {
     console.error("CRIADOR CAMPANHA ERRO:", err);
     return c.json({ sugestoes: fallbackVariacoes(topico) });
