@@ -2057,6 +2057,25 @@ async function motivoBloqueioIA(user: any) {
       : "IA nao configurada pelo administrador.";
   }
 
+  // Verifica limites globais (somados de todos os usuarios no mes)
+  const limReq = Number(configIA?.limite_mensal_requisicoes || 0);
+  const limCusto = Number(configIA?.limite_mensal_custo || 0);
+  if (limReq > 0 || limCusto > 0) {
+    const usoGlobal = await client.query(`
+      SELECT COUNT(*) AS chamadas, COALESCE(SUM(custo_estimado), 0) AS custo
+      FROM ia_usos
+      WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+    `);
+    const chamadasGlobal = Number(usoGlobal.rows[0]?.chamadas || 0);
+    const custoGlobal = Number(usoGlobal.rows[0]?.custo || 0);
+    if (limReq > 0 && chamadasGlobal >= limReq) {
+      return "Limite mensal global de chamadas atingido.";
+    }
+    if (limCusto > 0 && custoGlobal >= limCusto) {
+      return "Limite mensal global de custo atingido.";
+    }
+  }
+
   const limiteIA =
     await validarLimiteIAUsuario(user);
 
@@ -4818,6 +4837,7 @@ await client.query(`
     id INTEGER PRIMARY KEY DEFAULT 1,
     provedor TEXT DEFAULT 'openai',
     modelo TEXT DEFAULT 'gpt-5-mini',
+    anthropic_modelo TEXT DEFAULT 'claude-haiku-4-5-20251001',
     status TEXT DEFAULT 'nao_contratado',
     assinatura_status TEXT DEFAULT 'pendente',
     plano_api TEXT DEFAULT 'sob_demanda',
@@ -4828,6 +4848,10 @@ await client.query(`
     observacoes TEXT,
     atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+`);
+
+await client.query(`
+  ALTER TABLE ia_config ADD COLUMN IF NOT EXISTS anthropic_modelo TEXT DEFAULT 'claude-haiku-4-5-20251001';
 `);
 
 await client.query(`
@@ -7596,14 +7620,25 @@ app.get("/admin/ia", authMiddleware, async (c) => {
       .map((m: string) => m.trim())
       .filter(Boolean);
 
+    const anthropicModeloAtivo =
+      textoOpcional(configAtual.anthropic_modelo) || "claude-haiku-4-5-20251001";
+    const anthropic_modelos_disponiveis = [
+      { value: "claude-haiku-4-5-20251001", label: "Claude Haiku — Mais rapido e barato" },
+      { value: "claude-sonnet-4-6",         label: "Claude Sonnet — Recomendado (qualidade)" },
+      { value: "claude-opus-4-8",           label: "Claude Opus — Melhor qualidade" }
+    ];
+
     return c.json({
       config: {
         ...configAtual,
         modelo: modeloAtivo,
         modelo_railway: modeloRailway,
-        chave_configurada: Boolean(Bun.env.OPENAI_API_KEY)
+        anthropic_modelo: anthropicModeloAtivo,
+        chave_configurada: Boolean(Bun.env.OPENAI_API_KEY),
+        anthropic_chave_configurada: Boolean(Bun.env.ANTHROPIC_API_KEY)
       },
       modelos_disponiveis,
+      anthropic_modelos_disponiveis,
       resumo: resumo.rows[0],
       usuarios: usuarios.rows
     });
@@ -7704,6 +7739,7 @@ app.put("/admin/ia/config", authMiddleware, async (c) => {
       SET
         provedor = COALESCE($1, provedor),
         modelo = COALESCE($9, modelo),
+        anthropic_modelo = COALESCE($10, anthropic_modelo),
         status = COALESCE($2, status),
         assinatura_status = COALESCE($3, assinatura_status),
         plano_api = COALESCE($4, plano_api),
@@ -7730,7 +7766,8 @@ app.put("/admin/ia/config", authMiddleware, async (c) => {
           ? Number(body.custo_mensal_contratado)
           : null,
         body.observacoes || null,
-        textoOpcional(body.modelo) || null
+        textoOpcional(body.modelo) || null,
+        textoOpcional(body.anthropic_modelo) || null
       ]
     );
 
@@ -8415,12 +8452,13 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     const openaiKey = Bun.env.OPENAI_API_KEY;
     const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
 
+    const iaConf = await client.query(
+      "SELECT modelo, anthropic_modelo FROM ia_config WHERE id = 1 LIMIT 1"
+    );
+
     const tentarOpenAI = async () => {
       if (!openaiKey) return null;
       try {
-        const iaConf = await client.query(
-          "SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1"
-        );
         const modelo =
           textoOpcional(iaConf.rows[0]?.modelo) ||
           textoOpcional(Bun.env.OPENAI_MODEL) ||
@@ -8496,7 +8534,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            model: "claude-haiku-4-5-20251001",
+            model: textoOpcional(iaConf.rows[0]?.anthropic_modelo) || "claude-haiku-4-5-20251001",
             max_tokens: 2048,
             system: systemMsg,
             messages: [{ role: "user", content: prompt }]
