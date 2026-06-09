@@ -8281,7 +8281,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Retorne SOMENTE JSON valido sem texto antes ou depois:\n` +
       `{"v1":{...todos os campos...},"v2":{...},"v3":{...}}`;
 
-    const resp = await fetch(OPENAI_RESPONSES_URL, {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${apiKey}`,
@@ -8290,15 +8290,21 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       body: JSON.stringify({
         model: modelo,
         temperature: 1.0,
-        instructions:
-          "Voce e um redator publicitario criativo especializado em Meta Ads para imoveis no Brasil. " +
-          "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
-          "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
-          "Retorne SOMENTE JSON valido, sem markdown, sem texto adicional.",
-        input: [{
-          role: "user",
-          content: [{ type: "input_text", text: prompt }]
-        }]
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "Voce e um redator publicitario criativo especializado em Meta Ads para imoveis no Brasil. " +
+              "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
+              "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
+              "Retorne SOMENTE JSON valido."
+          },
+          {
+            role: "user",
+            content: prompt
+          }
+        ]
       })
     });
 
@@ -8313,18 +8319,14 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       });
     }
 
-    const textoResposta = extrairTextoRespostaOpenAI(data);
+    const textoResposta: string = data?.choices?.[0]?.message?.content || "";
     if (!textoResposta) {
       return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "resposta_vazia" });
     }
 
     let parsed: any;
     try {
-      const jsonStr = textoResposta
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/i, "")
-        .trim();
-      parsed = JSON.parse(jsonStr);
+      parsed = JSON.parse(textoResposta);
     } catch {
       console.error("CRIADOR CAMPANHA JSON PARSE ERROR:", textoResposta.slice(0, 300));
       return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "json_invalido" });
@@ -8353,15 +8355,19 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       norm(parsed.v3 || parsed.variacao_3, "APPLY_NOW")
     ];
 
-    const custo = calcularCustoEstimadoOpenAI(data?.usage);
+    const usageNorm = {
+      input_tokens: Number(data?.usage?.prompt_tokens || 0),
+      output_tokens: Number(data?.usage?.completion_tokens || 0)
+    };
+    const custo = calcularCustoEstimadoOpenAI(usageNorm);
     await registrarUsoIA(
       Number(user.id),
       "criador_campanha",
       "campanha",
       null,
       custo,
-      Number(data?.usage?.input_tokens || 0),
-      Number(data?.usage?.output_tokens || 0)
+      usageNorm.input_tokens,
+      usageNorm.output_tokens
     );
 
     return c.json({ sugestoes, _origem: "openai" });
