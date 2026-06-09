@@ -7664,9 +7664,21 @@ app.get("/admin/ia/saldos", authMiddleware, async (c) => {
       } catch { /* sem acesso a billing API */ }
     }
 
+    // Calcula saldo Anthropic em USD a partir dos tokens rastreados
+    const anthropicData = por_provider.anthropic || vazio;
+    const anthropicBudgetUSD = Number(Bun.env.ANTHROPIC_BUDGET_USD || 0);
+    const inputUSD = 0.25 / 1_000_000;  // claude-haiku-4-5-20251001
+    const outputUSD = 1.25 / 1_000_000;
+    const anthropicGastoUSD = Number(
+      (anthropicData.tokens_entrada * inputUSD + anthropicData.tokens_saida * outputUSD).toFixed(6)
+    );
+    const anthropicSaldo = anthropicBudgetUSD > 0
+      ? { budget_usd: anthropicBudgetUSD, gasto_usd: anthropicGastoUSD, saldo_usd: Math.max(0, anthropicBudgetUSD - anthropicGastoUSD) }
+      : null;
+
     return c.json({
       openai: { ...(por_provider.openai || vazio), saldo_api: openaiSaldo },
-      anthropic: por_provider.anthropic || vazio,
+      anthropic: { ...anthropicData, saldo_calculado: anthropicSaldo },
       atualizado_em: new Date().toISOString()
     });
 
