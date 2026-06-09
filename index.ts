@@ -1626,6 +1626,16 @@ function extrairTextoRespostaOpenAI(data: any) {
   return partes.join("\n").trim();
 }
 
+function calcularCustoEstimadoAnthropic(usage: { input_tokens: number; output_tokens: number }) {
+  // claude-haiku-4-5-20251001: $0.25/1M input, $1.25/1M output
+  const inputBRL = Number(Bun.env.ANTHROPIC_INPUT_1M_BRL || 1.44);
+  const outputBRL = Number(Bun.env.ANTHROPIC_OUTPUT_1M_BRL || 7.19);
+  return Number(
+    ((usage.input_tokens / 1_000_000) * inputBRL +
+     (usage.output_tokens / 1_000_000) * outputBRL).toFixed(4)
+  );
+}
+
 function calcularCustoEstimadoOpenAI(usage: any) {
   const inputTokens =
     Number(usage?.input_tokens || 0);
@@ -1958,7 +1968,8 @@ async function registrarUsoIA(
   referenciaId: string | number | null,
   custoEstimado = IA_CUSTO_ESTIMADO_PADRAO,
   tokensEntrada = 0,
-  tokensSaida = 0
+  tokensSaida = 0,
+  provider = "openai"
 ) {
   await client.query(
     `
@@ -1969,9 +1980,10 @@ async function registrarUsoIA(
       referencia_id,
       tokens_entrada,
       tokens_saida,
-      custo_estimado
+      custo_estimado,
+      provider
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     `,
     [
       usuarioId,
@@ -1980,7 +1992,8 @@ async function registrarUsoIA(
       referenciaId ? String(referenciaId) : null,
       tokensEntrada,
       tokensSaida,
-      custoEstimado
+      custoEstimado,
+      provider
     ]
   );
 }
@@ -4791,8 +4804,13 @@ await client.query(`
     tokens_entrada INTEGER DEFAULT 0,
     tokens_saida INTEGER DEFAULT 0,
     custo_estimado NUMERIC(12, 4) DEFAULT 0,
+    provider TEXT DEFAULT 'openai',
     criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+`);
+
+await client.query(`
+  ALTER TABLE ia_usos ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'openai';
 `);
 
 await client.query(`
@@ -7596,6 +7614,68 @@ app.get("/admin/ia", authMiddleware, async (c) => {
   }
 });
 
+app.get("/admin/ia/saldos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
+
+    const gastos = await client.query(`
+      SELECT
+        COALESCE(provider, 'openai') AS provider,
+        COUNT(*) AS chamadas,
+        COALESCE(SUM(tokens_entrada), 0) AS tokens_entrada,
+        COALESCE(SUM(tokens_saida), 0) AS tokens_saida,
+        COALESCE(SUM(custo_estimado), 0) AS custo_total
+      FROM ia_usos
+      WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+      GROUP BY provider
+    `);
+
+    const por_provider: Record<string, any> = {};
+    for (const row of gastos.rows) {
+      por_provider[row.provider] = {
+        chamadas: Number(row.chamadas),
+        tokens_entrada: Number(row.tokens_entrada),
+        tokens_saida: Number(row.tokens_saida),
+        custo_total: Number(row.custo_total)
+      };
+    }
+
+    const vazio = { chamadas: 0, tokens_entrada: 0, tokens_saida: 0, custo_total: 0 };
+
+    // Tenta consultar saldo restante da OpenAI (funciona em contas pre-pagas)
+    let openaiSaldo: { total_granted: number; total_used: number; total_available: number } | null = null;
+    const openaiKey = Bun.env.OPENAI_API_KEY;
+    if (openaiKey) {
+      try {
+        const resp = await fetch("https://api.openai.com/v1/dashboard/billing/credit_grants", {
+          headers: { "Authorization": `Bearer ${openaiKey}` }
+        });
+        if (resp.ok) {
+          const data: any = await resp.json();
+          if (typeof data?.total_available === "number") {
+            openaiSaldo = {
+              total_granted: Number(data.total_granted || 0),
+              total_used: Number(data.total_used || 0),
+              total_available: Number(data.total_available || 0)
+            };
+          }
+        }
+      } catch { /* sem acesso a billing API */ }
+    }
+
+    return c.json({
+      openai: { ...(por_provider.openai || vazio), saldo_api: openaiSaldo },
+      anthropic: por_provider.anthropic || vazio,
+      atualizado_em: new Date().toISOString()
+    });
+
+  } catch (err) {
+    console.error("ERRO SALDOS IA:", err);
+    return c.json({ error: "Erro ao consultar saldos" }, 500);
+  }
+});
+
 app.put("/admin/ia/config", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -8424,7 +8504,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         const sugestoes = parseSugestoes(textoAnthropic);
         const inTok = Number(dataAnthropic?.usage?.input_tokens || 0);
         const outTok = Number(dataAnthropic?.usage?.output_tokens || 0);
-        await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, 0, inTok, outTok);
+        const custoAnthropic = calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok });
+        await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, custoAnthropic, inTok, outTok, "anthropic");
         return { sugestoes, _origem: "anthropic" };
       } catch (err) {
         console.error("CRIADOR CAMPANHA ANTHROPIC EXCEPTION:", err);
