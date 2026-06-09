@@ -8223,86 +8223,126 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
 
     const body =
       await c.req.json().catch(() => ({}));
-    const campanha =
-      body.campanha || {};
     const contexto =
       textoOpcional(body.contexto) || "";
-    const nome =
-      textoOpcional(campanha.nome) ||
-      "Campanha imobiliaria";
 
-    const contextoExtra =
-      contexto
-        ? ` Contexto fornecido pelo anunciante: ${contexto}.`
-        : "";
-
-    const abordagens = [
-      "abordagem direta com urgencia e chamada para acao clara",
-      "abordagem emocional e aspiracional focada no sonho da casa propria",
-      "abordagem pratica listando beneficios concretos e diferenciais do imovel"
+    const fallbackSugestoes = [
+      {
+        titulo: "Encontre Seu Imovel Ideal — Cadastre-se Agora",
+        texto: "Temos opcoes selecionadas para o seu perfil. Atendimento rapido e personalizado com um corretor dedicado. Nao perca a oportunidade de realizar seu sonho.",
+        descricao: "Imoveis selecionados com atendimento rapido pelo corretor.",
+        perguntas: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?",
+        interesses: "imoveis, financiamento imobiliario, apartamento"
+      },
+      {
+        titulo: "O Lar que Voce Sonhou Pode Estar Aqui",
+        texto: "Imagine acordar todos os dias no lugar perfeito para voce e sua familia. Conectamos voce ao imovel certo com atendimento humanizado e sem burocracia.",
+        descricao: "Realizando sonhos imobiliarios com atendimento dedicado.",
+        perguntas: "Qual e o seu sonho de moradia?\nQual regiao faz sentido para sua familia?\nJa tem alguma reserva para entrada?",
+        interesses: "casa propria, imoveis familia, apartamento novo"
+      },
+      {
+        titulo: "Imovel com Localizacao, Preco e Atendimento — Tudo em Um",
+        texto: "Selecao curada de imoveis com os melhores custo-beneficio da regiao. Corretor disponivel para tirar duvidas e agendar visita rapidamente.",
+        descricao: "Melhor custo-beneficio com atendimento especializado.",
+        perguntas: "Qual tamanho de imovel voce precisa?\nQual regiao tem mais interesse?\nQual e o seu orcamento?",
+        interesses: "imoveis custo beneficio, comprar apartamento, financiamento caixa"
+      }
     ];
 
-    const fallback =
-      sugestaoIAFallback(
-        "Criador de anuncio IA",
-        "Sugestao inicial para campanha de captacao de leads.",
-        "Preencher os campos do anuncio e revisar antes de publicar.",
-        [],
-        [],
-        [
-          { chave: "titulo", valor: nome },
-          { chave: "texto", valor: "Encontre o imovel ideal com atendimento rapido e opcoes alinhadas ao seu perfil. Cadastre-se para receber mais informacoes." },
-          { chave: "descricao", valor: "Atendimento rapido pelo corretor." },
-          { chave: "perguntas", valor: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?" },
-          { chave: "interesses", valor: "imoveis, financiamento imobiliario, apartamento" }
-        ],
-        [
-          "Use imagem real do imovel ou empreendimento.",
-          "Mantenha o texto objetivo."
-        ]
-      );
+    const apiKey = Bun.env.OPENAI_API_KEY;
+    const modelo =
+      textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-5-mini";
 
-    const instrucaoCampos = `No array campos retorne obrigatoriamente estas cinco chaves: "titulo" (titulo do anuncio), "texto" (texto principal do anuncio, 2 a 3 frases), "descricao" (descricao curta de 1 frase), "perguntas" (perguntas do formulario de lead separadas por nova linha), "interesses" (lista de interesses para segmentacao separados por virgula).`;
+    if (!apiKey) {
+      return c.json({ sugestoes: fallbackSugestoes });
+    }
 
-    const resultados = await Promise.all(
-      abordagens.map(abordagem =>
-        gerarSugestaoComercialOpenAI(
-          `Criar anuncio Meta Ads para captacao de leads imobiliarios com ${abordagem}. ${instrucaoCampos}${contextoExtra}`,
-          { campanha },
-          fallback
-        )
-      )
+    const abordagens = [
+      "direta com urgencia e chamada para acao clara",
+      "emocional e aspiracional focada no sonho da casa propria",
+      "pratica listando beneficios concretos e diferenciais"
+    ];
+
+    const contextoTexto =
+      contexto
+        ? `\nContexto do anunciante: ${contexto}`
+        : "";
+
+    const schemaCriador = {
+      type: "object",
+      additionalProperties: false,
+      required: ["titulo", "texto", "descricao", "perguntas", "interesses"],
+      properties: {
+        titulo: { type: "string" },
+        texto: { type: "string" },
+        descricao: { type: "string" },
+        perguntas: { type: "string" },
+        interesses: { type: "string" }
+      }
+    };
+
+    const chamarIA = async (abordagem: string, idx: number) => {
+      try {
+        const res = await fetch(OPENAI_RESPONSES_URL, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: modelo,
+            instructions:
+              "Voce e um especialista em marketing imobiliario digital. Crie anuncios para Meta Ads (Facebook/Instagram) para captacao de leads. Responda somente no JSON solicitado, em portugues do Brasil, sem acentos.",
+            input: [{
+              role: "user",
+              content: [{
+                type: "input_text",
+                text: `Crie um anuncio com abordagem ${abordagem} para captacao de leads imobiliarios.${contextoTexto}\nRetorne: titulo (ate 40 chars), texto (2-3 frases envolventes), descricao (1 frase curta), perguntas (3 perguntas do formulario separadas por nova linha), interesses (5 interesses para segmentacao separados por virgula).`
+              }]
+            }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "criador_campanha_ia",
+                strict: true,
+                schema: schemaCriador
+              }
+            }
+          })
+        });
+
+        const data: any = await res.json();
+
+        if (!res.ok) throw new Error(data?.error?.message || "Erro OpenAI");
+
+        const texto = extrairTextoRespostaOpenAI(data);
+        if (!texto) throw new Error("Resposta vazia");
+
+        const parsed = JSON.parse(texto);
+
+        await registrarUsoIA(
+          Number(user.id),
+          "criador_campanha",
+          "campanha",
+          null,
+          calcularCustoEstimadoOpenAI(data?.usage),
+          Number(data?.usage?.input_tokens || 0),
+          Number(data?.usage?.output_tokens || 0)
+        );
+
+        return parsed;
+      } catch (err) {
+        console.error(`CRIADOR CAMPANHA opcao ${idx + 1}:`, err);
+        return fallbackSugestoes[idx];
+      }
+    };
+
+    const sugestoes = await Promise.all(
+      abordagens.map((abordagem, idx) => chamarIA(abordagem, idx))
     );
 
-    const custoTotal =
-      resultados.reduce(
-        (sum, r) => sum + (r.custo_estimado || 0),
-        0
-      );
-    const inputTotal =
-      resultados.reduce(
-        (sum, r) => sum + Number(r.usage?.input_tokens || 0),
-        0
-      );
-    const outputTotal =
-      resultados.reduce(
-        (sum, r) => sum + Number(r.usage?.output_tokens || 0),
-        0
-      );
-
-    await registrarUsoIA(
-      Number(user.id),
-      "criador_campanha",
-      "campanha",
-      null,
-      custoTotal,
-      inputTotal,
-      outputTotal
-    );
-
-    return c.json({
-      sugestoes: resultados.map(r => r.sugestao)
-    });
+    return c.json({ sugestoes });
   } catch (err) {
     console.error("ERRO IA CRIADOR CAMPANHA:", err);
     return c.json({ error: "Erro ao gerar campanha com IA" }, 500);
