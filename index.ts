@@ -2266,6 +2266,7 @@ const authMiddleware = async (c: any, next: any) => {
         ia_limite_mensal,
         ia_custo_limite_mensal,
         COALESCE(ia_ativo, true) AS ia_ativo,
+        COALESCE(ia_provider, 'auto') AS ia_provider,
         COALESCE(ativo, true) AS ativo
       FROM usuarios
       WHERE id = $1
@@ -4866,6 +4867,7 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS ia_limite_mensal INTEGER DEFAULT 300,
     ADD COLUMN IF NOT EXISTS ia_custo_limite_mensal NUMERIC(12, 2) DEFAULT 120,
     ADD COLUMN IF NOT EXISTS ia_ativo BOOLEAN DEFAULT true,
+    ADD COLUMN IF NOT EXISTS ia_provider TEXT DEFAULT 'auto',
     ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 `);
 
@@ -7534,6 +7536,7 @@ app.get("/admin/ia", authMiddleware, async (c) => {
         u.ia_limite_mensal,
         u.ia_custo_limite_mensal,
         COALESCE(u.ia_ativo, true) AS ia_ativo,
+        COALESCE(u.ia_provider, 'auto') AS ia_provider,
         COALESCE(COUNT(iu.id), 0) AS chamadas_mes,
         COALESCE(SUM(iu.custo_estimado), 0) AS custo_mes,
         COALESCE(SUM(iu.tokens_entrada), 0) AS tokens_entrada_mes,
@@ -7556,7 +7559,8 @@ app.get("/admin/ia", authMiddleware, async (c) => {
         u.assinatura_inicio,
         u.ia_limite_mensal,
         u.ia_custo_limite_mensal,
-        u.ia_ativo
+        u.ia_ativo,
+        u.ia_provider
       ORDER BY u.plano_ativado_em DESC NULLS LAST, u.id ASC
     `);
 
@@ -7660,6 +7664,10 @@ app.put("/admin/usuarios/:id/ia-limites", authMiddleware, async (c) => {
     const id = c.req.param("id");
     const body = await c.req.json();
 
+    const providerValido = ["auto", "openai", "anthropic"].includes(body.ia_provider)
+      ? body.ia_provider
+      : null;
+
     await client.query(
       `
       UPDATE usuarios
@@ -7667,16 +7675,16 @@ app.put("/admin/usuarios/:id/ia-limites", authMiddleware, async (c) => {
         ia_limite_mensal = $1,
         ia_custo_limite_mensal = $2,
         assinatura_status = COALESCE($3, assinatura_status),
-        ia_ativo = COALESCE($4, ia_ativo)
-      WHERE id = $5
+        ia_ativo = COALESCE($4, ia_ativo),
+        ia_provider = COALESCE($5, ia_provider)
+      WHERE id = $6
       `,
       [
         Math.max(0, Number(body.ia_limite_mensal || 0)),
         Math.max(0, Number(body.ia_custo_limite_mensal || 0)),
         body.assinatura_status || null,
-        typeof body.ia_ativo === "boolean"
-          ? body.ia_ativo
-          : null,
+        typeof body.ia_ativo === "boolean" ? body.ia_ativo : null,
+        providerValido,
         id
       ]
     );
@@ -8311,9 +8319,12 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
       "Retorne SOMENTE JSON valido.";
 
-    // ── Tenta OpenAI ──────────────────────────────────────────────
+    const iaProvider: string = (user as any).ia_provider || "auto";
     const openaiKey = Bun.env.OPENAI_API_KEY;
-    if (openaiKey) {
+    const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
+
+    const tentarOpenAI = async () => {
+      if (!openaiKey) return null;
       try {
         const iaConf = await client.query(
           "SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1"
@@ -8347,9 +8358,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
             };
 
         const resp = await fetch(
-          usarResponsesAPI
-            ? OPENAI_RESPONSES_URL
-            : "https://api.openai.com/v1/chat/completions",
+          usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
           {
             method: "POST",
             headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
@@ -8359,32 +8368,33 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
 
         const data: any = await resp.json();
 
-        if (resp.ok) {
-          const textoResposta: string = usarResponsesAPI
-            ? extrairTextoRespostaOpenAI(data)
-            : (data?.choices?.[0]?.message?.content || "");
-
-          if (textoResposta) {
-            const sugestoes = parseSugestoes(textoResposta);
-            const usageNorm = {
-              input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
-              output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0)
-            };
-            const custo = calcularCustoEstimadoOpenAI(usageNorm);
-            await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
-            return c.json({ sugestoes, _origem: "openai" });
-          }
-        } else {
+        if (!resp.ok) {
           console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+          return null;
         }
-      } catch (errOpenai) {
-        console.error("CRIADOR CAMPANHA OPENAI EXCEPTION:", errOpenai);
-      }
-    }
 
-    // ── Fallback: Anthropic (Claude Haiku) ────────────────────────
-    const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
-    if (anthropicKey) {
+        const textoResposta: string = usarResponsesAPI
+          ? extrairTextoRespostaOpenAI(data)
+          : (data?.choices?.[0]?.message?.content || "");
+
+        if (!textoResposta) return null;
+
+        const sugestoes = parseSugestoes(textoResposta);
+        const usageNorm = {
+          input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
+          output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0)
+        };
+        const custo = calcularCustoEstimadoOpenAI(usageNorm);
+        await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
+        return { sugestoes, _origem: "openai" };
+      } catch (err) {
+        console.error("CRIADOR CAMPANHA OPENAI EXCEPTION:", err);
+        return null;
+      }
+    };
+
+    const tentarAnthropic = async () => {
+      if (!anthropicKey) return null;
       try {
         const respAnthropic = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
@@ -8403,27 +8413,43 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
 
         const dataAnthropic: any = await respAnthropic.json();
 
-        if (respAnthropic.ok) {
-          const textoAnthropic: string = dataAnthropic?.content?.[0]?.text || "";
-          if (textoAnthropic) {
-            const sugestoes = parseSugestoes(textoAnthropic);
-            const inTok = Number(dataAnthropic?.usage?.input_tokens || 0);
-            const outTok = Number(dataAnthropic?.usage?.output_tokens || 0);
-            await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, 0, inTok, outTok);
-            return c.json({ sugestoes, _origem: "anthropic" });
-          }
-        } else {
+        if (!respAnthropic.ok) {
           console.error("CRIADOR CAMPANHA ANTHROPIC ERROR:", dataAnthropic?.error?.message);
+          return null;
         }
-      } catch (errAnthropic) {
-        console.error("CRIADOR CAMPANHA ANTHROPIC EXCEPTION:", errAnthropic);
+
+        const textoAnthropic: string = dataAnthropic?.content?.[0]?.text || "";
+        if (!textoAnthropic) return null;
+
+        const sugestoes = parseSugestoes(textoAnthropic);
+        const inTok = Number(dataAnthropic?.usage?.input_tokens || 0);
+        const outTok = Number(dataAnthropic?.usage?.output_tokens || 0);
+        await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, 0, inTok, outTok);
+        return { sugestoes, _origem: "anthropic" };
+      } catch (err) {
+        console.error("CRIADOR CAMPANHA ANTHROPIC EXCEPTION:", err);
+        return null;
       }
+    };
+
+    // ── Executa conforme provider do usuario ──────────────────────
+    let resultado: { sugestoes: any[]; _origem: string } | null = null;
+
+    if (iaProvider === "openai") {
+      resultado = await tentarOpenAI();
+    } else if (iaProvider === "anthropic") {
+      resultado = await tentarAnthropic();
+    } else {
+      // auto: tenta OpenAI, fallback para Anthropic
+      resultado = await tentarOpenAI() ?? await tentarAnthropic();
     }
+
+    if (resultado) return c.json(resultado);
 
     // ── Sem IA disponivel ─────────────────────────────────────────
     return c.json({
       sugestoes: fallbackVariacoes(topico),
-      _origem: openaiKey ? "api_error" : "sem_chave"
+      _origem: "sem_chave"
     });
 
   } catch (err) {
