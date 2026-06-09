@@ -8227,162 +8227,127 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       textoOpcional(body.contexto) || "";
 
     const topico =
-      contexto || "imovel imobiliario generico";
+      contexto || "imovel imobiliario";
 
-    const fallbackBase = (sufixo: string) => ({
-      nome_campanha: topico.slice(0, 50),
-      titulo: `${topico.slice(0, 35)} — Cadastre-se`,
-      texto: "Encontre o imovel ideal com atendimento rapido e opcoes alinhadas ao seu perfil. Cadastre-se para receber mais informacoes.",
-      descricao: "Atendimento rapido pelo corretor.",
-      cta: "SIGN_UP",
-      perguntas: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?",
-      interesses: "imoveis, financiamento imobiliario, apartamento",
-      localidade: "",
-      genero: "",
-      idade_min: "25",
-      idade_max: "55",
-      obrigado_titulo: "Recebemos seu contato!",
-      obrigado_botao: "Ver mais",
-      obrigado_texto: `Em breve nosso corretor vai entrar em contato sobre ${topico}.`
+    const extrairCampo = (sugestao: any, chave: string): string =>
+      (sugestao?.campos || []).find(
+        (item: any) => String(item.chave || "").toLowerCase() === chave
+      )?.valor || "";
+
+    const toVariacao = (sugestao: any) => ({
+      nome_campanha:
+        extrairCampo(sugestao, "nome_campanha") ||
+        sugestao.titulo || topico.slice(0, 50),
+      titulo:
+        extrairCampo(sugestao, "titulo") ||
+        sugestao.titulo || "",
+      texto:
+        extrairCampo(sugestao, "texto") ||
+        sugestao.resumo || "",
+      descricao:
+        extrairCampo(sugestao, "descricao") ||
+        sugestao.acao_principal || "",
+      cta:
+        extrairCampo(sugestao, "cta") || "SIGN_UP",
+      perguntas:
+        extrairCampo(sugestao, "perguntas") || "",
+      interesses:
+        extrairCampo(sugestao, "interesses") || "",
+      localidade:
+        extrairCampo(sugestao, "localidade") || "",
+      genero:
+        extrairCampo(sugestao, "genero") || "",
+      idade_min:
+        extrairCampo(sugestao, "idade_min") || "25",
+      idade_max:
+        extrairCampo(sugestao, "idade_max") || "55",
+      obrigado_titulo:
+        extrairCampo(sugestao, "obrigado_titulo") || "Recebemos seu contato!",
+      obrigado_botao:
+        extrairCampo(sugestao, "obrigado_botao") || "Ver mais",
+      obrigado_texto:
+        extrairCampo(sugestao, "obrigado_texto") ||
+        `Em breve nosso corretor vai entrar em contato sobre ${topico}.`
     });
-
-    const apiKey = Bun.env.OPENAI_API_KEY;
-    const modelo =
-      textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-5-mini";
-
-    if (!apiKey) {
-      return c.json({
-        sugestoes: [
-          fallbackBase("urgente"),
-          fallbackBase("emocional"),
-          fallbackBase("pratico")
-        ]
-      });
-    }
 
     const abordagens = [
       "direta com urgencia e chamada para acao clara",
       "emocional e aspiracional focada no sonho e estilo de vida",
-      "pratica destacando beneficios concretos e diferenciais do imovel"
+      "pratica destacando beneficios concretos e diferenciais"
     ];
 
-    const schemaCriador = {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "nome_campanha", "titulo", "texto", "descricao", "cta",
-        "perguntas", "interesses", "localidade", "genero",
-        "idade_min", "idade_max",
-        "obrigado_titulo", "obrigado_botao", "obrigado_texto"
-      ],
-      properties: {
-        nome_campanha: { type: "string" },
-        titulo: { type: "string" },
-        texto: { type: "string" },
-        descricao: { type: "string" },
-        cta: { type: "string", enum: ["LEARN_MORE", "SIGN_UP", "APPLY_NOW"] },
-        perguntas: { type: "string" },
-        interesses: { type: "string" },
-        localidade: { type: "string" },
-        genero: { type: "string" },
-        idade_min: { type: "string" },
-        idade_max: { type: "string" },
-        obrigado_titulo: { type: "string" },
-        obrigado_botao: { type: "string" },
-        obrigado_texto: { type: "string" }
-      }
-    };
+    const resultados = await Promise.all(
+      abordagens.map(abordagem => {
+        const objetivo = [
+          `PRODUTO A ANUNCIAR: "${topico}"`,
+          `ABORDAGEM: ${abordagem}`,
+          "",
+          `Crie um anuncio Meta Ads completo para captacao de leads ESPECIFICAMENTE sobre "${topico}".`,
+          "Todo o conteudo deve refletir o produto acima — nao use texto generico.",
+          "",
+          "No array campos inclua estas chaves:",
+          "nome_campanha (curto, max 50 chars),",
+          "titulo (chamativo, max 40 chars),",
+          "texto (2 a 3 frases envolventes sobre o produto),",
+          "descricao (1 frase curta),",
+          "cta (SIGN_UP, LEARN_MORE ou APPLY_NOW),",
+          "perguntas (3 perguntas do formulario sobre o produto, uma por linha),",
+          "interesses (5 interesses para segmentacao separados por virgula),",
+          "localidade (cidade ou regiao do produto, ou vazio),",
+          "genero (vazio para todos, 1 para homens, 2 para mulheres),",
+          "idade_min (numero como texto), idade_max (numero como texto),",
+          "obrigado_titulo, obrigado_botao, obrigado_texto (personalizados para o produto)"
+        ].join("\n");
 
-    const chamarIA = async (abordagem: string, idx: number) => {
-      try {
-        const res = await fetch(OPENAI_RESPONSES_URL, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: modelo,
-            instructions:
-              "Voce e um especialista em marketing imobiliario digital. Crie anuncios completos para Meta Ads para captacao de leads. Responda somente no JSON solicitado, em portugues do Brasil, sem acentos.",
-            input: [{
-              role: "user",
-              content: [{
-                type: "input_text",
-                text: [
-                  `IMOVEL/PRODUTO: "${topico}"`,
-                  `ABORDAGEM: ${abordagem}`,
-                  "",
-                  "Crie um anuncio Meta Ads completo para captacao de leads ESPECIFICAMENTE sobre o imovel/produto acima.",
-                  "Todo o conteudo deve refletir diretamente o imovel/produto descrito.",
-                  "",
-                  "Campos a preencher:",
-                  "- nome_campanha: nome curto para identificar a campanha (max 50 chars)",
-                  "- titulo: titulo do anuncio chamativo (max 40 chars)",
-                  "- texto: texto principal do anuncio, 2 a 3 frases envolventes sobre o imovel",
-                  "- descricao: descricao curta de 1 frase",
-                  "- cta: SIGN_UP para cadastro, LEARN_MORE para saber mais, APPLY_NOW para solicitar",
-                  "- perguntas: 3 perguntas qualificadoras do formulario, uma por linha, relevantes ao imovel",
-                  "- interesses: 5 interesses de segmentacao separados por virgula, relevantes ao imovel",
-                  "- localidade: cidade ou regiao mencionada no imovel, ou vazio se nao mencionada",
-                  "- genero: vazio para todos, 1 para homens, 2 para mulheres",
-                  "- idade_min: idade minima do publico ideal (numero como texto)",
-                  "- idade_max: idade maxima do publico ideal (numero como texto)",
-                  "- obrigado_titulo: titulo da tela de confirmacao do formulario",
-                  "- obrigado_botao: texto do botao na confirmacao",
-                  "- obrigado_texto: mensagem de agradecimento personalizada para o imovel"
-                ].join("\n")
-              }]
-            }],
-            text: {
-              format: {
-                type: "json_schema",
-                name: "criador_campanha_ia",
-                strict: true,
-                schema: schemaCriador
-              }
-            }
-          })
-        });
+        const fallbackVariacao = {
+          titulo: "",
+          resumo: "",
+          acao_principal: "",
+          mensagens: [],
+          motivos: [],
+          campos: [
+            { chave: "nome_campanha", valor: topico.slice(0, 50) },
+            { chave: "titulo", valor: topico.slice(0, 40) },
+            { chave: "texto", valor: `Conheca ${topico}. Atendimento rapido e personalizado com corretor dedicado.` },
+            { chave: "descricao", valor: `${topico} — saiba mais com nosso corretor.` },
+            { chave: "cta", valor: "SIGN_UP" },
+            { chave: "perguntas", valor: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?" },
+            { chave: "interesses", valor: "imoveis, casa propria, financiamento imobiliario, apartamento, comprar imovel" },
+            { chave: "localidade", valor: "" },
+            { chave: "genero", valor: "" },
+            { chave: "idade_min", valor: "25" },
+            { chave: "idade_max", valor: "55" },
+            { chave: "obrigado_titulo", valor: "Recebemos seu contato!" },
+            { chave: "obrigado_botao", valor: "Ver mais" },
+            { chave: "obrigado_texto", valor: `Em breve nosso corretor vai entrar em contato sobre ${topico}.` }
+          ],
+          recomendacoes: []
+        };
 
-        const data: any = await res.json();
-
-        if (!res.ok) {
-          console.error(`CRIADOR CAMPANHA ${idx + 1} HTTP ${res.status}:`, JSON.stringify(data));
-          throw new Error(data?.error?.message || `HTTP ${res.status}`);
-        }
-
-        const textoResposta = extrairTextoRespostaOpenAI(data);
-
-        if (!textoResposta) {
-          console.error(`CRIADOR CAMPANHA ${idx + 1} sem texto:`, JSON.stringify(data));
-          throw new Error("Resposta vazia da OpenAI");
-        }
-
-        const parsed = JSON.parse(textoResposta);
-
-        await registrarUsoIA(
-          Number(user.id),
-          "criador_campanha",
-          "campanha",
-          null,
-          calcularCustoEstimadoOpenAI(data?.usage),
-          Number(data?.usage?.input_tokens || 0),
-          Number(data?.usage?.output_tokens || 0)
-        );
-
-        return parsed;
-      } catch (err) {
-        console.error(`CRIADOR CAMPANHA opcao ${idx + 1} FALLBACK:`, err);
-        return fallbackBase(abordagem);
-      }
-    };
-
-    const sugestoes = await Promise.all(
-      abordagens.map((abordagem, idx) => chamarIA(abordagem, idx))
+        return gerarSugestaoComercialOpenAI(objetivo, {}, fallbackVariacao);
+      })
     );
 
-    return c.json({ sugestoes });
+    const totalCusto =
+      resultados.reduce((s, r) => s + (r.custo_estimado || 0), 0);
+    const totalInput =
+      resultados.reduce((s, r) => s + Number(r.usage?.input_tokens || 0), 0);
+    const totalOutput =
+      resultados.reduce((s, r) => s + Number(r.usage?.output_tokens || 0), 0);
+
+    await registrarUsoIA(
+      Number(user.id),
+      "criador_campanha",
+      "campanha",
+      null,
+      totalCusto,
+      totalInput,
+      totalOutput
+    );
+
+    return c.json({
+      sugestoes: resultados.map(r => toVariacao(r.sugestao))
+    });
   } catch (err) {
     console.error("ERRO IA CRIADOR CAMPANHA:", err);
     return c.json({ error: "Erro ao gerar campanha com IA" }, 500);
