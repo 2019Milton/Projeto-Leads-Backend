@@ -3979,6 +3979,15 @@ app.get(
 
     const token = conn.rows[0].access_token;
 
+    // 🔥 PÁGINAS COM TERMOS DE LEAD ADS JÁ ACEITOS
+    const tosAceitos = await client.query(
+      "SELECT page_id FROM meta_tos_aceites WHERE usuario_id = $1",
+      [usuario_id]
+    );
+
+    const tosAceitas =
+      tosAceitos.rows.map((linha: any) => linha.page_id);
+
     // 🔥 USUÁRIO META
     const me = await fetch(
       `https://graph.facebook.com/v19.0/me?fields=id,name,picture&access_token=${token}`
@@ -4042,6 +4051,7 @@ app.get(
           moeda: conta.currency || null
         })),
         paginas: paginasSemConta,
+        tos_aceitas: tosAceitas,
         instagram: null,
         metricas: {
           campanhas: 0,
@@ -4281,6 +4291,8 @@ app.get(
 
       paginas,
 
+      tos_aceitas: tosAceitas,
+
       instagram,
 
       metricas: {
@@ -4317,6 +4329,49 @@ app.get(
         detalhe: err?.message || err
       }, 500);
     }
+});
+
+app.post("/meta/tos-aceitar", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const { page_id, usuario_id } = await c.req.json();
+
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    if (!page_id) {
+      return c.json({ error: "page_id obrigatório" }, 400);
+    }
+
+    await client.query(
+      `
+      INSERT INTO meta_tos_aceites (usuario_id, page_id)
+      VALUES ($1, $2)
+      ON CONFLICT (usuario_id, page_id) DO NOTHING
+      `,
+      [usuarioId, page_id]
+    );
+
+    return c.json({ sucesso: true });
+
+  } catch (err) {
+
+    console.error(
+      "ERRO TOS ACEITAR:",
+      err
+    );
+
+    return c.json({
+      error: "Erro ao registrar aceite dos termos"
+    }, 500);
+  }
 });
 
 app.post("/meta/direcionamento/interesses", authMiddleware, async (c) => {
@@ -4756,6 +4811,16 @@ await client.query(`
 await client.query(`
   CREATE INDEX IF NOT EXISTS idx_meta_oauth_states_hash
   ON meta_oauth_states (state_hash);
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_tos_aceites (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL,
+    page_id TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(usuario_id, page_id)
+  );
 `);
 
 await client.query(`
