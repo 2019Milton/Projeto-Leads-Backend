@@ -3556,17 +3556,23 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
 
     const token = conn.rows[0].access_token;
 
-    // 🔥 CONTA DE ANÚNCIOS
+    // 🔥 CONTA DE ANÚNCIOS — usa a selecionada ou a única disponível
+    let contaAnunciosId = conn.rows[0].conta_anuncios_id;
+
+    if (!contaAnunciosId) {
+      contaAnunciosId = await obterContaAnunciosSelecionadaIdUsuario(usuarioId);
+    }
+
     const contaAds =
       await obterContaAnuncios(
         token,
-        conn.rows[0].conta_anuncios_id
+        contaAnunciosId
       );
 
     if (!contaAds) {
 
       return c.json({
-        error: "Conta anúncios não encontrada"
+        error: "Conta de anúncios não encontrada. Selecione a conta Meta no painel de conexão."
       }, 400);
     }
 
@@ -3638,15 +3644,12 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
       hash
     });
 
-  } catch (err) {
+  } catch (err: any) {
 
-    console.error(
-      "UPLOAD IMAGEM:",
-      err
-    );
+    console.error("UPLOAD IMAGEM:", err?.message || err);
 
     return c.json({
-      error: "Erro upload imagem"
+      error: err?.message || "Erro upload imagem"
     }, 500);
   }
 });
