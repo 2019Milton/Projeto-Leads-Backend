@@ -519,6 +519,8 @@ async function listarPaginasComInstagram(
     `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,instagram_business_account{id,username,profile_picture_url}&access_token=${token}`
   ).then(r => r.json());
 
+  console.log("META /me/accounts resposta:", JSON.stringify({ total: pages.data?.length ?? 0, error: pages.error ?? null }));
+
   return Array.isArray(pages.data)
     ? pages.data.map((pagina: any) => ({
         ...pagina,
