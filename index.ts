@@ -8246,132 +8246,119 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       return c.json({ error: bloqueio }, 403);
     }
 
-    const apiKey = Bun.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "sem_chave" });
-    }
-
-    const modelo =
-      textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-4o-mini";
-
-    const systemPrompt =
-      `Voce e um especialista em marketing digital para imobiliarias brasileiras.\n` +
-      `Retorne SOMENTE um JSON valido com exatamente esta estrutura (sem texto fora do JSON):\n` +
-      `{\n` +
-      `  "variacao_1": {\n` +
-      `    "nome_campanha": "...",\n` +
-      `    "titulo": "headline ate 40 chars",\n` +
-      `    "texto": "corpo do anuncio 2-3 frases",\n` +
-      `    "descricao": "frase complementar curta",\n` +
-      `    "cta": "SIGN_UP",\n` +
-      `    "perguntas": "Pergunta 1?\\nPergunta 2?\\nPergunta 3?",\n` +
-      `    "interesses": "interesse1, interesse2, interesse3",\n` +
-      `    "localidade": "cidade ou regiao ou vazio",\n` +
-      `    "genero": "",\n` +
-      `    "idade_min": "25",\n` +
-      `    "idade_max": "55",\n` +
-      `    "obrigado_titulo": "titulo pos-cadastro",\n` +
-      `    "obrigado_botao": "texto do botao",\n` +
-      `    "obrigado_texto": "mensagem de confirmacao"\n` +
-      `  },\n` +
-      `  "variacao_2": { mesma estrutura },\n` +
-      `  "variacao_3": { mesma estrutura }\n` +
-      `}`;
-
-    const userPrompt =
-      `Crie 3 campanhas Meta Ads COMPLETAMENTE DIFERENTES para captar leads de:\n\n"${topico}"\n\n` +
-      `variacao_1 — URGENCIA: use urgencia, escassez, gatilho de perda. cta: SIGN_UP\n` +
-      `variacao_2 — EMOCIONAL: sonho realizado, qualidade de vida, sentimento de conquista. cta: LEARN_MORE\n` +
-      `variacao_3 — RACIONAL: diferenciais concretos, beneficios especificos, custo-beneficio. cta: APPLY_NOW\n\n` +
-      `REGRAS:\n` +
-      `- O titulo de cada opcao deve ser diferente e usar o contexto "${topico}" de forma criativa\n` +
-      `- O texto deve ser especifico ao produto/local descrito, nao generico\n` +
-      `- As perguntas devem ser relevantes ao tipo de produto descrito\n` +
-      `- Os interesses devem refletir o perfil do comprador desse produto\n` +
-      `- Se o contexto mencionar uma cidade ou regiao, use em localidade\n` +
-      `- idade_min e idade_max como string numerica (ex: "28", "50")`;
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
+    const abordagens = [
+      {
+        label: "URGENCIA",
+        instrucao: "Use urgencia, escassez e gatilho de perda. Titulo impactante com senso de oportunidade limitada.",
+        cta: "SIGN_UP"
       },
-      body: JSON.stringify({
-        model: modelo,
-        response_format: { type: "json_object" },
-        temperature: 0.8,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ]
-      })
-    });
-
-    const data: any = await response.json();
-
-    if (!response.ok) {
-      console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "model:", modelo);
-      return c.json({
-        sugestoes: fallbackVariacoes(topico),
-        _origem: "api_error",
-        _erro: data?.error?.message
-      });
-    }
-
-    const texto = data?.choices?.[0]?.message?.content || "";
-    if (!texto) {
-      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "resposta_vazia" });
-    }
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(texto);
-    } catch {
-      console.error("CRIADOR CAMPANHA JSON PARSE ERROR:", texto.slice(0, 200));
-      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "json_invalido" });
-    }
-
-    const normalizar = (v: any) => ({
-      nome_campanha: v?.nome_campanha || topico.slice(0, 50),
-      titulo: v?.titulo || "",
-      texto: v?.texto || "",
-      descricao: v?.descricao || "",
-      cta: v?.cta || "SIGN_UP",
-      perguntas: v?.perguntas || "",
-      interesses: v?.interesses || "",
-      localidade: v?.localidade || "",
-      genero: v?.genero || "",
-      idade_min: v?.idade_min || "25",
-      idade_max: v?.idade_max || "55",
-      obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
-      obrigado_botao: v?.obrigado_botao || "Ver mais",
-      obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
-    });
-
-    const sugestoes = [
-      normalizar(parsed.variacao_1),
-      normalizar(parsed.variacao_2),
-      normalizar(parsed.variacao_3)
+      {
+        label: "EMOCIONAL",
+        instrucao: "Foque no sonho realizado, qualidade de vida e conquista pessoal. Linguagem aspiracional e envolvente.",
+        cta: "LEARN_MORE"
+      },
+      {
+        label: "RACIONAL",
+        instrucao: "Destaque diferenciais concretos, beneficios especificos e custo-beneficio. Linguagem objetiva e direta.",
+        cta: "APPLY_NOW"
+      }
     ];
 
-    const usageNorm = {
-      input_tokens: Number(data?.usage?.prompt_tokens || 0),
-      output_tokens: Number(data?.usage?.completion_tokens || 0)
-    };
-    const custo = calcularCustoEstimadoOpenAI(usageNorm);
+    const getCampo = (sugestao: any, chave: string) =>
+      (sugestao?.campos || []).find(
+        (c: any) => String(c?.chave || "").toLowerCase() === chave.toLowerCase()
+      )?.valor || "";
+
+    const toVariacao = (sugestao: any, cta: string) => ({
+      nome_campanha:
+        getCampo(sugestao, "nome_campanha") ||
+        String(sugestao?.titulo || "").slice(0, 50) ||
+        topico.slice(0, 50),
+      titulo: sugestao?.titulo || "",
+      texto: sugestao?.resumo || "",
+      descricao: sugestao?.acao_principal || "",
+      cta: getCampo(sugestao, "cta") || cta,
+      perguntas:
+        getCampo(sugestao, "perguntas") ||
+        (sugestao?.mensagens || []).slice(0, 3).join("\n"),
+      interesses: getCampo(sugestao, "interesses") || "",
+      localidade: getCampo(sugestao, "localidade") || "",
+      genero: getCampo(sugestao, "genero") || "",
+      idade_min: getCampo(sugestao, "idade_min") || "25",
+      idade_max: getCampo(sugestao, "idade_max") || "55",
+      obrigado_titulo:
+        getCampo(sugestao, "obrigado_titulo") || "Recebemos seu contato!",
+      obrigado_botao:
+        getCampo(sugestao, "obrigado_botao") || "Ver mais",
+      obrigado_texto:
+        getCampo(sugestao, "obrigado_texto") ||
+        `Em breve entraremos em contato sobre ${topico}.`
+    });
+
+    const resultados = [];
+    let totalCusto = 0;
+    let totalInput = 0;
+    let totalOutput = 0;
+
+    for (const ab of abordagens) {
+      const objetivo =
+        `Escreva um anuncio Meta Ads (variacao ${abordagens.indexOf(ab) + 1} de 3) ` +
+        `com abordagem ${ab.label} para o produto/contexto: "${topico}". ` +
+        `${ab.instrucao} ` +
+        `Preencha os campos assim: ` +
+        `titulo = headline criativa sobre o produto (max 40 chars), ` +
+        `resumo = texto do anuncio com 2 ou 3 frases especificas sobre "${topico}" (NAO use frases genericas), ` +
+        `acao_principal = descricao curta e persuasiva (max 90 chars), ` +
+        `mensagens = array com 3 perguntas qualificadoras relevantes para o tipo de produto, ` +
+        `campos inclua: cta="${ab.cta}", interesses=lista de interesses do publico ideal separados por virgula, ` +
+        `localidade=cidade ou regiao mencionada no contexto (vazio se nao houver), ` +
+        `genero=vazio, idade_min=idade minima do publico, idade_max=idade maxima, ` +
+        `nome_campanha=nome interno da campanha`;
+
+      const fallback = sugestaoIAFallback(
+        topico.slice(0, 40),
+        `Conheca ${topico}.`,
+        `${topico} com atendimento especializado.`,
+        [
+          `Qual regiao voce procura?`,
+          `Qual faixa de investimento?`,
+          `Pretende financiar?`
+        ],
+        [],
+        [
+          { chave: "cta", valor: ab.cta },
+          { chave: "interesses", valor: "imoveis, casa propria, financiamento imobiliario" },
+          { chave: "localidade", valor: "" },
+          { chave: "genero", valor: "" },
+          { chave: "idade_min", valor: "25" },
+          { chave: "idade_max", valor: "55" },
+          { chave: "nome_campanha", valor: topico.slice(0, 50) }
+        ],
+        []
+      );
+
+      const r = await gerarSugestaoComercialOpenAI(objetivo, { produto: topico }, fallback);
+
+      totalCusto += r.custo_estimado || 0;
+      totalInput += Number(r.usage?.input_tokens || 0);
+      totalOutput += Number(r.usage?.output_tokens || 0);
+      resultados.push({ sugestao: r.sugestao, cta: ab.cta, origem: r.sugestao?.origem });
+    }
 
     await registrarUsoIA(
       Number(user.id),
       "criador_campanha",
       "campanha",
       null,
-      custo,
-      usageNorm.input_tokens,
-      usageNorm.output_tokens
+      totalCusto,
+      totalInput,
+      totalOutput
     );
 
-    return c.json({ sugestoes, _origem: "openai" });
+    const sugestoes = resultados.map(r => toVariacao(r.sugestao, r.cta));
+    const origens = resultados.map(r => r.origem);
+
+    return c.json({ sugestoes, _origem: origens });
   } catch (err) {
     console.error("CRIADOR CAMPANHA ERRO:", err);
     return c.json({ sugestoes: fallbackVariacoes(topico) });
