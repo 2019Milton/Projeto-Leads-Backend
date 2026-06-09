@@ -3616,7 +3616,8 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       cta,
       campanha_nome,
       configuracoes_avancadas,
-      imageHash
+      imageHash,
+      imageHashes
     } = await c.req.json();
 
     const usuarioId =
@@ -3698,6 +3699,43 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       "Entre em contato agora";
 
     // 🔥 CRIATIVO
+    const hashes: string[] =
+      Array.isArray(imageHashes) && imageHashes.length > 0
+        ? imageHashes
+        : imageHash
+        ? [imageHash]
+        : [];
+
+    const isCarrossel = hashes.length > 1;
+
+    const ctaType = cta || "LEARN_MORE";
+
+    const linkDataBase: Record<string, any> = {
+      message: texto || "Quer mais clientes? 🚀"
+    };
+
+    if (isCarrossel) {
+      linkDataBase.child_attachments = hashes.map((hash, i) => ({
+        link: linkDestino,
+        image_hash: hash,
+        name: i === 0 ? tituloAnuncio : `Slide ${i + 1}`,
+        call_to_action: {
+          type: ctaType,
+          value: { lead_gen_form_id: form_id }
+        }
+      }));
+      linkDataBase.multi_share_end_card = false;
+    } else {
+      linkDataBase.link = linkDestino;
+      linkDataBase.image_hash = hashes[0] || imageHash;
+      linkDataBase.name = tituloAnuncio;
+      linkDataBase.description = descricaoAnuncio;
+      linkDataBase.call_to_action = {
+        type: ctaType,
+        value: { lead_gen_form_id: form_id }
+      };
+    }
+
     const creative = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
       {
@@ -3712,34 +3750,8 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
           name: `Criativo Leads ${Date.now()}`,
 
           object_story_spec: {
-
             page_id,
-
-            link_data: {
-
-              link: linkDestino,
-
-              image_hash: imageHash,
-
-              message:
-                texto ||
-                "Quer mais clientes? 🚀",
-
-              name: tituloAnuncio,
-
-              description: descricaoAnuncio,
-
-              call_to_action: {
-
-                type:
-                  cta ||
-                  "LEARN_MORE",
-
-                value: {
-                  lead_gen_form_id: form_id
-                }
-              }
-            }
+            link_data: linkDataBase
           },
 
           access_token: token
