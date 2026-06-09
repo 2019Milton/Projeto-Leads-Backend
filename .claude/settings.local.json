@@ -10,7 +10,8 @@
       "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\.bun\\\\bin\" -ErrorAction SilentlyContinue; Get-ChildItem \"C:\\\\Users\\\\perei\\\\.bun\\\\bin\" -ErrorAction SilentlyContinue)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "WebSearch"
     ]
   }
 }
