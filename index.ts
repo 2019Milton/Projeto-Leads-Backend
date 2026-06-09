@@ -8251,10 +8251,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "sem_chave" });
     }
 
-    const modelo =
-      textoOpcional(Bun.env.OPENAI_MODEL_CRIADOR) ||
-      textoOpcional(Bun.env.OPENAI_MODEL) ||
-      "gpt-4o-mini";
+    const modelo = "gpt-4o-mini";
 
     const prompt =
       `Produto/empreendimento: "${topico}"\n\n` +
