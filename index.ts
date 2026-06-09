@@ -7560,19 +7560,27 @@ app.get("/admin/ia", authMiddleware, async (c) => {
       ORDER BY u.plano_ativado_em DESC NULLS LAST, u.id ASC
     `);
 
-    const configAtual =
-      config.rows[0] || {};
+    const configAtual = config.rows[0] || {};
+    const modeloRailway =
+      textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-5-mini";
     const modeloAtivo =
-      textoOpcional(Bun.env.OPENAI_MODEL) ||
-      "gpt-5-mini";
+      textoOpcional(configAtual.modelo) || modeloRailway;
+
+    const modelosDisponiveisRaw =
+      textoOpcional(Bun.env.OPENAI_MODELOS_DISPONIVEIS) || modeloRailway;
+    const modelos_disponiveis = modelosDisponiveisRaw
+      .split(",")
+      .map((m: string) => m.trim())
+      .filter(Boolean);
 
     return c.json({
       config: {
         ...configAtual,
         modelo: modeloAtivo,
-        modelo_origem: "railway",
+        modelo_railway: modeloRailway,
         chave_configurada: Boolean(Bun.env.OPENAI_API_KEY)
       },
+      modelos_disponiveis,
       resumo: resumo.rows[0],
       usuarios: usuarios.rows
     });
@@ -7598,7 +7606,7 @@ app.put("/admin/ia/config", authMiddleware, async (c) => {
       UPDATE ia_config
       SET
         provedor = COALESCE($1, provedor),
-        modelo = modelo,
+        modelo = COALESCE($9, modelo),
         status = COALESCE($2, status),
         assinatura_status = COALESCE($3, assinatura_status),
         plano_api = COALESCE($4, plano_api),
@@ -7624,7 +7632,8 @@ app.put("/admin/ia/config", authMiddleware, async (c) => {
         Number.isFinite(Number(body.custo_mensal_contratado))
           ? Number(body.custo_mensal_contratado)
           : null,
-        body.observacoes || null
+        body.observacoes || null,
+        textoOpcional(body.modelo) || null
       ]
     );
 
@@ -8251,7 +8260,19 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "sem_chave" });
     }
 
-    const modelo = "gpt-4o-mini";
+    const iaConf = await client.query(
+      "SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1"
+    );
+    const modelo =
+      textoOpcional(iaConf.rows[0]?.modelo) ||
+      textoOpcional(Bun.env.OPENAI_MODEL) ||
+      "gpt-5-mini";
+
+    const usarResponsesAPI =
+      modelo.startsWith("gpt-5") ||
+      modelo.startsWith("o1") ||
+      modelo.startsWith("o3") ||
+      modelo.startsWith("o4");
 
     const prompt =
       `Produto/empreendimento: "${topico}"\n\n` +
@@ -8281,37 +8302,44 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Retorne SOMENTE JSON valido sem texto antes ou depois:\n` +
       `{"v1":{...todos os campos...},"v2":{...},"v3":{...}}`;
 
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: modelo,
-        temperature: 1.0,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content:
-              "Voce e um redator publicitario criativo especializado em Meta Ads para imoveis no Brasil. " +
-              "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
-              "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
-              "Retorne SOMENTE JSON valido."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ]
-      })
-    });
+    const systemMsg =
+      "Voce e um redator publicitario criativo especializado em Meta Ads para imoveis no Brasil. " +
+      "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
+      "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
+      "Retorne SOMENTE JSON valido.";
+
+    const respBody = usarResponsesAPI
+      ? {
+          model: modelo,
+          temperature: 1.0,
+          instructions: systemMsg,
+          input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }]
+        }
+      : {
+          model: modelo,
+          temperature: 1.0,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: systemMsg },
+            { role: "user", content: prompt }
+          ]
+        };
+
+    const resp = await fetch(
+      usarResponsesAPI
+        ? OPENAI_RESPONSES_URL
+        : "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(respBody)
+      }
+    );
 
     const data: any = await resp.json();
 
     if (!resp.ok) {
-      console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+      console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "| model:", modelo, "| responses:", usarResponsesAPI);
       return c.json({
         sugestoes: fallbackVariacoes(topico),
         _origem: "api_error",
@@ -8319,7 +8347,9 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       });
     }
 
-    const textoResposta: string = data?.choices?.[0]?.message?.content || "";
+    const textoResposta: string = usarResponsesAPI
+      ? extrairTextoRespostaOpenAI(data)
+      : (data?.choices?.[0]?.message?.content || "");
     if (!textoResposta) {
       return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "resposta_vazia" });
     }
@@ -8356,8 +8386,12 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     ];
 
     const usageNorm = {
-      input_tokens: Number(data?.usage?.prompt_tokens || 0),
-      output_tokens: Number(data?.usage?.completion_tokens || 0)
+      input_tokens: Number(
+        data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0
+      ),
+      output_tokens: Number(
+        data?.usage?.output_tokens || data?.usage?.completion_tokens || 0
+      )
     };
     const custo = calcularCustoEstimadoOpenAI(usageNorm);
     await registrarUsoIA(
