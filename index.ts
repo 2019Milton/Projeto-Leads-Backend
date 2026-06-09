@@ -1746,19 +1746,7 @@ async function gerarAnaliseIAOpenAI(
   lead: any,
   ml: any = null
 ) {
-  const apiKey =
-    Bun.env.OPENAI_API_KEY;
-
-  if (!apiKey) {
-    return null;
-  }
-
-  const modelo =
-    textoOpcional(Bun.env.OPENAI_MODEL) ||
-    "gpt-5-mini";
-
-  const fallback =
-    gerarAnaliseIAOuroLead(lead, ml);
+  const fallback = gerarAnaliseIAOuroLead(lead, ml);
 
   const payloadLead = {
     id: lead?.id,
@@ -1781,143 +1769,158 @@ async function gerarAnaliseIAOpenAI(
     ml
   };
 
-  const response = await fetch(
-    OPENAI_RESPONSES_URL,
-    {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: modelo,
-        instructions:
-          "Voce e uma IA comercial para uma plataforma imobiliaria. Analise o lead, priorize a acao do corretor e, quando o status for perdido, foque em recuperacao. Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso.",
-        input: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: JSON.stringify({
-                  lead: payloadLead,
-                  objetivo:
-                    "Gerar analise comercial, proxima acao, mensagem de WhatsApp e recuperacao quando aplicavel."
-                })
-              }
-            ]
-          }
-        ],
-        text: {
-          format: {
-            type: "json_schema",
-            name: "analise_ia_lead",
-            strict: true,
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              required: [
-                "prioridade",
-                "resumo",
-                "proxima_acao",
-                "mensagem_whatsapp",
-                "perguntas_qualificacao",
-                "sinais",
-                "riscos",
-                "explicacao",
-                "recuperacao"
-              ],
-              properties: {
-                prioridade: {
-                  type: "string",
-                  enum: ["alta", "media", "baixa"]
-                },
-                resumo: {
-                  type: "string"
-                },
-                proxima_acao: {
-                  type: "string"
-                },
-                mensagem_whatsapp: {
-                  type: "string"
-                },
-                perguntas_qualificacao: {
-                  type: "array",
-                  items: { type: "string" }
-                },
-                sinais: {
-                  type: "array",
-                  items: { type: "string" }
-                },
-                riscos: {
-                  type: "array",
-                  items: { type: "string" }
-                },
-                explicacao: {
-                  type: "string"
-                },
-                recuperacao: {
+  const iaConf = await buscarConfigIA();
+  const systemMsg =
+    "Voce e uma IA comercial para uma plataforma imobiliaria. Analise o lead, priorize a acao do corretor e, quando o status for perdido, foque em recuperacao. Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso.";
+  const schemaDescricao =
+    `Retorne SOMENTE JSON valido com esta estrutura exata (sem texto antes ou depois):
+{"prioridade":"alta"|"media"|"baixa","resumo":"string","proxima_acao":"string","mensagem_whatsapp":"string","perguntas_qualificacao":["string"],"sinais":["string"],"riscos":["string"],"explicacao":"string","recuperacao":{"chance":"alta"|"media"|"baixa"|"nao_aplicavel","motivo_perda":"string","recomendacao":"string"}}`;
+  const userText = JSON.stringify({
+    lead: payloadLead,
+    objetivo: "Gerar analise comercial, proxima acao, mensagem de WhatsApp e recuperacao quando aplicavel."
+  });
+
+  const parseAnalise = (texto: string) => {
+    const limpo = texto.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    return normalizarAnaliseOpenAI(JSON.parse(limpo), fallback);
+  };
+
+  // ── Tenta OpenAI ──────────────────────────────────────────────
+  const openaiKey = Bun.env.OPENAI_API_KEY;
+  if (openaiKey) {
+    try {
+      const modelo =
+        textoOpcional(iaConf?.modelo) ||
+        textoOpcional(Bun.env.OPENAI_MODEL) ||
+        "gpt-5-mini";
+      const usarResponsesAPI =
+        modelo.startsWith("gpt-5") || modelo.startsWith("o1") ||
+        modelo.startsWith("o3") || modelo.startsWith("o4");
+
+      const respBody = usarResponsesAPI
+        ? {
+            model: modelo,
+            instructions: systemMsg,
+            input: [{ role: "user", content: [{ type: "input_text", text: userText }] }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "analise_ia_lead",
+                strict: true,
+                schema: {
                   type: "object",
                   additionalProperties: false,
-                  required: [
-                    "chance",
-                    "motivo_perda",
-                    "recomendacao"
-                  ],
+                  required: ["prioridade","resumo","proxima_acao","mensagem_whatsapp","perguntas_qualificacao","sinais","riscos","explicacao","recuperacao"],
                   properties: {
-                    chance: {
-                      type: "string",
-                      enum: [
-                        "alta",
-                        "media",
-                        "baixa",
-                        "nao_aplicavel"
-                      ]
-                    },
-                    motivo_perda: {
-                      type: "string"
-                    },
-                    recomendacao: {
-                      type: "string"
+                    prioridade: { type: "string", enum: ["alta","media","baixa"] },
+                    resumo: { type: "string" },
+                    proxima_acao: { type: "string" },
+                    mensagem_whatsapp: { type: "string" },
+                    perguntas_qualificacao: { type: "array", items: { type: "string" } },
+                    sinais: { type: "array", items: { type: "string" } },
+                    riscos: { type: "array", items: { type: "string" } },
+                    explicacao: { type: "string" },
+                    recuperacao: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["chance","motivo_perda","recomendacao"],
+                      properties: {
+                        chance: { type: "string", enum: ["alta","media","baixa","nao_aplicavel"] },
+                        motivo_perda: { type: "string" },
+                        recomendacao: { type: "string" }
+                      }
                     }
                   }
                 }
               }
-            }
+            },
+            max_output_tokens: 1200
           }
-        },
-        max_output_tokens: 1200
-      })
+        : {
+            model: modelo,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: systemMsg + "\n\n" + schemaDescricao },
+              { role: "user", content: userText }
+            ],
+            max_tokens: 1200
+          };
+
+      const response = await fetch(
+        usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
+        {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify(respBody)
+        }
+      );
+      const data: any = await response.json();
+
+      if (response.ok) {
+        const texto = usarResponsesAPI
+          ? extrairTextoRespostaOpenAI(data)
+          : (data?.choices?.[0]?.message?.content || "");
+        if (texto) {
+          return {
+            analise: parseAnalise(texto),
+            usage: data?.usage || {},
+            custo_estimado: calcularCustoEstimadoOpenAI(data?.usage),
+            modelo,
+            provider: "openai"
+          };
+        }
+      } else {
+        console.error("ANALISE OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+      }
+    } catch (err) {
+      console.error("ANALISE OPENAI EXCEPTION:", err);
     }
-  );
-
-  const data =
-    await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.error?.message ||
-      "Erro ao chamar OpenAI"
-    );
   }
 
-  const texto =
-    extrairTextoRespostaOpenAI(data);
+  // ── Fallback: Anthropic ───────────────────────────────────────
+  const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) {
+    try {
+      const anthropicModelo =
+        textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: anthropicModelo,
+          max_tokens: 1200,
+          system: systemMsg + "\n\n" + schemaDescricao,
+          messages: [{ role: "user", content: userText }]
+        })
+      });
+      const data: any = await resp.json();
 
-  const analiseModelo =
-    JSON.parse(texto);
+      if (resp.ok) {
+        const texto = data?.content?.[0]?.text || "";
+        if (texto) {
+          const inTok = Number(data?.usage?.input_tokens || 0);
+          const outTok = Number(data?.usage?.output_tokens || 0);
+          return {
+            analise: parseAnalise(texto),
+            usage: { input_tokens: inTok, output_tokens: outTok },
+            custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }),
+            modelo: anthropicModelo,
+            provider: "anthropic"
+          };
+        }
+      } else {
+        console.error("ANALISE ANTHROPIC ERROR:", data?.error?.message);
+      }
+    } catch (err) {
+      console.error("ANALISE ANTHROPIC EXCEPTION:", err);
+    }
+  }
 
-  return {
-    analise:
-      normalizarAnaliseOpenAI(
-        analiseModelo,
-        fallback
-      ),
-    usage: data?.usage || {},
-    custo_estimado:
-      calcularCustoEstimadoOpenAI(data?.usage),
-    modelo
-  };
+  return null;
 }
 
 function aplicarMLAoScoreLead(lead: any) {
@@ -2113,137 +2116,149 @@ async function gerarSugestaoComercialOpenAI(
   dados: any,
   fallback: any
 ) {
-  const apiKey =
-    Bun.env.OPENAI_API_KEY;
+  const iaConf = await buscarConfigIA();
+  const systemMsg =
+    "Voce e uma IA comercial para corretores imobiliarios. Gere respostas curtas, naturais, praticas e prontas para uso. Responda somente no JSON solicitado, em portugues do Brasil.";
+  const schemaDescricao =
+    `Retorne SOMENTE JSON valido com esta estrutura exata (sem texto antes ou depois):
+{"titulo":"string","resumo":"string","acao_principal":"string","mensagens":["string"],"motivos":["string"],"campos":[{"chave":"string","valor":"string"}],"recomendacoes":["string"]}`;
+  const userText = JSON.stringify({ objetivo, dados });
 
-  if (!apiKey) {
-    return {
-      sugestao: fallback,
-      usage: null,
-      custo_estimado: IA_CUSTO_ESTIMADO_PADRAO
-    };
-  }
+  const parseSugestao = (texto: string) => {
+    const limpo = texto.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    return { ...fallback, ...JSON.parse(limpo), disponivel: true };
+  };
 
-  const modelo =
-    textoOpcional(Bun.env.OPENAI_MODEL) ||
-    "gpt-5-mini";
+  // ── Tenta OpenAI ──────────────────────────────────────────────
+  const openaiKey = Bun.env.OPENAI_API_KEY;
+  if (openaiKey) {
+    try {
+      const modelo =
+        textoOpcional(iaConf?.modelo) ||
+        textoOpcional(Bun.env.OPENAI_MODEL) ||
+        "gpt-5-mini";
+      const usarResponsesAPI =
+        modelo.startsWith("gpt-5") || modelo.startsWith("o1") ||
+        modelo.startsWith("o3") || modelo.startsWith("o4");
 
-  try {
-    const response = await fetch(
-      OPENAI_RESPONSES_URL,
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: modelo,
-          instructions:
-            "Voce e uma IA comercial para corretores imobiliarios. Gere respostas curtas, naturais, praticas e prontas para uso. Responda somente no JSON solicitado, em portugues do Brasil.",
-          input: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "input_text",
-                  text: JSON.stringify({
-                    objetivo,
-                    dados
-                  })
-                }
-              ]
-            }
-          ],
-          text: {
-            format: {
-              type: "json_schema",
-              name: "sugestao_comercial_ia",
-              strict: true,
-              schema: {
-                type: "object",
-                additionalProperties: false,
-                required: [
-                  "titulo",
-                  "resumo",
-                  "acao_principal",
-                  "mensagens",
-                  "motivos",
-                  "campos",
-                  "recomendacoes"
-                ],
-                properties: {
-                  titulo: { type: "string" },
-                  resumo: { type: "string" },
-                  acao_principal: { type: "string" },
-                  mensagens: {
-                    type: "array",
-                    items: { type: "string" }
-                  },
-                  motivos: {
-                    type: "array",
-                    items: { type: "string" }
-                  },
-                  campos: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      additionalProperties: false,
-                      required: ["chave", "valor"],
-                      properties: {
-                        chave: { type: "string" },
-                        valor: { type: "string" }
+      const respBody = usarResponsesAPI
+        ? {
+            model: modelo,
+            instructions: systemMsg,
+            input: [{ role: "user", content: [{ type: "input_text", text: userText }] }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "sugestao_comercial_ia",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["titulo","resumo","acao_principal","mensagens","motivos","campos","recomendacoes"],
+                  properties: {
+                    titulo: { type: "string" },
+                    resumo: { type: "string" },
+                    acao_principal: { type: "string" },
+                    mensagens: { type: "array", items: { type: "string" } },
+                    motivos: { type: "array", items: { type: "string" } },
+                    campos: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["chave","valor"],
+                        properties: { chave: { type: "string" }, valor: { type: "string" } }
                       }
-                    }
-                  },
-                  recomendacoes: {
-                    type: "array",
-                    items: { type: "string" }
+                    },
+                    recomendacoes: { type: "array", items: { type: "string" } }
                   }
                 }
               }
             }
           }
-        })
-      }
-    );
+        : {
+            model: modelo,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: systemMsg + "\n\n" + schemaDescricao },
+              { role: "user", content: userText }
+            ]
+          };
 
-    const data: any =
-      await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        data?.error?.message ||
-        "Erro ao chamar OpenAI"
+      const response = await fetch(
+        usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
+        {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify(respBody)
+        }
       );
+      const data: any = await response.json();
+
+      if (response.ok) {
+        const texto = usarResponsesAPI
+          ? extrairTextoRespostaOpenAI(data)
+          : (data?.choices?.[0]?.message?.content || "");
+        if (texto) {
+          return {
+            sugestao: parseSugestao(texto),
+            usage: data?.usage || null,
+            custo_estimado: calcularCustoEstimadoOpenAI(data?.usage),
+            provider: "openai"
+          };
+        }
+      } else {
+        console.error("SUGESTAO OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+      }
+    } catch (err) {
+      console.error("SUGESTAO OPENAI EXCEPTION:", err);
     }
-
-    const texto =
-      extrairTextoRespostaOpenAI(data);
-
-    if (!texto) {
-      throw new Error("Resposta vazia da OpenAI");
-    }
-
-    return {
-      sugestao: {
-        ...fallback,
-        ...JSON.parse(texto),
-        disponivel: true,
-        origem: "openai"
-      },
-      usage: data?.usage || null,
-      custo_estimado:
-        calcularCustoEstimadoOpenAI(data?.usage)
-    };
-  } catch (err) {
-    console.error("OPENAI SUGESTAO FALLBACK:", err);
-    return {
-      sugestao: fallback,
-      usage: null,
-      custo_estimado: IA_CUSTO_ESTIMADO_PADRAO
-    };
   }
+
+  // ── Fallback: Anthropic ───────────────────────────────────────
+  const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) {
+    try {
+      const anthropicModelo =
+        textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: anthropicModelo,
+          max_tokens: 1200,
+          system: systemMsg + "\n\n" + schemaDescricao,
+          messages: [{ role: "user", content: userText }]
+        })
+      });
+      const data: any = await resp.json();
+
+      if (resp.ok) {
+        const texto = data?.content?.[0]?.text || "";
+        if (texto) {
+          const inTok = Number(data?.usage?.input_tokens || 0);
+          const outTok = Number(data?.usage?.output_tokens || 0);
+          return {
+            sugestao: parseSugestao(texto),
+            usage: { input_tokens: inTok, output_tokens: outTok },
+            custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }),
+            provider: "anthropic"
+          };
+        }
+      } else {
+        console.error("SUGESTAO ANTHROPIC ERROR:", data?.error?.message);
+      }
+    } catch (err) {
+      console.error("SUGESTAO ANTHROPIC EXCEPTION:", err);
+    }
+  }
+
+  // Sem IA disponível
+  return { sugestao: fallback, usage: null, custo_estimado: IA_CUSTO_ESTIMADO_PADRAO, provider: "fallback" };
 }
 
 
@@ -7329,10 +7344,10 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
       "analise_lead",
       "lead",
       lead.id,
-      usoIA?.custo_estimado ||
-        IA_CUSTO_ESTIMADO_PADRAO,
+      usoIA?.custo_estimado || IA_CUSTO_ESTIMADO_PADRAO,
       Number(usoIA?.usage?.input_tokens || 0),
-      Number(usoIA?.usage?.output_tokens || 0)
+      Number(usoIA?.usage?.output_tokens || 0),
+      usoIA?.provider || "openai"
     );
 
     return c.json({ analise });
@@ -8172,7 +8187,8 @@ app.post("/ia/leads/:id/sugestao", authMiddleware, async (c) => {
       lead.id,
       usoIA.custo_estimado,
       Number(usoIA.usage?.input_tokens || 0),
-      Number(usoIA.usage?.output_tokens || 0)
+      Number(usoIA.usage?.output_tokens || 0),
+      usoIA.provider || "openai"
     );
 
     return c.json({
@@ -8264,7 +8280,8 @@ app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
       ids.join(","),
       usoIA.custo_estimado,
       Number(usoIA.usage?.input_tokens || 0),
-      Number(usoIA.usage?.output_tokens || 0)
+      Number(usoIA.usage?.output_tokens || 0),
+      usoIA.provider || "openai"
     );
 
     return c.json({ sugestao: usoIA.sugestao });
@@ -8343,7 +8360,8 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
       user.id,
       usoIA.custo_estimado,
       Number(usoIA.usage?.input_tokens || 0),
-      Number(usoIA.usage?.output_tokens || 0)
+      Number(usoIA.usage?.output_tokens || 0),
+      usoIA.provider || "openai"
     );
 
     return c.json({ sugestao: usoIA.sugestao });
@@ -8638,7 +8656,8 @@ app.post("/ia/campanhas/analise", authMiddleware, async (c) => {
       campanha.id || campanha.campaign_id || null,
       usoIA.custo_estimado,
       Number(usoIA.usage?.input_tokens || 0),
-      Number(usoIA.usage?.output_tokens || 0)
+      Number(usoIA.usage?.output_tokens || 0),
+      usoIA.provider || "openai"
     );
 
     return c.json({ sugestao: usoIA.sugestao });
