@@ -8252,7 +8252,9 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     }
 
     const modelo =
-      textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-4o-mini";
+      textoOpcional(Bun.env.OPENAI_MODEL_CRIADOR) ||
+      textoOpcional(Bun.env.OPENAI_MODEL) ||
+      "gpt-4o-mini";
 
     const prompt =
       `Produto/empreendimento: "${topico}"\n\n` +
