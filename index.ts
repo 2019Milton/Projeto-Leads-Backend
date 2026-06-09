@@ -8207,6 +8207,13 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 });
 
 app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
+  const body =
+    await c.req.json().catch(() => ({}));
+  const contexto =
+    textoOpcional(body.contexto) || "";
+  const topico =
+    contexto || "imovel imobiliario";
+
   try {
     const user: any = c.get("user");
     const limite =
@@ -8221,155 +8228,136 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       return c.json({ error: bloqueio }, 403);
     }
 
-    const body =
-      await c.req.json().catch(() => ({}));
-    const contexto =
-      textoOpcional(body.contexto) || "";
+    const extrairCampo = (sugestao: any, chave: string): string =>
+      (sugestao?.campos || []).find(
+        (item: any) => String(item.chave || "").toLowerCase() === chave
+      )?.valor || "";
 
-    const topico =
-      contexto || "imovel imobiliario";
-
-    const fallbackVariacao = (n: number) => ({
-      nome_campanha: topico.slice(0, 50),
-      titulo: topico.slice(0, 40),
-      texto: `Conheca ${topico}. Atendimento rapido e personalizado com corretor dedicado.`,
-      descricao: `${topico} — saiba mais com nosso corretor.`,
-      cta: "SIGN_UP",
-      perguntas: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?",
-      interesses: "imoveis, casa propria, financiamento imobiliario, apartamento, comprar imovel",
-      localidade: "",
-      genero: "",
-      idade_min: "25",
-      idade_max: "55",
-      obrigado_titulo: "Recebemos seu contato!",
-      obrigado_botao: "Ver mais",
-      obrigado_texto: `Em breve nosso corretor vai entrar em contato sobre ${topico}.`
+    const toVariacao = (sugestao: any) => ({
+      nome_campanha:
+        extrairCampo(sugestao, "nome_campanha") ||
+        sugestao.titulo || topico.slice(0, 50),
+      titulo:
+        extrairCampo(sugestao, "titulo") ||
+        sugestao.titulo || "",
+      texto:
+        extrairCampo(sugestao, "texto") ||
+        sugestao.resumo || "",
+      descricao:
+        extrairCampo(sugestao, "descricao") ||
+        sugestao.acao_principal || "",
+      cta:
+        extrairCampo(sugestao, "cta") || "SIGN_UP",
+      perguntas:
+        extrairCampo(sugestao, "perguntas") ||
+        (sugestao.mensagens || []).join("\n") || "",
+      interesses:
+        extrairCampo(sugestao, "interesses") || "",
+      localidade:
+        extrairCampo(sugestao, "localidade") || "",
+      genero:
+        extrairCampo(sugestao, "genero") || "",
+      idade_min:
+        extrairCampo(sugestao, "idade_min") || "25",
+      idade_max:
+        extrairCampo(sugestao, "idade_max") || "55",
+      obrigado_titulo:
+        extrairCampo(sugestao, "obrigado_titulo") || "Recebemos seu contato!",
+      obrigado_botao:
+        extrairCampo(sugestao, "obrigado_botao") || "Ver mais",
+      obrigado_texto:
+        extrairCampo(sugestao, "obrigado_texto") ||
+        `Em breve nosso corretor vai entrar em contato sobre ${topico}.`
     });
 
-    const apiKey = Bun.env.OPENAI_API_KEY;
-    const modelo =
-      textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-5-mini";
+    const camposInstrucao =
+      "No array campos inclua: nome_campanha, titulo, texto, descricao, " +
+      "cta (SIGN_UP ou LEARN_MORE ou APPLY_NOW), perguntas (separadas por nova linha), " +
+      "interesses (separados por virgula), localidade, genero (vazio/1/2), " +
+      "idade_min, idade_max, obrigado_titulo, obrigado_botao, obrigado_texto.";
 
-    if (!apiKey) {
-      return c.json({
-        sugestoes: [fallbackVariacao(1), fallbackVariacao(2), fallbackVariacao(3)]
-      });
-    }
+    const fallbackPorAbordagem = (abordagem: string) =>
+      sugestaoIAFallback(
+        `Anuncio ${abordagem}`,
+        `Anuncio sobre ${topico}`,
+        "Preencher campos e revisar",
+        [],
+        [],
+        [
+          { chave: "nome_campanha", valor: topico.slice(0, 50) },
+          { chave: "titulo", valor: topico.slice(0, 40) },
+          { chave: "texto", valor: `Conheca ${topico}. Atendimento rapido e personalizado com corretor dedicado.` },
+          { chave: "descricao", valor: `${topico} com atendimento especializado.` },
+          { chave: "cta", valor: "SIGN_UP" },
+          { chave: "perguntas", valor: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?" },
+          { chave: "interesses", valor: "imoveis, casa propria, financiamento imobiliario, apartamento" },
+          { chave: "localidade", valor: "" },
+          { chave: "genero", valor: "" },
+          { chave: "idade_min", valor: "25" },
+          { chave: "idade_max", valor: "55" },
+          { chave: "obrigado_titulo", valor: "Recebemos seu contato!" },
+          { chave: "obrigado_botao", valor: "Ver mais" },
+          { chave: "obrigado_texto", valor: `Em breve entraremos em contato sobre ${topico}.` }
+        ],
+        []
+      );
 
-    const variacaoSchema = {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "nome_campanha", "titulo", "texto", "descricao", "cta",
-        "perguntas", "interesses", "localidade", "genero",
-        "idade_min", "idade_max",
-        "obrigado_titulo", "obrigado_botao", "obrigado_texto"
-      ],
-      properties: {
-        nome_campanha: { type: "string" },
-        titulo: { type: "string" },
-        texto: { type: "string" },
-        descricao: { type: "string" },
-        cta: { type: "string" },
-        perguntas: { type: "string" },
-        interesses: { type: "string" },
-        localidade: { type: "string" },
-        genero: { type: "string" },
-        idade_min: { type: "string" },
-        idade_max: { type: "string" },
-        obrigado_titulo: { type: "string" },
-        obrigado_botao: { type: "string" },
-        obrigado_texto: { type: "string" }
-      }
-    };
-
-    const schema = {
-      type: "object",
-      additionalProperties: false,
-      required: ["variacao_1", "variacao_2", "variacao_3"],
-      properties: {
-        variacao_1: variacaoSchema,
-        variacao_2: variacaoSchema,
-        variacao_3: variacaoSchema
-      }
-    };
-
-    const res = await fetch(OPENAI_RESPONSES_URL, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: modelo,
-        instructions:
-          "Voce e um especialista em marketing imobiliario digital. Crie anuncios completos para Meta Ads para captacao de leads. Responda somente no JSON solicitado, em portugues do Brasil, sem acentos.",
-        input: [{
-          role: "user",
-          content: [{
-            type: "input_text",
-            text: [
-              `PRODUTO A ANUNCIAR: "${topico}"`,
-              "",
-              `Crie 3 variacoes COMPLETAMENTE DIFERENTES de anuncio Meta Ads para captacao de leads sobre "${topico}".`,
-              "Todo o conteudo deve ser especifico para este produto — nao use texto generico de imoveis.",
-              "",
-              "variacao_1: abordagem DIRETA com urgencia, CTA forte, tom objetivo",
-              "variacao_2: abordagem EMOCIONAL e aspiracional, foco no sonho e estilo de vida que o produto proporciona",
-              "variacao_3: abordagem PRATICA listando beneficios e diferenciais concretos do produto",
-              "",
-              "Para cta use: SIGN_UP (cadastro), LEARN_MORE (saber mais) ou APPLY_NOW (solicitar).",
-              "Para genero: vazio para todos, 1 para homens, 2 para mulheres.",
-              "As 3 variacoes devem ter titulos, textos e perguntas totalmente distintos entre si."
-            ].join("\n")
-          }]
-        }],
-        text: {
-          format: {
-            type: "json_schema",
-            name: "variacoes_campanha_ia",
-            strict: true,
-            schema
-          }
-        }
-      })
-    });
-
-    const data: any = await res.json();
-
-    if (!res.ok) {
-      console.error("CRIADOR CAMPANHA HTTP:", res.status, JSON.stringify(data));
-      throw new Error(data?.error?.message || `HTTP ${res.status}`);
-    }
-
-    const textoResposta = extrairTextoRespostaOpenAI(data);
-
-    if (!textoResposta) {
-      console.error("CRIADOR CAMPANHA resposta vazia:", JSON.stringify(data));
-      throw new Error("Resposta vazia");
-    }
-
-    const parsed = JSON.parse(textoResposta);
-    const sugestoes = [
-      parsed.variacao_1 || fallbackVariacao(1),
-      parsed.variacao_2 || fallbackVariacao(2),
-      parsed.variacao_3 || fallbackVariacao(3)
+    const abordagens = [
+      "direta com urgencia e chamada para acao forte",
+      "emocional e aspiracional focada no sonho e estilo de vida",
+      "pratica listando beneficios concretos e diferenciais"
     ];
+
+    const resultados = await Promise.all(
+      abordagens.map(abordagem =>
+        gerarSugestaoComercialOpenAI(
+          `Criar anuncio Meta Ads para captacao de leads com abordagem ${abordagem}. ${camposInstrucao}`,
+          { produto: topico },
+          fallbackPorAbordagem(abordagem)
+        )
+      )
+    );
+
+    const totalCusto =
+      resultados.reduce((s, r) => s + (r.custo_estimado || 0), 0);
+    const totalInput =
+      resultados.reduce((s, r) => s + Number(r.usage?.input_tokens || 0), 0);
+    const totalOutput =
+      resultados.reduce((s, r) => s + Number(r.usage?.output_tokens || 0), 0);
 
     await registrarUsoIA(
       Number(user.id),
       "criador_campanha",
       "campanha",
       null,
-      calcularCustoEstimadoOpenAI(data?.usage),
-      Number(data?.usage?.input_tokens || 0),
-      Number(data?.usage?.output_tokens || 0)
+      totalCusto,
+      totalInput,
+      totalOutput
     );
 
-    return c.json({ sugestoes });
+    return c.json({
+      sugestoes: resultados.map(r => toVariacao(r.sugestao))
+    });
   } catch (err) {
-    console.error("CRIADOR CAMPANHA FALLBACK:", err);
-    return c.json({ error: "Erro ao gerar campanha com IA" }, 500);
+    console.error("CRIADOR CAMPANHA ERRO:", err);
+    return c.json({
+      sugestoes: [1, 2, 3].map(() => ({
+        nome_campanha: topico.slice(0, 50),
+        titulo: topico.slice(0, 40),
+        texto: `Conheca ${topico}. Atendimento rapido e personalizado.`,
+        descricao: `${topico} com atendimento especializado.`,
+        cta: "SIGN_UP",
+        perguntas: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?",
+        interesses: "imoveis, casa propria, financiamento imobiliario, apartamento",
+        localidade: "",
+        genero: "",
+        idade_min: "25",
+        idade_max: "55",
+        obrigado_titulo: "Recebemos seu contato!",
+        obrigado_botao: "Ver mais",
+        obrigado_texto: `Em breve nosso corretor vai entrar em contato sobre ${topico}.`
+      }))
+    });
   }
 });
 
