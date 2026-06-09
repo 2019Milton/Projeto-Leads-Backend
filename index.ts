@@ -5891,6 +5891,25 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       [user.id, contaAnunciosId]
     );
 
+    // 🔥 ISSUES (ex.: erro de pagamento) de todas as campanhas da conta
+    const issuesPorCampanha: Record<string, any[]> = {};
+
+    if (token && contaAnunciosId) {
+      try {
+        const issuesResp = await fetch(
+          `https://graph.facebook.com/v19.0/${contaAnunciosId}/campaigns?fields=id,issues_info&limit=500&access_token=${token}`
+        ).then(r => r.json());
+
+        for (const item of issuesResp.data || []) {
+          if (item.issues_info?.length) {
+            issuesPorCampanha[item.id] = item.issues_info;
+          }
+        }
+      } catch {
+        // métricas continuam sem info de issues
+      }
+    }
+
     const metricas = [];
 
     for (const campanha of campanhas.rows) {
@@ -5952,6 +5971,16 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       const totalLeadsBanco =
         Number(leadsBanco.rows[0]?.total || 0);
 
+      // 🔥 ERRO DE PAGAMENTO REPORTADO PELA META
+      const issuesCampanha =
+        issuesPorCampanha[campanha.campaign_id] || [];
+
+      const issuePagamento = issuesCampanha.find((i: any) =>
+        /pagamento|payment|billing|cobran/i.test(
+          `${i.error_summary || ""} ${i.error_message || ""}`
+        )
+      );
+
       metricas.push({
         id: campanha.id,
         nome: campanha.nome,
@@ -5994,7 +6023,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         criado_em: campanha.criado_em,
         metricas_origem: metaDisponivel ? "meta" : "local",
         meta_disponivel: metaDisponivel,
-        erro_meta: erroMeta
+        erro_meta: erroMeta,
+        erro_pagamento: issuePagamento
+          ? (issuePagamento.error_summary || issuePagamento.error_message || "Erro no pagamento")
+          : null
       });
     }
 
