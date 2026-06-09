@@ -8262,10 +8262,12 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         ]
       );
 
+    const instrucaoCampos = `No array campos retorne obrigatoriamente estas cinco chaves: "titulo" (titulo do anuncio), "texto" (texto principal do anuncio, 2 a 3 frases), "descricao" (descricao curta de 1 frase), "perguntas" (perguntas do formulario de lead separadas por nova linha), "interesses" (lista de interesses para segmentacao separados por virgula).`;
+
     const resultados = await Promise.all(
       abordagens.map(abordagem =>
         gerarSugestaoComercialOpenAI(
-          `Criar sugestoes para anuncio Meta com ${abordagem}: titulo, texto principal, descricao, perguntas do formulario e interesses.${contextoExtra}`,
+          `Criar anuncio Meta Ads para captacao de leads imobiliarios com ${abordagem}. ${instrucaoCampos}${contextoExtra}`,
           { campanha },
           fallback
         )
