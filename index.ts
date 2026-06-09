@@ -8255,27 +8255,32 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-4o-mini";
 
     const prompt =
-      `Crie 3 campanhas de Meta Ads completamente diferentes para captar leads do seguinte produto ou empreendimento:\n\n` +
-      `"${topico}"\n\n` +
-      `Variacao 1 - URGENCIA: use escassez, medo de perder a oportunidade, senso de urgencia.\n` +
-      `Variacao 2 - EMOCIONAL: foque no sonho realizado, qualidade de vida, conquista pessoal.\n` +
-      `Variacao 3 - RACIONAL: destaque beneficios concretos, diferenciais especificos do produto.\n\n` +
-      `Para cada variacao crie:\n` +
-      `- nome_campanha: nome interno (ex: "Leads Urgencia - [produto]")\n` +
-      `- titulo: headline do anuncio, max 40 caracteres. IMPORTANTE: nao repita o nome do produto como titulo. Crie uma frase de impacto.\n` +
-      `- texto: corpo do anuncio com 2 ou 3 frases que usem os detalhes especificos do produto acima\n` +
-      `- descricao: frase de apoio curta e persuasiva\n` +
-      `- cta: use SIGN_UP para variacao 1, LEARN_MORE para variacao 2, APPLY_NOW para variacao 3\n` +
-      `- perguntas: 3 perguntas qualificadoras separadas por \\n, relevantes para o produto\n` +
-      `- interesses: palavras-chave do publico ideal, separadas por virgula\n` +
-      `- localidade: cidade ou regiao mencionada no produto (deixe vazio se nao houver)\n` +
-      `- genero: deixe vazio\n` +
-      `- idade_min e idade_max: faixa etaria do publico ideal como numeros em string\n` +
-      `- obrigado_titulo: titulo da pagina de confirmacao pos-cadastro\n` +
-      `- obrigado_botao: texto do botao pos-cadastro\n` +
-      `- obrigado_texto: mensagem personalizada mencionando o produto\n\n` +
-      `Retorne SOMENTE um JSON valido com esta estrutura exata, sem texto antes ou depois:\n` +
-      `{"v1":{nome_campanha,titulo,texto,descricao,cta,perguntas,interesses,localidade,genero,idade_min,idade_max,obrigado_titulo,obrigado_botao,obrigado_texto},"v2":{...},"v3":{...}}`;
+      `Produto/empreendimento: "${topico}"\n\n` +
+      `Crie 3 anuncios Meta Ads com estilos COMPLETAMENTE DIFERENTES para captar leads desse produto.\n\n` +
+      `REGRAS OBRIGATORIAS:\n` +
+      `1. O titulo NUNCA pode ser o nome do produto. Deve ser uma frase de impacto.\n` +
+      `2. PROIBIDO usar: "Conheca X", "Atendimento rapido e personalizado", "com atendimento especializado".\n` +
+      `3. Cada variacao deve ter titulo, texto e descricao totalmente diferentes das outras.\n` +
+      `4. Use os detalhes especificos do produto para criar copy relevante e unico.\n\n` +
+      `v1 — URGENCIA E ESCASSEZ:\n` +
+      `  Titulo exemplo: "Ultimas unidades! Reserve hoje mesmo"\n` +
+      `  Texto: crie senso de urgencia, medo de perder a oportunidade\n` +
+      `  cta: SIGN_UP\n\n` +
+      `v2 — EMOCIONAL E FAMILIAR:\n` +
+      `  Titulo exemplo: "Sua familia merece um lar assim"\n` +
+      `  Texto: evoque emocao, sonho realizado, qualidade de vida\n` +
+      `  cta: LEARN_MORE\n\n` +
+      `v3 — RACIONAL E OBJETIVO:\n` +
+      `  Titulo exemplo: "Localizacao + seguranca + conforto"\n` +
+      `  Texto: destaque beneficios concretos e diferenciais especificos\n` +
+      `  cta: APPLY_NOW\n\n` +
+      `Campos de cada variacao:\n` +
+      `nome_campanha, titulo (max 40 chars), texto (2-3 frases), descricao (1 frase curta),\n` +
+      `cta, perguntas (3 qualificadoras separadas por \\n), interesses (keywords separados por virgula),\n` +
+      `localidade (regiao do produto ou vazio), genero (vazio), idade_min, idade_max,\n` +
+      `obrigado_titulo, obrigado_botao, obrigado_texto\n\n` +
+      `Retorne SOMENTE JSON valido sem texto antes ou depois:\n` +
+      `{"v1":{...todos os campos...},"v2":{...},"v3":{...}}`;
 
     const resp = await fetch(OPENAI_RESPONSES_URL, {
       method: "POST",
@@ -8285,10 +8290,11 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       },
       body: JSON.stringify({
         model: modelo,
-        temperature: 0.85,
+        temperature: 1.0,
         instructions:
-          "Voce e um redator publicitario especialista em campanhas de imoveis para Meta Ads no Brasil. " +
-          "Gere conteudo criativo e especifico baseado no contexto fornecido. " +
+          "Voce e um redator publicitario criativo especializado em Meta Ads para imoveis no Brasil. " +
+          "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
+          "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
           "Retorne SOMENTE JSON valido, sem markdown, sem texto adicional.",
         input: [{
           role: "user",
