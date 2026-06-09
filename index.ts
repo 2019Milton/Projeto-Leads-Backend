@@ -8217,12 +8217,9 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 });
 
 app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
-  const body =
-    await c.req.json().catch(() => ({}));
-  const contexto =
-    textoOpcional(body.contexto) || "";
-  const topico =
-    contexto || "imovel imobiliario";
+  const body = await c.req.json().catch(() => ({}));
+  const contexto = textoOpcional(body.contexto) || "";
+  const topico = contexto || "imovel imobiliario";
 
   const fallbackVariacoes = (t: string) =>
     [1, 2, 3].map(() => ({
@@ -8242,38 +8239,43 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       obrigado_texto: `Em breve nosso corretor vai entrar em contato sobre ${t}.`
     }));
 
+  const norm = (v: any, ctaDefault: string) => ({
+    nome_campanha: v?.nome_campanha || topico.slice(0, 50),
+    titulo: v?.titulo || topico.slice(0, 40),
+    texto: v?.texto || "",
+    descricao: v?.descricao || "",
+    cta: v?.cta || ctaDefault,
+    perguntas: v?.perguntas || "",
+    interesses: v?.interesses || "",
+    localidade: v?.localidade || "",
+    genero: v?.genero || "",
+    idade_min: String(v?.idade_min || "25"),
+    idade_max: String(v?.idade_max || "55"),
+    obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
+    obrigado_botao: v?.obrigado_botao || "Ver mais",
+    obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
+  });
+
+  const parseSugestoes = (texto: string) => {
+    const limpo = texto
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+    const parsed = JSON.parse(limpo);
+    return [
+      norm(parsed.v1 || parsed.variacao_1, "SIGN_UP"),
+      norm(parsed.v2 || parsed.variacao_2, "LEARN_MORE"),
+      norm(parsed.v3 || parsed.variacao_3, "APPLY_NOW")
+    ];
+  };
+
   try {
     const user: any = c.get("user");
-    const limite =
-      limitarRequisicao(c, `ia:${user.id}`, 20, 60 * 1000);
-
+    const limite = limitarRequisicao(c, `ia:${user.id}`, 20, 60 * 1000);
     if (limite) return limite;
 
-    const bloqueio =
-      await motivoBloqueioIA(user);
-
-    if (bloqueio) {
-      return c.json({ error: bloqueio }, 403);
-    }
-
-    const apiKey = Bun.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "sem_chave" });
-    }
-
-    const iaConf = await client.query(
-      "SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1"
-    );
-    const modelo =
-      textoOpcional(iaConf.rows[0]?.modelo) ||
-      textoOpcional(Bun.env.OPENAI_MODEL) ||
-      "gpt-5-mini";
-
-    const usarResponsesAPI =
-      modelo.startsWith("gpt-5") ||
-      modelo.startsWith("o1") ||
-      modelo.startsWith("o3") ||
-      modelo.startsWith("o4");
+    const bloqueio = await motivoBloqueioIA(user);
+    if (bloqueio) return c.json({ error: bloqueio }, 403);
 
     const prompt =
       `Produto/empreendimento: "${topico}"\n\n` +
@@ -8309,103 +8311,121 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
       "Retorne SOMENTE JSON valido.";
 
-    const respBody = usarResponsesAPI
-      ? {
-          model: modelo,
-          temperature: 1.0,
-          instructions: systemMsg,
-          input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }]
+    // ── Tenta OpenAI ──────────────────────────────────────────────
+    const openaiKey = Bun.env.OPENAI_API_KEY;
+    if (openaiKey) {
+      try {
+        const iaConf = await client.query(
+          "SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1"
+        );
+        const modelo =
+          textoOpcional(iaConf.rows[0]?.modelo) ||
+          textoOpcional(Bun.env.OPENAI_MODEL) ||
+          "gpt-5-mini";
+
+        const usarResponsesAPI =
+          modelo.startsWith("gpt-5") ||
+          modelo.startsWith("o1") ||
+          modelo.startsWith("o3") ||
+          modelo.startsWith("o4");
+
+        const respBody = usarResponsesAPI
+          ? {
+              model: modelo,
+              temperature: 1.0,
+              instructions: systemMsg,
+              input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }]
+            }
+          : {
+              model: modelo,
+              temperature: 1.0,
+              response_format: { type: "json_object" },
+              messages: [
+                { role: "system", content: systemMsg },
+                { role: "user", content: prompt }
+              ]
+            };
+
+        const resp = await fetch(
+          usarResponsesAPI
+            ? OPENAI_RESPONSES_URL
+            : "https://api.openai.com/v1/chat/completions",
+          {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+            body: JSON.stringify(respBody)
+          }
+        );
+
+        const data: any = await resp.json();
+
+        if (resp.ok) {
+          const textoResposta: string = usarResponsesAPI
+            ? extrairTextoRespostaOpenAI(data)
+            : (data?.choices?.[0]?.message?.content || "");
+
+          if (textoResposta) {
+            const sugestoes = parseSugestoes(textoResposta);
+            const usageNorm = {
+              input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
+              output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0)
+            };
+            const custo = calcularCustoEstimadoOpenAI(usageNorm);
+            await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
+            return c.json({ sugestoes, _origem: "openai" });
+          }
+        } else {
+          console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "| model:", modelo);
         }
-      : {
-          model: modelo,
-          temperature: 1.0,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: systemMsg },
-            { role: "user", content: prompt }
-          ]
-        };
-
-    const resp = await fetch(
-      usarResponsesAPI
-        ? OPENAI_RESPONSES_URL
-        : "https://api.openai.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify(respBody)
+      } catch (errOpenai) {
+        console.error("CRIADOR CAMPANHA OPENAI EXCEPTION:", errOpenai);
       }
-    );
-
-    const data: any = await resp.json();
-
-    if (!resp.ok) {
-      console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "| model:", modelo, "| responses:", usarResponsesAPI);
-      return c.json({
-        sugestoes: fallbackVariacoes(topico),
-        _origem: "api_error",
-        _erro: data?.error?.message
-      });
     }
 
-    const textoResposta: string = usarResponsesAPI
-      ? extrairTextoRespostaOpenAI(data)
-      : (data?.choices?.[0]?.message?.content || "");
-    if (!textoResposta) {
-      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "resposta_vazia" });
+    // ── Fallback: Anthropic (Claude Haiku) ────────────────────────
+    const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
+    if (anthropicKey) {
+      try {
+        const respAnthropic = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "x-api-key": anthropicKey,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 2048,
+            system: systemMsg,
+            messages: [{ role: "user", content: prompt }]
+          })
+        });
+
+        const dataAnthropic: any = await respAnthropic.json();
+
+        if (respAnthropic.ok) {
+          const textoAnthropic: string = dataAnthropic?.content?.[0]?.text || "";
+          if (textoAnthropic) {
+            const sugestoes = parseSugestoes(textoAnthropic);
+            const inTok = Number(dataAnthropic?.usage?.input_tokens || 0);
+            const outTok = Number(dataAnthropic?.usage?.output_tokens || 0);
+            await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, 0, inTok, outTok);
+            return c.json({ sugestoes, _origem: "anthropic" });
+          }
+        } else {
+          console.error("CRIADOR CAMPANHA ANTHROPIC ERROR:", dataAnthropic?.error?.message);
+        }
+      } catch (errAnthropic) {
+        console.error("CRIADOR CAMPANHA ANTHROPIC EXCEPTION:", errAnthropic);
+      }
     }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(textoResposta);
-    } catch {
-      console.error("CRIADOR CAMPANHA JSON PARSE ERROR:", textoResposta.slice(0, 300));
-      return c.json({ sugestoes: fallbackVariacoes(topico), _origem: "json_invalido" });
-    }
-
-    const norm = (v: any, ctaDefault: string) => ({
-      nome_campanha: v?.nome_campanha || topico.slice(0, 50),
-      titulo: v?.titulo || topico.slice(0, 40),
-      texto: v?.texto || "",
-      descricao: v?.descricao || "",
-      cta: v?.cta || ctaDefault,
-      perguntas: v?.perguntas || "",
-      interesses: v?.interesses || "",
-      localidade: v?.localidade || "",
-      genero: v?.genero || "",
-      idade_min: String(v?.idade_min || "25"),
-      idade_max: String(v?.idade_max || "55"),
-      obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
-      obrigado_botao: v?.obrigado_botao || "Ver mais",
-      obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
+    // ── Sem IA disponivel ─────────────────────────────────────────
+    return c.json({
+      sugestoes: fallbackVariacoes(topico),
+      _origem: openaiKey ? "api_error" : "sem_chave"
     });
 
-    const sugestoes = [
-      norm(parsed.v1 || parsed.variacao_1, "SIGN_UP"),
-      norm(parsed.v2 || parsed.variacao_2, "LEARN_MORE"),
-      norm(parsed.v3 || parsed.variacao_3, "APPLY_NOW")
-    ];
-
-    const usageNorm = {
-      input_tokens: Number(
-        data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0
-      ),
-      output_tokens: Number(
-        data?.usage?.output_tokens || data?.usage?.completion_tokens || 0
-      )
-    };
-    const custo = calcularCustoEstimadoOpenAI(usageNorm);
-    await registrarUsoIA(
-      Number(user.id),
-      "criador_campanha",
-      "campanha",
-      null,
-      custo,
-      usageNorm.input_tokens,
-      usageNorm.output_tokens
-    );
-
-    return c.json({ sugestoes, _origem: "openai" });
   } catch (err) {
     console.error("CRIADOR CAMPANHA ERRO:", err);
     return c.json({ sugestoes: fallbackVariacoes(topico) });
