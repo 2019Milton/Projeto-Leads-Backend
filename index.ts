@@ -8225,9 +8225,22 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       await c.req.json().catch(() => ({}));
     const campanha =
       body.campanha || {};
+    const contexto =
+      textoOpcional(body.contexto) || "";
     const nome =
       textoOpcional(campanha.nome) ||
       "Campanha imobiliaria";
+
+    const contextoExtra =
+      contexto
+        ? ` Contexto fornecido pelo anunciante: ${contexto}.`
+        : "";
+
+    const abordagens = [
+      "abordagem direta com urgencia e chamada para acao clara",
+      "abordagem emocional e aspiracional focada no sonho da casa propria",
+      "abordagem pratica listando beneficios concretos e diferenciais do imovel"
+    ];
 
     const fallback =
       sugestaoIAFallback(
@@ -8249,11 +8262,30 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         ]
       );
 
-    const usoIA =
-      await gerarSugestaoComercialOpenAI(
-        "Criar sugestoes para anuncio Meta: titulo, texto principal, descricao, perguntas do formulario e interesses.",
-        { campanha },
-        fallback
+    const resultados = await Promise.all(
+      abordagens.map(abordagem =>
+        gerarSugestaoComercialOpenAI(
+          `Criar sugestoes para anuncio Meta com ${abordagem}: titulo, texto principal, descricao, perguntas do formulario e interesses.${contextoExtra}`,
+          { campanha },
+          fallback
+        )
+      )
+    );
+
+    const custoTotal =
+      resultados.reduce(
+        (sum, r) => sum + (r.custo_estimado || 0),
+        0
+      );
+    const inputTotal =
+      resultados.reduce(
+        (sum, r) => sum + Number(r.usage?.input_tokens || 0),
+        0
+      );
+    const outputTotal =
+      resultados.reduce(
+        (sum, r) => sum + Number(r.usage?.output_tokens || 0),
+        0
       );
 
     await registrarUsoIA(
@@ -8261,12 +8293,14 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       "criador_campanha",
       "campanha",
       null,
-      usoIA.custo_estimado,
-      Number(usoIA.usage?.input_tokens || 0),
-      Number(usoIA.usage?.output_tokens || 0)
+      custoTotal,
+      inputTotal,
+      outputTotal
     );
 
-    return c.json({ sugestao: usoIA.sugestao });
+    return c.json({
+      sugestoes: resultados.map(r => r.sugestao)
+    });
   } catch (err) {
     console.error("ERRO IA CRIADOR CAMPANHA:", err);
     return c.json({ error: "Erro ao gerar campanha com IA" }, 500);
