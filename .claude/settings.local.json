@@ -37,7 +37,11 @@
       "Bash(railway status *)",
       "Bash(find \"/c/Users/perei/Downloads\" -iname \"*Analise-do-app*\" -o -iname \"*Análise*\" 2>/dev/null)",
       "Read(//c/Users/perei/Downloads/**)",
-      "Bash(git show *)"
+      "Bash(git show *)",
+      "Bash(cd \"/c/Users/perei/Projeto-Leads-Backend\" && cat package.json | head -30)",
+      "Read(//c/c/Users/perei/Projeto-Leads-Backend/**)",
+      "Bash(cd \"/c/Users/perei/Projeto-Leads\" && ls -la | grep -iE \"vercel|netlify|railway|deploy|\\\\.toml|\\\\.yml|\\\\.yaml\")",
+      "Read(//c/c/Users/perei/**)"
     ]
   }
 }
