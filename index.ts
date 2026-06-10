@@ -3314,6 +3314,11 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       return c.text("Erro ao obter token Instagram", 502);
     }
 
+    console.log(
+      "INSTAGRAM SHORT TOKEN OK. user_id:",
+      shortTokenData.user_id
+    );
+
     // 🔥 troca por token de longa duracao
     const longParams =
       new URLSearchParams({
@@ -3326,12 +3331,20 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       `https://graph.instagram.com/access_token?${longParams.toString()}`
     ).then(r => r.json());
 
+    console.log(
+      "INSTAGRAM LONG TOKEN:",
+      JSON.stringify({
+        ok: Boolean(longTokenData.access_token),
+        error: longTokenData.error
+      })
+    );
+
     const access_token =
       longTokenData.access_token || shortTokenData.access_token;
 
     // 🔥 BUSCA PERFIL DA CONTA DO INSTAGRAM
     const perfil = await fetch(
-      `https://graph.instagram.com/v21.0/me?fields=id,username,profile_picture_url&access_token=${access_token}`
+      `https://graph.instagram.com/me?fields=id,username,account_type,profile_picture_url&access_token=${encodeURIComponent(access_token)}`
     ).then(r => r.json());
 
     console.log("INSTAGRAM LOGIN PERFIL:", JSON.stringify(perfil));
