@@ -7112,14 +7112,26 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
     const token = conn.rows[0].access_token;
 
     // 🔥 CONTA DE ANÚNCIOS
-    const contaAds =
-      await obterContaAnuncios(
-        token,
-        conn.rows[0].conta_anuncios_id
-      );
-    
+    let contaAds;
+
+    try {
+
+      contaAds =
+        await obterContaAnuncios(
+          token,
+          conn.rows[0].conta_anuncios_id
+        );
+
+    } catch (erroConta: any) {
+
+      return c.json({
+        error: erroConta?.message ||
+          "Selecione a conta de anúncios Meta que deseja usar."
+      }, 400);
+    }
+
     if (!contaAds) {
-    
+
       return c.json({
         error: "Nenhuma conta de anúncios encontrada"
       }, 400);
