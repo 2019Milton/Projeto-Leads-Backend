@@ -12,7 +12,8 @@
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
       "WebSearch",
-      "Bash(npx tsc *)"
+      "Bash(npx tsc *)",
+      "PowerShell(npx tsc --noEmit 2>&1)"
     ]
   }
 }

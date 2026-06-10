@@ -5891,22 +5891,67 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       [user.id, contaAnunciosId]
     );
 
+    // 🔥 STATUS DA CONTA (account_status indica problema de pagamento/cobranca)
+    let erroPagamentoConta: string | null = null;
+
+    if (token && contaAnunciosId) {
+      try {
+        const contaInfo = await fetch(
+          `https://graph.facebook.com/v19.0/${contaAnunciosId}?fields=account_status,disable_reason&access_token=${token}`
+        ).then(r => r.json());
+
+        console.log("META ACCOUNT STATUS:", JSON.stringify(contaInfo));
+
+        // 3 = UNSETTLED, 8 = PENDING_SETTLEMENT, 9 = IN_GRACE_PERIOD
+        if ([3, 8, 9].includes(Number(contaInfo.account_status))) {
+          erroPagamentoConta =
+            "A conta de anúncios está com pendência de pagamento na Meta. Verifique o método de cobrança.";
+        }
+      } catch (e) {
+        console.error("ERRO STATUS CONTA:", e);
+      }
+    }
+
     // 🔥 ISSUES (ex.: erro de pagamento) de todas as campanhas da conta
     const issuesPorCampanha: Record<string, any[]> = {};
 
     if (token && contaAnunciosId) {
       try {
-        const issuesResp = await fetch(
+        const issuesCampResp = await fetch(
           `https://graph.facebook.com/v19.0/${contaAnunciosId}/campaigns?fields=id,issues_info&limit=500&access_token=${token}`
         ).then(r => r.json());
 
-        for (const item of issuesResp.data || []) {
+        console.log("META ISSUES CAMPANHAS:", JSON.stringify(issuesCampResp));
+
+        for (const item of issuesCampResp.data || []) {
           if (item.issues_info?.length) {
-            issuesPorCampanha[item.id] = item.issues_info;
+            issuesPorCampanha[item.id] = [
+              ...(issuesPorCampanha[item.id] || []),
+              ...item.issues_info
+            ];
           }
         }
-      } catch {
-        // métricas continuam sem info de issues
+      } catch (e) {
+        console.error("ERRO ISSUES CAMPANHAS:", e);
+      }
+
+      try {
+        const issuesAdsetResp = await fetch(
+          `https://graph.facebook.com/v19.0/${contaAnunciosId}/adsets?fields=id,campaign_id,issues_info,effective_status&limit=500&access_token=${token}`
+        ).then(r => r.json());
+
+        console.log("META ISSUES ADSETS:", JSON.stringify(issuesAdsetResp));
+
+        for (const item of issuesAdsetResp.data || []) {
+          if (item.issues_info?.length && item.campaign_id) {
+            issuesPorCampanha[item.campaign_id] = [
+              ...(issuesPorCampanha[item.campaign_id] || []),
+              ...item.issues_info
+            ];
+          }
+        }
+      } catch (e) {
+        console.error("ERRO ISSUES ADSETS:", e);
       }
     }
 
@@ -5981,6 +6026,16 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         )
       );
 
+      const campanhaAtiva =
+        ["ACTIVE", "ENABLED"].includes(
+          String(campanha.status || "").toUpperCase()
+        );
+
+      const mensagemErroPagamento =
+        (issuePagamento &&
+          (issuePagamento.error_summary || issuePagamento.error_message)) ||
+        (campanhaAtiva ? erroPagamentoConta : null);
+
       metricas.push({
         id: campanha.id,
         nome: campanha.nome,
@@ -6024,9 +6079,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         metricas_origem: metaDisponivel ? "meta" : "local",
         meta_disponivel: metaDisponivel,
         erro_meta: erroMeta,
-        erro_pagamento: issuePagamento
-          ? (issuePagamento.error_summary || issuePagamento.error_message || "Erro no pagamento")
-          : null
+        erro_pagamento: mensagemErroPagamento || null
       });
     }
 
