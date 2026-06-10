@@ -566,7 +566,14 @@ async function detectarInstagramMeta(
         `https://graph.facebook.com/v19.0/${instaRes.instagram_business_account.id}?fields=username,profile_picture_url&access_token=${token}`
       ).then(r => r.json());
 
-      instagram = instaInfo;
+      instagram = {
+        id: instaRes.instagram_business_account.id,
+        username: instaInfo.username || null,
+        profile_picture_url: instaInfo.profile_picture_url || null
+      };
+
+      // Reflete o vinculo encontrado na propria Pagina, para o front-end
+      primeiraPagina.instagram = instagram;
     }
   }
 
