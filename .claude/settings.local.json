@@ -32,7 +32,9 @@
       "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" status --porcelain -b)",
       "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" push origin main)",
       "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" push origin main)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(railway --version)",
+      "Bash(railway status *)"
     ]
   }
 }
