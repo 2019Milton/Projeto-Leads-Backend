@@ -3127,7 +3127,7 @@ app.get("/auth/meta/callback", async (c) => {
    📷 INSTAGRAM LOGIN (Business Login)
 ========================= */
 
-// 🔹 REDIRECIONA PARA LOGIN INSTAGRAM (Business Login)
+// 🔹 REDIRECIONA PARA LOGIN INSTAGRAM (Instagram API with Instagram Login)
 app.get("/auth/meta/instagram/login", async (c) => {
   try {
 
@@ -3144,13 +3144,11 @@ app.get("/auth/meta/instagram/login", async (c) => {
     return c.text("Token invalido ou expirado", 401);
   }
 
-  const clientId = Bun.env.META_APP_ID;
-  const redirectUri = Bun.env.META_INSTAGRAM_REDIRECT_URI;
-  const configId =
-    Bun.env.META_INSTAGRAM_CONFIG_ID || "1494114041652301";
+  const clientId = Bun.env.INSTAGRAM_APP_ID;
+  const redirectUri = Bun.env.INSTAGRAM_REDIRECT_URI;
 
   if (!clientId || !redirectUri) {
-    return c.text("Configuracao Meta Instagram incompleta", 500);
+    return c.text("Configuracao Instagram incompleta", 500);
   }
 
   // State temporario de uso unico para o OAuth do Instagram.
@@ -3189,13 +3187,13 @@ app.get("/auth/meta/instagram/login", async (c) => {
     new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
-      config_id: configId,
-      state,
-      locale: "pt_BR"
+      response_type: "code",
+      scope: "instagram_business_basic",
+      state
     });
 
   const url =
-    `https://www.facebook.com/v19.0/dialog/oauth?${params.toString()}`;
+    `https://www.instagram.com/oauth/authorize?${params.toString()}`;
 
   return c.redirect(url);
   } catch (err) {
@@ -3219,12 +3217,12 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       return c.text("Erro: code não recebido");
     }
 
-    const clientId = Bun.env.META_APP_ID;
-    const clientSecret = Bun.env.META_APP_SECRET;
-    const redirectUri = Bun.env.META_INSTAGRAM_REDIRECT_URI;
+    const clientId = Bun.env.INSTAGRAM_APP_ID;
+    const clientSecret = Bun.env.INSTAGRAM_APP_SECRET;
+    const redirectUri = Bun.env.INSTAGRAM_REDIRECT_URI;
 
     if (!clientId || !clientSecret || !redirectUri) {
-      return c.text("Configuracao Meta Instagram incompleta", 500);
+      return c.text("Configuracao Instagram incompleta", 500);
     }
 
     // 🔥 troca code por token
@@ -3292,55 +3290,65 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       `);
     }
 
-    const params =
-      new URLSearchParams({
-        client_id: clientId,
-        redirect_uri: redirectUri,
-        client_secret: clientSecret,
-        code
-      });
+    // 🔥 troca code por token de curta duracao
+    const shortTokenForm = new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: "authorization_code",
+      redirect_uri: redirectUri,
+      code
+    });
 
-    const tokenRes = await fetch(
-      `https://graph.facebook.com/v19.0/oauth/access_token?${params.toString()}`
+    const shortTokenRes = await fetch(
+      "https://api.instagram.com/oauth/access_token",
+      {
+        method: "POST",
+        body: shortTokenForm
+      }
     );
 
-    const tokenData = await tokenRes.json();
-    const access_token = tokenData.access_token;
+    const shortTokenData = await shortTokenRes.json();
 
-    if (!tokenRes.ok || !access_token) {
-      console.error("ERRO TOKEN INSTAGRAM:", tokenData);
+    if (!shortTokenRes.ok || !shortTokenData.access_token) {
+      console.error("ERRO TOKEN INSTAGRAM:", shortTokenData);
       return c.text("Erro ao obter token Instagram", 502);
     }
 
-    // 🔥 BUSCA CONTA DO INSTAGRAM VINCULADA ÀS PÁGINAS DO USUÁRIO
-    const paginas = await fetch(
-      `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,instagram_business_account{id,username,profile_picture_url}&access_token=${access_token}`
+    // 🔥 troca por token de longa duracao
+    const longParams =
+      new URLSearchParams({
+        grant_type: "ig_exchange_token",
+        client_secret: clientSecret,
+        access_token: shortTokenData.access_token
+      });
+
+    const longTokenData = await fetch(
+      `https://graph.instagram.com/access_token?${longParams.toString()}`
     ).then(r => r.json());
 
-    console.log("INSTAGRAM LOGIN PAGINAS:", JSON.stringify(paginas));
+    const access_token =
+      longTokenData.access_token || shortTokenData.access_token;
 
-    let instagram: any = null;
+    // 🔥 BUSCA PERFIL DA CONTA DO INSTAGRAM
+    const perfil = await fetch(
+      `https://graph.instagram.com/v21.0/me?fields=id,username,profile_picture_url&access_token=${access_token}`
+    ).then(r => r.json());
 
-    for (const pagina of paginas.data || []) {
-      if (pagina.instagram_business_account?.id) {
-        instagram = pagina.instagram_business_account;
-        break;
-      }
-    }
+    console.log("INSTAGRAM LOGIN PERFIL:", JSON.stringify(perfil));
 
-    if (!instagram) {
-      console.error("INSTAGRAM LOGIN: nenhuma conta profissional encontrada");
+    if (!perfil.id) {
+      console.error("INSTAGRAM LOGIN: perfil invalido", perfil);
       return c.html(`
         <script>
           if (window.opener) {
-            window.opener.postMessage({ type: "instagram_erro", erro: "Nenhuma conta profissional do Instagram foi encontrada nas Páginas vinculadas." }, "*");
+            window.opener.postMessage({ type: "instagram_erro", erro: "Não foi possível obter os dados da conta do Instagram." }, "*");
           }
           window.close();
         </script>
       `);
     }
 
-    console.log("INSTAGRAM conectado com sucesso:", instagram.username);
+    console.log("INSTAGRAM conectado com sucesso:", perfil.username);
 
     // 💾 salva no banco
     await client.query(
@@ -3354,9 +3362,9 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       WHERE id = $5
       `,
       [
-        instagram.id,
-        instagram.username || null,
-        instagram.profile_picture_url || null,
+        perfil.id,
+        perfil.username || null,
+        perfil.profile_picture_url || null,
         access_token,
         conexao.rows[0].id
       ]
