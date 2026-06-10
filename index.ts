@@ -603,6 +603,29 @@ async function detectarInstagramMeta(
   return instagram;
 }
 
+// 🔥 Contas do Instagram vinculadas ao Gerenciador de Negócios da conta de anúncios
+// (utilizáveis como instagram_actor_id mesmo sem vínculo direto com a Página)
+async function listarContasInstagramAnuncio(
+  token: string,
+  adAccountId: string
+) {
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/instagram_accounts?fields=id,username,profile_picture_url&access_token=${token}`
+    ).then(r => r.json());
+
+    console.log(
+      "META INSTAGRAM ACCOUNTS (ad account):",
+      JSON.stringify({ total: res.data?.length ?? 0, error: res.error ?? null })
+    );
+
+    return Array.isArray(res.data) ? res.data : [];
+  } catch (e) {
+    console.error("ERRO INSTAGRAM ACCOUNTS AD ACCOUNT:", e);
+    return [];
+  }
+}
+
 function urlOpcional(value: unknown, fallback: string) {
   const url = textoOpcional(value);
 
@@ -4071,6 +4094,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       cta,
       campanha_nome,
       configuracoes_avancadas,
+      daily_budget,
       imageHash,
       imageHashes
     } = await c.req.json();
@@ -4191,6 +4215,37 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       };
     }
 
+    // 🔥 INSTAGRAM ACTOR (necessario para o anuncio veicular no Instagram)
+    const plataformasSelecionadas: string[] =
+      Array.isArray(avancadas?.plataformas)
+        ? avancadas.plataformas
+        : [];
+
+    let instagramActorId: string | null = null;
+
+    if (plataformasSelecionadas.includes("instagram")) {
+
+      instagramActorId =
+        textoOpcional(avancadas.instagram_actor_id);
+
+      if (!instagramActorId) {
+        const contasInstagramAnuncio =
+          await listarContasInstagramAnuncio(token, adAccountId);
+
+        instagramActorId =
+          contasInstagramAnuncio[0]?.id || null;
+      }
+    }
+
+    const objectStorySpec: Record<string, any> = {
+      page_id,
+      link_data: linkDataBase
+    };
+
+    if (instagramActorId) {
+      objectStorySpec.instagram_actor_id = instagramActorId;
+    }
+
     const creative = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
       {
@@ -4204,10 +4259,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
 
           name: `Criativo Leads ${Date.now()}`,
 
-          object_story_spec: {
-            page_id,
-            link_data: linkDataBase
-          },
+          object_story_spec: objectStorySpec,
 
           access_token: token
         })
@@ -4311,14 +4363,16 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         adset_id = $1,
         ad_id = $2,
         form_id = $3,
-        page_id = $4
-      WHERE CAST(campaign_id AS TEXT) = $5
+        page_id = $4,
+        daily_budget = $5
+      WHERE CAST(campaign_id AS TEXT) = $6
       `,
       [
         adset_id,
         ad.id,
         form_id,
         page_id,
+        numeroOpcional(daily_budget),
         String(campaign_id)
       ]
     );
@@ -4531,6 +4585,11 @@ app.get(
         profile_picture_url: conn.rows[0].instagram_profile_picture_url
       } : null);
 
+    // 🔥 INSTAGRAM VINCULADO AO GERENCIADOR DE NEGOCIOS DA CONTA DE ANUNCIOS
+    // (permite anunciar no Instagram mesmo sem vinculo direto com a Pagina)
+    const contasInstagramAnuncio =
+      await listarContasInstagramAnuncio(token, adAccountId);
+
     // 🔥 MÉTRICAS
 
     const campanhasCount = await client.query(
@@ -4732,6 +4791,12 @@ app.get(
       tos_aceitas: tosAceitas,
 
       instagram,
+
+      contas_instagram_anuncio: contasInstagramAnuncio.map((conta: any) => ({
+        id: conta.id,
+        username: conta.username || null,
+        profile_picture_url: conta.profile_picture_url || null
+      })),
 
       metricas: {
         campanhas: campanhasBancoTotal,
@@ -5581,7 +5646,25 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP,
     ADD COLUMN IF NOT EXISTS configuracoes_avancadas JSONB,
     ADD COLUMN IF NOT EXISTS encaminhada_para_usuario_id INTEGER,
-    ADD COLUMN IF NOT EXISTS encaminhada_em TIMESTAMP;
+    ADD COLUMN IF NOT EXISTS encaminhada_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS daily_budget INTEGER;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanha_corretores (
+    campanha_id INTEGER NOT NULL REFERENCES campanhas(id) ON DELETE CASCADE,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    criado_em TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (campanha_id, usuario_id)
+  );
+`);
+
+await client.query(`
+  INSERT INTO campanha_corretores (campanha_id, usuario_id)
+  SELECT id, encaminhada_para_usuario_id
+  FROM campanhas
+  WHERE encaminhada_para_usuario_id IS NOT NULL
+  ON CONFLICT DO NOTHING;
 `);
 
 await client.query(`
@@ -5597,6 +5680,8 @@ await client.query(`
     ON campanhas(conta_anuncios_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_encaminhada_usuario_id
     ON campanhas(encaminhada_para_usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_campanha_corretores_usuario
+    ON campanha_corretores(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_meta_conexoes_usuario_id
     ON meta_conexoes(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_leads_conta_anuncios_id
@@ -6175,18 +6260,33 @@ app.get("/campanhas", authMiddleware, async (c) => {
         dono.email AS criado_por_email,
         dono.nome AS criado_por_nome,
         dono.sobrenome AS criado_por_sobrenome,
-        corretor.email AS corretor_encaminhado_email,
-        corretor.nome AS corretor_encaminhado_nome,
-        corretor.sobrenome AS corretor_encaminhado_sobrenome
+        COALESCE(
+          (
+            SELECT json_agg(json_build_object(
+              'id', cor.id,
+              'nome', cor.nome,
+              'sobrenome', cor.sobrenome,
+              'email', cor.email
+            ))
+            FROM campanha_corretores cc
+            INNER JOIN usuarios cor
+              ON cor.id = cc.usuario_id
+            WHERE cc.campanha_id = c.id
+          ),
+          '[]'
+        ) AS corretores_encaminhados
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
-      LEFT JOIN usuarios corretor
-        ON corretor.id = c.encaminhada_para_usuario_id
       WHERE
         (
           c.usuario_id = $1
-          OR c.encaminhada_para_usuario_id = $1
+          OR EXISTS (
+            SELECT 1
+            FROM campanha_corretores cc2
+            WHERE cc2.campanha_id = c.id
+            AND cc2.usuario_id = $1
+          )
         )
         AND c.conta_anuncios_id = $2
       ORDER BY c.id DESC
@@ -6287,10 +6387,15 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
     const body =
       await c.req.json();
 
-    const corretorId =
-      body.corretor_id
-        ? Number(body.corretor_id)
-        : null;
+    const corretorIds: number[] = Array.isArray(body.corretor_ids)
+      ? Array.from(new Set<number>(
+          body.corretor_ids
+            .map((id: any) => Number(id))
+            .filter((id: number) => Number.isFinite(id))
+        ))
+      : body.corretor_id
+        ? [Number(body.corretor_id)]
+        : [];
 
     const campanha = await client.query(
       `
@@ -6309,60 +6414,93 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
       }, 404);
     }
 
-    if (corretorId) {
+    if (corretorIds.length) {
 
-      const corretor =
+      const corretores =
         user.tipo === "admin_corretor"
           ? await client.query(
               `
               SELECT id
               FROM usuarios
-              WHERE id = $1
+              WHERE id = ANY($1::int[])
               AND admin_id = $2
               AND tipo = 'corretor'
               AND COALESCE(ativo, true) = true
-              LIMIT 1
               `,
-              [corretorId, user.id]
+              [corretorIds, user.id]
             )
           : await client.query(
               `
               SELECT id
               FROM usuarios
-              WHERE id = $1
+              WHERE id = ANY($1::int[])
               AND tipo = 'corretor'
               AND COALESCE(ativo, true) = true
-              LIMIT 1
               `,
-              [corretorId]
+              [corretorIds]
             );
 
-      if (!corretor.rows.length) {
+      if (corretores.rows.length !== corretorIds.length) {
         return c.json({
-          error: "Selecione um corretor vinculado e ativo"
+          error: "Selecione apenas corretores vinculados e ativos"
         }, 400);
       }
     }
 
-    const update = await client.query(
-      `
-      UPDATE campanhas
-      SET
-        encaminhada_para_usuario_id = $1,
-        encaminhada_em = CASE
-          WHEN $1::integer IS NULL THEN NULL
-          ELSE NOW()
-        END
-      WHERE id = $2
-      AND usuario_id = $3
-      RETURNING id, encaminhada_para_usuario_id
-      `,
-      [corretorId, campanhaId, user.id]
-    );
+    const conn = await client.connect();
+
+    try {
+
+      await conn.query("BEGIN");
+
+      await conn.query(
+        `
+        DELETE FROM campanha_corretores
+        WHERE campanha_id = $1
+        `,
+        [campanhaId]
+      );
+
+      for (const corretorId of corretorIds) {
+        await conn.query(
+          `
+          INSERT INTO campanha_corretores (campanha_id, usuario_id)
+          VALUES ($1, $2)
+          ON CONFLICT DO NOTHING
+          `,
+          [campanhaId, corretorId]
+        );
+      }
+
+      await conn.query(
+        `
+        UPDATE campanhas
+        SET
+          encaminhada_para_usuario_id = NULL,
+          encaminhada_em = CASE
+            WHEN $1::int > 0 THEN NOW()
+            ELSE NULL
+          END
+        WHERE id = $2
+        `,
+        [corretorIds.length, campanhaId]
+      );
+
+      await conn.query("COMMIT");
+
+    } catch (err) {
+      await conn.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      conn.release();
+    }
 
     return c.json({
       sucesso: true,
-      campanha: update.rows[0]
+      campanha: {
+        id: campanhaId,
+        corretor_ids: corretorIds
+      }
     });
 
   } catch (err) {
@@ -6409,18 +6547,33 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         dono.email AS criado_por_email,
         dono.nome AS criado_por_nome,
         dono.sobrenome AS criado_por_sobrenome,
-        corretor.email AS corretor_encaminhado_email,
-        corretor.nome AS corretor_encaminhado_nome,
-        corretor.sobrenome AS corretor_encaminhado_sobrenome
+        COALESCE(
+          (
+            SELECT json_agg(json_build_object(
+              'id', cor.id,
+              'nome', cor.nome,
+              'sobrenome', cor.sobrenome,
+              'email', cor.email
+            ))
+            FROM campanha_corretores cc
+            INNER JOIN usuarios cor
+              ON cor.id = cc.usuario_id
+            WHERE cc.campanha_id = c.id
+          ),
+          '[]'
+        ) AS corretores_encaminhados
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
-      LEFT JOIN usuarios corretor
-        ON corretor.id = c.encaminhada_para_usuario_id
       WHERE
         (
           c.usuario_id = $1
-          OR c.encaminhada_para_usuario_id = $1
+          OR EXISTS (
+            SELECT 1
+            FROM campanha_corretores cc2
+            WHERE cc2.campanha_id = c.id
+            AND cc2.usuario_id = $1
+          )
         )
         AND (
           $2::text IS NULL
@@ -6670,20 +6823,20 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
             campanha.criado_por_nome,
             campanha.criado_por_sobrenome
           ].filter(Boolean).join(" ") || null,
-        encaminhada_para_usuario_id:
-          campanha.encaminhada_para_usuario_id || null,
-        corretor_encaminhado_email:
-          campanha.corretor_encaminhado_email || null,
-        corretor_encaminhado_nome:
-          [
-            campanha.corretor_encaminhado_nome,
-            campanha.corretor_encaminhado_sobrenome
-          ].filter(Boolean).join(" ") || null,
+        corretores_encaminhados:
+          (campanha.corretores_encaminhados || []).map((cor: any) => ({
+            id: cor.id,
+            email: cor.email,
+            nome:
+              [cor.nome, cor.sobrenome]
+                .filter(Boolean).join(" ") || cor.email
+          })),
         recebida_por_encaminhamento:
-          Number(campanha.encaminhada_para_usuario_id) ===
-          Number(user.id),
+          Number(campanha.usuario_id) !== Number(user.id),
         configuracoes_avancadas:
           campanha.configuracoes_avancadas || {},
+        daily_budget:
+          campanha.daily_budget || null,
 
         impressoes: dados.impressions || 0,
         cliques: dados.clicks || 0,
@@ -7470,7 +7623,12 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       WHERE campaign_id = $1
       AND (
         usuario_id = $2
-        OR encaminhada_para_usuario_id = $2
+        OR EXISTS (
+          SELECT 1
+          FROM campanha_corretores cc
+          WHERE cc.campanha_id = campanhas.id
+          AND cc.usuario_id = $2
+        )
       )
       AND conta_anuncios_id = $3
       LIMIT 1
@@ -7826,6 +7984,206 @@ app.post("/meta/restaurar-campanha", authMiddleware, async (c) => {
     }, 500);
   }
 });
+
+
+// 🔹 editar segmentação, orçamento, datas e lance de uma campanha existente
+app.post("/meta/editar-campanha", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const {
+      usuario_id,
+      campaign_id,
+      daily_budget,
+      configuracoes_avancadas
+    } = await c.req.json();
+
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(
+        usuarioId
+      );
+
+    const campanhaBanco = await client.query(
+      `
+      SELECT id, adset_id
+      FROM campanhas
+      WHERE campaign_id = $1
+      AND (
+        usuario_id = $2
+        OR encaminhada_para_usuario_id = $2
+      )
+      AND conta_anuncios_id = $3
+      LIMIT 1
+      `,
+      [campaign_id, usuarioId, contaAnunciosId]
+    );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({
+        error: "Campanha não disponível para este usuário"
+      }, 404);
+    }
+
+    const adsetId =
+      campanhaBanco.rows[0]?.adset_id;
+
+    if (!adsetId) {
+      return c.json({
+        error: "Conjunto de anúncios não encontrado para esta campanha"
+      }, 400);
+    }
+
+    // 🔐 TOKEN
+    const conn = await client.query(
+      `
+      SELECT access_token
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [usuarioId]
+    );
+
+    if (!conn.rows.length) {
+      return c.json({
+        error: "Meta não conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    const avancadas =
+      configuracoes_avancadas || {};
+
+    const targeting =
+      montarTargetingMeta(avancadas);
+
+    const categoriaEspecial =
+      textoOpcional(avancadas.categoria_especial);
+
+    if (
+      [
+        "HOUSING",
+        "CREDIT",
+        "EMPLOYMENT"
+      ].includes(categoriaEspecial)
+    ) {
+      delete targeting.age_min;
+      delete targeting.age_max;
+      delete targeting.genders;
+    }
+
+    const bidStrategy =
+      textoOpcional(avancadas.bid_strategy) ||
+      "LOWEST_COST_WITHOUT_CAP";
+
+    const bidAmount =
+      numeroOpcional(avancadas.bid_amount);
+
+    const inicio =
+      textoOpcional(avancadas.inicio);
+
+    const fim =
+      textoOpcional(avancadas.fim);
+
+    const dailyBudget =
+      numeroOpcional(daily_budget);
+
+    const payloadAdset: any = {
+      targeting,
+      bid_strategy: bidStrategy,
+      access_token: token
+    };
+
+    if (dailyBudget !== null) {
+      payloadAdset.daily_budget = dailyBudget;
+    }
+
+    if (
+      bidAmount !== null &&
+      bidStrategy !== "LOWEST_COST_WITHOUT_CAP"
+    ) {
+      payloadAdset.bid_amount =
+        Math.round(bidAmount * 100);
+    }
+
+    if (fim) {
+      payloadAdset.end_time =
+        new Date(fim).toISOString();
+    }
+
+    if (inicio) {
+      const inicioData = new Date(inicio);
+
+      if (inicioData.getTime() > Date.now()) {
+        payloadAdset.start_time =
+          inicioData.toISOString();
+      }
+    }
+
+    const adsetRes = await fetch(
+      `https://graph.facebook.com/v19.0/${adsetId}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadAdset)
+      }
+    ).then(r => r.json());
+
+    console.log(
+      "EDITAR CAMPANHA PAYLOAD:",
+      JSON.stringify(payloadAdset, null, 2)
+    );
+
+    console.log("EDITAR CAMPANHA RESPONSE:", adsetRes);
+
+    if (adsetRes.error) {
+      return c.json({
+        error: adsetRes.error,
+        targeting_enviado: targeting
+      }, 400);
+    }
+
+    await client.query(
+      `
+      UPDATE campanhas
+      SET
+        configuracoes_avancadas = $1,
+        daily_budget = COALESCE($2, daily_budget),
+        atualizado_em = NOW()
+      WHERE id = $3
+      `,
+      [
+        JSON.stringify(avancadas),
+        dailyBudget,
+        campanhaBanco.rows[0].id
+      ]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("EDITAR CAMPANHA:", err);
+
+    return c.json({
+      error: "Erro ao editar campanha"
+    }, 500);
+  }
+});
+
 
 // 🔹 criar lead
 app.post("/leads", authMiddleware, async (c) => {
