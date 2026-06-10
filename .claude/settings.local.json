@@ -14,7 +14,10 @@
       "WebSearch",
       "Bash(npx tsc *)",
       "PowerShell(npx tsc --noEmit 2>&1)",
-      "Bash(awk '/^input\\\\[type/,/^}/' \"c:\\\\Users\\\\perei\\\\Projeto-Leads\\\\index.html\")"
+      "Bash(awk '/^input\\\\[type/,/^}/' \"c:\\\\Users\\\\perei\\\\Projeto-Leads\\\\index.html\")",
+      "Bash(bun --version)",
+      "Bash(bunx tsc *)",
+      "PowerShell(bun --version)"
     ]
   }
 }
