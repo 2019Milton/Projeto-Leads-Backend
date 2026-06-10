@@ -13,7 +13,8 @@
       "Bash(git push *)",
       "WebSearch",
       "Bash(npx tsc *)",
-      "PowerShell(npx tsc --noEmit 2>&1)"
+      "PowerShell(npx tsc --noEmit 2>&1)",
+      "Bash(awk '/^input\\\\[type/,/^}/' \"c:\\\\Users\\\\perei\\\\Projeto-Leads\\\\index.html\")"
     ]
   }
 }
