@@ -4153,6 +4153,47 @@ app.get(
       }
     }
 
+    // 🔥 DIAGNÓSTICO: permissões realmente concedidas pelo usuário
+    try {
+      const permsRes = await fetch(
+        `https://graph.facebook.com/v19.0/me/permissions?access_token=${token}`
+      ).then(r => r.json());
+
+      console.log("META PERMISSOES:", JSON.stringify(permsRes));
+    } catch (e) {
+      console.error("ERRO PERMISSOES META:", e);
+    }
+
+    // 🔥 INSTAGRAM via Business Manager (conta vinculada direto ao portfolio, sem Página)
+    if (!instagram) {
+      try {
+        const businesses = await fetch(
+          `https://graph.facebook.com/v19.0/me/businesses?fields=id,name&access_token=${token}`
+        ).then(r => r.json());
+
+        console.log("META BUSINESSES:", JSON.stringify(businesses));
+
+        for (const business of businesses.data || []) {
+
+          const igAccounts = await fetch(
+            `https://graph.facebook.com/v19.0/${business.id}/instagram_accounts?fields=id,username,profile_picture_url&access_token=${token}`
+          ).then(r => r.json());
+
+          console.log(
+            `META INSTAGRAM ACCOUNTS (business ${business.id}):`,
+            JSON.stringify(igAccounts)
+          );
+
+          if (igAccounts.data?.length) {
+            instagram = igAccounts.data[0];
+            break;
+          }
+        }
+      } catch (e) {
+        console.error("ERRO INSTAGRAM BUSINESS:", e);
+      }
+    }
+
     // 🔥 MÉTRICAS
 
     const campanhasCount = await client.query(
