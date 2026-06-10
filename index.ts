@@ -6042,6 +6042,15 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           (issuePagamento.error_summary || issuePagamento.error_message)) ||
         (campanhaAtiva ? erroPagamentoConta : null);
 
+      console.log(
+        "ERRO PAGAMENTO CAMPANHA:",
+        campanha.nome,
+        "status:", campanha.status,
+        "campanhaAtiva:", campanhaAtiva,
+        "erroPagamentoConta:", erroPagamentoConta,
+        "mensagemErroPagamento:", mensagemErroPagamento
+      );
+
       metricas.push({
         id: campanha.id,
         nome: campanha.nome,
