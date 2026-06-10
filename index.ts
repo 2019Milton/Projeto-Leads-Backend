@@ -2898,7 +2898,8 @@ app.get("/auth/meta/login", async (c) => {
     "leads_retrieval",
     "pages_show_list",
     "pages_read_engagement",
-    "pages_manage_ads"
+    "pages_manage_ads",
+    "instagram_basic"
 
   ].join(",");
 
@@ -4116,6 +4117,17 @@ app.get(
     // 🔥 PÁGINAS
     const paginas =
       await listarPaginasComInstagram(token);
+
+    console.log(
+      "META PAGINAS + INSTAGRAM:",
+      JSON.stringify(
+        paginas.map((p: any) => ({
+          id: p.id,
+          name: p.name,
+          instagram: p.instagram
+        }))
+      )
+    );
 
     const primeiraPagina = paginas[0];
 
@@ -6210,7 +6222,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         erro_meta: erroMeta,
         erro_pagamento: mensagemErroPagamento || null,
         veiculacao: veiculacaoStatus,
-        veiculacao_label: traduzirVeiculacaoMeta(veiculacaoStatus)
+        veiculacao_label: traduzirVeiculacaoMeta(veiculacaoStatus),
+        conta_anuncios_id: campanha.conta_anuncios_id || null
       });
     }
 
