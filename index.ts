@@ -2439,6 +2439,21 @@ function normalizarValorMonetarioMeta(
     : numero / 100;
 }
 
+// Extrai o saldo numérico de strings como "Saldo disponível (R$0,00 BRL)"
+function extrairSaldoDisponivelMeta(displayString?: string | null) {
+  if (!displayString) return null;
+
+  const match = displayString.match(/([\d.,]+)\s*[A-Z]{3}\)/);
+
+  if (!match) return null;
+
+  const saldo = Number(
+    match[1].replace(/\./g, "").replace(",", ".")
+  );
+
+  return Number.isNaN(saldo) ? null : saldo;
+}
+
 function extrairLeadsActionsMeta(actions: any[] = []) {
   const prioridade = [
     "onsite_conversion.lead_grouped",
@@ -4231,17 +4246,24 @@ app.get(
     const pagamentoManual =
       conta.is_prepay_account === true;
 
-    const pagamentoHabilitado =
-      pagamentoAutomatico ||
-      pagamentoManual;
-
     const saldoApi =
       normalizarValorMonetarioMeta(
         conta.balance,
         conta.currency
       );
 
-    const saldoPrePago = null;
+    const saldoPrePago = extrairSaldoDisponivelMeta(
+      conta.funding_source_details?.display_string
+    );
+
+    const saldoPrePagoZerado =
+      pagamentoManual &&
+      saldoPrePago !== null &&
+      saldoPrePago <= 0;
+
+    const pagamentoHabilitado =
+      pagamentoAutomatico ||
+      (pagamentoManual && !saldoPrePagoZerado);
 
     const tipoPagamento =
       pagamentoManual
@@ -4279,7 +4301,11 @@ app.get(
         pagamento_automatico: pagamentoAutomatico,
         pagamento_manual: pagamentoManual,
         pagamento_habilitado: pagamentoHabilitado,
-        possui_pagamento: pagamentoHabilitado
+        possui_pagamento: pagamentoHabilitado,
+        saldo_zerado: saldoPrePagoZerado,
+        erro_pagamento: saldoPrePagoZerado
+          ? "Sem saldo disponível na conta de anúncios. Adicione fundos na Meta para os anúncios voltarem a veicular."
+          : null
       },
 
       contas_anuncios: contasAds.map((conta: any) => ({
