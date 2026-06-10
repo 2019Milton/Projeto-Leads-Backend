@@ -578,6 +578,12 @@ function montarTargetingMeta(avancadas: any) {
   const raio =
     numeroOpcional(avancadas?.raio);
 
+  const localidadeKey =
+    textoOpcional(avancadas?.localidade_key);
+
+  const localidadeTipo =
+    textoOpcional(avancadas?.localidade_tipo);
+
   const targeting: any = {
     geo_locations: {
       countries: [pais],
@@ -588,7 +594,49 @@ function montarTargetingMeta(avancadas: any) {
     }
   };
 
-  if (
+  const camposGeoPorTipo: Record<string, string> = {
+    country: "countries",
+    region: "regions",
+    city: "cities",
+    neighborhood: "neighborhoods",
+    zip: "zips",
+    geo_market: "geo_markets",
+    electoral_district: "electoral_districts"
+  };
+
+  const campoGeo =
+    localidadeKey && localidadeTipo
+      ? camposGeoPorTipo[localidadeTipo]
+      : null;
+
+  if (campoGeo) {
+
+    if (campoGeo === "countries") {
+      targeting.geo_locations = {
+        countries: [localidadeKey],
+        location_types: [
+          "home",
+          "recent"
+        ]
+      };
+    } else {
+      const localizacao: any = { key: localidadeKey };
+
+      if (campoGeo === "cities" && raio !== null) {
+        localizacao.radius = raio;
+        localizacao.distance_unit = "kilometer";
+      }
+
+      targeting.geo_locations = {
+        [campoGeo]: [localizacao],
+        location_types: [
+          "home",
+          "recent"
+        ]
+      };
+    }
+
+  } else if (
     latitude !== null &&
     longitude !== null &&
     raio !== null
@@ -4550,6 +4598,96 @@ app.post("/meta/direcionamento/interesses", authMiddleware, async (c) => {
 
     return c.json({
       error: "Erro ao buscar interesses Meta"
+    }, 500);
+  }
+});
+
+app.post("/meta/direcionamento/localizacao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id,
+      busca
+    } = await c.req.json();
+
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const termo =
+      textoOpcional(busca)
+        .slice(0, 80);
+
+    if (termo.length < 2) {
+      return c.json({ data: [] });
+    }
+
+    const conn = await client.query(
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+
+    if (!conn.rows.length) {
+      return c.json({
+        error: "Conecte a Meta antes de buscar localizações"
+      }, 400);
+    }
+
+    const params =
+      new URLSearchParams({
+        type: "adgeolocation",
+        q: termo,
+        location_types: JSON.stringify([
+          "country",
+          "region",
+          "city",
+          "neighborhood",
+          "geo_market",
+          "zip"
+        ]),
+        limit: "10",
+        access_token: conn.rows[0].access_token
+      });
+
+    const resposta = await fetch(
+      `https://graph.facebook.com/v19.0/search?${params}`
+    ).then(r => r.json());
+
+    if (resposta.error) {
+      return c.json({
+        error:
+          resposta.error?.error_user_msg ||
+          resposta.error?.message ||
+          "Erro ao buscar localizações na Meta",
+        detalhe: resposta.error
+      }, 400);
+    }
+
+    return c.json({
+      data: Array.isArray(resposta.data)
+        ? resposta.data
+            .map((local: any) => ({
+              key: textoOpcional(local.key),
+              nome: textoOpcional(local.name),
+              tipo: textoOpcional(local.type),
+              regiao: textoOpcional(local.region),
+              pais: textoOpcional(local.country_name)
+            }))
+            .filter((local: any) =>
+              local.key &&
+              local.nome &&
+              local.tipo
+            )
+        : []
+    });
+  } catch (err) {
+    console.error("ERRO BUSCA LOCALIZACAO:", err);
+
+    return c.json({
+      error: "Erro ao buscar localização Meta"
     }, 500);
   }
 });
