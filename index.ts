@@ -2993,7 +2993,8 @@ app.get("/auth/meta/login", async (c) => {
       client_id: clientId,
       redirect_uri: redirectUri,
       scope: scopes,
-      state
+      state,
+      locale: "pt_BR"
     });
 
   const url =
@@ -3118,6 +3119,261 @@ app.get("/auth/meta/callback", async (c) => {
   } catch (err) {
     console.error("ERRO META:", err);
     return c.text("Erro ao conectar Meta");
+  }
+});
+
+
+/* =========================
+   📷 INSTAGRAM LOGIN (Business Login)
+========================= */
+
+// 🔹 REDIRECIONA PARA LOGIN INSTAGRAM (Business Login)
+app.get("/auth/meta/instagram/login", async (c) => {
+  try {
+
+  const token = c.req.query("token");
+
+  if (!token) {
+    return c.text("Token não enviado");
+  }
+
+  const usuario =
+    decodificarTokenUsuario(token);
+
+  if (!usuario?.id) {
+    return c.text("Token invalido ou expirado", 401);
+  }
+
+  const clientId = Bun.env.META_APP_ID;
+  const redirectUri = Bun.env.META_INSTAGRAM_REDIRECT_URI;
+  const configId =
+    Bun.env.META_INSTAGRAM_CONFIG_ID || "1494114041652301";
+
+  if (!clientId || !redirectUri) {
+    return c.text("Configuracao Meta Instagram incompleta", 500);
+  }
+
+  // State temporario de uso unico para o OAuth do Instagram.
+  const state = gerarMetaOAuthState();
+  const stateHash = hashMetaOAuthState(state);
+
+  await client.query(
+    `
+    DELETE FROM meta_oauth_states
+    WHERE expira_em <= NOW()
+    OR usado_em IS NOT NULL
+    `
+  );
+
+  await client.query(
+    `
+    INSERT INTO meta_oauth_states (
+      state_hash,
+      usuario_id,
+      expira_em
+    )
+    VALUES (
+      $1,
+      $2,
+      NOW() + ($3 || ' minutes')::interval
+    )
+    `,
+    [
+      stateHash,
+      usuario.id,
+      META_OAUTH_STATE_TTL_MINUTES
+    ]
+  );
+
+  const params =
+    new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      config_id: configId,
+      state,
+      locale: "pt_BR"
+    });
+
+  const url =
+    `https://www.facebook.com/v19.0/dialog/oauth?${params.toString()}`;
+
+  return c.redirect(url);
+  } catch (err) {
+    console.error("ERRO LOGIN INSTAGRAM:", err);
+    return c.text("Erro ao iniciar conexao Instagram", 500);
+  }
+});
+
+
+// 🔹 CALLBACK (SALVA CONTA DO INSTAGRAM)
+app.get("/auth/meta/instagram/callback", async (c) => {
+  try {
+    const code = c.req.query("code");
+    const state = c.req.query("state");
+
+    if (!state) {
+      return c.text("State nao recebido");
+    }
+
+    if (!code) {
+      return c.text("Erro: code não recebido");
+    }
+
+    const clientId = Bun.env.META_APP_ID;
+    const clientSecret = Bun.env.META_APP_SECRET;
+    const redirectUri = Bun.env.META_INSTAGRAM_REDIRECT_URI;
+
+    if (!clientId || !clientSecret || !redirectUri) {
+      return c.text("Configuracao Meta Instagram incompleta", 500);
+    }
+
+    // 🔥 troca code por token
+    const stateHash = hashMetaOAuthState(state);
+    const db = await client.connect();
+    let usuarioId: number | null = null;
+
+    try {
+      await db.query("BEGIN");
+
+      const stateResult = await db.query(
+        `
+        SELECT id, usuario_id
+        FROM meta_oauth_states
+        WHERE state_hash = $1
+        AND usado_em IS NULL
+        AND expira_em > NOW()
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [stateHash]
+      );
+
+      if (stateResult.rows.length === 0) {
+        await db.query("ROLLBACK");
+        return c.text("State invalido ou expirado", 401);
+      }
+
+      usuarioId = Number(stateResult.rows[0].usuario_id);
+
+      await db.query(
+        `
+        UPDATE meta_oauth_states
+        SET usado_em = NOW()
+        WHERE id = $1
+        `,
+        [stateResult.rows[0].id]
+      );
+
+      await db.query("COMMIT");
+    } catch (err) {
+      await db.query("ROLLBACK");
+      throw err;
+    } finally {
+      db.release();
+    }
+
+    if (!usuarioId) {
+      return c.text("Usuário inválido", 401);
+    }
+
+    const conexao = await client.query(
+      "SELECT id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+
+    if (conexao.rows.length === 0) {
+      return c.html(`
+        <script>
+          if (window.opener) {
+            window.opener.postMessage({ type: "instagram_erro", erro: "Conecte sua conta Meta antes de vincular o Instagram." }, "*");
+          }
+          window.close();
+        </script>
+      `);
+    }
+
+    const params =
+      new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        client_secret: clientSecret,
+        code
+      });
+
+    const tokenRes = await fetch(
+      `https://graph.facebook.com/v19.0/oauth/access_token?${params.toString()}`
+    );
+
+    const tokenData = await tokenRes.json();
+    const access_token = tokenData.access_token;
+
+    if (!tokenRes.ok || !access_token) {
+      console.error("ERRO TOKEN INSTAGRAM:", tokenData);
+      return c.text("Erro ao obter token Instagram", 502);
+    }
+
+    // 🔥 BUSCA CONTA DO INSTAGRAM VINCULADA ÀS PÁGINAS DO USUÁRIO
+    const paginas = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,instagram_business_account{id,username,profile_picture_url}&access_token=${access_token}`
+    ).then(r => r.json());
+
+    console.log("INSTAGRAM LOGIN PAGINAS:", JSON.stringify(paginas));
+
+    let instagram: any = null;
+
+    for (const pagina of paginas.data || []) {
+      if (pagina.instagram_business_account?.id) {
+        instagram = pagina.instagram_business_account;
+        break;
+      }
+    }
+
+    if (!instagram) {
+      console.error("INSTAGRAM LOGIN: nenhuma conta profissional encontrada");
+      return c.html(`
+        <script>
+          if (window.opener) {
+            window.opener.postMessage({ type: "instagram_erro", erro: "Nenhuma conta profissional do Instagram foi encontrada nas Páginas vinculadas." }, "*");
+          }
+          window.close();
+        </script>
+      `);
+    }
+
+    console.log("INSTAGRAM conectado com sucesso:", instagram.username);
+
+    // 💾 salva no banco
+    await client.query(
+      `
+      UPDATE meta_conexoes
+      SET instagram_id = $1,
+          instagram_username = $2,
+          instagram_profile_picture_url = $3,
+          instagram_token = $4,
+          instagram_conectado_em = NOW()
+      WHERE id = $5
+      `,
+      [
+        instagram.id,
+        instagram.username || null,
+        instagram.profile_picture_url || null,
+        access_token,
+        conexao.rows[0].id
+      ]
+    );
+
+    return c.html(`
+      <script>
+        if (window.opener) {
+          window.opener.postMessage({ type: "instagram_conectado" }, "*");
+        }
+        window.close();
+      </script>
+    `);
+
+  } catch (err) {
+    console.error("ERRO INSTAGRAM:", err);
+    return c.text("Erro ao conectar Instagram");
   }
 });
 
@@ -4083,7 +4339,8 @@ app.get(
     // 🔐 TOKEN
     const conn = await client.query(
       `
-      SELECT access_token, ultimo_sync, conta_anuncios_id
+      SELECT access_token, ultimo_sync, conta_anuncios_id,
+        instagram_id, instagram_username, instagram_profile_picture_url
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -4173,7 +4430,12 @@ app.get(
       );
 
       const instagramSemConta =
-        await detectarInstagramMeta(token, paginasSemConta);
+        (await detectarInstagramMeta(token, paginasSemConta)) ||
+        (conn.rows[0].instagram_id ? {
+          id: conn.rows[0].instagram_id,
+          username: conn.rows[0].instagram_username,
+          profile_picture_url: conn.rows[0].instagram_profile_picture_url
+        } : null);
 
       return c.json({
         conectado: true,
@@ -4241,7 +4503,12 @@ app.get(
 
     // 🔥 INSTAGRAM
     const instagram =
-      await detectarInstagramMeta(token, paginas);
+      (await detectarInstagramMeta(token, paginas)) ||
+      (conn.rows[0].instagram_id ? {
+        id: conn.rows[0].instagram_id,
+        username: conn.rows[0].instagram_username,
+        profile_picture_url: conn.rows[0].instagram_profile_picture_url
+      } : null);
 
     // 🔥 MÉTRICAS
 
@@ -5268,7 +5535,12 @@ await client.query(`
 await client.query(`
   ALTER TABLE meta_conexoes
     ADD COLUMN IF NOT EXISTS ultimo_sync TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS conta_anuncios_id TEXT;
+    ADD COLUMN IF NOT EXISTS conta_anuncios_id TEXT,
+    ADD COLUMN IF NOT EXISTS instagram_id TEXT,
+    ADD COLUMN IF NOT EXISTS instagram_username TEXT,
+    ADD COLUMN IF NOT EXISTS instagram_profile_picture_url TEXT,
+    ADD COLUMN IF NOT EXISTS instagram_token TEXT,
+    ADD COLUMN IF NOT EXISTS instagram_conectado_em TIMESTAMP;
 `);
 
 await client.query(`
