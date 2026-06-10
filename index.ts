@@ -5897,7 +5897,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
     if (token && contaAnunciosId) {
       try {
         const contaInfo = await fetch(
-          `https://graph.facebook.com/v19.0/${contaAnunciosId}?fields=account_status,disable_reason&access_token=${token}`
+          `https://graph.facebook.com/v19.0/${contaAnunciosId}?fields=account_status,disable_reason,balance,is_prepay_account,funding_source,funding_source_details&access_token=${token}`
         ).then(r => r.json());
 
         console.log("META ACCOUNT STATUS:", JSON.stringify(contaInfo));
@@ -5906,6 +5906,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         if ([3, 8, 9].includes(Number(contaInfo.account_status))) {
           erroPagamentoConta =
             "A conta de anúncios está com pendência de pagamento na Meta. Verifique o método de cobrança.";
+        } else if (
+          !contaInfo.funding_source &&
+          (!contaInfo.is_prepay_account || Number(contaInfo.balance || 0) <= 0)
+        ) {
+          erroPagamentoConta =
+            "Nenhum método de pagamento configurado na conta de anúncios. Adicione um cartão ou saldo pré-pago na Meta.";
         }
       } catch (e) {
         console.error("ERRO STATUS CONTA:", e);
