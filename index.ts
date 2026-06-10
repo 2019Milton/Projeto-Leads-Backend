@@ -2984,8 +2984,7 @@ app.get("/auth/meta/login", async (c) => {
     "leads_retrieval",
     "pages_show_list",
     "pages_read_engagement",
-    "pages_manage_ads",
-    "instagram_basic"
+    "pages_manage_ads"
 
   ].join(",");
 
