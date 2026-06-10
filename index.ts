@@ -5565,6 +5565,13 @@ await client.query(`
 `);
 
 await client.query(`
+  ALTER TABLE chat_mensagens
+    ADD COLUMN IF NOT EXISTS anexo_url TEXT,
+    ADD COLUMN IF NOT EXISTS anexo_tipo TEXT,
+    ADD COLUMN IF NOT EXISTS anexo_nome TEXT;
+`);
+
+await client.query(`
   ALTER TABLE campanhas
     ADD COLUMN IF NOT EXISTS adset_id TEXT,
     ADD COLUMN IF NOT EXISTS ad_id TEXT,
@@ -10178,6 +10185,113 @@ app.post("/chat/mensagem", authMiddleware, async (c: any) => {
   return c.json({ sucesso: true, conversa_id: conversaId });
 });
 
+// Envia anexo (imagem/print/arquivo) no chat — usuário ou suporte
+app.post("/chat/anexo", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+
+  try {
+    const body = await c.req.formData();
+    const arquivo = body.get("arquivo") as File | null;
+    const conteudo = String(body.get("conteudo") || "").trim();
+
+    if (!arquivo) {
+      return c.json({ error: "Arquivo não enviado" }, 400);
+    }
+
+    const TAMANHO_MAX = 8 * 1024 * 1024; // 8MB
+
+    if (arquivo.size > TAMANHO_MAX) {
+      return c.json({ error: "Arquivo muito grande (máximo 8MB)" }, 400);
+    }
+
+    const tiposPermitidos = [
+      "image/jpeg",
+      "image/png",
+      "image/gif",
+      "image/webp",
+      "application/pdf"
+    ];
+
+    if (!tiposPermitidos.includes(arquivo.type)) {
+      return c.json({ error: "Tipo de arquivo não suportado" }, 400);
+    }
+
+    const buffer = await arquivo.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString("base64");
+    const anexoUrl = `data:${arquivo.type};base64,${base64}`;
+
+    let conversaId: number;
+    let remetenteTipo: string;
+
+    if (isSuporte(user.tipo)) {
+
+      remetenteTipo = "suporte";
+
+      const conversaIdParam = body.get("conversa_id");
+      const usuarioIdParam = body.get("usuario_id");
+
+      if (conversaIdParam) {
+
+        conversaId = Number(conversaIdParam);
+
+        const conversa = await client.query(
+          `SELECT status FROM chat_conversas WHERE id = $1 LIMIT 1`,
+          [conversaId]
+        );
+
+        if (!conversa.rows.length) {
+          return c.json({ error: "Conversa nao encontrada" }, 404);
+        }
+
+        if (conversa.rows[0].status === "fechada") {
+          return c.json({ error: "Reabra a conversa antes de responder" }, 409);
+        }
+
+      } else if (usuarioIdParam) {
+
+        const alvo = await client.query(
+          `SELECT id FROM usuarios
+           WHERE id = $1
+           AND COALESCE(ativo, true) = true
+           AND tipo NOT IN ('suporte', 'super_admin', 'master')
+           LIMIT 1`,
+          [Number(usuarioIdParam)]
+        );
+
+        if (!alvo.rows.length) {
+          return c.json({ error: "Usuario nao encontrado" }, 404);
+        }
+
+        conversaId = await obterOuCriarConversaUsuario(Number(usuarioIdParam));
+
+      } else {
+        return c.json({ error: "Conversa ou usuario nao informado" }, 400);
+      }
+
+    } else {
+      remetenteTipo = "usuario";
+      conversaId = await obterOuCriarConversaUsuario(user.id);
+    }
+
+    await client.query(
+      `INSERT INTO chat_mensagens (conversa_id, remetente_id, remetente_tipo, conteudo, anexo_url, anexo_tipo, anexo_nome)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [conversaId, user.id, remetenteTipo, conteudo, anexoUrl, arquivo.type, arquivo.name]
+    );
+
+    await client.query(
+      `UPDATE chat_conversas SET status = 'aberta', atualizado_em = NOW() WHERE id = $1`,
+      [conversaId]
+    );
+
+    return c.json({ sucesso: true, conversa_id: conversaId });
+
+  } catch (err) {
+    console.error("ERRO CHAT ANEXO:", err);
+    return c.json({ error: "Erro ao enviar anexo" }, 500);
+  }
+});
+
 // Usuário busca mensagens da sua conversa
 app.get("/chat/mensagens", authMiddleware, async (c: any) => {
   const user: any = c.get("user");
@@ -10201,7 +10315,7 @@ app.get("/chat/mensagens", authMiddleware, async (c: any) => {
   );
 
   const msgs = await client.query(
-    `SELECT id, remetente_tipo, conteudo, lido, enviado_em
+    `SELECT id, remetente_tipo, conteudo, lido, enviado_em, anexo_url, anexo_tipo, anexo_nome
      FROM chat_mensagens WHERE conversa_id = $1 ORDER BY enviado_em ASC`,
     [conversaId]
   );
@@ -10268,6 +10382,7 @@ app.get("/chat/conversas/:id/mensagens", authMiddleware, async (c: any) => {
 
   const msgs = await client.query(
     `SELECT m.id, m.remetente_tipo, m.conteudo, m.lido, m.enviado_em,
+            m.anexo_url, m.anexo_tipo, m.anexo_nome,
             u.email AS remetente_email, u.nome AS remetente_nome
      FROM chat_mensagens m
      LEFT JOIN usuarios u ON u.id = m.remetente_id
