@@ -2439,6 +2439,28 @@ function normalizarValorMonetarioMeta(
     : numero / 100;
 }
 
+// Traduz o effective_status do anúncio para o rótulo da coluna "Veiculação" do Gerenciador de Anúncios
+function traduzirVeiculacaoMeta(status?: string | null) {
+  const labels: Record<string, string> = {
+    ACTIVE: "Ativo",
+    PAUSED: "Pausado",
+    DELETED: "Excluído",
+    PENDING_REVIEW: "Em análise",
+    DISAPPROVED: "Reprovado",
+    PREAPPROVED: "Pré-aprovado",
+    PENDING_BILLING_INFO: "Pendente: dados de pagamento",
+    CAMPAIGN_PAUSED: "Campanha pausada",
+    ARCHIVED: "Arquivado",
+    ADSET_PAUSED: "Conjunto pausado",
+    IN_PROCESS: "Preparando",
+    WITH_ISSUES: "Com problemas"
+  };
+
+  if (!status) return null;
+
+  return labels[status] || status;
+}
+
 // Extrai o saldo numérico de strings como "Saldo disponível (R$0,00 BRL)"
 function extrairSaldoDisponivelMeta(displayString?: string | null) {
   if (!displayString) return null;
@@ -6002,6 +6024,53 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       }
     }
 
+    // 🔥 VEICULAÇÃO (status detalhado dos anúncios, igual ao Gerenciador de Anúncios)
+    const veiculacaoPorCampanha: Record<string, string> = {};
+
+    if (token && contaAnunciosId) {
+      try {
+        const adsResp = await fetch(
+          `https://graph.facebook.com/v19.0/${contaAnunciosId}/ads?fields=id,campaign_id,effective_status&limit=500&access_token=${token}`
+        ).then(r => r.json());
+
+        console.log("META ADS EFFECTIVE STATUS:", JSON.stringify(adsResp));
+
+        const prioridade = [
+          "WITH_ISSUES",
+          "DISAPPROVED",
+          "PENDING_BILLING_INFO",
+          "PENDING_REVIEW",
+          "IN_PROCESS",
+          "PREAPPROVED",
+          "ADSET_PAUSED",
+          "CAMPAIGN_PAUSED",
+          "PAUSED",
+          "ACTIVE",
+          "ARCHIVED",
+          "DELETED"
+        ];
+
+        const statusPorCampanha: Record<string, string[]> = {};
+
+        for (const ad of adsResp.data || []) {
+          if (!ad.campaign_id || !ad.effective_status) continue;
+
+          statusPorCampanha[ad.campaign_id] =
+            statusPorCampanha[ad.campaign_id] || [];
+          statusPorCampanha[ad.campaign_id].push(ad.effective_status);
+        }
+
+        for (const [campaignId, statuses] of Object.entries(statusPorCampanha)) {
+          const melhorStatus = prioridade.find(p => statuses.includes(p));
+          if (melhorStatus) {
+            veiculacaoPorCampanha[campaignId] = melhorStatus;
+          }
+        }
+      } catch (e) {
+        console.error("ERRO ADS EFFECTIVE STATUS:", e);
+      }
+    }
+
     const metricas = [];
 
     for (const campanha of campanhas.rows) {
@@ -6083,6 +6152,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           (issuePagamento.error_summary || issuePagamento.error_message)) ||
         (campanhaAtiva ? erroPagamentoConta : null);
 
+      // 🔥 VEICULAÇÃO (status detalhado igual ao Gerenciador de Anúncios)
+      const veiculacaoStatus =
+        veiculacaoPorCampanha[campanha.campaign_id] || null;
+
       console.log(
         "ERRO PAGAMENTO CAMPANHA:",
         campanha.nome,
@@ -6135,7 +6208,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         metricas_origem: metaDisponivel ? "meta" : "local",
         meta_disponivel: metaDisponivel,
         erro_meta: erroMeta,
-        erro_pagamento: mensagemErroPagamento || null
+        erro_pagamento: mensagemErroPagamento || null,
+        veiculacao: veiculacaoStatus,
+        veiculacao_label: traduzirVeiculacaoMeta(veiculacaoStatus)
       });
     }
 
