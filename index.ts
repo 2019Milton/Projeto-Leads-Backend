@@ -5906,12 +5906,27 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         if ([3, 8, 9].includes(Number(contaInfo.account_status))) {
           erroPagamentoConta =
             "A conta de anúncios está com pendência de pagamento na Meta. Verifique o método de cobrança.";
-        } else if (
-          !contaInfo.funding_source &&
-          (!contaInfo.is_prepay_account || Number(contaInfo.balance || 0) <= 0)
-        ) {
+        } else if (!contaInfo.funding_source) {
           erroPagamentoConta =
             "Nenhum método de pagamento configurado na conta de anúncios. Adicione um cartão ou saldo pré-pago na Meta.";
+        } else if (contaInfo.is_prepay_account) {
+          // Conta com saldo pré-pago: o saldo real disponível vem na string
+          // "Saldo disponível (R$0,00 BRL)" — o campo "balance" não reflete isso.
+          const display: string =
+            contaInfo.funding_source_details?.display_string || "";
+
+          const match = display.match(/([\d.,]+)\s*[A-Z]{3}\)/);
+
+          if (match) {
+            const saldo = Number(
+              match[1].replace(/\./g, "").replace(",", ".")
+            );
+
+            if (!Number.isNaN(saldo) && saldo <= 0) {
+              erroPagamentoConta =
+                "Sem saldo disponível na conta de anúncios. Adicione fundos na Meta para os anúncios voltarem a veicular.";
+            }
+          }
         }
       } catch (e) {
         console.error("ERRO STATUS CONTA:", e);
