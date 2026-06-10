@@ -17,7 +17,21 @@
       "Bash(awk '/^input\\\\[type/,/^}/' \"c:\\\\Users\\\\perei\\\\Projeto-Leads\\\\index.html\")",
       "Bash(bun --version)",
       "Bash(bunx tsc *)",
-      "PowerShell(bun --version)"
+      "PowerShell(bun --version)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" status --porcelain)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" diff --stat)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" log --oneline -3)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" log --oneline -5)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" show --stat 3605556)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" show --stat 48b0efb)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" show --stat 6c1d36e)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" status --porcelain)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" log --oneline -5)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" show 6c1d36e -- index.ts)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" status --porcelain -b)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" status --porcelain -b)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\" push origin main)",
+      "Bash(git -C \"c:\\\\Users\\\\perei\\\\Projeto-Leads\" push origin main)"
     ]
   }
 }
