@@ -3344,12 +3344,12 @@ app.get("/auth/meta/instagram/callback", async (c) => {
 
     // 🔥 BUSCA PERFIL DA CONTA DO INSTAGRAM
     const perfil = await fetch(
-      `https://graph.instagram.com/me?fields=id,username,account_type,profile_picture_url&access_token=${encodeURIComponent(access_token)}`
+      `https://graph.instagram.com/v21.0/me?fields=user_id,username,account_type,profile_picture_url&access_token=${encodeURIComponent(access_token)}`
     ).then(r => r.json());
 
     console.log("INSTAGRAM LOGIN PERFIL:", JSON.stringify(perfil));
 
-    if (!perfil.id) {
+    if (!perfil.user_id) {
       console.error("INSTAGRAM LOGIN: perfil invalido", perfil);
       return c.html(`
         <script>
@@ -3375,7 +3375,7 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       WHERE id = $5
       `,
       [
-        perfil.id,
+        perfil.user_id,
         perfil.username || null,
         perfil.profile_picture_url || null,
         access_token,
