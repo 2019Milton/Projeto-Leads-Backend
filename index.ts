@@ -542,6 +542,67 @@ async function listarPaginasComInstagram(
     : [];
 }
 
+// 🔥 Detecta a conta profissional do Instagram vinculada (via Página ou via Business Manager)
+async function detectarInstagramMeta(
+  token: string,
+  paginas: any[]
+) {
+  let instagram =
+    paginas.find((pagina: any) =>
+      pagina.instagram?.id
+    )?.instagram || null;
+
+  const primeiraPagina = paginas[0];
+
+  if (!instagram && primeiraPagina?.id) {
+
+    const instaRes = await fetch(
+      `https://graph.facebook.com/v19.0/${primeiraPagina.id}?fields=instagram_business_account&access_token=${token}`
+    ).then(r => r.json());
+
+    if (instaRes.instagram_business_account?.id) {
+
+      const instaInfo = await fetch(
+        `https://graph.facebook.com/v19.0/${instaRes.instagram_business_account.id}?fields=username,profile_picture_url&access_token=${token}`
+      ).then(r => r.json());
+
+      instagram = instaInfo;
+    }
+  }
+
+  // Conta vinculada direto ao portfólio do Business Manager (sem Página)
+  if (!instagram) {
+    try {
+      const businesses = await fetch(
+        `https://graph.facebook.com/v19.0/me/businesses?fields=id,name&access_token=${token}`
+      ).then(r => r.json());
+
+      console.log("META BUSINESSES:", JSON.stringify(businesses));
+
+      for (const business of businesses.data || []) {
+
+        const igAccounts = await fetch(
+          `https://graph.facebook.com/v19.0/${business.id}/instagram_accounts?fields=id,username,profile_picture_url&access_token=${token}`
+        ).then(r => r.json());
+
+        console.log(
+          `META INSTAGRAM ACCOUNTS (business ${business.id}):`,
+          JSON.stringify(igAccounts)
+        );
+
+        if (igAccounts.data?.length) {
+          instagram = igAccounts.data[0];
+          break;
+        }
+      }
+    } catch (e) {
+      console.error("ERRO INSTAGRAM BUSINESS:", e);
+    }
+  }
+
+  return instagram;
+}
+
 function urlOpcional(value: unknown, fallback: string) {
   const url = textoOpcional(value);
 
@@ -569,20 +630,10 @@ function montarTargetingMeta(avancadas: any) {
       .toUpperCase()
       .slice(0, 2) || "BR";
 
-  const latitude =
-    numeroOpcional(avancadas?.latitude);
-
-  const longitude =
-    numeroOpcional(avancadas?.longitude);
-
-  const raio =
-    numeroOpcional(avancadas?.raio);
-
-  const localidadeKey =
-    textoOpcional(avancadas?.localidade_key);
-
-  const localidadeTipo =
-    textoOpcional(avancadas?.localidade_tipo);
+  const localidades =
+    Array.isArray(avancadas?.localidades)
+      ? avancadas.localidades
+      : [];
 
   const targeting: any = {
     geo_locations: {
@@ -604,52 +655,39 @@ function montarTargetingMeta(avancadas: any) {
     electoral_district: "electoral_districts"
   };
 
-  const campoGeo =
-    localidadeKey && localidadeTipo
-      ? camposGeoPorTipo[localidadeTipo]
-      : null;
+  const gruposGeo: Record<string, any[]> = {};
 
-  if (campoGeo) {
+  for (const local of localidades) {
+    const key = textoOpcional(local?.key);
+    const tipo = textoOpcional(local?.tipo);
+    const campo = camposGeoPorTipo[tipo];
 
-    if (campoGeo === "countries") {
-      targeting.geo_locations = {
-        countries: [localidadeKey],
-        location_types: [
-          "home",
-          "recent"
-        ]
-      };
-    } else {
-      const localizacao: any = { key: localidadeKey };
+    if (!key || !campo) continue;
 
-      if (campoGeo === "cities" && raio !== null) {
-        localizacao.radius = raio;
-        localizacao.distance_unit = "kilometer";
-      }
-
-      targeting.geo_locations = {
-        [campoGeo]: [localizacao],
-        location_types: [
-          "home",
-          "recent"
-        ]
-      };
+    if (campo === "countries") {
+      gruposGeo.countries = gruposGeo.countries || [];
+      gruposGeo.countries.push(key);
+      continue;
     }
 
-  } else if (
-    latitude !== null &&
-    longitude !== null &&
-    raio !== null
-  ) {
+    const entrada: any = { key };
+
+    if (campo === "cities") {
+      const raio = numeroOpcional(local?.raio);
+
+      if (raio !== null) {
+        entrada.radius = raio;
+        entrada.distance_unit = "kilometer";
+      }
+    }
+
+    gruposGeo[campo] = gruposGeo[campo] || [];
+    gruposGeo[campo].push(entrada);
+  }
+
+  if (Object.keys(gruposGeo).length) {
     targeting.geo_locations = {
-      custom_locations: [
-        {
-          latitude,
-          longitude,
-          radius: raio,
-          distance_unit: "kilometer"
-        }
-      ],
+      ...gruposGeo,
       location_types: [
         "home",
         "recent"
@@ -4124,6 +4162,20 @@ app.get(
       const paginasSemConta =
         await listarPaginasComInstagram(token);
 
+      console.log(
+        "META PAGINAS + INSTAGRAM (sem conta selecionada):",
+        JSON.stringify(
+          paginasSemConta.map((p: any) => ({
+            id: p.id,
+            name: p.name,
+            instagram: p.instagram
+          }))
+        )
+      );
+
+      const instagramSemConta =
+        await detectarInstagramMeta(token, paginasSemConta);
+
       return c.json({
         conectado: true,
         possui_conta_anuncios: true,
@@ -4138,7 +4190,7 @@ app.get(
         })),
         paginas: paginasSemConta,
         tos_aceitas: tosAceitas,
-        instagram: null,
+        instagram: instagramSemConta,
         metricas: {
           campanhas: 0,
           campanhas_ativas: 0,
@@ -4177,30 +4229,6 @@ app.get(
       )
     );
 
-    const primeiraPagina = paginas[0];
-
-    // 🔥 INSTAGRAM
-    let instagram =
-      paginas.find((pagina: any) =>
-        pagina.instagram?.id
-      )?.instagram || null;
-
-    if (!instagram && primeiraPagina?.id) {
-
-      const instaRes = await fetch(
-        `https://graph.facebook.com/v19.0/${primeiraPagina.id}?fields=instagram_business_account&access_token=${token}`
-      ).then(r => r.json());
-
-      if (instaRes.instagram_business_account?.id) {
-
-        const instaInfo = await fetch(
-          `https://graph.facebook.com/v19.0/${instaRes.instagram_business_account.id}?fields=username,profile_picture_url&access_token=${token}`
-        ).then(r => r.json());
-
-        instagram = instaInfo;
-      }
-    }
-
     // 🔥 DIAGNÓSTICO: permissões realmente concedidas pelo usuário
     try {
       const permsRes = await fetch(
@@ -4212,35 +4240,9 @@ app.get(
       console.error("ERRO PERMISSOES META:", e);
     }
 
-    // 🔥 INSTAGRAM via Business Manager (conta vinculada direto ao portfolio, sem Página)
-    if (!instagram) {
-      try {
-        const businesses = await fetch(
-          `https://graph.facebook.com/v19.0/me/businesses?fields=id,name&access_token=${token}`
-        ).then(r => r.json());
-
-        console.log("META BUSINESSES:", JSON.stringify(businesses));
-
-        for (const business of businesses.data || []) {
-
-          const igAccounts = await fetch(
-            `https://graph.facebook.com/v19.0/${business.id}/instagram_accounts?fields=id,username,profile_picture_url&access_token=${token}`
-          ).then(r => r.json());
-
-          console.log(
-            `META INSTAGRAM ACCOUNTS (business ${business.id}):`,
-            JSON.stringify(igAccounts)
-          );
-
-          if (igAccounts.data?.length) {
-            instagram = igAccounts.data[0];
-            break;
-          }
-        }
-      } catch (e) {
-        console.error("ERRO INSTAGRAM BUSINESS:", e);
-      }
-    }
+    // 🔥 INSTAGRAM
+    const instagram =
+      await detectarInstagramMeta(token, paginas);
 
     // 🔥 MÉTRICAS
 
