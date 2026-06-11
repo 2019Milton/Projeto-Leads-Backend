@@ -41,7 +41,10 @@
       "Bash(cd \"/c/Users/perei/Projeto-Leads-Backend\" && cat package.json | head -30)",
       "Read(//c/c/Users/perei/Projeto-Leads-Backend/**)",
       "Bash(cd \"/c/Users/perei/Projeto-Leads\" && ls -la | grep -iE \"vercel|netlify|railway|deploy|\\\\.toml|\\\\.yml|\\\\.yaml\")",
-      "Read(//c/c/Users/perei/**)"
+      "Read(//c/c/Users/perei/**)",
+      "Bash(awk -F: '$1>10408 && $1<10800')",
+      "Bash(bun build *)",
+      "PowerShell(cd \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\"; bun build index.ts --outdir \"$env:TEMP\\\\buildcheck\" 2>&1 | Select-Object -Last 40)"
     ]
   }
 }

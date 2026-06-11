@@ -709,7 +709,7 @@ function montarTargetingMeta(avancadas: any) {
 
     const entrada: any = { key };
 
-    if (campo === "cities") {
+    if (campo === "cities" || campo === "zips") {
       const raio = numeroOpcional(local?.raio);
 
       if (raio !== null) {
@@ -2439,7 +2439,8 @@ const authMiddleware = async (c: any, next: any) => {
         ia_custo_limite_mensal,
         COALESCE(ia_ativo, true) AS ia_ativo,
         COALESCE(ia_provider, 'auto') AS ia_provider,
-        COALESCE(ativo, true) AS ativo
+        COALESCE(ativo, true) AS ativo,
+        COALESCE(is_parceiro, false) AS is_parceiro
       FROM usuarios
       WHERE id = $1
       LIMIT 1
@@ -2935,6 +2936,86 @@ app.put("/admin/usuarios/:id/vinculo", authMiddleware, async (c) => {
 
     return c.json({
       error: "Erro ao alterar vínculo"
+    }, 500);
+  }
+});
+
+
+app.put("/admin/usuarios/:id/parceiro", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const id = c.req.param("id");
+
+    const body = await c.req.json();
+
+    await client.query(`
+      UPDATE usuarios
+      SET is_parceiro = $1
+      WHERE id = $2
+    `, [
+      !!body.is_parceiro,
+      id
+    ]);
+
+    return c.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO PARCEIRO:", err);
+
+    return c.json({
+      error: "Erro ao alterar parceiro"
+    }, 500);
+  }
+});
+
+
+app.put("/admin/usuarios/:id/vinculo-parceiro", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const id = c.req.param("id");
+
+    const body = await c.req.json();
+
+    await client.query(`
+      UPDATE usuarios
+      SET parceiro_id = $1
+      WHERE id = $2
+    `, [
+      body.parceiro_id || null,
+      id
+    ]);
+
+    return c.json({
+      success: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO VINCULO PARCEIRO:", err);
+
+    return c.json({
+      error: "Erro ao alterar vínculo de parceiro"
     }, 500);
   }
 });
@@ -5621,7 +5702,30 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS ia_custo_limite_mensal NUMERIC(12, 2) DEFAULT 120,
     ADD COLUMN IF NOT EXISTS ia_ativo BOOLEAN DEFAULT true,
     ADD COLUMN IF NOT EXISTS ia_provider TEXT DEFAULT 'auto',
-    ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS is_parceiro BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS parceiro_id INTEGER;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS parceiro_financeiro (
+    id SERIAL PRIMARY KEY,
+    parceiro_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    cliente_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    mes_referencia DATE NOT NULL,
+    valor_mensalidade NUMERIC(12, 2) DEFAULT 0,
+    valor_comissao NUMERIC(12, 2) DEFAULT 0,
+    status TEXT DEFAULT 'pendente',
+    pago_em TIMESTAMP,
+    observacoes TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (cliente_id, mes_referencia)
+  );
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_parceiro_financeiro_parceiro
+    ON parceiro_financeiro(parceiro_id);
 `);
 
 await client.query(`
@@ -9049,6 +9153,9 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         COALESCE(u.ia_ativo, true) AS ia_ativo,
         u.admin_id,
         admin.email AS admin_email,
+        COALESCE(u.is_parceiro, false) AS is_parceiro,
+        u.parceiro_id,
+        parceiro.email AS parceiro_email,
         COALESCE(u.ativo, true) AS ativo,
         COALESCE(ia.uso_mes, 0) AS ia_uso_mes,
         COALESCE(ia.custo_mes, 0) AS ia_custo_mes,
@@ -9057,6 +9164,8 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
       FROM usuarios u
       LEFT JOIN usuarios admin
         ON admin.id = u.admin_id
+      LEFT JOIN usuarios parceiro
+        ON parceiro.id = u.parceiro_id
       LEFT JOIN (
         SELECT
           usuario_id,
@@ -9084,6 +9193,9 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.ia_ativo,
         u.admin_id,
         admin.email,
+        u.is_parceiro,
+        u.parceiro_id,
+        parceiro.email,
         u.ativo,
         ia.uso_mes,
         ia.custo_mes
@@ -9123,6 +9235,328 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
   }
 });
 
+
+/* =========================
+   🤝 FINANCEIRO DE PARCEIROS
+========================= */
+
+// 🔹 listar lançamentos (super_admin)
+app.get("/admin/parceiro-financeiro", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const result = await client.query(`
+      SELECT
+        pf.id,
+        pf.parceiro_id,
+        parceiro.email AS parceiro_email,
+        pf.cliente_id,
+        cliente.email AS cliente_email,
+        pf.mes_referencia,
+        pf.valor_mensalidade,
+        pf.valor_comissao,
+        pf.status,
+        pf.pago_em,
+        pf.observacoes,
+        pf.criado_em
+      FROM parceiro_financeiro pf
+      INNER JOIN usuarios parceiro
+        ON parceiro.id = pf.parceiro_id
+      INNER JOIN usuarios cliente
+        ON cliente.id = pf.cliente_id
+      ORDER BY pf.mes_referencia DESC, pf.id DESC
+    `);
+
+    return c.json({
+      lancamentos: result.rows
+    });
+
+  } catch (err) {
+
+    console.error("ERRO LISTAR FINANCEIRO PARCEIRO:", err);
+
+    return c.json({
+      error: "Erro ao buscar financeiro de parceiros"
+    }, 500);
+  }
+});
+
+// 🔹 criar/atualizar lançamento (super_admin)
+app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const body = await c.req.json();
+
+    const {
+      cliente_id,
+      mes_referencia,
+      valor_mensalidade,
+      valor_comissao,
+      status,
+      observacoes
+    } = body;
+
+    if (!cliente_id || !mes_referencia) {
+      return c.json({
+        error: "Cliente e mês de referência são obrigatórios"
+      }, 400);
+    }
+
+    const cliente = await client.query(
+      `
+      SELECT id, parceiro_id
+      FROM usuarios
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [cliente_id]
+    );
+
+    const parceiroId = cliente.rows[0]?.parceiro_id;
+
+    if (!parceiroId) {
+      return c.json({
+        error: "Este cliente não está vinculado a um parceiro"
+      }, 400);
+    }
+
+    const result = await client.query(
+      `
+      INSERT INTO parceiro_financeiro (
+        parceiro_id,
+        cliente_id,
+        mes_referencia,
+        valor_mensalidade,
+        valor_comissao,
+        status,
+        observacoes,
+        pago_em
+      )
+      VALUES (
+        $1, $2, $3, $4, $5,
+        COALESCE($6, 'pendente'),
+        $7,
+        CASE WHEN $6 = 'pago' THEN NOW() ELSE NULL END
+      )
+      ON CONFLICT (cliente_id, mes_referencia)
+      DO UPDATE SET
+        valor_mensalidade = EXCLUDED.valor_mensalidade,
+        valor_comissao = EXCLUDED.valor_comissao,
+        status = EXCLUDED.status,
+        observacoes = EXCLUDED.observacoes,
+        pago_em = CASE
+          WHEN EXCLUDED.status = 'pago' THEN COALESCE(parceiro_financeiro.pago_em, NOW())
+          ELSE NULL
+        END
+      RETURNING id
+      `,
+      [
+        parceiroId,
+        cliente_id,
+        mes_referencia,
+        valor_mensalidade || 0,
+        valor_comissao || 0,
+        status || "pendente",
+        observacoes || null
+      ]
+    );
+
+    return c.json({
+      sucesso: true,
+      id: result.rows[0].id
+    });
+
+  } catch (err) {
+
+    console.error("ERRO SALVAR FINANCEIRO PARCEIRO:", err);
+
+    return c.json({
+      error: "Erro ao salvar lançamento"
+    }, 500);
+  }
+});
+
+// 🔹 atualizar status/valores de um lançamento (super_admin)
+app.put("/admin/parceiro-financeiro/:id", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+
+    const body = await c.req.json();
+
+    const {
+      valor_mensalidade,
+      valor_comissao,
+      status,
+      observacoes
+    } = body;
+
+    await client.query(
+      `
+      UPDATE parceiro_financeiro
+      SET
+        valor_mensalidade = COALESCE($1, valor_mensalidade),
+        valor_comissao = COALESCE($2, valor_comissao),
+        status = COALESCE($3, status),
+        observacoes = COALESCE($4, observacoes),
+        pago_em = CASE
+          WHEN $3 = 'pago' THEN COALESCE(pago_em, NOW())
+          WHEN $3 = 'pendente' THEN NULL
+          ELSE pago_em
+        END
+      WHERE id = $5
+      `,
+      [
+        valor_mensalidade,
+        valor_comissao,
+        status,
+        observacoes,
+        id
+      ]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO ATUALIZAR FINANCEIRO PARCEIRO:", err);
+
+    return c.json({
+      error: "Erro ao atualizar lançamento"
+    }, 500);
+  }
+});
+
+// 🔹 excluir lançamento (super_admin)
+app.delete("/admin/parceiro-financeiro/:id", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso negado"
+      }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+
+    await client.query(
+      `
+      DELETE FROM parceiro_financeiro
+      WHERE id = $1
+      `,
+      [id]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("ERRO EXCLUIR FINANCEIRO PARCEIRO:", err);
+
+    return c.json({
+      error: "Erro ao excluir lançamento"
+    }, 500);
+  }
+});
+
+// 🔹 painel do parceiro (somente leitura)
+app.get("/parceiro/painel", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    if (!user.is_parceiro && user.tipo !== "super_admin") {
+      return c.json({
+        error: "Acesso restrito a parceiros"
+      }, 403);
+    }
+
+    const clientes = await client.query(
+      `
+      SELECT
+        id,
+        email,
+        nome,
+        sobrenome,
+        tipo,
+        plano,
+        COALESCE(ativo, true) AS ativo
+      FROM usuarios
+      WHERE parceiro_id = $1
+      ORDER BY email ASC
+      `,
+      [user.id]
+    );
+
+    const lancamentos = await client.query(
+      `
+      SELECT
+        pf.id,
+        pf.cliente_id,
+        cliente.email AS cliente_email,
+        pf.mes_referencia,
+        pf.valor_mensalidade,
+        pf.valor_comissao,
+        pf.status,
+        pf.pago_em,
+        pf.observacoes
+      FROM parceiro_financeiro pf
+      INNER JOIN usuarios cliente
+        ON cliente.id = pf.cliente_id
+      WHERE pf.parceiro_id = $1
+      ORDER BY pf.mes_referencia DESC, pf.id DESC
+      `,
+      [user.id]
+    );
+
+    return c.json({
+      clientes: clientes.rows,
+      lancamentos: lancamentos.rows
+    });
+
+  } catch (err) {
+
+    console.error("ERRO PAINEL PARCEIRO:", err);
+
+    return c.json({
+      error: "Erro ao carregar painel do parceiro"
+    }, 500);
+  }
+});
 
 
 app.get("/admin/recursos", authMiddleware, async (c) => {
