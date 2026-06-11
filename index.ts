@@ -4526,6 +4526,14 @@ app.get(
           profile_picture_url: conn.rows[0].instagram_profile_picture_url
         } : null);
 
+      if (instagramSemConta) {
+        for (const pagina of paginasSemConta) {
+          if (!pagina.instagram) {
+            pagina.instagram = instagramSemConta;
+          }
+        }
+      }
+
       return c.json({
         conectado: true,
         possui_conta_anuncios: true,
@@ -4598,6 +4606,15 @@ app.get(
         username: conn.rows[0].instagram_username,
         profile_picture_url: conn.rows[0].instagram_profile_picture_url
       } : null);
+
+    // Reflete o vinculo encontrado (qualquer origem) nas Paginas, para o front-end
+    if (instagram) {
+      for (const pagina of paginas) {
+        if (!pagina.instagram) {
+          pagina.instagram = instagram;
+        }
+      }
+    }
 
     // 🔥 INSTAGRAM VINCULADO AO GERENCIADOR DE NEGOCIOS DA CONTA DE ANUNCIOS
     // (permite anunciar no Instagram mesmo sem vinculo direto com a Pagina)
