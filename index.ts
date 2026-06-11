@@ -2635,6 +2635,41 @@ function extrairLeadsActionsMeta(actions: any[] = []) {
     );
 }
 
+async function listarCampaignIdsMetaDoUsuario(
+  usuarioId: number,
+  contaAnunciosId: string
+) {
+  const result = await client.query(
+    `
+    SELECT DISTINCT campaign_id
+    FROM campanhas
+    WHERE usuario_id = $1
+      AND conta_anuncios_id = $2
+      AND campaign_id IS NOT NULL
+      AND COALESCE(status, '') <> 'DELETED'
+      AND (
+        ad_id IS NOT NULL
+        OR adset_id IS NOT NULL
+        OR form_id IS NOT NULL
+        OR EXISTS (
+          SELECT 1
+          FROM leads l
+          WHERE l.usuario_id = campanhas.usuario_id
+            AND l.conta_anuncios_id = campanhas.conta_anuncios_id
+            AND l.campanha = campanhas.nome
+        )
+      )
+    `,
+    [usuarioId, contaAnunciosId]
+  );
+
+  return new Set(
+    result.rows
+      .map((row: any) => String(row.campaign_id || ""))
+      .filter(Boolean)
+  );
+}
+
 async function obterContaAnuncios(
   token: string,
   contaSelecionadaId?: string | null
@@ -2741,8 +2776,9 @@ async function sincronizarTodasCampanhas() {
             SELECT id
             FROM campanhas
             WHERE campaign_id = $1
+            AND usuario_id = $2
             `,
-            [campanha.id]
+            [campanha.id, user.usuario_id]
           );
 
           if (existe.rows.length > 0) {
@@ -2756,12 +2792,14 @@ async function sincronizarTodasCampanhas() {
                 conta_anuncios_id = $3,
                 atualizado_em = NOW()
               WHERE campaign_id = $4
+              AND usuario_id = $5
               `,
               [
                 campanha.name,
                 statusFinal,
                 adAccountId,
-                campanha.id
+                campanha.id,
+                user.usuario_id
               ]
             );
 
@@ -4464,6 +4502,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         page_id = $4,
         daily_budget = $5
       WHERE CAST(campaign_id AS TEXT) = $6
+      AND usuario_id = $7
       `,
       [
         adset_id,
@@ -4471,7 +4510,8 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         form_id,
         page_id,
         numeroOpcional(daily_budget),
-        String(campaign_id)
+        String(campaign_id),
+        usuarioId
       ]
     );
 
@@ -5365,8 +5405,13 @@ app.post("/webhook/meta", async (c) => {
 
             // 🔄 EVITA DUPLICATA
             const leadExiste = await client.query(
-              `SELECT id FROM leads WHERE lead_id = $1`,
-              [leadgen_id]
+              `
+              SELECT id
+              FROM leads
+              WHERE lead_id = $1
+              AND usuario_id = $2
+              `,
+              [leadgen_id, usuarioId]
             );
 
             if (leadExiste.rows.length > 0) {
@@ -7072,6 +7117,12 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
 
     const adAccountId = contaAds.id;
 
+    const campaignIdsUsuario =
+      await listarCampaignIdsMetaDoUsuario(
+        Number(user.id),
+        adAccountId
+      );
+
     const inicio = new Date();
     inicio.setDate(inicio.getDate() - (dias - 1));
     inicio.setHours(0, 0, 0, 0);
@@ -7094,7 +7145,7 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
       );
 
     const insights = await fetch(
-      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend,actions,impressions,clicks,reach&time_increment=1&time_range=${timeRange}&access_token=${token}`
+      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=campaign_id,spend,actions,impressions,clicks,reach&level=campaign&time_increment=1&time_range=${timeRange}&access_token=${token}`
     ).then(r => r.json());
 
     if (insights.error) {
@@ -7131,12 +7182,37 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
       ])
     );
 
-    const metaPorDia = new Map(
-      (insights.data || []).map((linha: any) => [
-        linha.date_start,
-        linha
-      ])
-    );
+    const metaPorDia = new Map();
+
+    for (const linha of insights.data || []) {
+      const campaignId =
+        String(linha.campaign_id || "");
+
+      if (!campaignIdsUsuario.has(campaignId)) {
+        continue;
+      }
+
+      const dataLinha =
+        linha.date_start;
+
+      const atual =
+        metaPorDia.get(dataLinha) || {
+          date_start: dataLinha,
+          spend: 0,
+          leads: 0,
+          clicks: 0,
+          impressions: 0,
+          reach: 0
+        };
+
+      atual.spend += Number(linha.spend || 0);
+      atual.leads += extrairLeadsActionsMeta(linha.actions || []);
+      atual.clicks += Number(linha.clicks || 0);
+      atual.impressions += Number(linha.impressions || 0);
+      atual.reach += Number(linha.reach || 0);
+
+      metaPorDia.set(dataLinha, atual);
+    }
 
     const datasPeriodo = Array.from(
       { length: dias },
@@ -7154,7 +7230,7 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         const gasto =
           Number(linha.spend || 0);
         const leadsMeta =
-          extrairLeadsActionsMeta(linha.actions || []);
+          Number(linha.leads || 0);
         const leadsPlataforma =
           leadsBancoPorDia.get(data) || 0;
         const leads =
@@ -7339,6 +7415,11 @@ app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: an
     }
 
     const adAccountId = contaAds.id;
+    const campaignIdsUsuario =
+      await listarCampaignIdsMetaDoUsuario(
+        Number(user.id),
+        adAccountId
+      );
     const timeRange = encodeURIComponent(JSON.stringify({ since: data, until: data }));
 
     const insights = await fetch(
@@ -7349,19 +7430,23 @@ app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: an
       return c.json({ error: "Erro ao buscar dados da Meta", detalhe: insights.error }, 400);
     }
 
-    const campanhas = (insights.data || []).map((item: any) => {
-      const gasto = Number(item.spend || 0);
-      const leads = extrairLeadsActionsMeta(item.actions || []);
-      return {
-        campaign_id: item.campaign_id,
-        nome: item.campaign_name || "Campanha sem nome",
-        gasto,
-        leads,
-        cliques: Number(item.clicks || 0),
-        impressoes: Number(item.impressions || 0),
-        custo_por_lead: leads > 0 ? gasto / leads : null
-      };
-    });
+    const campanhas = (insights.data || [])
+      .filter((item: any) =>
+        campaignIdsUsuario.has(String(item.campaign_id || ""))
+      )
+      .map((item: any) => {
+        const gasto = Number(item.spend || 0);
+        const leads = extrairLeadsActionsMeta(item.actions || []);
+        return {
+          campaign_id: item.campaign_id,
+          nome: item.campaign_name || "Campanha sem nome",
+          gasto,
+          leads,
+          cliques: Number(item.clicks || 0),
+          impressoes: Number(item.impressions || 0),
+          custo_por_lead: leads > 0 ? gasto / leads : null
+        };
+      });
 
     campanhas.sort((a: any, b: any) => b.gasto - a.gasto);
 
@@ -7476,8 +7561,9 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
         SELECT id
         FROM campanhas
         WHERE campaign_id = $1
+        AND usuario_id = $2
         `,
-        [campanha.id]
+        [campanha.id, user.id]
       );
 
       if (existe.rows.length > 0) {
@@ -7491,12 +7577,14 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             conta_anuncios_id = $3,
             atualizado_em = NOW()
           WHERE campaign_id = $4
+          AND usuario_id = $5
           `,
           [
             campanha.name,
             statusFinal,
             adAccountId,
-            campanha.id
+            campanha.id,
+            user.id
           ]
         );
 
@@ -7577,9 +7665,10 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
           FROM campanhas
           WHERE form_id = $1
           AND conta_anuncios_id = $2
+          AND usuario_id = $3
           LIMIT 1
           `,
-          [form.id, adAccountId]
+          [form.id, adAccountId, user.id]
         );
 
         if (!campanhaBanco.rows.length) {
@@ -7637,8 +7726,9 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             SELECT id
             FROM leads
             WHERE lead_id = $1
+            AND usuario_id = $2
             `,
-            [lead.id]
+            [lead.id, user.id]
           );
 
           if (leadExiste.rows.length > 0) {
@@ -11487,8 +11577,3 @@ Bun.serve({
   port: Number(Bun.env.PORT) || 3000,
   fetch: app.fetch,
 });
-
-
-
-
-
