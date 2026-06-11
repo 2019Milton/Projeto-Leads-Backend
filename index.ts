@@ -605,6 +605,13 @@ async function detectarInstagramMeta(
     } catch (e) {
       console.error("ERRO INSTAGRAM BUSINESS:", e);
     }
+
+    // Reflete o vinculo encontrado via Business Manager nas Paginas, para o front-end
+    if (instagram) {
+      for (const pagina of paginas) {
+        pagina.instagram = instagram;
+      }
+    }
   }
 
   return instagram;
