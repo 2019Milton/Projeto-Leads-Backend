@@ -47,6 +47,9 @@ const PLANOS_PLATAFORMA = [
   "ouro"
 ] as const;
 
+// 🤝 percentual repassado ao parceiro sobre o valor cobrado do cliente
+const PARCEIRO_PERCENTUAL_COMISSAO = 0.35;
+
 type PlanoPlataforma =
   typeof PLANOS_PLATAFORMA[number];
 
@@ -5713,6 +5716,7 @@ await client.query(`
     parceiro_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
     cliente_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
     mes_referencia DATE NOT NULL,
+    plano TEXT,
     valor_mensalidade NUMERIC(12, 2) DEFAULT 0,
     valor_comissao NUMERIC(12, 2) DEFAULT 0,
     status TEXT DEFAULT 'pendente',
@@ -5721,6 +5725,11 @@ await client.query(`
     criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (cliente_id, mes_referencia)
   );
+`);
+
+await client.query(`
+  ALTER TABLE parceiro_financeiro
+    ADD COLUMN IF NOT EXISTS plano TEXT;
 `);
 
 await client.query(`
@@ -9261,6 +9270,7 @@ app.get("/admin/parceiro-financeiro", authMiddleware, async (c) => {
         pf.cliente_id,
         cliente.email AS cliente_email,
         pf.mes_referencia,
+        pf.plano,
         pf.valor_mensalidade,
         pf.valor_comissao,
         pf.status,
@@ -9307,8 +9317,8 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
     const {
       cliente_id,
       mes_referencia,
-      valor_mensalidade,
-      valor_comissao,
+      plano,
+      valor_total,
       status,
       observacoes
     } = body;
@@ -9337,12 +9347,18 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
       }, 400);
     }
 
+    const valorTotal = Number(valor_total) || 0;
+    const valorComissao = Math.round(
+      valorTotal * PARCEIRO_PERCENTUAL_COMISSAO * 100
+    ) / 100;
+
     const result = await client.query(
       `
       INSERT INTO parceiro_financeiro (
         parceiro_id,
         cliente_id,
         mes_referencia,
+        plano,
         valor_mensalidade,
         valor_comissao,
         status,
@@ -9350,13 +9366,14 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
         pago_em
       )
       VALUES (
-        $1, $2, $3, $4, $5,
-        COALESCE($6, 'pendente'),
-        $7,
-        CASE WHEN $6 = 'pago' THEN NOW() ELSE NULL END
+        $1, $2, $3, $4, $5, $6,
+        COALESCE($7, 'pendente'),
+        $8,
+        CASE WHEN $7 = 'pago' THEN NOW() ELSE NULL END
       )
       ON CONFLICT (cliente_id, mes_referencia)
       DO UPDATE SET
+        plano = EXCLUDED.plano,
         valor_mensalidade = EXCLUDED.valor_mensalidade,
         valor_comissao = EXCLUDED.valor_comissao,
         status = EXCLUDED.status,
@@ -9371,8 +9388,9 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
         parceiroId,
         cliente_id,
         mes_referencia,
-        valor_mensalidade || 0,
-        valor_comissao || 0,
+        plano || null,
+        valorTotal,
+        valorComissao,
         status || "pendente",
         observacoes || null
       ]
@@ -9411,30 +9429,39 @@ app.put("/admin/parceiro-financeiro/:id", authMiddleware, async (c) => {
     const body = await c.req.json();
 
     const {
-      valor_mensalidade,
-      valor_comissao,
+      plano,
+      valor_total,
       status,
       observacoes
     } = body;
+
+    const valorComissao =
+      valor_total != null
+        ? Math.round(
+            Number(valor_total) * PARCEIRO_PERCENTUAL_COMISSAO * 100
+          ) / 100
+        : null;
 
     await client.query(
       `
       UPDATE parceiro_financeiro
       SET
-        valor_mensalidade = COALESCE($1, valor_mensalidade),
-        valor_comissao = COALESCE($2, valor_comissao),
-        status = COALESCE($3, status),
-        observacoes = COALESCE($4, observacoes),
+        plano = COALESCE($1, plano),
+        valor_mensalidade = COALESCE($2, valor_mensalidade),
+        valor_comissao = COALESCE($3, valor_comissao),
+        status = COALESCE($4, status),
+        observacoes = COALESCE($5, observacoes),
         pago_em = CASE
-          WHEN $3 = 'pago' THEN COALESCE(pago_em, NOW())
-          WHEN $3 = 'pendente' THEN NULL
+          WHEN $4 = 'pago' THEN COALESCE(pago_em, NOW())
+          WHEN $4 = 'pendente' THEN NULL
           ELSE pago_em
         END
-      WHERE id = $5
+      WHERE id = $6
       `,
       [
-        valor_mensalidade,
-        valor_comissao,
+        plano,
+        valor_total,
+        valorComissao,
         status,
         observacoes,
         id
@@ -9529,6 +9556,7 @@ app.get("/parceiro/painel", authMiddleware, async (c) => {
         pf.cliente_id,
         cliente.email AS cliente_email,
         pf.mes_referencia,
+        pf.plano,
         pf.valor_mensalidade,
         pf.valor_comissao,
         pf.status,
