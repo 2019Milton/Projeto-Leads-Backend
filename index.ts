@@ -4334,6 +4334,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         link: linkDestino,
         image_hash: hash,
         name: i === 0 ? tituloAnuncio : `Slide ${i + 1}`,
+        description: descricaoAnuncio,
         call_to_action: {
           type: ctaType,
           value: { lead_gen_form_id: form_id }
