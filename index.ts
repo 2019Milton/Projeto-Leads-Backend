@@ -5779,6 +5779,11 @@ await client.query(`
 `);
 
 await client.query(`
+  ALTER TABLE parceiro_financeiro
+    ADD COLUMN IF NOT EXISTS percentual_parceiro NUMERIC(5, 2) DEFAULT ${PARCEIRO_PERCENTUAL_COMISSAO * 100};
+`);
+
+await client.query(`
   CREATE INDEX IF NOT EXISTS idx_parceiro_financeiro_parceiro
     ON parceiro_financeiro(parceiro_id);
 `);
@@ -9364,6 +9369,7 @@ app.get("/admin/parceiro-financeiro", authMiddleware, async (c) => {
         pf.plano,
         pf.valor_mensalidade,
         pf.valor_comissao,
+        pf.percentual_parceiro,
         pf.status,
         pf.pago_em,
         pf.observacoes,
@@ -9410,6 +9416,7 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
       mes_referencia,
       plano,
       valor_total,
+      percentual_parceiro,
       status,
       observacoes
     } = body;
@@ -9439,8 +9446,12 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
     }
 
     const valorTotal = Number(valor_total) || 0;
+    const percentualParceiro =
+      percentual_parceiro != null && percentual_parceiro !== ""
+        ? Number(percentual_parceiro)
+        : PARCEIRO_PERCENTUAL_COMISSAO * 100;
     const valorComissao = Math.round(
-      valorTotal * PARCEIRO_PERCENTUAL_COMISSAO * 100
+      valorTotal * (percentualParceiro / 100) * 100
     ) / 100;
 
     const result = await client.query(
@@ -9452,21 +9463,23 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
         plano,
         valor_mensalidade,
         valor_comissao,
+        percentual_parceiro,
         status,
         observacoes,
         pago_em
       )
       VALUES (
-        $1, $2, $3, $4, $5, $6,
-        COALESCE($7, 'pendente'),
-        $8,
-        CASE WHEN $7 = 'pago' THEN NOW() ELSE NULL END
+        $1, $2, $3, $4, $5, $6, $7,
+        COALESCE($8, 'pendente'),
+        $9,
+        CASE WHEN $8 = 'pago' THEN NOW() ELSE NULL END
       )
       ON CONFLICT (cliente_id, mes_referencia)
       DO UPDATE SET
         plano = EXCLUDED.plano,
         valor_mensalidade = EXCLUDED.valor_mensalidade,
         valor_comissao = EXCLUDED.valor_comissao,
+        percentual_parceiro = EXCLUDED.percentual_parceiro,
         status = EXCLUDED.status,
         observacoes = EXCLUDED.observacoes,
         pago_em = CASE
@@ -9482,6 +9495,7 @@ app.post("/admin/parceiro-financeiro", authMiddleware, async (c) => {
         plano || null,
         valorTotal,
         valorComissao,
+        percentualParceiro,
         status || "pendente",
         observacoes || null
       ]
@@ -9522,16 +9536,31 @@ app.put("/admin/parceiro-financeiro/:id", authMiddleware, async (c) => {
     const {
       plano,
       valor_total,
+      percentual_parceiro,
       status,
       observacoes
     } = body;
 
-    const valorComissao =
-      valor_total != null
-        ? Math.round(
-            Number(valor_total) * PARCEIRO_PERCENTUAL_COMISSAO * 100
-          ) / 100
-        : null;
+    let valorComissao = null;
+
+    if (valor_total != null || percentual_parceiro != null) {
+      const atual = await client.query(
+        `SELECT valor_mensalidade, percentual_parceiro FROM parceiro_financeiro WHERE id = $1`,
+        [id]
+      );
+
+      const valorTotal =
+        valor_total != null
+          ? Number(valor_total)
+          : Number(atual.rows[0]?.valor_mensalidade) || 0;
+
+      const percentualParceiro =
+        percentual_parceiro != null && percentual_parceiro !== ""
+          ? Number(percentual_parceiro)
+          : Number(atual.rows[0]?.percentual_parceiro) || (PARCEIRO_PERCENTUAL_COMISSAO * 100);
+
+      valorComissao = Math.round(valorTotal * (percentualParceiro / 100) * 100) / 100;
+    }
 
     await client.query(
       `
@@ -9540,19 +9569,21 @@ app.put("/admin/parceiro-financeiro/:id", authMiddleware, async (c) => {
         plano = COALESCE($1, plano),
         valor_mensalidade = COALESCE($2, valor_mensalidade),
         valor_comissao = COALESCE($3, valor_comissao),
-        status = COALESCE($4, status),
-        observacoes = COALESCE($5, observacoes),
+        percentual_parceiro = COALESCE($4, percentual_parceiro),
+        status = COALESCE($5, status),
+        observacoes = COALESCE($6, observacoes),
         pago_em = CASE
-          WHEN $4 = 'pago' THEN COALESCE(pago_em, NOW())
-          WHEN $4 = 'pendente' THEN NULL
+          WHEN $5 = 'pago' THEN COALESCE(pago_em, NOW())
+          WHEN $5 = 'pendente' THEN NULL
           ELSE pago_em
         END
-      WHERE id = $6
+      WHERE id = $7
       `,
       [
         plano,
         valor_total,
         valorComissao,
+        percentual_parceiro,
         status,
         observacoes,
         id
@@ -9650,6 +9681,7 @@ app.get("/parceiro/painel", authMiddleware, async (c) => {
         pf.plano,
         pf.valor_mensalidade,
         pf.valor_comissao,
+        pf.percentual_parceiro,
         pf.status,
         pf.pago_em,
         pf.observacoes
@@ -10339,6 +10371,91 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   } catch (err) {
     console.error("CRIADOR CAMPANHA ERRO:", err);
     return c.json({ sugestoes: fallbackVariacoes(topico) });
+  }
+});
+
+app.post("/ia/gerar-banner", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const limite = limitarRequisicao(c, `ia-banner:${user.id}`, 5, 60 * 1000);
+    if (limite) return limite;
+
+    const bloqueio = await motivoBloqueioIA(user);
+    if (bloqueio) return c.json({ error: bloqueio }, 403);
+
+    const body = await c.req.json().catch(() => ({}));
+    const prompt = textoOpcional(body.prompt);
+    if (!prompt) return c.json({ error: "Descreva o banner antes de gerar." }, 400);
+
+    const imagensBase64: Array<{ data: string; tipo: string }> = Array.isArray(body.imagens_base64)
+      ? body.imagens_base64.slice(0, 4)
+      : [];
+
+    const openaiKey = Bun.env.OPENAI_API_KEY;
+    if (!openaiKey) return c.json({ error: "Geração de imagem não configurada. Configure a chave OpenAI." }, 400);
+
+    let imagemBase64 = "";
+
+    if (imagensBase64.length > 0) {
+      // Usa gpt-image-1 com imagens de referência via multipart
+      const formData = new FormData();
+      formData.append("model", "gpt-image-1");
+      formData.append("prompt", prompt);
+      formData.append("n", "1");
+      formData.append("size", "1024x1024");
+
+      for (let i = 0; i < imagensBase64.length; i++) {
+        const { data, tipo } = imagensBase64[i];
+        const buffer = Buffer.from(data, "base64");
+        const blob = new Blob([buffer], { type: tipo || "image/png" });
+        formData.append("image", blob, `ref_${i + 1}.png`);
+      }
+
+      const resp = await fetch("https://api.openai.com/v1/images/edits", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${openaiKey}` },
+        body: formData
+      });
+
+      const result: any = await resp.json();
+      if (!resp.ok) {
+        console.error("GERAR BANNER GPT-IMAGE-1 ERROR:", result?.error?.message);
+        return c.json({ error: result?.error?.message || "Erro ao gerar banner com as imagens selecionadas." }, 500);
+      }
+      imagemBase64 = result?.data?.[0]?.b64_json || "";
+    } else {
+      // Usa DALL-E 3 somente com texto
+      const resp = await fetch("https://api.openai.com/v1/images/generations", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${openaiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "dall-e-3",
+          prompt,
+          n: 1,
+          size: "1024x1024",
+          response_format: "b64_json"
+        })
+      });
+
+      const result: any = await resp.json();
+      if (!resp.ok) {
+        console.error("GERAR BANNER DALL-E-3 ERROR:", result?.error?.message);
+        return c.json({ error: result?.error?.message || "Erro ao gerar banner." }, 500);
+      }
+      imagemBase64 = result?.data?.[0]?.b64_json || "";
+    }
+
+    if (!imagemBase64) return c.json({ error: "A IA não retornou uma imagem. Tente novamente." }, 500);
+
+    await registrarUsoIA(Number(user.id), "gerar_banner", "imagem", null, 0, 0, 0);
+
+    return c.json({ sucesso: true, imagem_base64: imagemBase64 });
+  } catch (err) {
+    console.error("GERAR BANNER EXCEPTION:", err);
+    return c.json({ error: "Erro interno ao gerar banner." }, 500);
   }
 });
 
