@@ -10391,7 +10391,13 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       ? body.imagens_base64.slice(0, 4)
       : [];
 
-    const openaiKey = Bun.env.OPENAI_API_KEY;
+    // Respeita o provider do usuário — geração de imagem só é suportada pela OpenAI,
+    // então Anthropic faz fallback silencioso para OpenAI.
+    const iaProvider: string = (user as any).ia_provider || "auto";
+    const openaiKey = iaProvider === "anthropic"
+      ? (Bun.env.OPENAI_API_KEY ?? null)   // fallback silencioso
+      : Bun.env.OPENAI_API_KEY;
+
     if (!openaiKey) return c.json({ error: "Geração de imagem não configurada. Configure a chave OpenAI." }, 400);
 
     let imagemBase64 = "";
