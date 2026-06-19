@@ -5930,6 +5930,8 @@ await client.query(`
   ON CONFLICT (slug) DO UPDATE SET cor = EXCLUDED.cor, nome = EXCLUDED.nome;
 `);
 
+await client.query(`UPDATE nichos SET cor = '#7C3AED' WHERE slug = 'saude';`);
+
 await client.query(`
   CREATE TABLE IF NOT EXISTS usuario_nichos (
     usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
