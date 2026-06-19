@@ -5925,12 +5925,12 @@ await client.query(`
 await client.query(`
   INSERT INTO nichos (slug, nome, cor) VALUES
     ('imoveis',     'Imóveis',          '#2563EB'),
-    ('saude',       'Convênio Médico',  '#7C3AED'),
+    ('saude',       'Planos de Saúde',  '#7C3AED'),
     ('suplementos', 'Suplementos',      '#EA580C')
   ON CONFLICT (slug) DO UPDATE SET cor = EXCLUDED.cor, nome = EXCLUDED.nome;
 `);
 
-await client.query(`UPDATE nichos SET cor = '#7C3AED' WHERE slug = 'saude';`);
+await client.query(`UPDATE nichos SET cor = '#7C3AED', nome = 'Planos de Saúde' WHERE slug = 'saude';`);
 
 await client.query(`
   CREATE TABLE IF NOT EXISTS usuario_nichos (
