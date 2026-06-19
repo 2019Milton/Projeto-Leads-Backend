@@ -11930,7 +11930,7 @@ app.put("/usuario/nichos", authMiddleware, async (c) => {
 app.get("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    if (user.tipo !== "super_admin" && user.tipo !== "admin_corretor") {
+    if (user.tipo !== "super_admin") {
       return c.json({ error: "Acesso negado" }, 403);
     }
     const targetId = Number(c.req.param("id"));
@@ -11953,7 +11953,7 @@ app.get("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
 app.put("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    if (user.tipo !== "super_admin" && user.tipo !== "admin_corretor") {
+    if (user.tipo !== "super_admin") {
       return c.json({ error: "Acesso negado" }, 403);
     }
     const targetId = Number(c.req.param("id"));
