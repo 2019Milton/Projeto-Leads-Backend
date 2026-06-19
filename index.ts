@@ -5925,9 +5925,9 @@ await client.query(`
 await client.query(`
   INSERT INTO nichos (slug, nome, cor) VALUES
     ('imoveis',     'Imóveis',          '#2563EB'),
-    ('saude',       'Convênio Médico',  '#16A34A'),
+    ('saude',       'Convênio Médico',  '#7C3AED'),
     ('suplementos', 'Suplementos',      '#EA580C')
-  ON CONFLICT (slug) DO NOTHING;
+  ON CONFLICT (slug) DO UPDATE SET cor = EXCLUDED.cor, nome = EXCLUDED.nome;
 `);
 
 await client.query(`
