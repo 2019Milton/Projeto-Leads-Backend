@@ -2432,20 +2432,34 @@ const authMiddleware = async (c: any, next: any) => {
     const usuarioAtual = await client.query(
       `
       SELECT
-        id,
-        email,
-        tipo,
-        nome,
-        sobrenome,
-        plano,
-        ia_limite_mensal,
-        ia_custo_limite_mensal,
-        COALESCE(ia_ativo, true) AS ia_ativo,
-        COALESCE(ia_provider, 'auto') AS ia_provider,
-        COALESCE(ativo, true) AS ativo,
-        COALESCE(is_parceiro, false) AS is_parceiro
-      FROM usuarios
-      WHERE id = $1
+        u.id,
+        u.email,
+        u.tipo,
+        u.nome,
+        u.sobrenome,
+        u.plano,
+        u.ia_limite_mensal,
+        u.ia_custo_limite_mensal,
+        COALESCE(u.ia_ativo, true) AS ia_ativo,
+        COALESCE(u.ia_provider, 'auto') AS ia_provider,
+        COALESCE(u.ativo, true) AS ativo,
+        COALESCE(u.is_parceiro, false) AS is_parceiro,
+        COALESCE(
+          (
+            SELECT json_agg(json_build_object(
+              'id',   n.id,
+              'slug', n.slug,
+              'nome', n.nome,
+              'cor',  n.cor
+            ) ORDER BY n.id)
+            FROM usuario_nichos un
+            INNER JOIN nichos n ON n.id = un.nicho_id
+            WHERE un.usuario_id = u.id
+          ),
+          '[]'::json
+        ) AS nichos
+      FROM usuarios u
+      WHERE u.id = $1
       LIMIT 1
       `,
       [user.id]
@@ -3670,7 +3684,8 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
       usuario_id,
       nome,
       objetivo,
-      configuracoes_avancadas
+      configuracoes_avancadas,
+      nicho_id
     } = await c.req.json();
 
     const usuarioId =
@@ -3745,9 +3760,10 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
         nome,
         status,
         origem,
-        configuracoes_avancadas
+        configuracoes_avancadas,
+        nicho_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       `,
       [
         usuarioId,
@@ -3756,7 +3772,8 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
         nome || "Campanha Plataforma",
         "PAUSED",
         "plataforma",
-        JSON.stringify(configuracoes_avancadas || {})
+        JSON.stringify(configuracoes_avancadas || {}),
+        nicho_id ?? null
       ]
     );
 
@@ -5335,11 +5352,12 @@ app.post("/webhook/meta", async (c) => {
             let usuarioId: number | null = null;
             let nomeCampanha = "Campanha Meta";
             let contaAnunciosId: string | null = null;
+            let nichoIdLead: number | null = null;
 
             if (form_id) {
               const campanhaByForm = await client.query(
                 `
-                SELECT usuario_id, nome, conta_anuncios_id
+                SELECT usuario_id, nome, conta_anuncios_id, nicho_id
                 FROM campanhas
                 WHERE form_id = $1
                 LIMIT 1
@@ -5351,13 +5369,14 @@ app.post("/webhook/meta", async (c) => {
                 usuarioId = campanhaByForm.rows[0].usuario_id;
                 nomeCampanha = campanhaByForm.rows[0].nome;
                 contaAnunciosId = campanhaByForm.rows[0].conta_anuncios_id;
+                nichoIdLead = campanhaByForm.rows[0].nicho_id ?? null;
               }
             }
 
             if (!usuarioId && page_id) {
               const campanhaByPage = await client.query(
                 `
-                SELECT usuario_id, nome, conta_anuncios_id
+                SELECT usuario_id, nome, conta_anuncios_id, nicho_id
                 FROM campanhas
                 WHERE page_id = $1
                 ORDER BY id DESC
@@ -5370,6 +5389,7 @@ app.post("/webhook/meta", async (c) => {
                 usuarioId = campanhaByPage.rows[0].usuario_id;
                 nomeCampanha = campanhaByPage.rows[0].nome;
                 contaAnunciosId = campanhaByPage.rows[0].conta_anuncios_id;
+                nichoIdLead = campanhaByPage.rows[0].nicho_id ?? null;
               }
             }
 
@@ -5466,9 +5486,10 @@ app.post("/webhook/meta", async (c) => {
                 campanha,
                 conta_anuncios_id,
                 respostas_qualificacao,
+                nicho_id,
                 criado_em
               )
-              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE($11::timestamptz, NOW()))
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,COALESCE($12::timestamptz, NOW()))
               `,
               [
                 usuarioId,
@@ -5481,6 +5502,7 @@ app.post("/webhook/meta", async (c) => {
                 nomeCampanha,
                 contaAnunciosId,
                 JSON.stringify(respostasQualificacao),
+                nichoIdLead,
                 criadoEmMeta
               ]
             );
@@ -5889,6 +5911,84 @@ await client.query(`
     ON password_history(usuario_id, criado_em DESC);
   CREATE INDEX IF NOT EXISTS idx_ia_usos_usuario_data
     ON ia_usos(usuario_id, criado_em DESC);
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS nichos (
+    id SERIAL PRIMARY KEY,
+    slug TEXT UNIQUE NOT NULL,
+    nome TEXT NOT NULL,
+    cor TEXT NOT NULL
+  );
+`);
+
+await client.query(`
+  INSERT INTO nichos (slug, nome, cor) VALUES
+    ('imoveis',     'Imóveis',          '#2563EB'),
+    ('saude',       'Convênio Médico',  '#16A34A'),
+    ('suplementos', 'Suplementos',      '#EA580C')
+  ON CONFLICT (slug) DO NOTHING;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS usuario_nichos (
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    nicho_id   INTEGER NOT NULL REFERENCES nichos(id)   ON DELETE CASCADE,
+    criado_em  TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (usuario_id, nicho_id)
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas_imoveis (
+    campanha_id INTEGER PRIMARY KEY REFERENCES campanhas(id) ON DELETE CASCADE,
+    tipo_imovel TEXT,
+    finalidade  TEXT,
+    valor_min   NUMERIC(12, 2),
+    valor_max   NUMERIC(12, 2),
+    regiao      TEXT
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas_saude (
+    campanha_id      INTEGER PRIMARY KEY REFERENCES campanhas(id) ON DELETE CASCADE,
+    operadora        TEXT,
+    tipo_plano       TEXT,
+    faixa_etaria_min INTEGER,
+    faixa_etaria_max INTEGER,
+    cobertura        TEXT,
+    acomodacao       TEXT
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas_suplementos (
+    campanha_id  INTEGER PRIMARY KEY REFERENCES campanhas(id) ON DELETE CASCADE,
+    produto      TEXT,
+    objetivo     TEXT,
+    marca        TEXT,
+    publico_alvo TEXT
+  );
+`);
+
+await client.query(`
+  ALTER TABLE campanhas
+    ADD COLUMN IF NOT EXISTS nicho_id INTEGER REFERENCES nichos(id);
+`);
+
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS nicho_id INTEGER REFERENCES nichos(id);
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_campanhas_nicho_id
+    ON campanhas(nicho_id);
+  CREATE INDEX IF NOT EXISTS idx_leads_nicho_id
+    ON leads(nicho_id);
+  CREATE INDEX IF NOT EXISTS idx_usuario_nichos_usuario
+    ON usuario_nichos(usuario_id);
 `);
 
 /* =========================
@@ -6444,16 +6544,18 @@ app.get("/campanhas", authMiddleware, async (c) => {
         user.id
       );
 
-    if (!contaAnunciosId) {
-      return c.json([]);
-    }
+    const nichoSlug =
+      textoOpcional(c.req.query("nicho"));
 
     const campanhas = await client.query(
       `
       SELECT
         c.*,
-        dono.email AS criado_por_email,
-        dono.nome AS criado_por_nome,
+        n.slug  AS nicho_slug,
+        n.nome  AS nicho_nome,
+        n.cor   AS nicho_cor,
+        dono.email     AS criado_por_email,
+        dono.nome      AS criado_por_nome,
         dono.sobrenome AS criado_por_sobrenome,
         COALESCE(
           (
@@ -6473,6 +6575,8 @@ app.get("/campanhas", authMiddleware, async (c) => {
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
+      LEFT JOIN nichos n
+        ON n.id = c.nicho_id
       WHERE
         (
           c.usuario_id = $1
@@ -6483,10 +6587,14 @@ app.get("/campanhas", authMiddleware, async (c) => {
             AND cc2.usuario_id = $1
           )
         )
-        AND c.conta_anuncios_id = $2
+        AND (
+          c.origem = 'manual'
+          OR c.conta_anuncios_id = $2
+        )
+        AND ($3::text IS NULL OR n.slug = $3)
       ORDER BY c.id DESC
       `,
-      [user.id, contaAnunciosId]
+      [user.id, contaAnunciosId ?? null, nichoSlug ?? null]
     );
 
     console.log("CAMPANHAS:", campanhas.rows);
@@ -7667,7 +7775,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
         // 🔥 BUSCA CAMPANHA PELO FORM
         const campanhaBanco = await client.query(
           `
-          SELECT nome
+          SELECT nome, nicho_id
           FROM campanhas
           WHERE form_id = $1
           AND conta_anuncios_id = $2
@@ -7684,10 +7792,13 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
           );
           continue;
         }
-        
+
         const nomeCampanha =
           campanhaBanco.rows[0]?.nome ||
           "Campanha sem vínculo";
+
+        const nichoIdSync: number | null =
+          campanhaBanco.rows[0]?.nicho_id ?? null;
         
         console.log("FORM:", form.name);
 
@@ -7783,10 +7894,11 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               origem,
               status,
               respostas_qualificacao,
+              nicho_id,
               criado_em
             )
             VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()
             )
             `,
             [
@@ -7799,7 +7911,8 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               adAccountId,
               "meta",
               "novo",
-              JSON.stringify(respostasQualificacao)
+              JSON.stringify(respostasQualificacao),
+              nichoIdSync
             ]
           );
 
@@ -8465,26 +8578,31 @@ app.get("/leads", authMiddleware, async (c) => {
     const result = await client.query(
       `
       SELECT
-        id,
-        nome,
-        telefone,
-        email,
-        status,
-        origem,
-        campanha,
-        observacao,
-        score,
-        score_manual,
-        motivo_perda,
-        respostas_qualificacao,
-        criado_em
-      FROM leads
-      WHERE usuario_id = $1
+        l.id,
+        l.nome,
+        l.telefone,
+        l.email,
+        l.status,
+        l.origem,
+        l.campanha,
+        l.observacao,
+        l.score,
+        l.score_manual,
+        l.motivo_perda,
+        l.respostas_qualificacao,
+        l.criado_em,
+        l.nicho_id,
+        n.slug AS nicho_slug,
+        n.nome AS nicho_nome,
+        n.cor  AS nicho_cor
+      FROM leads l
+      LEFT JOIN nichos n ON n.id = l.nicho_id
+      WHERE l.usuario_id = $1
       AND (
-        COALESCE(origem, 'manual') <> 'meta'
-        OR conta_anuncios_id = $2
+        COALESCE(l.origem, 'manual') <> 'meta'
+        OR l.conta_anuncios_id = $2
       )
-      ORDER BY criado_em DESC
+      ORDER BY l.criado_em DESC
       `,
       [user.id, contaAnunciosId]
     );
@@ -9249,6 +9367,8 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.id,
         u.email,
         u.tipo,
+        u.nome,
+        u.sobrenome,
         u.plano,
         u.plano_ativado_em,
         u.assinatura_status,
@@ -9265,7 +9385,21 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         COALESCE(ia.uso_mes, 0) AS ia_uso_mes,
         COALESCE(ia.custo_mes, 0) AS ia_custo_mes,
         COUNT(DISTINCT c.id) AS campanhas,
-        COUNT(DISTINCT l.id) AS leads
+        COUNT(DISTINCT l.id) AS leads,
+        COALESCE(
+          (
+            SELECT json_agg(json_build_object(
+              'id',   n.id,
+              'slug', n.slug,
+              'nome', n.nome,
+              'cor',  n.cor
+            ) ORDER BY n.id)
+            FROM usuario_nichos un
+            INNER JOIN nichos n ON n.id = un.nicho_id
+            WHERE un.usuario_id = u.id
+          ),
+          '[]'::json
+        ) AS nichos
       FROM usuarios u
       LEFT JOIN usuarios admin
         ON admin.id = u.admin_id
@@ -9289,6 +9423,8 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.id,
         u.email,
         u.tipo,
+        u.nome,
+        u.sobrenome,
         u.plano,
         u.plano_ativado_em,
         u.assinatura_status,
@@ -10765,7 +10901,8 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       senha,
       tipo,
       admin_id,
-      plano
+      plano,
+      nicho_ids
     } = await c.req.json();
 
     if (
@@ -10806,7 +10943,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
     const senhaHash = await gerarHashSenha(senha);
     const planoFinal = normalizarPlano(plano);
 
-    await client.query(
+    const novoUsuario = await client.query(
       `
       INSERT INTO usuarios (
         nome,
@@ -10827,6 +10964,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         CASE WHEN $7 = 'ouro' THEN NOW() ELSE NULL END,
         CASE WHEN $7 = 'ouro' THEN 'manual' ELSE 'manual' END
       )
+      RETURNING id
       `,
       [
         nome,
@@ -10839,8 +10977,21 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       ]
     );
 
+    const novoId = novoUsuario.rows[0].id;
+
+    if (Array.isArray(nicho_ids) && nicho_ids.length > 0) {
+      for (const nid of nicho_ids.slice(0, 3)) {
+        await client.query(
+          `INSERT INTO usuario_nichos (usuario_id, nicho_id)
+           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [novoId, nid]
+        );
+      }
+    }
+
     return c.json({
-      sucesso: true
+      sucesso: true,
+      id: novoId
     });
 
   } catch (err) {
@@ -11690,6 +11841,434 @@ app.post("/admin/corrigir-datas-leads", authMiddleware, masterMiddleware, async 
     return c.json({ total: leads.length, atualizados, erros, detalhes });
   } catch (err: any) {
     return c.json({ error: err.message }, 500);
+  }
+});
+
+/* =========================
+   🏷️ NICHOS
+========================= */
+
+// listar todos os nichos
+app.get("/nichos", async (c) => {
+  try {
+    const result = await client.query(
+      `SELECT id, slug, nome, cor FROM nichos ORDER BY id`
+    );
+    return c.json(result.rows);
+  } catch (err) {
+    console.error("ERRO GET /nichos:", err);
+    return c.json({ error: "Erro ao buscar nichos" }, 500);
+  }
+});
+
+// nichos habilitados do usuário autenticado
+app.get("/usuario/nichos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const result = await client.query(
+      `SELECT n.id, n.slug, n.nome, n.cor
+       FROM usuario_nichos un
+       INNER JOIN nichos n ON n.id = un.nicho_id
+       WHERE un.usuario_id = $1
+       ORDER BY n.id`,
+      [user.id]
+    );
+    return c.json(result.rows);
+  } catch (err) {
+    console.error("ERRO GET /usuario/nichos:", err);
+    return c.json({ error: "Erro ao buscar nichos do usuário" }, 500);
+  }
+});
+
+// atualizar nichos do usuário (substitui a lista)
+app.put("/usuario/nichos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { nicho_ids } = await c.req.json();
+
+    if (
+      !Array.isArray(nicho_ids) ||
+      nicho_ids.length === 0 ||
+      nicho_ids.length > 3
+    ) {
+      return c.json(
+        { error: "Informe entre 1 e 3 nichos" },
+        400
+      );
+    }
+
+    const validos = await client.query(
+      `SELECT id FROM nichos WHERE id = ANY($1::int[])`,
+      [nicho_ids]
+    );
+
+    if (validos.rows.length !== nicho_ids.length) {
+      return c.json({ error: "Nicho inválido" }, 400);
+    }
+
+    await client.query(
+      `DELETE FROM usuario_nichos WHERE usuario_id = $1`,
+      [user.id]
+    );
+
+    for (const nid of nicho_ids) {
+      await client.query(
+        `INSERT INTO usuario_nichos (usuario_id, nicho_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [user.id, nid]
+      );
+    }
+
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO PUT /usuario/nichos:", err);
+    return c.json({ error: "Erro ao atualizar nichos" }, 500);
+  }
+});
+
+// nichos habilitados de outro usuário (admin)
+app.get("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "admin" && user.tipo !== "admin_corretor") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+    const targetId = Number(c.req.param("id"));
+    const result = await client.query(
+      `SELECT n.id, n.slug, n.nome, n.cor
+       FROM usuario_nichos un
+       INNER JOIN nichos n ON n.id = un.nicho_id
+       WHERE un.usuario_id = $1
+       ORDER BY n.id`,
+      [targetId]
+    );
+    return c.json(result.rows);
+  } catch (err) {
+    console.error("ERRO GET /admin/usuarios/:id/nichos:", err);
+    return c.json({ error: "Erro ao buscar nichos" }, 500);
+  }
+});
+
+// atualizar nichos de outro usuário (admin)
+app.put("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "admin" && user.tipo !== "admin_corretor") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+    const targetId = Number(c.req.param("id"));
+    const { nicho_ids } = await c.req.json();
+
+    if (
+      !Array.isArray(nicho_ids) ||
+      nicho_ids.length === 0 ||
+      nicho_ids.length > 3
+    ) {
+      return c.json(
+        { error: "Informe entre 1 e 3 nichos" },
+        400
+      );
+    }
+
+    await client.query(
+      `DELETE FROM usuario_nichos WHERE usuario_id = $1`,
+      [targetId]
+    );
+
+    for (const nid of nicho_ids) {
+      await client.query(
+        `INSERT INTO usuario_nichos (usuario_id, nicho_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [targetId, nid]
+      );
+    }
+
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO PUT /admin/usuarios/:id/nichos:", err);
+    return c.json({ error: "Erro ao atualizar nichos" }, 500);
+  }
+});
+
+/* =============================================
+   📋 CAMPANHAS MANUAIS (saúde / suplementos)
+   e detalhes por nicho
+============================================= */
+
+// criar campanha manual (não-Meta) com dados do nicho
+app.post("/campanhas/manual", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.json();
+
+    const {
+      nome,
+      nicho_id,
+      // campos de imóveis
+      tipo_imovel,
+      finalidade,
+      valor_min,
+      valor_max,
+      regiao,
+      // campos de saúde
+      operadora,
+      tipo_plano,
+      faixa_etaria_min,
+      faixa_etaria_max,
+      cobertura,
+      acomodacao,
+      // campos de suplementos
+      produto,
+      objetivo,
+      marca,
+      publico_alvo
+    } = body;
+
+    if (!nome) {
+      return c.json({ error: "Nome obrigatório" }, 400);
+    }
+
+    if (!nicho_id) {
+      return c.json({ error: "Nicho obrigatório" }, 400);
+    }
+
+    const nichoRes = await client.query(
+      `SELECT slug FROM nichos WHERE id = $1`,
+      [nicho_id]
+    );
+    if (nichoRes.rows.length === 0) {
+      return c.json({ error: "Nicho inválido" }, 400);
+    }
+    const slug = nichoRes.rows[0].slug;
+
+    const habilitado = await client.query(
+      `SELECT 1 FROM usuario_nichos
+       WHERE usuario_id = $1 AND nicho_id = $2`,
+      [user.id, nicho_id]
+    );
+    if (habilitado.rows.length === 0) {
+      return c.json(
+        { error: "Você não tem esse nicho habilitado" },
+        403
+      );
+    }
+
+    const campRes = await client.query(
+      `INSERT INTO campanhas (usuario_id, nome, status, origem, nicho_id)
+       VALUES ($1, $2, 'ACTIVE', 'manual', $3)
+       RETURNING id`,
+      [user.id, nome, nicho_id]
+    );
+    const campanhaId = campRes.rows[0].id;
+
+    if (slug === "imoveis") {
+      await client.query(
+        `INSERT INTO campanhas_imoveis
+           (campanha_id, tipo_imovel, finalidade, valor_min, valor_max, regiao)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [campanhaId, tipo_imovel ?? null, finalidade ?? null,
+         valor_min ?? null, valor_max ?? null, regiao ?? null]
+      );
+    } else if (slug === "saude") {
+      await client.query(
+        `INSERT INTO campanhas_saude
+           (campanha_id, operadora, tipo_plano, faixa_etaria_min,
+            faixa_etaria_max, cobertura, acomodacao)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [campanhaId, operadora ?? null, tipo_plano ?? null,
+         faixa_etaria_min ?? null, faixa_etaria_max ?? null,
+         cobertura ?? null, acomodacao ?? null]
+      );
+    } else if (slug === "suplementos") {
+      await client.query(
+        `INSERT INTO campanhas_suplementos
+           (campanha_id, produto, objetivo, marca, publico_alvo)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [campanhaId, produto ?? null, objetivo ?? null,
+         marca ?? null, publico_alvo ?? null]
+      );
+    }
+
+    return c.json({ id: campanhaId });
+  } catch (err) {
+    console.error("ERRO POST /campanhas/manual:", err);
+    return c.json({ error: "Erro ao criar campanha" }, 500);
+  }
+});
+
+// buscar detalhes do nicho de uma campanha
+app.get("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+
+    const campRes = await client.query(
+      `SELECT c.id, c.nicho_id, n.slug, n.nome AS nicho_nome, n.cor AS nicho_cor
+       FROM campanhas c
+       LEFT JOIN nichos n ON n.id = c.nicho_id
+       WHERE c.id = $1
+         AND (c.usuario_id = $2 OR EXISTS (
+           SELECT 1 FROM campanha_corretores cc
+           WHERE cc.campanha_id = c.id AND cc.usuario_id = $2
+         ))`,
+      [campanhaId, user.id]
+    );
+
+    if (campRes.rows.length === 0) {
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const camp = campRes.rows[0];
+    let dados: any = null;
+
+    if (camp.slug === "imoveis") {
+      const r = await client.query(
+        `SELECT * FROM campanhas_imoveis WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      dados = r.rows[0] ?? null;
+    } else if (camp.slug === "saude") {
+      const r = await client.query(
+        `SELECT * FROM campanhas_saude WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      dados = r.rows[0] ?? null;
+    } else if (camp.slug === "suplementos") {
+      const r = await client.query(
+        `SELECT * FROM campanhas_suplementos WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      dados = r.rows[0] ?? null;
+    }
+
+    return c.json({
+      nicho_id: camp.nicho_id,
+      nicho_slug: camp.slug,
+      nicho_nome: camp.nicho_nome,
+      nicho_cor: camp.nicho_cor,
+      dados
+    });
+  } catch (err) {
+    console.error("ERRO GET /campanhas/:id/nicho-dados:", err);
+    return c.json({ error: "Erro ao buscar dados do nicho" }, 500);
+  }
+});
+
+// atualizar detalhes do nicho de uma campanha
+app.put("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    const body = await c.req.json();
+
+    const campRes = await client.query(
+      `SELECT c.id, c.nicho_id, n.slug
+       FROM campanhas c
+       LEFT JOIN nichos n ON n.id = c.nicho_id
+       WHERE c.id = $1 AND c.usuario_id = $2`,
+      [campanhaId, user.id]
+    );
+
+    if (campRes.rows.length === 0) {
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const { slug } = campRes.rows[0];
+
+    if (slug === "imoveis") {
+      await client.query(
+        `INSERT INTO campanhas_imoveis
+           (campanha_id, tipo_imovel, finalidade, valor_min, valor_max, regiao)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (campanha_id) DO UPDATE SET
+           tipo_imovel = EXCLUDED.tipo_imovel,
+           finalidade  = EXCLUDED.finalidade,
+           valor_min   = EXCLUDED.valor_min,
+           valor_max   = EXCLUDED.valor_max,
+           regiao      = EXCLUDED.regiao`,
+        [campanhaId,
+         body.tipo_imovel ?? null, body.finalidade ?? null,
+         body.valor_min ?? null, body.valor_max ?? null, body.regiao ?? null]
+      );
+    } else if (slug === "saude") {
+      await client.query(
+        `INSERT INTO campanhas_saude
+           (campanha_id, operadora, tipo_plano, faixa_etaria_min,
+            faixa_etaria_max, cobertura, acomodacao)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (campanha_id) DO UPDATE SET
+           operadora        = EXCLUDED.operadora,
+           tipo_plano       = EXCLUDED.tipo_plano,
+           faixa_etaria_min = EXCLUDED.faixa_etaria_min,
+           faixa_etaria_max = EXCLUDED.faixa_etaria_max,
+           cobertura        = EXCLUDED.cobertura,
+           acomodacao       = EXCLUDED.acomodacao`,
+        [campanhaId,
+         body.operadora ?? null, body.tipo_plano ?? null,
+         body.faixa_etaria_min ?? null, body.faixa_etaria_max ?? null,
+         body.cobertura ?? null, body.acomodacao ?? null]
+      );
+    } else if (slug === "suplementos") {
+      await client.query(
+        `INSERT INTO campanhas_suplementos
+           (campanha_id, produto, objetivo, marca, publico_alvo)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (campanha_id) DO UPDATE SET
+           produto      = EXCLUDED.produto,
+           objetivo     = EXCLUDED.objetivo,
+           marca        = EXCLUDED.marca,
+           publico_alvo = EXCLUDED.publico_alvo`,
+        [campanhaId,
+         body.produto ?? null, body.objetivo ?? null,
+         body.marca ?? null, body.publico_alvo ?? null]
+      );
+    } else {
+      return c.json({ error: "Campanha sem nicho definido" }, 400);
+    }
+
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO PUT /campanhas/:id/nicho-dados:", err);
+    return c.json({ error: "Erro ao atualizar dados do nicho" }, 500);
+  }
+});
+
+// vincular/trocar nicho de uma campanha existente (inclusive Meta)
+app.patch("/campanhas/:id/nicho", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    const { nicho_id } = await c.req.json();
+
+    if (!nicho_id) {
+      return c.json({ error: "nicho_id obrigatório" }, 400);
+    }
+
+    const campRes = await client.query(
+      `SELECT id FROM campanhas WHERE id = $1 AND usuario_id = $2`,
+      [campanhaId, user.id]
+    );
+    if (campRes.rows.length === 0) {
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const nichoRes = await client.query(
+      `SELECT id FROM nichos WHERE id = $1`,
+      [nicho_id]
+    );
+    if (nichoRes.rows.length === 0) {
+      return c.json({ error: "Nicho inválido" }, 400);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET nicho_id = $1 WHERE id = $2`,
+      [nicho_id, campanhaId]
+    );
+
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO PATCH /campanhas/:id/nicho:", err);
+    return c.json({ error: "Erro ao vincular nicho" }, 500);
   }
 });
 
