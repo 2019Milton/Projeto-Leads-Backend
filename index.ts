@@ -10279,7 +10279,65 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const contexto = textoOpcional(body.contexto) || "";
-  const topico = contexto || "imovel imobiliario";
+  const nicho: string = textoOpcional(body.campanha?.nicho) || textoOpcional(body.nicho) || "imoveis";
+
+  const nichoConfig: Record<string, {
+    topicoDefault: string;
+    especialidade: string;
+    v1titulo: string; v1texto: string;
+    v2titulo: string; v2texto: string;
+    v3titulo: string; v3texto: string;
+    perguntas: string;
+    interesses: string;
+    idadeMin: string; idadeMax: string;
+    obrigadoTextoSufixo: string;
+  }> = {
+    imoveis: {
+      topicoDefault: "imovel imobiliario",
+      especialidade: "imoveis no Brasil",
+      v1titulo: "Ultimas unidades! Reserve hoje mesmo",
+      v1texto: "crie senso de urgencia, medo de perder a oportunidade",
+      v2titulo: "Sua familia merece um lar assim",
+      v2texto: "evoque emocao, sonho realizado, qualidade de vida",
+      v3titulo: "Localizacao + seguranca + conforto",
+      v3texto: "destaque beneficios concretos e diferenciais especificos",
+      perguntas: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?",
+      interesses: "imoveis, casa propria, financiamento imobiliario, apartamento",
+      idadeMin: "25", idadeMax: "55",
+      obrigadoTextoSufixo: "nosso corretor vai entrar em contato"
+    },
+    saude: {
+      topicoDefault: "plano de saude",
+      especialidade: "planos de saude no Brasil",
+      v1titulo: "Sua saude nao pode esperar",
+      v1texto: "crie urgencia em torno da importancia de estar protegido, risco de ficar sem plano",
+      v2titulo: "Cuide de quem voce ama com o plano certo",
+      v2texto: "evoque emocao, protecao da familia, tranquilidade e seguranca",
+      v3titulo: "Cobertura completa, preco justo",
+      v3texto: "destaque beneficios concretos: rede credenciada, sem carencia, preco acessivel",
+      perguntas: "Voce possui plano de saude atualmente?\nQuantas pessoas seriam incluidas no plano?\nQual regiao voce mora?",
+      interesses: "plano de saude, saude e bem-estar, convenio medico, seguro saude, consulta medica",
+      idadeMin: "22", idadeMax: "60",
+      obrigadoTextoSufixo: "nosso consultor vai apresentar as melhores opcoes de plano"
+    },
+    suplementos: {
+      topicoDefault: "suplemento alimentar",
+      especialidade: "suplementos e nutricao esportiva no Brasil",
+      v1titulo: "Resultados reais em menos tempo",
+      v1texto: "crie urgencia em torno de evolucao fisica, estoque limitado ou promocao por tempo limitado",
+      v2titulo: "Seu corpo merece o melhor combustivel",
+      v2texto: "evoque motivacao, transformacao corporal, superacao de limites",
+      v3titulo: "Qualidade comprovada, entrega rapida",
+      v3texto: "destaque composicao, pureza, certificacoes e diferencial do produto",
+      perguntas: "Qual e seu principal objetivo: ganho de massa ou emagrecimento?\nVoce ja usa suplementos atualmente?\nCom que frequencia voce treina?",
+      interesses: "musculacao, fitness, suplementacao, treino, academia, nutricao esportiva, whey protein",
+      idadeMin: "18", idadeMax: "45",
+      obrigadoTextoSufixo: "nossa equipe vai te ajudar a escolher o suplemento ideal"
+    }
+  };
+
+  const cfg = nichoConfig[nicho] || nichoConfig["imoveis"];
+  const topico = contexto || cfg.topicoDefault;
 
   const fallbackVariacoes = (t: string) =>
     [1, 2, 3].map(() => ({
@@ -10288,15 +10346,15 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       texto: `Conheca ${t}. Atendimento rapido e personalizado.`,
       descricao: `${t} com atendimento especializado.`,
       cta: "SIGN_UP",
-      perguntas: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?",
-      interesses: "imoveis, casa propria, financiamento imobiliario, apartamento",
+      perguntas: cfg.perguntas,
+      interesses: cfg.interesses,
       localidade: "",
       genero: "",
-      idade_min: "25",
-      idade_max: "55",
+      idade_min: cfg.idadeMin,
+      idade_max: cfg.idadeMax,
       obrigado_titulo: "Recebemos seu contato!",
       obrigado_botao: "Ver mais",
-      obrigado_texto: `Em breve nosso corretor vai entrar em contato sobre ${t}.`
+      obrigado_texto: `Em breve ${cfg.obrigadoTextoSufixo}.`
     }));
 
   const norm = (v: any, ctaDefault: string) => ({
@@ -10309,8 +10367,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     interesses: v?.interesses || "",
     localidade: v?.localidade || "",
     genero: v?.genero || "",
-    idade_min: String(v?.idade_min || "25"),
-    idade_max: String(v?.idade_max || "55"),
+    idade_min: String(v?.idade_min || cfg.idadeMin),
+    idade_max: String(v?.idade_max || cfg.idadeMax),
     obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
     obrigado_botao: v?.obrigado_botao || "Ver mais",
     obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
@@ -10338,24 +10396,25 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     if (bloqueio) return c.json({ error: bloqueio }, 403);
 
     const prompt =
-      `Produto/empreendimento: "${topico}"\n\n` +
+      `Produto/servico: "${topico}"\n` +
+      `Nicho: ${cfg.especialidade}\n\n` +
       `Crie 3 anuncios Meta Ads com estilos COMPLETAMENTE DIFERENTES para captar leads desse produto.\n\n` +
       `REGRAS OBRIGATORIAS:\n` +
       `1. O titulo NUNCA pode ser o nome do produto. Deve ser uma frase de impacto.\n` +
       `2. PROIBIDO usar: "Conheca X", "Atendimento rapido e personalizado", "com atendimento especializado".\n` +
       `3. Cada variacao deve ter titulo, texto e descricao totalmente diferentes das outras.\n` +
-      `4. Use os detalhes especificos do produto para criar copy relevante e unico.\n\n` +
+      `4. Use os detalhes especificos do produto e do nicho para criar copy relevante e unico.\n\n` +
       `v1 — URGENCIA E ESCASSEZ:\n` +
-      `  Titulo exemplo: "Ultimas unidades! Reserve hoje mesmo"\n` +
-      `  Texto: crie senso de urgencia, medo de perder a oportunidade\n` +
+      `  Titulo exemplo: "${cfg.v1titulo}"\n` +
+      `  Texto: ${cfg.v1texto}\n` +
       `  cta: SIGN_UP\n\n` +
-      `v2 — EMOCIONAL E FAMILIAR:\n` +
-      `  Titulo exemplo: "Sua familia merece um lar assim"\n` +
-      `  Texto: evoque emocao, sonho realizado, qualidade de vida\n` +
+      `v2 — EMOCIONAL:\n` +
+      `  Titulo exemplo: "${cfg.v2titulo}"\n` +
+      `  Texto: ${cfg.v2texto}\n` +
       `  cta: LEARN_MORE\n\n` +
       `v3 — RACIONAL E OBJETIVO:\n` +
-      `  Titulo exemplo: "Localizacao + seguranca + conforto"\n` +
-      `  Texto: destaque beneficios concretos e diferenciais especificos\n` +
+      `  Titulo exemplo: "${cfg.v3titulo}"\n` +
+      `  Texto: ${cfg.v3texto}\n` +
       `  cta: APPLY_NOW\n\n` +
       `Campos de cada variacao:\n` +
       `nome_campanha, titulo (max 40 chars), texto (2-3 frases), descricao (1 frase curta),\n` +
@@ -10366,7 +10425,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `{"v1":{...todos os campos...},"v2":{...},"v3":{...}}`;
 
     const systemMsg =
-      "Voce e um redator publicitario criativo especializado em Meta Ads para imoveis no Brasil. " +
+      `Voce e um redator publicitario criativo especializado em Meta Ads para ${cfg.especialidade}. ` +
       "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
       "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
       "Retorne SOMENTE JSON valido.";
