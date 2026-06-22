@@ -11603,7 +11603,8 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       tipo,
       admin_id,
       plano,
-      nicho_ids
+      nicho_ids,
+      whatsapp
     } = await c.req.json();
 
     if (
@@ -11657,13 +11658,15 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         plano,
         plano_ativado_em,
         assinatura_inicio,
-        assinatura_status
+        assinatura_status,
+        whatsapp
       )
       VALUES (
         $1,$2,$3,$4,$5,true,$6,$7,
         CASE WHEN $7 = 'ouro' THEN NOW() ELSE NULL END,
         CASE WHEN $7 = 'ouro' THEN NOW() ELSE NULL END,
-        CASE WHEN $7 = 'ouro' THEN 'manual' ELSE 'manual' END
+        CASE WHEN $7 = 'ouro' THEN 'manual' ELSE 'manual' END,
+        $8
       )
       RETURNING id
       `,
@@ -11674,7 +11677,8 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         senhaHash,
         tipo || "corretor",
         admin_id || null,
-        planoFinal
+        planoFinal,
+        whatsapp ? String(whatsapp).replace(/\D/g, "").slice(0, 20) : null
       ]
     );
 
