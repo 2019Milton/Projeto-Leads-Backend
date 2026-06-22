@@ -45,7 +45,10 @@
       "Bash(awk -F: '$1>10408 && $1<10800')",
       "Bash(bun build *)",
       "PowerShell(cd \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\"; bun build index.ts --outdir \"$env:TEMP\\\\buildcheck\" 2>&1 | Select-Object -Last 40)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(vercel --version)",
+      "PowerShell(node -e \"console.log\\('sau�de'.normalize\\('NFD'\\).replace\\(/['-?]/g,''\\)\\)\")",
+      "Bash(grep -n \"usuario/me\\\\|\\\\/me\\\\b\\\\|usuario/nichos\\\\|usuarioLogado\\\\.\" index.html)"
     ]
   }
 }
