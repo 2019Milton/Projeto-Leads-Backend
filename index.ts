@@ -7353,6 +7353,24 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       const veiculacaoStatus =
         veiculacaoPorCampanha[campanha.campaign_id] || null;
 
+      // Corrige divergência de status entre banco e Meta automaticamente.
+      // Ex.: usuário pausou direto na Meta → banco ainda mostra ACTIVE.
+      const statusMetaCampanha =
+        veiculacaoStatus === "CAMPAIGN_PAUSED" ? "PAUSED"
+        : veiculacaoStatus === "ACTIVE"        ? "ACTIVE"
+        : null;
+
+      if (
+        statusMetaCampanha &&
+        statusMetaCampanha !== String(campanha.status || "").toUpperCase()
+      ) {
+        client.query(
+          `UPDATE campanhas SET status = $1, atualizado_em = NOW() WHERE id = $2`,
+          [statusMetaCampanha, campanha.id]
+        ).catch(() => {});
+        campanha.status = statusMetaCampanha;
+      }
+
       const diagnosticoVeiculacao =
         diagnosticarVeiculacaoMeta(
           veiculacaoStatus,
