@@ -2647,7 +2647,8 @@ function urlAcaoVeiculacaoMeta(
 function diagnosticarVeiculacaoMeta(
   status: string | null,
   issues: any[] = [],
-  erroPagamentoConta?: string | null
+  erroPagamentoConta?: string | null,
+  campanhaStatusLocal?: string | null
 ) {
   const statusNormalizado =
     String(status || "").toUpperCase();
@@ -2707,7 +2708,39 @@ function diagnosticarVeiculacaoMeta(
     };
   }
 
-  if (["PAUSED", "CAMPAIGN_PAUSED"].includes(statusNormalizado)) {
+  if (statusNormalizado === "CAMPAIGN_PAUSED") {
+    return {
+      tipo: "pausado",
+      subcategoria: "campanha_pausada",
+      motivo: "A campanha está pausada na Meta e os anúncios não estão sendo exibidos.",
+      acao: "Use a chave no topo deste card para ativar a campanha.",
+      acao_passos: [] as string[],
+      detalhes
+    };
+  }
+
+  if (statusNormalizado === "PAUSED") {
+    const campanhaAtiva =
+      ["ACTIVE", "ENABLED"].includes(
+        String(campanhaStatusLocal || "").toUpperCase()
+      );
+
+    if (campanhaAtiva) {
+      return {
+        tipo: "pausado",
+        subcategoria: "ad_pausado",
+        motivo: "Os anúncios foram pausados diretamente na Meta, mas a campanha permanece ativa na plataforma.",
+        acao: "Acesse os anúncios na Meta para ativá-los.",
+        acao_passos: [
+          "Clique em 'Ver anúncios na Meta' abaixo",
+          "Localize o anúncio com status 'Pausado'",
+          "Ative-o usando a chave ao lado do nome do anúncio",
+          "Os anúncios voltam a veicular automaticamente"
+        ],
+        detalhes
+      };
+    }
+
     return {
       tipo: "pausado",
       subcategoria: "campanha_pausada",
@@ -7375,7 +7408,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         diagnosticarVeiculacaoMeta(
           veiculacaoStatus,
           issuesCampanha,
-          mensagemErroPagamento || erroPagamentoConta
+          mensagemErroPagamento || erroPagamentoConta,
+          campanha.status
         );
 
       console.log(
