@@ -6273,6 +6273,33 @@ await client.query(`
     ON usuario_nichos(usuario_id);
 `);
 
+await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(20);
+`);
+
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS data_contato DATE,
+    ADD COLUMN IF NOT EXISTS lembrete_1dia_enviado BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS lembrete_dia_enviado   BOOLEAN DEFAULT FALSE;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS notificacoes (
+    id           SERIAL PRIMARY KEY,
+    usuario_id   INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    lead_id      INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+    tipo         VARCHAR(50) NOT NULL DEFAULT 'lembrete_contato',
+    titulo       TEXT NOT NULL,
+    mensagem     TEXT NOT NULL,
+    lido         BOOLEAN DEFAULT FALSE,
+    criado_em    TIMESTAMP DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_notificacoes_usuario
+    ON notificacoes(usuario_id, lido, criado_em DESC);
+`);
+
 /* =========================
    🔐 LOGIN
 ========================= */
@@ -6680,6 +6707,19 @@ app.post("/login", async (c) => {
   });
 });
 
+// 🔹 perfil do usuário autenticado
+app.get("/usuarios/me", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  return c.json({
+    id:        user.id,
+    email:     user.email,
+    nome:      user.nome,
+    sobrenome: user.sobrenome,
+    whatsapp:  user.whatsapp || null,
+    tipo:      user.tipo
+  });
+});
+
 app.get("/usuarios/me/plano", authMiddleware, async (c) => {
   const user: any = c.get("user");
 
@@ -6803,6 +6843,23 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
   }
 });
 
+
+// 🔹 atualizar WhatsApp do usuário autenticado
+app.patch("/usuarios/me/whatsapp", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { whatsapp } = await c.req.json();
+    const numero = String(whatsapp || "").replace(/\D/g, "").slice(0, 20) || null;
+    await client.query(
+      `UPDATE usuarios SET whatsapp = $1 WHERE id = $2`,
+      [numero, user.id]
+    );
+    return c.json({ ok: true, whatsapp: numero });
+  } catch (err) {
+    console.error("ERRO WHATSAPP:", err);
+    return c.json({ error: "Erro ao salvar WhatsApp" }, 500);
+  }
+});
 
 /* =========================
    📊 LEADS
@@ -9483,6 +9540,83 @@ app.put("/leads/:id", authMiddleware, async (c) => {
 });
 
 
+
+// 🔹 agendar data de contato do lead
+app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const leadId = Number(c.req.param("id"));
+    const body = await c.req.json().catch(() => ({}));
+    const dataContato = body.data_contato ?? null;
+
+    const res = await client.query(
+      `UPDATE leads
+       SET data_contato = $1,
+           lembrete_1dia_enviado = FALSE,
+           lembrete_dia_enviado  = FALSE
+       WHERE id = $2
+         AND usuario_id = $3
+       RETURNING id, data_contato`,
+      [dataContato, leadId, user.id]
+    );
+
+    if (!res.rows[0]) return c.json({ error: "Lead não encontrado" }, 404);
+    return c.json(res.rows[0]);
+  } catch (err) {
+    console.error("ERRO DATA CONTATO:", err);
+    return c.json({ error: "Erro ao salvar data de contato" }, 500);
+  }
+});
+
+// 🔹 buscar notificações não lidas do usuário
+app.get("/notificacoes", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const res = await client.query(
+      `SELECT n.id, n.tipo, n.titulo, n.mensagem, n.lido, n.criado_em,
+              l.nome AS lead_nome, l.telefone AS lead_telefone
+       FROM notificacoes n
+       LEFT JOIN leads l ON l.id = n.lead_id
+       WHERE n.usuario_id = $1
+       ORDER BY n.criado_em DESC
+       LIMIT 50`,
+      [user.id]
+    );
+    return c.json(res.rows);
+  } catch (err) {
+    console.error("ERRO NOTIFICACOES:", err);
+    return c.json({ error: "Erro ao buscar notificações" }, 500);
+  }
+});
+
+// 🔹 marcar notificação como lida
+app.patch("/notificacoes/:id/lida", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const notifId = Number(c.req.param("id"));
+    await client.query(
+      `UPDATE notificacoes SET lido = TRUE WHERE id = $1 AND usuario_id = $2`,
+      [notifId, user.id]
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    return c.json({ error: "Erro" }, 500);
+  }
+});
+
+// 🔹 marcar todas as notificações como lidas
+app.patch("/notificacoes/ler-todas", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    await client.query(
+      `UPDATE notificacoes SET lido = TRUE WHERE usuario_id = $1`,
+      [user.id]
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    return c.json({ error: "Erro" }, 500);
+  }
+});
 
 // 🔹 histórico lead
 app.get(
@@ -12838,6 +12972,135 @@ app.patch("/campanhas/:id/nicho", authMiddleware, async (c) => {
     return c.json({ error: "Erro ao vincular nicho" }, 500);
   }
 });
+
+/* =========================
+   ⏰ CRON — LEMBRETES DE CONTATO
+========================= */
+
+async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
+  const baseUrl = Bun.env.EVOLUTION_API_URL;
+  const apiKey  = Bun.env.EVOLUTION_API_KEY;
+  const instancia = Bun.env.EVOLUTION_INSTANCE || "plataforma";
+  if (!baseUrl || !apiKey) return;
+
+  const numero = String(telefone).replace(/\D/g, "");
+  if (!numero) return;
+
+  try {
+    await fetch(`${baseUrl}/message/sendText/${instancia}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": apiKey
+      },
+      body: JSON.stringify({
+        number: numero.startsWith("55") ? numero : `55${numero}`,
+        text: mensagem
+      })
+    });
+  } catch (e) {
+    console.error("ERRO EVOLUTION API:", e);
+  }
+}
+
+async function processarLembretesContato() {
+  try {
+    const hoje     = new Date().toISOString().slice(0, 10);
+    const amanha   = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+
+    // ── 1. Leads para contatar AMANHÃ (lembrete antecipado) ──
+    const antecipados = await client.query(
+      `SELECT l.id, l.nome, l.data_contato, l.usuario_id,
+              u.nome AS corretor_nome, u.whatsapp AS corretor_whatsapp
+       FROM leads l
+       INNER JOIN usuarios u ON u.id = l.usuario_id
+       WHERE l.data_contato = $1
+         AND l.lembrete_1dia_enviado = FALSE`,
+      [amanha]
+    );
+
+    for (const lead of antecipados.rows) {
+      const dataFormatada = new Date(lead.data_contato + "T12:00:00").toLocaleDateString("pt-BR");
+      const titulo = `Lembrete: contatar ${lead.nome} amanhã`;
+      const mensagem = `Olá ${lead.corretor_nome}! Lembrete: amanhã (${dataFormatada}) é o dia combinado para entrar em contato com o lead *${lead.nome}*. Não esqueça! 📅`;
+
+      // Notificação na plataforma
+      await client.query(
+        `INSERT INTO notificacoes (usuario_id, lead_id, tipo, titulo, mensagem)
+         VALUES ($1, $2, 'lembrete_antecipado', $3, $4)`,
+        [lead.usuario_id, lead.id, titulo, mensagem]
+      );
+
+      // WhatsApp
+      if (lead.corretor_whatsapp) {
+        await enviarLembreteWhatsApp(lead.corretor_whatsapp, mensagem);
+      }
+
+      await client.query(
+        `UPDATE leads SET lembrete_1dia_enviado = TRUE WHERE id = $1`,
+        [lead.id]
+      );
+    }
+
+    // ── 2. Leads para contatar HOJE ──
+    const hoje_leads = await client.query(
+      `SELECT l.id, l.nome, l.data_contato, l.usuario_id,
+              u.nome AS corretor_nome, u.whatsapp AS corretor_whatsapp
+       FROM leads l
+       INNER JOIN usuarios u ON u.id = l.usuario_id
+       WHERE l.data_contato = $1
+         AND l.lembrete_dia_enviado = FALSE`,
+      [hoje]
+    );
+
+    for (const lead of hoje_leads.rows) {
+      const dataFormatada = new Date(lead.data_contato + "T12:00:00").toLocaleDateString("pt-BR");
+      const titulo = `Hoje é o dia: ligue para ${lead.nome}`;
+      const mensagem = `Bom dia, ${lead.corretor_nome}! 🔔 Hoje (${dataFormatada}) é o dia combinado para entrar em contato com o lead *${lead.nome}*. Boa venda! 💪`;
+
+      // Notificação na plataforma
+      await client.query(
+        `INSERT INTO notificacoes (usuario_id, lead_id, tipo, titulo, mensagem)
+         VALUES ($1, $2, 'lembrete_dia', $3, $4)`,
+        [lead.usuario_id, lead.id, titulo, mensagem]
+      );
+
+      // WhatsApp
+      if (lead.corretor_whatsapp) {
+        await enviarLembreteWhatsApp(lead.corretor_whatsapp, mensagem);
+      }
+
+      await client.query(
+        `UPDATE leads SET lembrete_dia_enviado = TRUE WHERE id = $1`,
+        [lead.id]
+      );
+    }
+
+    if (antecipados.rows.length + hoje_leads.rows.length > 0) {
+      console.log(`LEMBRETES: ${antecipados.rows.length} antecipados, ${hoje_leads.rows.length} no dia`);
+    }
+  } catch (e) {
+    console.error("ERRO CRON LEMBRETES:", e);
+  }
+}
+
+// Agendador: verifica a cada hora se são 8h (BRT = UTC-3)
+function agendarLembretes() {
+  const HORA_ENVIO = 8; // 8h horário de Brasília
+  const verificar = () => {
+    const agora = new Date();
+    const horaBRT = (agora.getUTCHours() - 3 + 24) % 24;
+    if (horaBRT === HORA_ENVIO) {
+      processarLembretesContato();
+    }
+  };
+  // Verifica a cada 30 minutos
+  setInterval(verificar, 30 * 60 * 1000);
+  // Roda uma vez ao iniciar (útil se servidor reiniciou às 8h)
+  verificar();
+}
+
+agendarLembretes();
 
 /* =========================
    🚀 START
