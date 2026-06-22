@@ -10452,8 +10452,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
 
   const fallbackVariacoes = (t: string) =>
     [1, 2, 3].map(() => ({
-      nome_campanha: t.slice(0, 50),
       titulo: t.slice(0, 40),
+      nome_campanha: t.slice(0, 40),
       texto: `Conheca ${t}. Atendimento rapido e personalizado.`,
       descricao: `${t} com atendimento especializado.`,
       cta: "SIGN_UP",
@@ -10468,22 +10468,27 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       obrigado_texto: `Em breve ${cfg.obrigadoTextoSufixo}.`
     }));
 
-  const norm = (v: any, ctaDefault: string) => ({
-    nome_campanha: v?.nome_campanha || topico.slice(0, 50),
-    titulo: v?.titulo || topico.slice(0, 40),
-    texto: v?.texto || "",
-    descricao: v?.descricao || "",
-    cta: v?.cta || ctaDefault,
-    perguntas: v?.perguntas || "",
-    interesses: v?.interesses || "",
-    localidade: v?.localidade || "",
-    genero: v?.genero || "",
-    idade_min: String(v?.idade_min || cfg.idadeMin),
-    idade_max: String(v?.idade_max || cfg.idadeMax),
-    obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
-    obrigado_botao: v?.obrigado_botao || "Ver mais",
-    obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
-  });
+  const norm = (v: any, ctaDefault: string) => {
+    const titulo =
+      v?.titulo || v?.nome_campanha || topico.slice(0, 40);
+
+    return {
+      nome_campanha: titulo,
+      titulo,
+      texto: v?.texto || "",
+      descricao: v?.descricao || "",
+      cta: v?.cta || ctaDefault,
+      perguntas: v?.perguntas || "",
+      interesses: v?.interesses || "",
+      localidade: v?.localidade || "",
+      genero: v?.genero || "",
+      idade_min: String(v?.idade_min || cfg.idadeMin),
+      idade_max: String(v?.idade_max || cfg.idadeMax),
+      obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
+      obrigado_botao: v?.obrigado_botao || "Ver mais",
+      obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
+    };
+  };
 
   const parseSugestoes = (texto: string) => {
     const limpo = texto
@@ -10528,7 +10533,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `  Texto: ${cfg.v3texto}\n` +
       `  cta: APPLY_NOW\n\n` +
       `Campos de cada variacao:\n` +
-      `nome_campanha, titulo (max 40 chars), texto (2-3 frases), descricao (1 frase curta),\n` +
+      `nome_campanha (igual ao titulo), titulo (max 40 chars), texto (2-3 frases), descricao (1 frase curta),\n` +
       `cta, perguntas (3 qualificadoras separadas por \\n), interesses (keywords separados por virgula),\n` +
       `localidade (regiao do produto ou vazio), genero (vazio), idade_min, idade_max,\n` +
       `obrigado_titulo, obrigado_botao, obrigado_texto\n\n` +
