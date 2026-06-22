@@ -2606,7 +2606,44 @@ function traduzirVeiculacaoMeta(status?: string | null) {
   return labels[status] || status;
 }
 
-// Resume o status de veiculação da Meta em motivo e ação prática para o usuário.
+// Monta a URL de ação específica na Meta com base na subcategoria do problema.
+function urlAcaoVeiculacaoMeta(
+  subcategoria: string | null,
+  campaignId: string | null,
+  contaAnunciosId: string | null
+): string {
+  const actId =
+    String(contaAnunciosId || "").replace(/^act_/, "");
+  const actParam =
+    actId ? `act=${encodeURIComponent(actId)}` : "";
+  const campParam =
+    campaignId ? `selected_campaign_ids=${encodeURIComponent(campaignId)}` : "";
+
+  const base = "https://adsmanager.facebook.com/adsmanager/manage";
+
+  switch (subcategoria) {
+    case "pagamento":
+      return `${base}/billing${actParam ? `?${actParam}` : ""}`;
+    case "adset_pausado":
+      return [
+        `${base}/adsets`,
+        [actParam, campParam].filter(Boolean).join("&")
+      ].filter(Boolean).join("?");
+    case "reprovado":
+    case "politica":
+      return [
+        `${base}/ads`,
+        [actParam, campParam].filter(Boolean).join("&")
+      ].filter(Boolean).join("?");
+    default:
+      return [
+        `${base}/campaigns`,
+        [actParam, campParam].filter(Boolean).join("&")
+      ].filter(Boolean).join("?");
+  }
+}
+
+// Resume o status de veiculação da Meta em motivo, ação prática, passos e subcategoria.
 function diagnosticarVeiculacaoMeta(
   status: string | null,
   issues: any[] = [],
@@ -2616,6 +2653,8 @@ function diagnosticarVeiculacaoMeta(
     String(status || "").toUpperCase();
 
   const issuePrincipal = issues[0] || null;
+  const errorType =
+    String(issuePrincipal?.error_type || "").toUpperCase();
   const issueTexto =
     issuePrincipal?.error_summary ||
     issuePrincipal?.error_message ||
@@ -2633,11 +2672,26 @@ function diagnosticarVeiculacaoMeta(
       .filter(Boolean)
       .slice(0, 5);
 
+  const isBilling =
+    errorType === "BILLING" ||
+    /pagamento|payment|billing|cobran/i.test(
+      `${issueTexto || ""} ${erroPagamentoConta || ""}`
+    );
+
+  const isPolitica =
+    errorType === "POLICY" ||
+    /política|policy|violat|reprov|disapprov/i.test(issueTexto || "");
+
   if (!statusNormalizado) {
     return {
       tipo: "desconhecido",
+      subcategoria: null as string | null,
       motivo: "A Meta não retornou status de veiculação para os anúncios desta campanha.",
       acao: "Sincronize novamente ou confira a campanha no Gerenciador de Anúncios.",
+      acao_passos: [
+        "Clique em 'Sincronizar' na campanha",
+        "Se o problema persistir, abra o Gerenciador de Anúncios da Meta"
+      ],
       detalhes
     };
   }
@@ -2645,22 +2699,37 @@ function diagnosticarVeiculacaoMeta(
   if (statusNormalizado === "ACTIVE") {
     return {
       tipo: "ok",
+      subcategoria: null as string | null,
       motivo: "A Meta indica que os anúncios estão aptos a veicular.",
       acao: "Acompanhe gasto, leads, CPL e CTR.",
+      acao_passos: [] as string[],
       detalhes
     };
   }
 
-  if (["PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"].includes(statusNormalizado)) {
+  if (["PAUSED", "CAMPAIGN_PAUSED"].includes(statusNormalizado)) {
     return {
       tipo: "pausado",
-      motivo:
-        statusNormalizado === "CAMPAIGN_PAUSED"
-          ? "A campanha está pausada na Meta."
-          : statusNormalizado === "ADSET_PAUSED"
-          ? "O conjunto de anúncios está pausado na Meta."
-          : "O anúncio está pausado na Meta.",
-      acao: "Use a chave do card para ativar a campanha ou revise no Gerenciador de Anúncios.",
+      subcategoria: "campanha_pausada",
+      motivo: "A campanha está pausada e os anúncios não estão sendo exibidos.",
+      acao: "Use a chave no topo deste card para ativar a campanha.",
+      acao_passos: [] as string[],
+      detalhes
+    };
+  }
+
+  if (statusNormalizado === "ADSET_PAUSED") {
+    return {
+      tipo: "pausado",
+      subcategoria: "adset_pausado",
+      motivo: "O conjunto de anúncios está pausado na Meta. A campanha está ativa, mas os anúncios não veiculam.",
+      acao: "Acesse os conjuntos de anúncios na Meta para ativar.",
+      acao_passos: [
+        "Clique em 'Ver conjuntos na Meta' abaixo",
+        "Localize o conjunto de anúncios com status pausado",
+        "Ative-o usando a chave ao lado do nome do conjunto",
+        "Os anúncios voltam a veicular automaticamente"
+      ],
       detalhes
     };
   }
@@ -2671,13 +2740,49 @@ function diagnosticarVeiculacaoMeta(
       erroPagamentoConta ||
       "A Meta encontrou um problema que impede ou limita a veiculação.";
 
+    if (isBilling || statusNormalizado === "PENDING_BILLING_INFO") {
+      return {
+        tipo: "problema",
+        subcategoria: "pagamento",
+        motivo: textoDiagnostico,
+        acao: "O método de pagamento da conta de anúncios precisa ser revisado.",
+        acao_passos: [
+          "Clique em 'Ver cobrança na Meta' abaixo",
+          "Na seção de Cobrança, verifique se o cartão ou conta bancária está ativo",
+          "Adicione saldo (pré-pago) ou atualize os dados do cartão",
+          "Após corrigir, os anúncios retomam a veiculação automaticamente"
+        ],
+        detalhes
+      };
+    }
+
+    if (isPolitica) {
+      return {
+        tipo: "problema",
+        subcategoria: "politica",
+        motivo: textoDiagnostico,
+        acao: "Um ou mais anúncios foram sinalizados por violação de política da Meta.",
+        acao_passos: [
+          "Clique em 'Ver anúncios na Meta' abaixo",
+          "Identifique o anúncio com ícone de aviso ou status 'Com problemas'",
+          "Leia a notificação de política exibida pela Meta",
+          "Edite o texto, imagem ou URL de destino conforme as diretrizes",
+          "Salve e reenvie o anúncio para análise da Meta"
+        ],
+        detalhes
+      };
+    }
+
     return {
       tipo: "problema",
+      subcategoria: "geral",
       motivo: textoDiagnostico,
-      acao:
-        /pagamento|payment|billing|cobran/i.test(textoDiagnostico)
-          ? "Revise a forma de pagamento ou saldo da conta de anúncios."
-          : "Abra o Gerenciador de Anúncios para ver o detalhe informado pela Meta.",
+      acao: "Acesse o Gerenciador de Anúncios para ver o detalhe do problema.",
+      acao_passos: [
+        "Clique em 'Abrir na Meta' abaixo",
+        "Localize o ícone de aviso ao lado da campanha ou anúncio",
+        "Leia a notificação e siga as instruções da Meta para resolver"
+      ],
       detalhes
     };
   }
@@ -2685,8 +2790,16 @@ function diagnosticarVeiculacaoMeta(
   if (statusNormalizado === "DISAPPROVED") {
     return {
       tipo: "problema",
+      subcategoria: "reprovado",
       motivo: issueTexto || "O anúncio foi reprovado pela análise da Meta.",
-      acao: "Revise criativo, texto, página de destino e políticas da Meta antes de tentar publicar novamente.",
+      acao: "O anúncio precisa ser corrigido e reenviado para análise.",
+      acao_passos: [
+        "Clique em 'Ver anúncio na Meta' abaixo",
+        "Leia o motivo da reprovação informado pela Meta",
+        "Edite o criativo, texto ou URL de destino",
+        "Certifique-se de que o conteúdo segue as políticas de anúncio da Meta",
+        "Salve e reenvie para análise — o anúncio volta a veicular após aprovação"
+      ],
       detalhes
     };
   }
@@ -2694,16 +2807,27 @@ function diagnosticarVeiculacaoMeta(
   if (["PENDING_REVIEW", "IN_PROCESS", "PREAPPROVED"].includes(statusNormalizado)) {
     return {
       tipo: "analise",
-      motivo: "A Meta ainda está analisando ou preparando a entrega do anúncio.",
-      acao: "Aguarde a conclusão da análise. Se demorar muito, revise no Gerenciador de Anúncios.",
+      subcategoria: "em_analise",
+      motivo: "A Meta está analisando o anúncio antes de iniciar a veiculação.",
+      acao: "Nenhuma ação necessária agora. Aguarde a conclusão da análise.",
+      acao_passos: [
+        "Aguarde — a Meta geralmente conclui a análise em até 24 horas",
+        "Se ultrapassar 24h, clique em 'Abrir na Meta' para verificar o status"
+      ],
       detalhes
     };
   }
 
   return {
     tipo: "atencao",
+    subcategoria: "outro",
     motivo: issueTexto || `Status retornado pela Meta: ${statusNormalizado}.`,
     acao: "Confira o Gerenciador de Anúncios para ver detalhes atualizados.",
+    acao_passos: [
+      "Clique em 'Abrir na Meta' abaixo",
+      "Verifique o status da campanha e dos anúncios",
+      "Siga as instruções exibidas pela Meta para normalizar a veiculação"
+    ],
     detalhes
   };
 }
@@ -7292,8 +7416,15 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         veiculacao: veiculacaoStatus,
         veiculacao_label: traduzirVeiculacaoMeta(veiculacaoStatus),
         veiculacao_tipo: diagnosticoVeiculacao.tipo,
+        veiculacao_subcategoria: diagnosticoVeiculacao.subcategoria,
         veiculacao_motivo: diagnosticoVeiculacao.motivo,
         veiculacao_acao: diagnosticoVeiculacao.acao,
+        veiculacao_acao_passos: diagnosticoVeiculacao.acao_passos,
+        veiculacao_acao_url: urlAcaoVeiculacaoMeta(
+          diagnosticoVeiculacao.subcategoria,
+          campanha.campaign_id || null,
+          campanha.conta_anuncios_id || null
+        ),
         veiculacao_detalhes: diagnosticoVeiculacao.detalhes,
         conta_anuncios_id: campanha.conta_anuncios_id || null
       });
