@@ -7478,7 +7478,11 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           campanha.conta_anuncios_id || null
         ),
         veiculacao_detalhes: diagnosticoVeiculacao.detalhes,
-        conta_anuncios_id: campanha.conta_anuncios_id || null
+        conta_anuncios_id: campanha.conta_anuncios_id || null,
+        nicho_id: campanha.nicho_id || null,
+        nicho_slug: campanha.nicho_slug || null,
+        nicho_nome: campanha.nicho_nome || null,
+        nicho_cor: campanha.nicho_cor || null
       });
     }
 
