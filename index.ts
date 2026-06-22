@@ -819,14 +819,14 @@ function montarTargetingMeta(avancadas: any) {
     targeting.device_platforms = dispositivos;
   }
 
-  const advantageAudienceAtivo =
-    avancadas?.advantage_audience === true ||
-    avancadas?.advantage_audience === 1 ||
-    avancadas?.advantage_audience === "1" ||
-    avancadas?.advantage_audience === "true";
+  const advantageAudienceDesativado =
+    avancadas?.advantage_audience === false ||
+    avancadas?.advantage_audience === 0 ||
+    avancadas?.advantage_audience === "0" ||
+    avancadas?.advantage_audience === "false";
 
   targeting.targeting_automation = {
-    advantage_audience: advantageAudienceAtivo ? 1 : 0
+    advantage_audience: advantageAudienceDesativado ? 0 : 1
   };
 
   return targeting;
