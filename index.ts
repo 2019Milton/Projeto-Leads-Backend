@@ -7409,25 +7409,30 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         String(campanha.status || "").toUpperCase() !== "DELETED"
       ) {
         try {
-          const insights = await fetch(
-            `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&time_increment=1&date_preset=last_7d&access_token=${token}`
-          ).then(r => r.json());
+          const [insightsTotais, insightsGrafico] = await Promise.all([
+            fetch(
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&date_preset=last_30d&access_token=${token}`
+            ).then(r => r.json()),
+            fetch(
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,ctr&time_increment=1&date_preset=last_30d&access_token=${token}`
+            ).then(r => r.json())
+          ]);
 
-          if (insights.error) {
+          if (insightsTotais.error) {
             erroMeta =
-              insights.error.message ||
+              insightsTotais.error.message ||
               "Métricas indisponíveis na Meta";
           } else {
-            dados = insights.data?.[0] || {};
+            dados = insightsTotais.data?.[0] || {};
 
             grafico =
-              insights.data?.map((d: any) => ({
+              (insightsGrafico.data || []).map((d: any) => ({
                 data: d.date_start,
                 clicks: Number(d.clicks || 0),
                 ctr: Number(d.ctr || 0),
                 gasto: Number(d.spend || 0),
                 impressoes: Number(d.impressions || 0)
-              })) || [];
+              }));
 
             metaDisponivel = true;
           }
