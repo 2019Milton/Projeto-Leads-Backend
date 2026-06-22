@@ -6833,9 +6833,10 @@ app.get("/campanhas", authMiddleware, async (c) => {
       `
       SELECT
         c.*,
-        n.slug  AS nicho_slug,
-        n.nome  AS nicho_nome,
-        n.cor   AS nicho_cor,
+        COALESCE(n.id,   nd.id)   AS nicho_id,
+        COALESCE(n.slug, nd.slug) AS nicho_slug,
+        COALESCE(n.nome, nd.nome) AS nicho_nome,
+        COALESCE(n.cor,  nd.cor)  AS nicho_cor,
         dono.email     AS criado_por_email,
         dono.nome      AS criado_por_nome,
         dono.sobrenome AS criado_por_sobrenome,
@@ -6859,6 +6860,20 @@ app.get("/campanhas", authMiddleware, async (c) => {
         ON dono.id = c.usuario_id
       LEFT JOIN nichos n
         ON n.id = c.nicho_id
+      LEFT JOIN LATERAL (
+        SELECT ni.id, ni.slug, ni.nome, ni.cor
+        FROM nichos ni
+        WHERE c.nicho_id IS NULL AND (
+          EXISTS (SELECT 1 FROM campanhas_saude      cs WHERE cs.campanha_id = c.id) AND ni.slug = 'saude'
+          OR
+          EXISTS (SELECT 1 FROM campanhas_imoveis    ci WHERE ci.campanha_id = c.id) AND ni.slug = 'imoveis'
+          OR
+          EXISTS (SELECT 1 FROM campanhas_suplementos cp WHERE cp.campanha_id = c.id) AND ni.slug = 'suplementos'
+          OR
+          EXISTS (SELECT 1 FROM leads l WHERE l.campanha = c.nome AND l.nicho_id = ni.id AND l.usuario_id = c.usuario_id LIMIT 1)
+        )
+        LIMIT 1
+      ) nd ON true
       WHERE
         (
           c.usuario_id = $1
@@ -7411,6 +7426,14 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           mensagemErroPagamento || erroPagamentoConta,
           campanha.status
         );
+
+      // Persiste nicho detectado pelas tabelas de detalhe ou leads
+      if (!campanha.nicho_id && campanha.nicho_slug) {
+        client.query(
+          `UPDATE campanhas SET nicho_id = (SELECT id FROM nichos WHERE slug = $1 LIMIT 1) WHERE id = $2`,
+          [campanha.nicho_slug, campanha.id]
+        ).catch(() => {});
+      }
 
       console.log(
         "ERRO PAGAMENTO CAMPANHA:",
