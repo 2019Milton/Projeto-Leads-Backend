@@ -2606,6 +2606,108 @@ function traduzirVeiculacaoMeta(status?: string | null) {
   return labels[status] || status;
 }
 
+// Resume o status de veiculação da Meta em motivo e ação prática para o usuário.
+function diagnosticarVeiculacaoMeta(
+  status: string | null,
+  issues: any[] = [],
+  erroPagamentoConta?: string | null
+) {
+  const statusNormalizado =
+    String(status || "").toUpperCase();
+
+  const issuePrincipal = issues[0] || null;
+  const issueTexto =
+    issuePrincipal?.error_summary ||
+    issuePrincipal?.error_message ||
+    issuePrincipal?.message ||
+    null;
+
+  const detalhes =
+    issues
+      .map((issue: any) =>
+        issue.error_summary ||
+        issue.error_message ||
+        issue.message ||
+        ""
+      )
+      .filter(Boolean)
+      .slice(0, 5);
+
+  if (!statusNormalizado) {
+    return {
+      tipo: "desconhecido",
+      motivo: "A Meta não retornou status de veiculação para os anúncios desta campanha.",
+      acao: "Sincronize novamente ou confira a campanha no Gerenciador de Anúncios.",
+      detalhes
+    };
+  }
+
+  if (statusNormalizado === "ACTIVE") {
+    return {
+      tipo: "ok",
+      motivo: "A Meta indica que os anúncios estão aptos a veicular.",
+      acao: "Acompanhe gasto, leads, CPL e CTR.",
+      detalhes
+    };
+  }
+
+  if (["PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"].includes(statusNormalizado)) {
+    return {
+      tipo: "pausado",
+      motivo:
+        statusNormalizado === "CAMPAIGN_PAUSED"
+          ? "A campanha está pausada na Meta."
+          : statusNormalizado === "ADSET_PAUSED"
+          ? "O conjunto de anúncios está pausado na Meta."
+          : "O anúncio está pausado na Meta.",
+      acao: "Use a chave do card para ativar a campanha ou revise no Gerenciador de Anúncios.",
+      detalhes
+    };
+  }
+
+  if (statusNormalizado === "WITH_ISSUES" || statusNormalizado === "PENDING_BILLING_INFO") {
+    const textoDiagnostico =
+      issueTexto ||
+      erroPagamentoConta ||
+      "A Meta encontrou um problema que impede ou limita a veiculação.";
+
+    return {
+      tipo: "problema",
+      motivo: textoDiagnostico,
+      acao:
+        /pagamento|payment|billing|cobran/i.test(textoDiagnostico)
+          ? "Revise a forma de pagamento ou saldo da conta de anúncios."
+          : "Abra o Gerenciador de Anúncios para ver o detalhe informado pela Meta.",
+      detalhes
+    };
+  }
+
+  if (statusNormalizado === "DISAPPROVED") {
+    return {
+      tipo: "problema",
+      motivo: issueTexto || "O anúncio foi reprovado pela análise da Meta.",
+      acao: "Revise criativo, texto, página de destino e políticas da Meta antes de tentar publicar novamente.",
+      detalhes
+    };
+  }
+
+  if (["PENDING_REVIEW", "IN_PROCESS", "PREAPPROVED"].includes(statusNormalizado)) {
+    return {
+      tipo: "analise",
+      motivo: "A Meta ainda está analisando ou preparando a entrega do anúncio.",
+      acao: "Aguarde a conclusão da análise. Se demorar muito, revise no Gerenciador de Anúncios.",
+      detalhes
+    };
+  }
+
+  return {
+    tipo: "atencao",
+    motivo: issueTexto || `Status retornado pela Meta: ${statusNormalizado}.`,
+    acao: "Confira o Gerenciador de Anúncios para ver detalhes atualizados.",
+    detalhes
+  };
+}
+
 // Extrai o saldo numérico de strings como "Saldo disponível (R$0,00 BRL)"
 function extrairSaldoDisponivelMeta(displayString?: string | null) {
   if (!displayString) return null;
@@ -4904,10 +5006,15 @@ app.get(
       conta.funding_source_details?.display_string
     );
 
+    const saldoManual =
+      saldoPrePago !== null
+        ? saldoPrePago
+        : saldoApi;
+
     const saldoPrePagoZerado =
       pagamentoManual &&
-      saldoPrePago !== null &&
-      saldoPrePago <= 0;
+      saldoManual !== null &&
+      saldoManual <= 0;
 
     const pagamentoHabilitado =
       pagamentoAutomatico ||
@@ -4938,11 +5045,23 @@ app.get(
         moeda: conta.currency || null,
         saldo:
           pagamentoManual
-            ? saldoPrePago
+            ? saldoManual
             : saldoApi,
         saldo_pre_pago: saldoPrePago,
         saldo_pendente_api: saldoApi,
         saldo_bruto_api: conta.balance ?? null,
+        saldo_origem:
+          pagamentoManual && saldoPrePago !== null
+            ? "saldo_pre_pago"
+            : saldoApi !== null
+            ? "balance"
+            : null,
+        saldo_observacao:
+          pagamentoManual && saldoPrePago === null && saldoApi !== null
+            ? "A Meta nao informou o saldo pre-pago detalhado, entao exibimos o saldo retornado pela API."
+            : pagamentoManual && saldoManual === null
+            ? "A Meta nao confirmou o saldo pela API. Confira o saldo diretamente no Gerenciador de Anuncios."
+            : null,
         pre_pago: pagamentoManual,
         ativa: contaAtiva,
         tipo_pagamento: tipoPagamento,
@@ -7110,6 +7229,13 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       const veiculacaoStatus =
         veiculacaoPorCampanha[campanha.campaign_id] || null;
 
+      const diagnosticoVeiculacao =
+        diagnosticarVeiculacaoMeta(
+          veiculacaoStatus,
+          issuesCampanha,
+          mensagemErroPagamento || erroPagamentoConta
+        );
+
       console.log(
         "ERRO PAGAMENTO CAMPANHA:",
         campanha.nome,
@@ -7165,6 +7291,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         erro_pagamento: mensagemErroPagamento || null,
         veiculacao: veiculacaoStatus,
         veiculacao_label: traduzirVeiculacaoMeta(veiculacaoStatus),
+        veiculacao_tipo: diagnosticoVeiculacao.tipo,
+        veiculacao_motivo: diagnosticoVeiculacao.motivo,
+        veiculacao_acao: diagnosticoVeiculacao.acao,
+        veiculacao_detalhes: diagnosticoVeiculacao.detalhes,
         conta_anuncios_id: campanha.conta_anuncios_id || null
       });
     }
@@ -10465,7 +10595,19 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       idade_max: cfg.idadeMax,
       obrigado_titulo: "Recebemos seu contato!",
       obrigado_botao: "Ver mais",
-      obrigado_texto: `Em breve ${cfg.obrigadoTextoSufixo}.`
+      obrigado_texto: `Em breve ${cfg.obrigadoTextoSufixo}.`,
+      nicho_tipo_imovel: "",
+      nicho_finalidade: "",
+      nicho_valor_min: "",
+      nicho_valor_max: "",
+      nicho_operadora: "",
+      nicho_tipo_plano: "",
+      nicho_cobertura: "",
+      nicho_acomodacao: "",
+      nicho_produto: "",
+      nicho_objetivo: "",
+      nicho_marca: "",
+      nicho_publico_alvo: ""
     }));
 
   const norm = (v: any, ctaDefault: string) => {
@@ -10486,7 +10628,19 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       idade_max: String(v?.idade_max || cfg.idadeMax),
       obrigado_titulo: v?.obrigado_titulo || "Recebemos seu contato!",
       obrigado_botao: v?.obrigado_botao || "Ver mais",
-      obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`
+      obrigado_texto: v?.obrigado_texto || `Em breve entraremos em contato sobre ${topico}.`,
+      nicho_tipo_imovel: v?.nicho_tipo_imovel || v?.tipo_imovel || "",
+      nicho_finalidade: v?.nicho_finalidade || v?.finalidade || "",
+      nicho_valor_min: v?.nicho_valor_min || v?.valor_min || "",
+      nicho_valor_max: v?.nicho_valor_max || v?.valor_max || "",
+      nicho_operadora: v?.nicho_operadora || v?.operadora || "",
+      nicho_tipo_plano: v?.nicho_tipo_plano || v?.tipo_plano || "",
+      nicho_cobertura: v?.nicho_cobertura || v?.cobertura || "",
+      nicho_acomodacao: v?.nicho_acomodacao || v?.acomodacao || "",
+      nicho_produto: v?.nicho_produto || v?.produto || "",
+      nicho_objetivo: v?.nicho_objetivo || v?.objetivo_nicho || "",
+      nicho_marca: v?.nicho_marca || v?.marca || "",
+      nicho_publico_alvo: v?.nicho_publico_alvo || v?.publico_alvo || ""
     };
   };
 
@@ -10536,7 +10690,12 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `nome_campanha (igual ao titulo), titulo (max 40 chars), texto (2-3 frases), descricao (1 frase curta),\n` +
       `cta, perguntas (3 qualificadoras separadas por \\n), interesses (keywords separados por virgula),\n` +
       `localidade (regiao do produto ou vazio), genero (vazio), idade_min, idade_max,\n` +
-      `obrigado_titulo, obrigado_botao, obrigado_texto\n\n` +
+      `obrigado_titulo, obrigado_botao, obrigado_texto.\n\n` +
+      `Campos opcionais de nicho: preencha SOMENTE se o contexto do usuario trouxer a informacao de forma clara.\n` +
+      `Para imoveis: nicho_tipo_imovel (residencial|comercial|rural), nicho_finalidade (venda|locacao), nicho_valor_min, nicho_valor_max.\n` +
+      `Para saude: nicho_operadora, nicho_tipo_plano (individual|familiar|empresarial), nicho_cobertura (basica|intermediaria|premium), nicho_acomodacao (enfermaria|apartamento).\n` +
+      `Para suplementos: nicho_produto (whey|creatina|pre_workout|bcaa|multivitaminico|colageno|outro), nicho_objetivo (ganho_massa|emagrecimento|performance|saude), nicho_marca, nicho_publico_alvo (iniciantes|intermediario|avancado).\n` +
+      `Se o usuario informou esses detalhes, use-os nos 3 conteudos e tambem nos campos opcionais de nicho. Se nao informou, deixe vazio.\n\n` +
       `Retorne SOMENTE JSON valido sem texto antes ou depois:\n` +
       `{"v1":{...todos os campos...},"v2":{...},"v3":{...}}`;
 
