@@ -12982,28 +12982,24 @@ app.patch("/campanhas/:id/nicho", authMiddleware, async (c) => {
 ========================= */
 
 async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
-  const baseUrl = Bun.env.EVOLUTION_API_URL;
-  const apiKey  = Bun.env.EVOLUTION_API_KEY;
-  const instancia = Bun.env.EVOLUTION_INSTANCE || "plataforma";
-  if (!baseUrl || !apiKey) return;
+  const instanceId = Bun.env.ZAPI_INSTANCE_ID;
+  const token      = Bun.env.ZAPI_TOKEN;
+  if (!instanceId || !token) return;
 
   const numero = String(telefone).replace(/\D/g, "");
   if (!numero) return;
 
   try {
-    await fetch(`${baseUrl}/message/sendText/${instancia}`, {
+    await fetch(`https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": apiKey
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        number: numero.startsWith("55") ? numero : `55${numero}`,
-        text: mensagem
+        phone: numero.startsWith("55") ? numero : `55${numero}`,
+        message: mensagem
       })
     });
   } catch (e) {
-    console.error("ERRO EVOLUTION API:", e);
+    console.error("ERRO Z-API:", e);
   }
 }
 
