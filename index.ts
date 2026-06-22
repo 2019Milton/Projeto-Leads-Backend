@@ -9560,7 +9560,15 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
            lembrete_1dia_enviado = FALSE,
            lembrete_dia_enviado  = FALSE
        WHERE id = $2
-         AND usuario_id = $3
+         AND (
+           usuario_id = $3
+           OR usuario_id IN (
+             SELECT id FROM usuarios WHERE admin_id = $3
+           )
+           OR $3 IN (
+             SELECT admin_id FROM usuarios WHERE id = usuario_id AND admin_id IS NOT NULL
+           )
+         )
        RETURNING id, data_contato`,
       [dataContato, leadId, user.id]
     );
