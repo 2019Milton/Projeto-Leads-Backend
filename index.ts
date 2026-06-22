@@ -1,4 +1,4 @@
-import { Hono } from "hono@4";
+﻿import { Hono } from "hono@4";
 import { cors } from "hono/cors";
 import { Pool } from "pg";
 import bcrypt from "bcryptjs";
@@ -7313,6 +7313,27 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         }
       } catch (e) {
         console.error("ERRO ADS EFFECTIVE STATUS:", e);
+      }
+    }
+
+    // Detecção de nicho por nome para campanhas sem nicho_id no BD
+    const userNichos = (user.nichos || []) as Array<{id: number; slug: string; nome: string; cor: string}>;
+    if (userNichos.length > 0) {
+      const norm = (t: string) =>
+        String(t).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      for (const c of campanhas.rows as any[]) {
+        if (c.nicho_id || c.nicho_slug) continue;
+        const nomeLower = norm(c.nome || "");
+        for (const nicho of userNichos) {
+          const nichoNomeLower = norm(nicho.nome || "");
+          if (nomeLower.includes(nichoNomeLower) || nomeLower.includes(nicho.slug)) {
+            c.nicho_id   = nicho.id;
+            c.nicho_slug = nicho.slug;
+            c.nicho_nome = nicho.nome;
+            c.nicho_cor  = nicho.cor;
+            break;
+          }
+        }
       }
     }
 
