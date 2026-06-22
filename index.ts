@@ -8345,6 +8345,113 @@ app.post("/meta/restaurar-campanha", authMiddleware, async (c) => {
 });
 
 
+// 🔹 excluir definitivamente uma campanha da plataforma
+app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
+
+  try {
+
+    const user: any = c.get("user");
+
+    const campanhaId =
+      Number(c.req.param("id"));
+
+    if (!Number.isFinite(campanhaId)) {
+      return c.json({
+        error: "Campanha inválida"
+      }, 400);
+    }
+
+    const campanha = await client.query(
+      `
+      SELECT id, campaign_id, status
+      FROM campanhas
+      WHERE id = $1
+      AND usuario_id = $2
+      LIMIT 1
+      `,
+      [campanhaId, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({
+        error: "Apenas o dono da campanha pode excluí-la definitivamente"
+      }, 403);
+    }
+
+    const campanhaLocal =
+      campanha.rows[0];
+
+    const statusAtual =
+      String(campanhaLocal.status || "").toUpperCase();
+
+    if (
+      campanhaLocal.campaign_id &&
+      statusAtual !== "DELETED"
+    ) {
+      const conn = await client.query(
+        `
+        SELECT access_token
+        FROM meta_conexoes
+        WHERE usuario_id = $1
+        ORDER BY id DESC
+        LIMIT 1
+        `,
+        [user.id]
+      );
+
+      const token =
+        conn.rows[0]?.access_token || null;
+
+      if (token) {
+        const metaRes = await fetch(
+          `https://graph.facebook.com/v19.0/${campanhaLocal.campaign_id}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              status: "DELETED",
+              access_token: token
+            })
+          }
+        ).then(r => r.json());
+
+        console.log("DELETE DEFINITIVO META:", metaRes);
+
+        if (metaRes.error) {
+          return c.json({
+            error:
+              metaRes.error.message ||
+              "A Meta não permitiu excluir a campanha"
+          }, 400);
+        }
+      }
+    }
+
+    await client.query(
+      `
+      DELETE FROM campanhas
+      WHERE id = $1
+      AND usuario_id = $2
+      `,
+      [campanhaId, user.id]
+    );
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("EXCLUIR CAMPANHA DEFINITIVA:", err);
+
+    return c.json({
+      error: "Erro ao excluir campanha definitivamente"
+    }, 500);
+  }
+});
+
 // 🔹 editar segmentação, orçamento, datas e lance de uma campanha existente
 app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
