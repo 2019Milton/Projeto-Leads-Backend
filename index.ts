@@ -13102,6 +13102,20 @@ function agendarLembretes() {
 
 agendarLembretes();
 
+// 🔹 teste de envio WhatsApp (remover após confirmar funcionamento)
+app.post("/admin/teste-whatsapp", authMiddleware, async (c) => {
+  try {
+    const { telefone, mensagem } = await c.req.json();
+    await enviarLembreteWhatsApp(
+      telefone || "11933842509",
+      mensagem || "🔔 Teste da Plataforma de Leads — WhatsApp configurado com sucesso!"
+    );
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
 /* =========================
    🚀 START
 ========================= */
