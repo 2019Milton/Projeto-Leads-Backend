@@ -1903,7 +1903,7 @@ async function gerarAnaliseIAOpenAI(
 
   const iaConf = await buscarConfigIA();
   const systemMsg =
-    "Voce e uma IA comercial para uma plataforma imobiliaria. Analise o lead, priorize a acao do corretor e, quando o status for perdido, foque em recuperacao. Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso.";
+    "Voce e uma IA comercial para uma plataforma imobiliaria. Analise o lead, priorize a acao do corretor e, quando o status for perdido, foque em recuperacao. Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso. IMPORTANTE: o campo mensagem_whatsapp deve conter somente texto puro, sem emojis ou caracteres especiais.";
   const schemaDescricao =
     `Retorne SOMENTE JSON valido com esta estrutura exata (sem texto antes ou depois):
 {"prioridade":"alta"|"media"|"baixa","resumo":"string","proxima_acao":"string","mensagem_whatsapp":"string","perguntas_qualificacao":["string"],"sinais":["string"],"riscos":["string"],"explicacao":"string","recuperacao":{"chance":"alta"|"media"|"baixa"|"nao_aplicavel","motivo_perda":"string","recomendacao":"string"}}`;
