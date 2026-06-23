@@ -48,7 +48,10 @@
       "Bash(python3 -)",
       "Bash(vercel --version)",
       "PowerShell(node -e \"console.log\\('sau�de'.normalize\\('NFD'\\).replace\\(/['-?]/g,''\\)\\)\")",
-      "Bash(grep -n \"usuario/me\\\\|\\\\/me\\\\b\\\\|usuario/nichos\\\\|usuarioLogado\\\\.\" index.html)"
+      "Bash(grep -n \"usuario/me\\\\|\\\\/me\\\\b\\\\|usuario/nichos\\\\|usuarioLogado\\\\.\" index.html)",
+      "Bash(grep -r \"color\\\\|#[0-9a-fA-F]\\\\{3,6\\\\}\\\\|primary\\\\|brand\" c:/Users/perei/Projeto-Leads/index.html)",
+      "Bash(Test-Path \"c:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\\\\banner-planos.html\")",
+      "PowerShell(Start-Process \"C:\\\\Users\\\\perei\\\\Projeto-Leads-Backend\\\\banner-planos.html\")"
     ]
   }
 }
