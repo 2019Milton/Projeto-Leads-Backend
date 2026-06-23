@@ -6283,6 +6283,7 @@ await client.query(`
 await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS data_contato DATE;`);
 await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lembrete_1dia_enviado BOOLEAN DEFAULT FALSE;`);
 await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lembrete_dia_enviado BOOLEAN DEFAULT FALSE;`);
+await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS observacao_agendamento TEXT;`);
 
 await client.query(`
   CREATE TABLE IF NOT EXISTS notificacoes (
@@ -9129,7 +9130,9 @@ app.get("/leads", authMiddleware, async (c) => {
         l.nicho_id,
         n.slug AS nicho_slug,
         n.nome AS nicho_nome,
-        n.cor  AS nicho_cor
+        n.cor  AS nicho_cor,
+        l.data_contato,
+        l.observacao_agendamento
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
       WHERE l.usuario_id = $1
@@ -9552,6 +9555,7 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
     const leadId = Number(c.req.param("id"));
     const body = await c.req.json().catch(() => ({}));
     const dataContato = body.data_contato ?? null;
+    const observacaoAgendamento = body.observacao_agendamento ?? null;
 
     // busca o lead e o dono para checar permissão em JS
     const leadRow = await client.query(`SELECT id, usuario_id FROM leads WHERE id = $1`, [leadId]);
@@ -9575,11 +9579,12 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
     const res = await client.query(
       `UPDATE leads
        SET data_contato = $1,
+           observacao_agendamento = $2,
            lembrete_1dia_enviado = FALSE,
            lembrete_dia_enviado  = FALSE
-       WHERE id = $2
-       RETURNING id, data_contato`,
-      [dataContato, leadId]
+       WHERE id = $3
+       RETURNING id, data_contato, observacao_agendamento`,
+      [dataContato, observacaoAgendamento, leadId]
     );
 
     if (!res.rows[0]) return c.json({ error: "Falha ao atualizar" }, 500);
