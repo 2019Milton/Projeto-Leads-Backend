@@ -6296,6 +6296,11 @@ await client.query(`
 `);
 
 await client.query(`
+  ALTER TABLE chat_conversas
+    ADD COLUMN IF NOT EXISTS suporte_visto_em TIMESTAMP;
+`);
+
+await client.query(`
   ALTER TABLE parceiro_financeiro
     ADD COLUMN IF NOT EXISTS percentual_parceiro NUMERIC(5, 2) DEFAULT ${PARCEIRO_PERCENTUAL_COMISSAO * 100};
 `);
@@ -12370,15 +12375,25 @@ app.post("/chat/mensagem", authMiddleware, async (c: any) => {
     [conversaId]
   );
 
-  // Notifica admins via WhatsApp
+  // Notifica admins via WhatsApp (só se suporte não estiver com a conversa aberta)
   try {
-    const admins = await client.query(
-      `SELECT whatsapp FROM usuarios WHERE tipo = 'super_admin' AND whatsapp IS NOT NULL AND whatsapp <> ''`
+    const visto = await client.query(
+      `SELECT suporte_visto_em FROM chat_conversas WHERE id = $1`,
+      [conversaId]
     );
-    const nomeRemetente = `${user.nome || ""} ${user.sobrenome || ""}`.trim() || user.email;
-    const msgWpp = `💬 *Nova mensagem no chat da plataforma*\n\n*De:* ${nomeRemetente}\n*Mensagem:* ${conteudo.trim()}`;
-    for (const admin of admins.rows) {
-      await enviarLembreteWhatsApp(admin.whatsapp, msgWpp);
+    const vistoEm = visto.rows[0]?.suporte_visto_em;
+    const suporteAtivo = vistoEm && (Date.now() - new Date(vistoEm).getTime()) < 2 * 60 * 1000;
+
+    if (!suporteAtivo) {
+      const admins = await client.query(
+        `SELECT whatsapp FROM usuarios WHERE tipo = 'super_admin' AND whatsapp IS NOT NULL AND whatsapp <> ''`
+      );
+      const nomeRemetente = `${user.nome || ""} ${user.sobrenome || ""}`.trim() || user.email;
+      const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+      const msgWpp = `🔔 *Plataforma de Leads — Nova mensagem*\n\n👤 *Cliente:* ${nomeRemetente}\n💬 *Mensagem:* ${conteudo.trim()}\n⏰ *Horário:* ${agora}\n\nAcesse o painel de suporte para responder.`;
+      for (const admin of admins.rows) {
+        await enviarLembreteWhatsApp(admin.whatsapp, msgWpp);
+      }
     }
   } catch (e) {
     console.error("ERRO notif chat WhatsApp:", e);
@@ -12759,6 +12774,18 @@ app.put("/chat/conversas/:id/reabrir", authMiddleware, async (c: any) => {
     [id]
   );
 
+  return c.json({ sucesso: true });
+});
+
+// Marca conversa como visualizada pelo suporte (para não enviar WhatsApp desnecessário)
+app.patch("/chat/conversas/:id/visualizar", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+  if (!isSuporte(user.tipo)) return c.json({ error: "Acesso negado" }, 403);
+  const id = Number(c.req.param("id"));
+  await client.query(
+    `UPDATE chat_conversas SET suporte_visto_em = NOW() WHERE id = $1`,
+    [id]
+  );
   return c.json({ sucesso: true });
 });
 
