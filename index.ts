@@ -3539,7 +3539,11 @@ app.get("/auth/meta/callback", async (c) => {
       return c.text("Usuário inválido", 401);
     }
 
-    // 💾 salva no banco
+    // 💾 substitui conexão existente (evita duplicata)
+    await client.query(
+      "DELETE FROM meta_conexoes WHERE usuario_id = $1",
+      [usuarioId]
+    );
     await client.query(
       "INSERT INTO meta_conexoes (usuario_id, access_token) VALUES ($1, $2)",
       [usuarioId, access_token]
@@ -3555,8 +3559,9 @@ app.get("/auth/meta/callback", async (c) => {
     `);
 
   } catch (err) {
-    console.error("ERRO META:", err);
-    return c.text("Erro ao conectar Meta");
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("ERRO META CALLBACK:", msg, err);
+    return c.text(`Erro ao conectar Meta: ${msg}`);
   }
 });
 
