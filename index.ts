@@ -9551,10 +9551,23 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const dataContato = body.data_contato ?? null;
 
-    // debug: log lead owner vs current user
-    const debugLead = await client.query(`SELECT id, usuario_id FROM leads WHERE id = $1`, [leadId]);
-    const debugUser = await client.query(`SELECT id, admin_id FROM usuarios WHERE id = $1`, [user.id]);
-    console.log("DEBUG DATA-CONTATO lead:", debugLead.rows[0], "user:", debugUser.rows[0]);
+    // busca o lead e o dono para checar permissão em JS
+    const leadRow = await client.query(`SELECT id, usuario_id FROM leads WHERE id = $1`, [leadId]);
+    if (!leadRow.rows[0]) return c.json({ error: "Lead não encontrado" }, 404);
+
+    const leadOwnerId: number = leadRow.rows[0].usuario_id;
+    const ownerRow = await client.query(`SELECT id, admin_id FROM usuarios WHERE id = $1`, [leadOwnerId]);
+    const leadOwnerAdminId: number | null = ownerRow.rows[0]?.admin_id ?? null;
+
+    const temPermissao =
+      leadOwnerId === user.id ||           // lead é do próprio usuário
+      user.admin_id === leadOwnerId ||      // usuário é corretor e lead é do seu admin
+      leadOwnerAdminId === user.id;         // usuário é admin e lead é de um corretor dele
+
+    if (!temPermissao) {
+      console.error("PERMISSAO NEGADA data-contato:", { leadOwnerId, userId: user.id, userAdminId: user.admin_id, leadOwnerAdminId });
+      return c.json({ error: "Sem permissão para editar este lead" }, 403);
+    }
 
     const res = await client.query(
       `UPDATE leads
@@ -9562,16 +9575,11 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
            lembrete_1dia_enviado = FALSE,
            lembrete_dia_enviado  = FALSE
        WHERE id = $2
-         AND (
-           usuario_id = $3
-           OR usuario_id = (SELECT admin_id FROM usuarios WHERE id = $3)
-           OR usuario_id IN (SELECT id FROM usuarios WHERE admin_id = $3)
-         )
        RETURNING id, data_contato`,
-      [dataContato, leadId, user.id]
+      [dataContato, leadId]
     );
 
-    if (!res.rows[0]) return c.json({ error: "Lead não encontrado ou sem permissão", debug: { lead: debugLead.rows[0], user: debugUser.rows[0] } }, 404);
+    if (!res.rows[0]) return c.json({ error: "Falha ao atualizar" }, 500);
     return c.json(res.rows[0]);
   } catch (err: any) {
     console.error("ERRO DATA CONTATO:", err);
