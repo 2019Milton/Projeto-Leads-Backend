@@ -12600,11 +12600,12 @@ app.get("/chat/usuarios/:usuarioId/todas-mensagens", authMiddleware, async (c: a
   );
 
   const result = await client.query(
-    `SELECT m.id, m.conteudo, m.remetente_tipo, m.criado_em, m.lido, cv.id AS conversa_id
+    `SELECT m.id, m.conteudo, m.remetente_tipo, m.enviado_em, m.lido,
+            m.anexo_url, m.anexo_tipo, m.anexo_nome, cv.id AS conversa_id
      FROM chat_mensagens m
      JOIN chat_conversas cv ON cv.id = m.conversa_id
      WHERE cv.usuario_id = $1
-     ORDER BY m.criado_em ASC`,
+     ORDER BY m.enviado_em ASC`,
     [usuarioId]
   );
 
