@@ -12370,6 +12370,20 @@ app.post("/chat/mensagem", authMiddleware, async (c: any) => {
     [conversaId]
   );
 
+  // Notifica admins via WhatsApp
+  try {
+    const admins = await client.query(
+      `SELECT whatsapp FROM usuarios WHERE tipo = 'super_admin' AND whatsapp IS NOT NULL AND whatsapp <> ''`
+    );
+    const nomeRemetente = `${user.nome || ""} ${user.sobrenome || ""}`.trim() || user.email;
+    const msgWpp = `💬 *Nova mensagem no chat da plataforma*\n\n*De:* ${nomeRemetente}\n*Mensagem:* ${conteudo.trim()}`;
+    for (const admin of admins.rows) {
+      await enviarLembreteWhatsApp(admin.whatsapp, msgWpp);
+    }
+  } catch (e) {
+    console.error("ERRO notif chat WhatsApp:", e);
+  }
+
   return c.json({ sucesso: true, conversa_id: conversaId });
 });
 
