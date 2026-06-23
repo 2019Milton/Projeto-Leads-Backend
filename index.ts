@@ -2442,6 +2442,7 @@ const authMiddleware = async (c: any, next: any) => {
         u.nome,
         u.sobrenome,
         u.plano,
+        u.admin_id,
         u.ia_limite_mensal,
         u.ia_custo_limite_mensal,
         COALESCE(u.ia_ativo, true) AS ia_ativo,
@@ -9559,10 +9560,11 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
     const ownerRow = await client.query(`SELECT id, admin_id FROM usuarios WHERE id = $1`, [leadOwnerId]);
     const leadOwnerAdminId: number | null = ownerRow.rows[0]?.admin_id ?? null;
 
+    const uid = Number(user.id);
     const temPermissao =
-      leadOwnerId === user.id ||           // lead é do próprio usuário
-      user.admin_id === leadOwnerId ||      // usuário é corretor e lead é do seu admin
-      leadOwnerAdminId === user.id;         // usuário é admin e lead é de um corretor dele
+      Number(leadOwnerId) === uid ||           // lead é do próprio usuário
+      Number(user.admin_id) === Number(leadOwnerId) ||  // corretor acessando lead do seu admin
+      Number(leadOwnerAdminId) === uid;        // admin acessando lead de um corretor dele
 
     if (!temPermissao) {
       console.error("PERMISSAO NEGADA data-contato:", { leadOwnerId, userId: user.id, userAdminId: user.admin_id, leadOwnerAdminId });
