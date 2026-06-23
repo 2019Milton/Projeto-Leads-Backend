@@ -6513,6 +6513,27 @@ await client.query(`
     ON notificacoes(usuario_id, lido, criado_em DESC);
 `);
 
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas_rascunho (
+    id           SERIAL PRIMARY KEY,
+    criador_id   INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    corretor_id  INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    nome         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pendente'
+                   CHECK (status IN ('pendente', 'ativado', 'rejeitado', 'cancelado')),
+    configuracoes JSONB NOT NULL DEFAULT '{}',
+    motivo_rejeicao TEXT,
+    criado_em    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ativado_em   TIMESTAMP,
+    campanha_id  INTEGER REFERENCES campanhas(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_campanhas_rascunho_criador
+    ON campanhas_rascunho(criador_id);
+  CREATE INDEX IF NOT EXISTS idx_campanhas_rascunho_corretor
+    ON campanhas_rascunho(corretor_id, status);
+`);
+
 /* =========================
    🔐 LOGIN
 ========================= */
@@ -13417,6 +13438,600 @@ async function processarLembretesContato() {
     console.error("ERRO CRON LEMBRETES:", e);
   }
 }
+
+/* =========================
+   👷 CRIADOR DE CAMPANHA
+========================= */
+
+// Lista corretores disponíveis para o criador de campanha atribuir rascunhos
+app.get("/usuarios/corretores-disponiveis", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (
+      user.tipo !== "criador_campanha" &&
+      user.tipo !== "super_admin" &&
+      user.tipo !== "master"
+    ) {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const resultado = await client.query(
+      `SELECT id, nome, sobrenome, email, tipo, plano, ativo
+       FROM usuarios
+       WHERE tipo IN ('corretor', 'admin_corretor')
+         AND COALESCE(ativo, true) = true
+       ORDER BY nome ASC`
+    );
+
+    return c.json(resultado.rows);
+  } catch (err) {
+    console.error("ERRO GET /usuarios/corretores-disponiveis:", err);
+    return c.json({ error: "Erro ao listar corretores" }, 500);
+  }
+});
+
+// Criar rascunho de campanha
+app.post("/campanhas/rascunho", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (
+      user.tipo !== "criador_campanha" &&
+      user.tipo !== "super_admin" &&
+      user.tipo !== "master"
+    ) {
+      return c.json({ error: "Apenas criadores de campanha podem criar rascunhos" }, 403);
+    }
+
+    const { corretor_id, nome, configuracoes } = await c.req.json();
+
+    if (!corretor_id || !nome) {
+      return c.json({ error: "corretor_id e nome são obrigatórios" }, 400);
+    }
+
+    const corretorRes = await client.query(
+      `SELECT id FROM usuarios WHERE id = $1 AND tipo IN ('corretor', 'admin_corretor') AND COALESCE(ativo, true) = true`,
+      [corretor_id]
+    );
+
+    if (corretorRes.rows.length === 0) {
+      return c.json({ error: "Corretor não encontrado ou inativo" }, 404);
+    }
+
+    const resultado = await client.query(
+      `INSERT INTO campanhas_rascunho (criador_id, corretor_id, nome, configuracoes)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [user.id, corretor_id, nome, JSON.stringify(configuracoes || {})]
+    );
+
+    const rascunho = resultado.rows[0];
+
+    // Notifica o corretor
+    await client.query(
+      `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+       VALUES ($1, 'rascunho_campanha', 'Nova campanha aguardando ativação',
+               $2)`,
+      [
+        corretor_id,
+        `O criador preparou a campanha "${nome}" para você. Acesse e ative quando estiver pronto.`
+      ]
+    );
+
+    return c.json(rascunho, 201);
+  } catch (err) {
+    console.error("ERRO POST /campanhas/rascunho:", err);
+    return c.json({ error: "Erro ao criar rascunho" }, 500);
+  }
+});
+
+// Listar rascunhos (criador vê os próprios; corretor vê os atribuídos a ele)
+app.get("/campanhas/rascunho", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    let rows: any[];
+
+    if (
+      user.tipo === "criador_campanha" ||
+      user.tipo === "super_admin" ||
+      user.tipo === "master"
+    ) {
+      const filtroStatus = c.req.query("status");
+
+      const resultado = await client.query(
+        `SELECT r.*,
+                c.nome AS corretor_nome, c.sobrenome AS corretor_sobrenome, c.email AS corretor_email,
+                u.nome AS criador_nome
+         FROM campanhas_rascunho r
+         JOIN usuarios c ON c.id = r.corretor_id
+         JOIN usuarios u ON u.id = r.criador_id
+         WHERE r.criador_id = $1
+           AND ($2::text IS NULL OR r.status = $2)
+         ORDER BY r.criado_em DESC`,
+        [user.tipo === "criador_campanha" ? user.id : null, filtroStatus || null]
+      );
+
+      // super_admin/master veem todos
+      if (user.tipo !== "criador_campanha") {
+        const todos = await client.query(
+          `SELECT r.*,
+                  c.nome AS corretor_nome, c.sobrenome AS corretor_sobrenome, c.email AS corretor_email,
+                  u.nome AS criador_nome
+           FROM campanhas_rascunho r
+           JOIN usuarios c ON c.id = r.corretor_id
+           JOIN usuarios u ON u.id = r.criador_id
+           WHERE ($1::text IS NULL OR r.status = $1)
+           ORDER BY r.criado_em DESC`,
+          [filtroStatus || null]
+        );
+        rows = todos.rows;
+      } else {
+        rows = resultado.rows;
+      }
+    } else if (
+      user.tipo === "corretor" ||
+      user.tipo === "admin_corretor"
+    ) {
+      const filtroStatus = c.req.query("status");
+
+      const resultado = await client.query(
+        `SELECT r.*,
+                u.nome AS criador_nome,
+                u.email AS criador_email
+         FROM campanhas_rascunho r
+         JOIN usuarios u ON u.id = r.criador_id
+         WHERE r.corretor_id = $1
+           AND ($2::text IS NULL OR r.status = $2)
+         ORDER BY r.criado_em DESC`,
+        [user.id, filtroStatus || null]
+      );
+
+      rows = resultado.rows;
+    } else {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    return c.json(rows);
+  } catch (err) {
+    console.error("ERRO GET /campanhas/rascunho:", err);
+    return c.json({ error: "Erro ao listar rascunhos" }, 500);
+  }
+});
+
+// Buscar rascunho por ID
+app.get("/campanhas/rascunho/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+
+    const resultado = await client.query(
+      `SELECT r.*,
+              c.nome AS corretor_nome, c.sobrenome AS corretor_sobrenome, c.email AS corretor_email,
+              u.nome AS criador_nome, u.email AS criador_email
+       FROM campanhas_rascunho r
+       JOIN usuarios c ON c.id = r.corretor_id
+       JOIN usuarios u ON u.id = r.criador_id
+       WHERE r.id = $1`,
+      [id]
+    );
+
+    if (resultado.rows.length === 0) {
+      return c.json({ error: "Rascunho não encontrado" }, 404);
+    }
+
+    const rascunho = resultado.rows[0];
+
+    const podeVer =
+      user.tipo === "super_admin" ||
+      user.tipo === "master" ||
+      rascunho.criador_id === user.id ||
+      rascunho.corretor_id === user.id;
+
+    if (!podeVer) {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    return c.json(rascunho);
+  } catch (err) {
+    console.error("ERRO GET /campanhas/rascunho/:id:", err);
+    return c.json({ error: "Erro ao buscar rascunho" }, 500);
+  }
+});
+
+// Atualizar rascunho (somente criador, enquanto pendente)
+app.patch("/campanhas/rascunho/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+
+    const rascunhoRes = await client.query(
+      `SELECT * FROM campanhas_rascunho WHERE id = $1`,
+      [id]
+    );
+
+    if (rascunhoRes.rows.length === 0) {
+      return c.json({ error: "Rascunho não encontrado" }, 404);
+    }
+
+    const rascunho = rascunhoRes.rows[0];
+
+    if (
+      rascunho.criador_id !== user.id &&
+      user.tipo !== "super_admin" &&
+      user.tipo !== "master"
+    ) {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    if (rascunho.status !== "pendente") {
+      return c.json({ error: "Apenas rascunhos pendentes podem ser editados" }, 400);
+    }
+
+    const { nome, corretor_id, configuracoes } = await c.req.json();
+
+    const campos: string[] = [];
+    const valores: any[] = [];
+    let idx = 1;
+
+    if (nome) { campos.push(`nome = $${idx++}`); valores.push(nome); }
+    if (corretor_id) { campos.push(`corretor_id = $${idx++}`); valores.push(corretor_id); }
+    if (configuracoes !== undefined) { campos.push(`configuracoes = $${idx++}`); valores.push(JSON.stringify(configuracoes)); }
+    campos.push(`atualizado_em = NOW()`);
+
+    if (campos.length === 1) {
+      return c.json({ error: "Nenhum campo para atualizar" }, 400);
+    }
+
+    valores.push(id);
+
+    const atualizado = await client.query(
+      `UPDATE campanhas_rascunho SET ${campos.join(", ")} WHERE id = $${idx} RETURNING *`,
+      valores
+    );
+
+    return c.json(atualizado.rows[0]);
+  } catch (err) {
+    console.error("ERRO PATCH /campanhas/rascunho/:id:", err);
+    return c.json({ error: "Erro ao atualizar rascunho" }, 500);
+  }
+});
+
+// Cancelar/excluir rascunho (somente criador, enquanto pendente)
+app.delete("/campanhas/rascunho/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+
+    const rascunhoRes = await client.query(
+      `SELECT * FROM campanhas_rascunho WHERE id = $1`,
+      [id]
+    );
+
+    if (rascunhoRes.rows.length === 0) {
+      return c.json({ error: "Rascunho não encontrado" }, 404);
+    }
+
+    const rascunho = rascunhoRes.rows[0];
+
+    if (
+      rascunho.criador_id !== user.id &&
+      user.tipo !== "super_admin" &&
+      user.tipo !== "master"
+    ) {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    if (rascunho.status === "ativado") {
+      return c.json({ error: "Rascunho já ativado não pode ser excluído" }, 400);
+    }
+
+    await client.query(
+      `UPDATE campanhas_rascunho SET status = 'cancelado', atualizado_em = NOW() WHERE id = $1`,
+      [id]
+    );
+
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO DELETE /campanhas/rascunho/:id:", err);
+    return c.json({ error: "Erro ao cancelar rascunho" }, 500);
+  }
+});
+
+// Corretor rejeita rascunho
+app.post("/campanhas/rascunho/:id/rejeitar", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+
+    const rascunhoRes = await client.query(
+      `SELECT * FROM campanhas_rascunho WHERE id = $1`,
+      [id]
+    );
+
+    if (rascunhoRes.rows.length === 0) {
+      return c.json({ error: "Rascunho não encontrado" }, 404);
+    }
+
+    const rascunho = rascunhoRes.rows[0];
+
+    if (rascunho.corretor_id !== user.id) {
+      return c.json({ error: "Apenas o corretor destinatário pode rejeitar este rascunho" }, 403);
+    }
+
+    if (rascunho.status !== "pendente") {
+      return c.json({ error: "Rascunho não está pendente" }, 400);
+    }
+
+    const { motivo } = await c.req.json();
+
+    const atualizado = await client.query(
+      `UPDATE campanhas_rascunho
+       SET status = 'rejeitado', motivo_rejeicao = $1, atualizado_em = NOW()
+       WHERE id = $2
+       RETURNING *`,
+      [motivo || null, id]
+    );
+
+    // Notifica o criador
+    await client.query(
+      `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+       VALUES ($1, 'rascunho_rejeitado', 'Campanha rejeitada pelo corretor', $2)`,
+      [
+        rascunho.criador_id,
+        `O corretor rejeitou a campanha "${rascunho.nome}".${motivo ? ` Motivo: ${motivo}` : ""}`
+      ]
+    );
+
+    return c.json(atualizado.rows[0]);
+  } catch (err) {
+    console.error("ERRO POST /campanhas/rascunho/:id/rejeitar:", err);
+    return c.json({ error: "Erro ao rejeitar rascunho" }, 500);
+  }
+});
+
+// Corretor ativa rascunho — cria a campanha real no Meta usando as credenciais do corretor
+app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+
+    if (
+      user.tipo !== "corretor" &&
+      user.tipo !== "admin_corretor" &&
+      user.tipo !== "super_admin" &&
+      user.tipo !== "master"
+    ) {
+      return c.json({ error: "Apenas o corretor pode ativar rascunhos" }, 403);
+    }
+
+    const rascunhoRes = await client.query(
+      `SELECT * FROM campanhas_rascunho WHERE id = $1`,
+      [id]
+    );
+
+    if (rascunhoRes.rows.length === 0) {
+      return c.json({ error: "Rascunho não encontrado" }, 404);
+    }
+
+    const rascunho = rascunhoRes.rows[0];
+
+    if (
+      rascunho.corretor_id !== user.id &&
+      user.tipo !== "super_admin" &&
+      user.tipo !== "master"
+    ) {
+      return c.json({ error: "Este rascunho não está atribuído a você" }, 403);
+    }
+
+    if (rascunho.status !== "pendente") {
+      return c.json({ error: "Rascunho não está pendente" }, 400);
+    }
+
+    // Busca credenciais Meta do corretor
+    const metaRes = await client.query(
+      `SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+      [rascunho.corretor_id]
+    );
+
+    if (metaRes.rows.length === 0) {
+      return c.json({ error: "Corretor não possui conta Meta conectada" }, 400);
+    }
+
+    const token = metaRes.rows[0].access_token;
+    const contaAds = await obterContaAnuncios(token, metaRes.rows[0].conta_anuncios_id);
+
+    if (!contaAds) {
+      return c.json({ error: "Nenhuma conta de anúncios encontrada para este corretor" }, 400);
+    }
+
+    const adAccountId = contaAds.id;
+    const cfg = rascunho.configuracoes || {};
+    const cfgCampanha = cfg.campanha || {};
+    const cfgPublico = cfg.publico || {};
+    const cfgFormulario = cfg.formulario || {};
+    const cfgCriativo = cfg.criativo || {};
+
+    // 1. Cria campanha no Meta
+    const categoriaEspecial = textoOpcional(cfgCampanha.categoria_especial);
+    const payloadCampanha: any = {
+      name: rascunho.nome,
+      objective: cfgCampanha.objetivo || "OUTCOME_LEADS",
+      status: "PAUSED",
+      special_ad_categories: categoriaEspecial ? [categoriaEspecial] : [],
+      is_adset_budget_sharing_enabled: false,
+      access_token: token
+    };
+
+    if (cfgCampanha.orcamento_diario_centavos) {
+      payloadCampanha.daily_budget = cfgCampanha.orcamento_diario_centavos;
+    }
+
+    const campanhaMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/campaigns`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payloadCampanha) }
+    ).then(r => r.json());
+
+    if (!campanhaMeta.id) {
+      return c.json({ error: "Erro ao criar campanha no Meta", detalhe: campanhaMeta }, 400);
+    }
+
+    // 2. Busca page_id disponível do corretor
+    let pageId = textoOpcional(cfgCriativo.page_id);
+
+    if (!pageId) {
+      const pagesRes = await fetch(
+        `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+      ).then(r => r.json());
+
+      if (pagesRes.data && pagesRes.data.length > 0) {
+        pageId = pagesRes.data[0].id;
+      }
+    }
+
+    if (!pageId) {
+      return c.json({
+        error: "Nenhuma página do Facebook encontrada para o corretor. Configure uma página antes de ativar.",
+        campaign_id: campanhaMeta.id
+      }, 400);
+    }
+
+    // 3. Cria adset
+    const targeting = montarTargetingMeta({
+      ...cfgPublico,
+      categoria_especial: cfgCampanha.categoria_especial
+    });
+
+    const publicosPersonalizados = Array.isArray(cfgPublico.publicos_personalizados)
+      ? cfgPublico.publicos_personalizados.map((pid: any) => ({ id: String(pid) })).filter((p: any) => p.id)
+      : [];
+
+    if (publicosPersonalizados.length) {
+      targeting.custom_audiences = publicosPersonalizados;
+    }
+
+    const payloadAdset: any = {
+      name: `AdSet ${rascunho.nome} ${Date.now()}`,
+      campaign_id: campanhaMeta.id,
+      billing_event: "IMPRESSIONS",
+      optimization_goal: "LEAD_GENERATION",
+      destination_type: "ON_AD",
+      bid_strategy: textoOpcional(cfgCampanha.bid_strategy) || "LOWEST_COST_WITHOUT_CAP",
+      daily_budget: cfgPublico.orcamento_diario_centavos || cfgCampanha.orcamento_diario_centavos || 2000,
+      start_time: new Date(Date.now() + 60000).toISOString(),
+      targeting,
+      promoted_object: { page_id: pageId },
+      status: "PAUSED",
+      access_token: token
+    };
+
+    const adsetMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payloadAdset) }
+    ).then(r => r.json());
+
+    if (adsetMeta.error) {
+      return c.json({ error: "Erro ao criar adset no Meta", detalhe: adsetMeta, campaign_id: campanhaMeta.id }, 400);
+    }
+
+    // 4. Cria formulário de lead
+    const pagesDetalhes = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+    ).then(r => r.json());
+
+    const pagina = pagesDetalhes.data?.find((p: any) => p.id === pageId);
+    let formId: string | null = null;
+
+    if (pagina?.access_token) {
+      const perguntasExtras = Array.isArray(cfgFormulario.perguntas_customizadas)
+        ? cfgFormulario.perguntas_customizadas.slice(0, 10).map((q: string, i: number) => ({
+            type: "CUSTOM", key: `qualificacao_${i + 1}`, label: q
+          }))
+        : [];
+
+      const payloadForm: any = {
+        name: `Form ${rascunho.nome} ${Date.now()}`,
+        locale: "pt_BR",
+        questions: [
+          { type: "FULL_NAME" },
+          { type: "EMAIL" },
+          { type: "PHONE" },
+          ...perguntasExtras
+        ],
+        privacy_policy: {
+          url: urlOpcional(cfgFormulario.url_privacidade, "https://google.com"),
+          link_text: "Política de Privacidade"
+        },
+        thank_you_page: {
+          title: textoOpcional(cfgFormulario.mensagem_agradecimento_titulo) || "Obrigado!",
+          body: textoOpcional(cfgFormulario.mensagem_agradecimento) || "Recebemos seus dados 🚀",
+          button_type: "VIEW_WEBSITE",
+          button_text: "Ver mais",
+          website_url: urlOpcional(cfgFormulario.url_privacidade, "https://google.com")
+        },
+        access_token: pagina.access_token
+      };
+
+      const formMeta = await fetch(
+        `https://graph.facebook.com/v19.0/${pageId}/leadgen_forms`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payloadForm) }
+      ).then(r => r.json());
+
+      if (formMeta.id) {
+        formId = formMeta.id;
+      }
+    }
+
+    // 5. Salva na tabela campanhas
+    const campanhaBanco = await client.query(
+      `INSERT INTO campanhas (usuario_id, campaign_id, adset_id, form_id, page_id, conta_anuncios_id, nome, status, origem, configuracoes_avancadas, nicho_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'PAUSED', 'rascunho', $8, $9)
+       RETURNING id`,
+      [
+        rascunho.corretor_id,
+        campanhaMeta.id,
+        adsetMeta.id || null,
+        formId,
+        pageId,
+        adAccountId,
+        rascunho.nome,
+        JSON.stringify({ origem_rascunho_id: rascunho.id }),
+        cfg.nicho_id || null
+      ]
+    );
+
+    const campanhaId = campanhaBanco.rows[0].id;
+
+    // 6. Atualiza rascunho como ativado
+    await client.query(
+      `UPDATE campanhas_rascunho SET status = 'ativado', ativado_em = NOW(), campanha_id = $1, atualizado_em = NOW() WHERE id = $2`,
+      [campanhaId, id]
+    );
+
+    // Notifica o criador
+    await client.query(
+      `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+       VALUES ($1, 'rascunho_ativado', 'Campanha ativada pelo corretor', $2)`,
+      [
+        rascunho.criador_id,
+        `O corretor ativou a campanha "${rascunho.nome}" com sucesso.`
+      ]
+    );
+
+    return c.json({
+      ok: true,
+      campaign_id: campanhaMeta.id,
+      adset_id: adsetMeta.id || null,
+      form_id: formId,
+      campanha_id: campanhaId
+    });
+
+  } catch (err) {
+    console.error("ERRO POST /campanhas/rascunho/:id/ativar:", err);
+    return c.json({ error: "Erro ao ativar rascunho" }, 500);
+  }
+});
 
 // Agendador: verifica a cada hora se são 8h (BRT = UTC-3)
 function agendarLembretes() {
