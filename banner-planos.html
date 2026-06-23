@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Banner Planos — Plataforma de Leads</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #030712;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Inter', sans-serif;
+    }
+
+    .banner {
+      width: 1200px;
+      min-height: 780px;
+      background: #060b18;
+      border-radius: 24px;
+      overflow: hidden;
+      position: relative;
+      padding: 56px 64px 64px;
+      border: 1px solid #1e293b;
+    }
+
+    /* Fundo decorativo */
+    .banner::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 60% 50% at 80% -10%, rgba(124,58,237,0.18) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 40% at 10% 100%, rgba(37,99,235,0.15) 0%, transparent 60%);
+      pointer-events: none;
+    }
+
+    .grid-lines {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+      background-size: 60px 60px;
+      pointer-events: none;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 48px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .logo-icon {
+      width: 52px;
+      height: 52px;
+      background: linear-gradient(135deg, #7c3aed, #2563eb);
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+      box-shadow: 0 0 24px rgba(124,58,237,0.4);
+    }
+
+    .logo-text {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .logo-text span:first-child {
+      font-size: 22px;
+      font-weight: 800;
+      color: #f1f5f9;
+      letter-spacing: -0.5px;
+      line-height: 1.1;
+    }
+
+    .logo-text span:last-child {
+      font-size: 12px;
+      font-weight: 500;
+      color: #64748b;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .header-badge {
+      background: linear-gradient(135deg, rgba(124,58,237,0.15), rgba(37,99,235,0.15));
+      border: 1px solid rgba(124,58,237,0.3);
+      border-radius: 100px;
+      padding: 8px 20px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #a78bfa;
+      letter-spacing: 0.3px;
+    }
+
+    /* Headline */
+    .headline {
+      text-align: center;
+      margin-bottom: 48px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .headline h1 {
+      font-size: 38px;
+      font-weight: 900;
+      color: #f1f5f9;
+      letter-spacing: -1px;
+      line-height: 1.1;
+      margin-bottom: 12px;
+    }
+
+    .headline h1 span {
+      background: linear-gradient(90deg, #818cf8, #38bdf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .headline p {
+      font-size: 16px;
+      color: #64748b;
+      font-weight: 400;
+    }
+
+    /* Cards */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 20px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .card {
+      border-radius: 18px;
+      padding: 28px 24px 32px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      position: relative;
+      transition: transform 0.2s;
+    }
+
+    /* Bronze */
+    .card.bronze {
+      background: linear-gradient(160deg, #1c1309 0%, #0f0a04 100%);
+      border: 1px solid #44280a;
+    }
+
+    /* Prata */
+    .card.prata {
+      background: linear-gradient(160deg, #111827 0%, #0c1322 100%);
+      border: 1px solid #334155;
+    }
+
+    /* Ouro */
+    .card.ouro {
+      background: linear-gradient(160deg, #141006 0%, #0c0b04 100%);
+      border: 1px solid #854d0e;
+      box-shadow: 0 0 40px rgba(234,179,8,0.07);
+    }
+
+    /* Ouro + Campanha */
+    .card.campanha {
+      background: linear-gradient(160deg, #0d0c1e 0%, #070612 100%);
+      border: 1px solid #6d28d9;
+      box-shadow: 0 0 40px rgba(124,58,237,0.15);
+    }
+
+    .card.campanha::before {
+      content: '';
+      position: absolute;
+      inset: -1px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #7c3aed, #2563eb, #7c3aed);
+      z-index: -1;
+      opacity: 0.6;
+    }
+
+    .plan-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding: 5px 12px;
+      border-radius: 100px;
+      width: fit-content;
+    }
+
+    .badge-bronze { background: rgba(180,83,9,0.2); color: #f59e0b; border: 1px solid rgba(180,83,9,0.4); }
+    .badge-prata  { background: rgba(100,116,139,0.2); color: #cbd5e1; border: 1px solid rgba(100,116,139,0.4); }
+    .badge-ouro   { background: rgba(161,98,7,0.2); color: #fbbf24; border: 1px solid rgba(161,98,7,0.4); }
+    .badge-campanha { background: rgba(124,58,237,0.2); color: #a78bfa; border: 1px solid rgba(124,58,237,0.4); }
+
+    .popular-tag {
+      position: absolute;
+      top: -12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: linear-gradient(90deg, #7c3aed, #2563eb);
+      color: white;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      padding: 4px 14px;
+      border-radius: 100px;
+      white-space: nowrap;
+    }
+
+    .plan-name {
+      font-size: 22px;
+      font-weight: 800;
+      color: #f1f5f9;
+      letter-spacing: -0.3px;
+    }
+
+    .price-block {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .price-label {
+      font-size: 11px;
+      color: #475569;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .price {
+      display: flex;
+      align-items: baseline;
+      gap: 4px;
+    }
+
+    .price-currency {
+      font-size: 18px;
+      font-weight: 700;
+      color: #94a3b8;
+    }
+
+    .price-value {
+      font-size: 42px;
+      font-weight: 900;
+      line-height: 1;
+      letter-spacing: -2px;
+    }
+
+    .price-month {
+      font-size: 14px;
+      color: #475569;
+      font-weight: 500;
+    }
+
+    .price-value.bronze-color { color: #f59e0b; }
+    .price-value.prata-color  { color: #cbd5e1; }
+    .price-value.ouro-color   { color: #fbbf24; }
+    .price-value.campanha-color { color: #a78bfa; }
+
+    .divider {
+      height: 1px;
+      background: rgba(255,255,255,0.06);
+    }
+
+    .features {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      flex: 1;
+    }
+
+    .feature {
+      display: flex;
+      align-items: flex-start;
+      gap: 9px;
+      font-size: 13px;
+      color: #94a3b8;
+      line-height: 1.4;
+    }
+
+    .feature-check {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      margin-top: 1px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+    }
+
+    .check-bronze { background: rgba(245,158,11,0.15); color: #f59e0b; }
+    .check-prata  { background: rgba(203,213,225,0.12); color: #cbd5e1; }
+    .check-ouro   { background: rgba(251,191,36,0.12); color: #fbbf24; }
+    .check-campanha { background: rgba(167,139,250,0.15); color: #a78bfa; }
+
+    .cta-btn {
+      display: block;
+      text-align: center;
+      padding: 13px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      text-decoration: none;
+      margin-top: auto;
+    }
+
+    .btn-bronze   { background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.3); }
+    .btn-prata    { background: rgba(203,213,225,0.08); color: #cbd5e1; border: 1px solid rgba(203,213,225,0.2); }
+    .btn-ouro     { background: rgba(251,191,36,0.12); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+    .btn-campanha { background: linear-gradient(135deg, #7c3aed, #2563eb); color: #fff; border: none; }
+
+    /* Footer */
+    .footer {
+      margin-top: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-size: 13px;
+      color: #334155;
+      position: relative;
+      z-index: 1;
+    }
+
+    .footer-dot {
+      width: 4px;
+      height: 4px;
+      background: #334155;
+      border-radius: 50%;
+    }
+  </style>
+</head>
+<body>
+  <div class="banner">
+    <div class="grid-lines"></div>
+
+    <!-- Header -->
+    <div class="header">
+      <div class="logo">
+        <div class="logo-icon">🚀</div>
+        <div class="logo-text">
+          <span>Plataforma de Leads</span>
+          <span>Gestão inteligente de clientes</span>
+        </div>
+      </div>
+      <div class="header-badge">✦ Escolha o plano ideal para você</div>
+    </div>
+
+    <!-- Headline -->
+    <div class="headline">
+      <h1>Gere mais leads.<br /><span>Feche mais negócios.</span></h1>
+      <p>Planos acessíveis para corretores e equipes de vendas de alto desempenho</p>
+    </div>
+
+    <!-- Cards -->
+    <div class="cards">
+
+      <!-- Bronze -->
+      <div class="card bronze">
+        <div>
+          <div class="plan-badge badge-bronze">🥉 Bronze</div>
+        </div>
+        <div class="plan-name">Bronze</div>
+        <div class="price-block">
+          <div class="price-label">a partir de</div>
+          <div class="price">
+            <span class="price-currency">R$</span>
+            <span class="price-value bronze-color">600</span>
+          </div>
+          <span class="price-month">/mês</span>
+        </div>
+        <div class="divider"></div>
+        <div class="features">
+          <div class="feature">
+            <span class="feature-check check-bronze">✓</span>
+            Gestão completa de leads
+          </div>
+          <div class="feature">
+            <span class="feature-check check-bronze">✓</span>
+            CRM com funil de vendas
+          </div>
+          <div class="feature">
+            <span class="feature-check check-bronze">✓</span>
+            Campanhas no Meta Ads
+          </div>
+          <div class="feature">
+            <span class="feature-check check-bronze">✓</span>
+            Relatórios e métricas
+          </div>
+          <div class="feature">
+            <span class="feature-check check-bronze">✓</span>
+            Notificações automáticas
+          </div>
+        </div>
+        <a class="cta-btn btn-bronze" href="#">Começar agora</a>
+      </div>
+
+      <!-- Prata -->
+      <div class="card prata">
+        <div>
+          <div class="plan-badge badge-prata">🥈 Prata</div>
+        </div>
+        <div class="plan-name">Prata</div>
+        <div class="price-block">
+          <div class="price-label">a partir de</div>
+          <div class="price">
+            <span class="price-currency">R$</span>
+            <span class="price-value prata-color">900</span>
+          </div>
+          <span class="price-month">/mês</span>
+        </div>
+        <div class="divider"></div>
+        <div class="features">
+          <div class="feature">
+            <span class="feature-check check-prata">✓</span>
+            Gestão completa de leads
+          </div>
+          <div class="feature">
+            <span class="feature-check check-prata">✓</span>
+            CRM com funil de vendas
+          </div>
+          <div class="feature">
+            <span class="feature-check check-prata">✓</span>
+            Campanhas no Meta Ads
+          </div>
+          <div class="feature">
+            <span class="feature-check check-prata">✓</span>
+            Relatórios e métricas
+          </div>
+          <div class="feature">
+            <span class="feature-check check-prata">✓</span>
+            Notificações automáticas
+          </div>
+          <div class="divider"></div>
+          <div class="feature">
+            <span class="feature-check check-prata" style="background:rgba(99,102,241,0.18);color:#818cf8">⚡</span>
+            <strong style="color:#cbd5e1">Machine Learning</strong>
+          </div>
+          <div class="feature">
+            <span class="feature-check check-prata" style="background:rgba(99,102,241,0.18);color:#818cf8">✓</span>
+            Score inteligente de leads
+          </div>
+          <div class="feature">
+            <span class="feature-check check-prata" style="background:rgba(99,102,241,0.18);color:#818cf8">✓</span>
+            Qualificação automática por ML
+          </div>
+        </div>
+        <a class="cta-btn btn-prata" href="#">Escolher Prata</a>
+      </div>
+
+      <!-- Ouro -->
+      <div class="card ouro">
+        <div class="popular-tag">⭐ Mais popular</div>
+        <div>
+          <div class="plan-badge badge-ouro">🥇 Ouro</div>
+        </div>
+        <div class="plan-name">Ouro</div>
+        <div class="price-block">
+          <div class="price-label">a partir de</div>
+          <div class="price">
+            <span class="price-currency">R$</span>
+            <span class="price-value ouro-color">1.200</span>
+          </div>
+          <span class="price-month">/mês</span>
+        </div>
+        <div class="divider"></div>
+        <div class="features">
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            Gestão completa de leads
+          </div>
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            CRM com funil de vendas
+          </div>
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            Campanhas no Meta Ads
+          </div>
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            Score e qualificação por ML
+          </div>
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            Relatórios e métricas
+          </div>
+          <div class="divider"></div>
+          <div class="feature">
+            <span class="feature-check check-ouro" style="background:rgba(251,191,36,0.18);color:#fbbf24">🤖</span>
+            <strong style="color:#fbbf24">Inteligência Artificial</strong>
+          </div>
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            Assistente comercial com IA
+          </div>
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            Análise de campanhas com IA
+          </div>
+          <div class="feature">
+            <span class="feature-check check-ouro">✓</span>
+            WhatsApp com IA integrada
+          </div>
+        </div>
+        <a class="cta-btn btn-ouro" href="#">Escolher Ouro</a>
+      </div>
+
+      <!-- Ouro + Criação de Campanha -->
+      <div class="card campanha">
+        <div>
+          <div class="plan-badge badge-campanha">🚀 Completo</div>
+        </div>
+        <div class="plan-name">Ouro + Campanha</div>
+        <div class="price-block">
+          <div class="price-label">tudo incluso</div>
+          <div class="price">
+            <span class="price-currency">R$</span>
+            <span class="price-value campanha-color">1.500</span>
+          </div>
+          <span class="price-month">/mês</span>
+        </div>
+        <div class="divider"></div>
+        <div class="features">
+          <div class="feature">
+            <span class="feature-check check-campanha">✓</span>
+            Tudo do Ouro
+          </div>
+          <div class="feature">
+            <span class="feature-check check-campanha">✓</span>
+            Nossa equipe cria sua campanha
+          </div>
+          <div class="feature">
+            <span class="feature-check check-campanha">✓</span>
+            Configuração do público-alvo
+          </div>
+          <div class="feature">
+            <span class="feature-check check-campanha">✓</span>
+            Criativo e texto do anúncio
+          </div>
+          <div class="feature">
+            <span class="feature-check check-campanha">✓</span>
+            Você só ativa e recebe leads
+          </div>
+        </div>
+        <a class="cta-btn btn-campanha" href="#">Quero esse plano</a>
+      </div>
+
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      <span>plataformadeleads.com.br</span>
+      <div class="footer-dot"></div>
+      <span>Todos os planos incluem acesso imediato</span>
+      <div class="footer-dot"></div>
+      <span>Sem contrato de fidelidade</span>
+    </div>
+  </div>
+</body>
+</html>
