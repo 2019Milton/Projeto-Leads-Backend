@@ -6278,12 +6278,9 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(20);
 `);
 
-await client.query(`
-  ALTER TABLE leads
-    ADD COLUMN IF NOT EXISTS data_contato DATE,
-    ADD COLUMN IF NOT EXISTS lembrete_1dia_enviado BOOLEAN DEFAULT FALSE,
-    ADD COLUMN IF NOT EXISTS lembrete_dia_enviado   BOOLEAN DEFAULT FALSE;
-`);
+await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS data_contato DATE;`);
+await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lembrete_1dia_enviado BOOLEAN DEFAULT FALSE;`);
+await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lembrete_dia_enviado BOOLEAN DEFAULT FALSE;`);
 
 await client.query(`
   CREATE TABLE IF NOT EXISTS notificacoes (
@@ -9554,6 +9551,11 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const dataContato = body.data_contato ?? null;
 
+    // debug: log lead owner vs current user
+    const debugLead = await client.query(`SELECT id, usuario_id FROM leads WHERE id = $1`, [leadId]);
+    const debugUser = await client.query(`SELECT id, admin_id FROM usuarios WHERE id = $1`, [user.id]);
+    console.log("DEBUG DATA-CONTATO lead:", debugLead.rows[0], "user:", debugUser.rows[0]);
+
     const res = await client.query(
       `UPDATE leads
        SET data_contato = $1,
@@ -9569,7 +9571,7 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
       [dataContato, leadId, user.id]
     );
 
-    if (!res.rows[0]) return c.json({ error: "Lead não encontrado" }, 404);
+    if (!res.rows[0]) return c.json({ error: "Lead não encontrado ou sem permissão", debug: { lead: debugLead.rows[0], user: debugUser.rows[0] } }, 404);
     return c.json(res.rows[0]);
   } catch (err: any) {
     console.error("ERRO DATA CONTATO:", err);
