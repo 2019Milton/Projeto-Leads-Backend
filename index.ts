@@ -5367,6 +5367,10 @@ app.get(
     const contaAtiva =
       conta.account_status === 1;
 
+    // 3=UNSETTLED, 8=PENDING_SETTLEMENT, 9=IN_GRACE_PERIOD
+    const pendenciaPagamento =
+      [3, 8, 9].includes(Number(conta.account_status));
+
     const pagamentoAutomatico =
       Boolean(conta.funding_source);
 
@@ -5447,8 +5451,11 @@ app.get(
         pagamento_habilitado: pagamentoHabilitado,
         possui_pagamento: pagamentoHabilitado,
         saldo_zerado: saldoPrePagoZerado,
-        erro_pagamento: saldoPrePagoZerado
-          ? "Sem saldo disponível na conta de anúncios. Adicione fundos na Meta para os anúncios voltarem a veicular."
+        pendencia_pagamento: pendenciaPagamento,
+        erro_pagamento: pendenciaPagamento
+          ? "Sua conta tem uma pendência financeira registrada na Meta — isso pode acontecer mesmo com saldo disponível, quando a Meta tentou cobrar um método automático e a cobrança falhou. Para resolver: acesse o Gerenciador de Anúncios > Faturamento, verifique se há cobranças em aberto e confirme ou atualize o método de pagamento."
+          : saldoPrePagoZerado
+          ? "Saldo pré-pago zerado na conta de anúncios. Para resolver: acesse o Gerenciador de Anúncios > Faturamento, clique em 'Adicionar saldo' e insira um valor para os anúncios voltarem a veicular."
           : null
       },
 
