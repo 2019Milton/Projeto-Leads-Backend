@@ -12567,7 +12567,7 @@ app.get("/chat/conversas", authMiddleware, async (c: any) => {
 
   const result = await client.query(
     `SELECT cv.id, cv.status, cv.criado_em, cv.atualizado_em,
-            u.email AS usuario_email, u.nome AS usuario_nome,
+            u.id AS usuario_id, u.email AS usuario_email, u.nome AS usuario_nome,
             (SELECT COUNT(*) FROM chat_mensagens m
              WHERE m.conversa_id = cv.id
                AND m.remetente_tipo = 'usuario'
