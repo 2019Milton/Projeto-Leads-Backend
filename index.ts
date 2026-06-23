@@ -7499,10 +7499,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         // 3 = UNSETTLED, 8 = PENDING_SETTLEMENT, 9 = IN_GRACE_PERIOD
         if ([3, 8, 9].includes(Number(contaInfo.account_status))) {
           erroPagamentoConta =
-            "A conta de anúncios está com pendência de pagamento na Meta. Verifique o método de cobrança.";
+            "Sua conta tem uma pendência financeira registrada na Meta — isso pode acontecer mesmo com saldo disponível, quando a Meta tentou cobrar um método automático e a cobrança falhou. Para resolver: acesse o Gerenciador de Anúncios > Faturamento, verifique se há cobranças em aberto e confirme ou atualize o método de pagamento.";
         } else if (!contaInfo.funding_source) {
           erroPagamentoConta =
-            "Nenhum método de pagamento configurado na conta de anúncios. Adicione um cartão ou saldo pré-pago na Meta.";
+            "Nenhum método de pagamento configurado na conta de anúncios. Para resolver: acesse o Gerenciador de Anúncios > Faturamento e adicione um cartão de crédito ou saldo pré-pago para ativar as campanhas.";
         } else if (contaInfo.is_prepay_account) {
           // Conta com saldo pré-pago: o saldo real disponível vem na string
           // "Saldo disponível (R$0,00 BRL)" — o campo "balance" não reflete isso.
@@ -7518,7 +7518,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
             if (!Number.isNaN(saldo) && saldo <= 0) {
               erroPagamentoConta =
-                "Sem saldo disponível na conta de anúncios. Adicione fundos na Meta para os anúncios voltarem a veicular.";
+                "Saldo pré-pago zerado na conta de anúncios. Para resolver: acesse o Gerenciador de Anúncios > Faturamento, clique em 'Adicionar saldo' e insira um valor para os anúncios voltarem a veicular.";
             }
           }
         }
