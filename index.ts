@@ -3950,7 +3950,9 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
       nome,
       objetivo,
       configuracoes_avancadas,
-      nicho_id
+      nicho_id,
+      cbo,
+      daily_budget: dailyBudgetCampanha
     } = await c.req.json();
 
     const usuarioId =
@@ -3992,19 +3994,29 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
         ? [categoriaEspecial]
         : [];
     
+    const payloadCampanha: any = {
+      name: nome || "Campanha Leads Plataforma",
+      objective: objetivo || "OUTCOME_LEADS",
+      status: "PAUSED",
+      special_ad_categories: specialAdCategories,
+      is_adset_budget_sharing_enabled: false,
+      access_token: token
+    };
+
+    // CBO: orçamento gerenciado pela campanha em vez de cada adset
+    if (cbo) {
+      payloadCampanha.budget_rebalance_flag = true;
+      if (dailyBudgetCampanha) {
+        payloadCampanha.daily_budget = dailyBudgetCampanha;
+      }
+    }
+
     const campanha = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/campaigns`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: nome || "Campanha Leads Plataforma",
-          objective: objetivo || "OUTCOME_LEADS",
-          status: "PAUSED",
-          special_ad_categories: specialAdCategories,
-          is_adset_budget_sharing_enabled: false,
-          access_token: token
-        })
+        body: JSON.stringify(payloadCampanha)
       }
     ).then(r => r.json());
 
@@ -4037,7 +4049,10 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
         nome || "Campanha Plataforma",
         "PAUSED",
         "plataforma",
-        JSON.stringify(configuracoes_avancadas || {}),
+        JSON.stringify({
+          ...(configuracoes_avancadas || {}),
+          cbo: Boolean(cbo)
+        }),
         nicho_id ?? null
       ]
     );
@@ -4103,6 +4118,18 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
     const targeting =
       montarTargetingMeta(avancadas);
+
+    // Públicos personalizados/lookalike selecionados para o adset
+    const publicosPersonalizados =
+      Array.isArray(avancadas.custom_audiences)
+        ? avancadas.custom_audiences
+            .map((id: any) => ({ id: String(id) }))
+            .filter((p: any) => p.id)
+        : [];
+
+    if (publicosPersonalizados.length) {
+      targeting.custom_audiences = publicosPersonalizados;
+    }
 
     const categoriaEspecial =
       textoOpcional(avancadas.categoria_especial);
@@ -4173,6 +4200,30 @@ app.post("/meta/adset", authMiddleware, async (c) => {
     ) {
       payloadAdset.bid_amount =
         Math.round(bidAmount * 100);
+    }
+
+    // Janela de atribuição: define quantos dias após clique/visualização a Meta conta a conversão
+    const atribuicao =
+      textoOpcional(avancadas.attribution_spec);
+
+    if (atribuicao) {
+      const janelasValidas: Record<string, object> = {
+        "1d_click": [{ event_type: "CLICK_THROUGH", window_days: 1 }],
+        "7d_click": [{ event_type: "CLICK_THROUGH", window_days: 7 }],
+        "28d_click": [{ event_type: "CLICK_THROUGH", window_days: 28 }],
+        "1d_click_1d_view": [
+          { event_type: "CLICK_THROUGH", window_days: 1 },
+          { event_type: "VIEW_THROUGH", window_days: 1 }
+        ],
+        "7d_click_1d_view": [
+          { event_type: "CLICK_THROUGH", window_days: 7 },
+          { event_type: "VIEW_THROUGH", window_days: 1 }
+        ]
+      };
+
+      if (janelasValidas[atribuicao]) {
+        payloadAdset.attribution_spec = janelasValidas[atribuicao];
+      }
     }
 
     const adset = await fetch(
@@ -4337,6 +4388,168 @@ app.post("/meta/formulario", authMiddleware, async (c) => {
   }
 });
 
+// ─── PÚBLICOS PERSONALIZADOS ──────────────────────────────────────────────────
+
+// Lista públicos personalizados existentes na conta de anúncios
+app.get("/meta/publicos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const usuarioId = resolverUsuarioIdOperacao(user, c.req.query("usuario_id"));
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conn = await client.query(
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+    if (!conn.rows.length) return c.json({ error: "Meta não conectada" }, 400);
+
+    const token = conn.rows[0].access_token;
+    const contaAds = await obterContaAnuncios(token, conn.rows[0].conta_anuncios_id);
+    if (!contaAds) return c.json({ error: "Conta de anúncios não encontrada" }, 400);
+
+    const resp = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAds.id}/customaudiences?fields=id,name,subtype,approximate_count_lower_bound,approximate_count_upper_bound&limit=50&access_token=${token}`
+    ).then(r => r.json());
+
+    return c.json({ publicos: resp.data || [] });
+  } catch (err) {
+    return c.json({ error: "Erro ao listar públicos" }, 500);
+  }
+});
+
+// Cria público personalizado a partir dos leads da conta (upload de lista de emails/telefones)
+app.post("/meta/publico-personalizado", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, nome } = await c.req.json();
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conn = await client.query(
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+    if (!conn.rows.length) return c.json({ error: "Meta não conectada" }, 400);
+
+    const token = conn.rows[0].access_token;
+    const contaAds = await obterContaAnuncios(token, conn.rows[0].conta_anuncios_id);
+    if (!contaAds) return c.json({ error: "Conta de anúncios não encontrada" }, 400);
+
+    const leadsRes = await client.query(
+      "SELECT email, telefone FROM leads WHERE usuario_id = $1 AND (email IS NOT NULL OR telefone IS NOT NULL) LIMIT 5000",
+      [usuarioId]
+    );
+
+    if (leadsRes.rows.length < 100) {
+      return c.json({
+        error: "São necessários pelo menos 100 leads com email ou telefone para criar um público personalizado."
+      }, 400);
+    }
+
+    const criacao = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAds.id}/customaudiences`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: nome || `Leads Plataforma ${new Date().toLocaleDateString("pt-BR")}`,
+          subtype: "CUSTOM",
+          description: "Público criado automaticamente a partir dos leads da plataforma",
+          customer_file_source: "USER_PROVIDED_ONLY",
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    if (!criacao.id) {
+      return c.json({ error: "Erro ao criar público", detalhe: criacao }, 400);
+    }
+
+    // A Meta exige dados hasheados com SHA-256
+    const crypto = await import("crypto");
+    const hashear = (v: string) =>
+      crypto.createHash("sha256").update(v.trim().toLowerCase()).digest("hex");
+
+    const schema = ["EMAIL", "PHONE"];
+    const data = leadsRes.rows.map((row: any) => [
+      row.email ? hashear(row.email) : "",
+      row.telefone ? hashear(row.telefone.replace(/\D/g, "")) : ""
+    ]);
+
+    const upload = await fetch(
+      `https://graph.facebook.com/v19.0/${criacao.id}/users`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          payload: { schema, data },
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    return c.json({
+      id: criacao.id,
+      nome: nome || "Leads Plataforma",
+      total_leads: leadsRes.rows.length,
+      upload
+    });
+  } catch (err) {
+    console.error("ERRO PUBLICO PERSONALIZADO:", err);
+    return c.json({ error: "Erro ao criar público personalizado" }, 500);
+  }
+});
+
+// Cria público lookalike a partir de um público personalizado existente
+app.post("/meta/lookalike", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, publico_origem_id, pais, tamanho } = await c.req.json();
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conn = await client.query(
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+    if (!conn.rows.length) return c.json({ error: "Meta não conectada" }, 400);
+
+    const token = conn.rows[0].access_token;
+    const contaAds = await obterContaAnuncios(token, conn.rows[0].conta_anuncios_id);
+    if (!contaAds) return c.json({ error: "Conta de anúncios não encontrada" }, 400);
+
+    // tamanho: 1–10 (%) — 1 = mais parecido com os leads, 10 = mais amplo
+    const tamanhoValido = Math.min(10, Math.max(1, Number(tamanho) || 2));
+
+    const lookalike = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAds.id}/customaudiences`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: `Lookalike ${tamanhoValido}% — Leads Plataforma`,
+          subtype: "LOOKALIKE",
+          origin_audience_id: publico_origem_id,
+          lookalike_spec: {
+            type: "similarity",
+            ratio: tamanhoValido / 100,
+            country: textoOpcional(pais)?.toUpperCase().slice(0, 2) || "BR"
+          },
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    if (!lookalike.id) {
+      return c.json({ error: "Erro ao criar lookalike", detalhe: lookalike }, 400);
+    }
+
+    return c.json(lookalike);
+  } catch (err) {
+    console.error("ERRO LOOKALIKE:", err);
+    return c.json({ error: "Erro ao criar público lookalike" }, 500);
+  }
+});
 
 app.post("/meta/upload-imagem", authMiddleware, async (c) => {
 
@@ -12825,6 +13038,94 @@ app.post("/campanhas/manual", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO POST /campanhas/manual:", err);
     return c.json({ error: "Erro ao criar campanha" }, 500);
+  }
+});
+
+// duplicar uma campanha existente
+app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    const body = await c.req.json().catch(() => ({}));
+
+    const origRes = await client.query(
+      `SELECT c.*, n.slug AS nicho_slug
+       FROM campanhas c
+       LEFT JOIN nichos n ON n.id = c.nicho_id
+       WHERE c.id = $1 AND c.usuario_id = $2`,
+      [campanhaId, user.id]
+    );
+
+    if (origRes.rows.length === 0) {
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const orig = origRes.rows[0];
+    const novoNome = body.nome?.trim() || `Cópia de ${orig.nome}`;
+
+    const novaRes = await client.query(
+      `INSERT INTO campanhas
+         (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas)
+       VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5)
+       RETURNING id`,
+      [user.id, novoNome, orig.nicho_id ?? null, orig.daily_budget ?? null,
+       orig.configuracoes_avancadas ?? null]
+    );
+    const novaId = novaRes.rows[0].id;
+
+    if (orig.nicho_slug === "imoveis") {
+      const r = await client.query(
+        `SELECT tipo_imovel, finalidade, valor_min, valor_max, regiao
+         FROM campanhas_imoveis WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      if (r.rows.length > 0) {
+        const d = r.rows[0];
+        await client.query(
+          `INSERT INTO campanhas_imoveis
+             (campanha_id, tipo_imovel, finalidade, valor_min, valor_max, regiao)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [novaId, d.tipo_imovel, d.finalidade, d.valor_min, d.valor_max, d.regiao]
+        );
+      }
+    } else if (orig.nicho_slug === "saude") {
+      const r = await client.query(
+        `SELECT operadora, tipo_plano, faixa_etaria_min, faixa_etaria_max, cobertura, acomodacao
+         FROM campanhas_saude WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      if (r.rows.length > 0) {
+        const d = r.rows[0];
+        await client.query(
+          `INSERT INTO campanhas_saude
+             (campanha_id, operadora, tipo_plano, faixa_etaria_min,
+              faixa_etaria_max, cobertura, acomodacao)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [novaId, d.operadora, d.tipo_plano, d.faixa_etaria_min,
+           d.faixa_etaria_max, d.cobertura, d.acomodacao]
+        );
+      }
+    } else if (orig.nicho_slug === "suplementos") {
+      const r = await client.query(
+        `SELECT produto, objetivo, marca, publico_alvo
+         FROM campanhas_suplementos WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      if (r.rows.length > 0) {
+        const d = r.rows[0];
+        await client.query(
+          `INSERT INTO campanhas_suplementos
+             (campanha_id, produto, objetivo, marca, publico_alvo)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [novaId, d.produto, d.objetivo, d.marca, d.publico_alvo]
+        );
+      }
+    }
+
+    return c.json({ id: novaId });
+  } catch (err) {
+    console.error("ERRO POST /campanhas/:id/duplicar:", err);
+    return c.json({ error: "Erro ao duplicar campanha" }, 500);
   }
 });
 
