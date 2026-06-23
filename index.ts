@@ -11212,7 +11212,9 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_produto: "",
       nicho_objetivo: "",
       nicho_marca: "",
-      nicho_publico_alvo: ""
+      nicho_publico_alvo: "",
+      cbo: true,
+      attribution_spec: "7d_click_1d_view"
     }));
 
   const norm = (v: any, ctaDefault: string) => {
@@ -11245,7 +11247,9 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_produto: v?.nicho_produto || v?.produto || "",
       nicho_objetivo: v?.nicho_objetivo || v?.objetivo_nicho || "",
       nicho_marca: v?.nicho_marca || v?.marca || "",
-      nicho_publico_alvo: v?.nicho_publico_alvo || v?.publico_alvo || ""
+      nicho_publico_alvo: v?.nicho_publico_alvo || v?.publico_alvo || "",
+      cbo: v?.cbo ?? true,
+      attribution_spec: v?.attribution_spec || "7d_click_1d_view"
     };
   };
 
@@ -11295,7 +11299,9 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `nome_campanha (igual ao titulo), titulo (max 40 chars), texto (2-3 frases), descricao (1 frase curta),\n` +
       `cta, perguntas (3 qualificadoras separadas por \\n), interesses (keywords separados por virgula),\n` +
       `localidade (regiao do produto ou vazio), genero (vazio), idade_min, idade_max,\n` +
-      `obrigado_titulo, obrigado_botao, obrigado_texto.\n\n` +
+      `obrigado_titulo, obrigado_botao, obrigado_texto,\n` +
+      `cbo (true se houver multiplos publicos para testar, false para campanha simples),\n` +
+      `attribution_spec (janela de atribuicao recomendada: "1d_click", "7d_click", "28d_click", "1d_click_1d_view", "7d_click_1d_view" — use "7d_click_1d_view" como padrao).\n\n` +
       `Campos opcionais de nicho: preencha SOMENTE se o contexto do usuario trouxer a informacao de forma clara.\n` +
       `Para imoveis: nicho_tipo_imovel (residencial|comercial|rural), nicho_finalidade (venda|locacao), nicho_valor_min, nicho_valor_max.\n` +
       `Para saude: nicho_operadora, nicho_tipo_plano (individual|familiar|empresarial), nicho_cobertura (basica|intermediaria|premium), nicho_acomodacao (enfermaria|apartamento).\n` +
