@@ -9571,9 +9571,9 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
 
     if (!res.rows[0]) return c.json({ error: "Lead não encontrado" }, 404);
     return c.json(res.rows[0]);
-  } catch (err) {
+  } catch (err: any) {
     console.error("ERRO DATA CONTATO:", err);
-    return c.json({ error: "Erro ao salvar data de contato" }, 500);
+    return c.json({ error: "Erro ao salvar data de contato", detail: String(err?.message || err) }, 500);
   }
 });
 
