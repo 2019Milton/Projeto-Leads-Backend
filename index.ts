@@ -12585,6 +12585,42 @@ app.get("/chat/conversas", authMiddleware, async (c: any) => {
   return c.json({ conversas: result.rows });
 });
 
+// Suporte: todas as mensagens de um usuário (histórico unificado)
+app.get("/chat/usuarios/:usuarioId/todas-mensagens", authMiddleware, async (c: any) => {
+  const user: any = c.get("user");
+  if (!isSuporte(user.tipo)) return c.json({ error: "Acesso negado" }, 403);
+
+  const usuarioId = Number(c.req.param("usuarioId"));
+
+  await client.query(
+    `UPDATE chat_mensagens SET lido = TRUE
+     WHERE conversa_id IN (SELECT id FROM chat_conversas WHERE usuario_id = $1)
+     AND remetente_tipo = 'usuario' AND lido = FALSE`,
+    [usuarioId]
+  );
+
+  const result = await client.query(
+    `SELECT m.id, m.conteudo, m.remetente_tipo, m.criado_em, m.lido, cv.id AS conversa_id
+     FROM chat_mensagens m
+     JOIN chat_conversas cv ON cv.id = m.conversa_id
+     WHERE cv.usuario_id = $1
+     ORDER BY m.criado_em ASC`,
+    [usuarioId]
+  );
+
+  const convAtiva = await client.query(
+    `SELECT id FROM chat_conversas
+     WHERE usuario_id = $1 AND status = 'aberta'
+     ORDER BY atualizado_em DESC LIMIT 1`,
+    [usuarioId]
+  );
+
+  return c.json({
+    mensagens: result.rows,
+    conv_ativa_id: convAtiva.rows[0]?.id ?? null
+  });
+});
+
 // Suporte: mensagens de uma conversa específica
 app.get("/chat/conversas/:id/mensagens", authMiddleware, async (c: any) => {
   const user: any = c.get("user");
