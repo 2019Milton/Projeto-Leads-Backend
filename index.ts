@@ -2401,6 +2401,7 @@ app.use("/*", cors({
     "GET",
     "POST",
     "PUT",
+    "PATCH",
     "DELETE",
     "OPTIONS"
   ],
