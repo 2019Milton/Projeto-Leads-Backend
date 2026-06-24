@@ -4282,8 +4282,14 @@ app.post("/meta/adset", authMiddleware, async (c) => {
     }
 
     if (adset.error) {
+      const metaMsgAdset =
+        adset.error?.error_user_msg ||
+        adset.error?.message ||
+        null;
       return c.json({
-        error: adset.error,
+        error: metaMsgAdset || "Erro ao criar conjunto de anúncios",
+        codigo_meta: adset.error?.code ?? null,
+        detalhe: adset.error,
         targeting_enviado: targeting
       }, 400);
     }
@@ -4418,6 +4424,18 @@ app.post("/meta/formulario", authMiddleware, async (c) => {
         body: JSON.stringify(payloadFormulario)
       }
     ).then(r => r.json());
+
+    if (form.error) {
+      const metaMsgForm =
+        form.error?.error_user_msg ||
+        form.error?.message ||
+        null;
+      return c.json({
+        error: metaMsgForm || "Erro ao criar formulário na Meta",
+        codigo_meta: form.error?.code ?? null,
+        detalhe: form.error
+      }, 400);
+    }
 
     return c.json(form);
 
@@ -4949,10 +4967,15 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         creative
       );
 
+      const metaMsgCreativo =
+        creative?.error?.error_user_msg ||
+        creative?.error?.message ||
+        null;
+
       return c.json({
-        error: "Erro ao criar criativo",
-        detalhe:
-          creative.error || creative
+        error: metaMsgCreativo || "Erro ao criar criativo",
+        codigo_meta: creative?.error?.code ?? null,
+        detalhe: creative.error || creative
       }, 400);
     }
 
