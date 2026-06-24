@@ -4231,7 +4231,7 @@ app.post("/meta/adset", authMiddleware, async (c) => {
       }
     }
 
-    const adset = await fetch(
+    let adset = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       {
         method: "POST",
@@ -4246,6 +4246,34 @@ app.post("/meta/adset", authMiddleware, async (c) => {
     );
 
     console.log("ADSET RESPONSE:", adset);
+
+    // Se a janela de atribuição enviada for incompatível com o objetivo, tenta sem ela
+    if (adset.error && payloadAdset.attribution_spec) {
+      const errMsg = (
+        adset.error?.error_user_msg ||
+        adset.error?.message ||
+        ""
+      ).toLowerCase();
+      if (
+        errMsg.includes("attribution") ||
+        errMsg.includes("atribuição") ||
+        errMsg.includes("atribuicao")
+      ) {
+        console.log(
+          "ADSET: attribution_spec rejeitada pela Meta, tentando sem ela..."
+        );
+        delete payloadAdset.attribution_spec;
+        adset = await fetch(
+          `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payloadAdset)
+          }
+        ).then(r => r.json());
+        console.log("ADSET RETRY RESPONSE:", adset);
+      }
+    }
 
     if (adset.error) {
       return c.json({
