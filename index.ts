@@ -8884,7 +8884,7 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
       FROM campanhas
       WHERE campaign_id = $1
       AND usuario_id = $2
-      AND conta_anuncios_id = $3
+      AND (conta_anuncios_id = $3 OR conta_anuncios_id IS NULL)
       LIMIT 1
       `,
       [campaign_id, user.id, contaAnunciosId]
@@ -8937,10 +8937,26 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
     console.log("DELETE META:", metaRes);
 
     if (metaRes.error) {
+      const errCode = Number(metaRes.error?.code) || 0;
+      const errMsg = (metaRes.error?.message || "").toLowerCase();
 
-      return c.json({
-        error: metaRes.error.message
-      }, 400);
+      // Campanha não existe mais no Meta (inválida, já excluída lá ou nunca criada):
+      // marca como deletada localmente sem bloquear o usuário
+      const naoPertenceMaisMeta =
+        errCode === 803 ||   // no such object
+        errCode === 100 ||   // invalid parameter (inclui IDs inexistentes)
+        errMsg.includes("invalid parameter") ||
+        errMsg.includes("no such") ||
+        errMsg.includes("does not exist") ||
+        errMsg.includes("deleted");
+
+      if (!naoPertenceMaisMeta) {
+        return c.json({
+          error: metaRes.error?.error_user_msg || metaRes.error?.message || "Erro ao excluir no Meta"
+        }, 400);
+      }
+
+      console.log("EXCLUIR: campanha não encontrada no Meta, removendo localmente:", campaign_id);
     }
 
     // 💾 REMOVE LOCAL
