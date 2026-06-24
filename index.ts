@@ -4027,8 +4027,14 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
 
     if (!campanha.id) {
 
+      const metaMsg =
+        campanha?.error?.error_user_msg ||
+        campanha?.error?.message ||
+        null;
+
       return c.json({
-        error: "Erro ao criar campanha",
+        error: metaMsg || "Erro ao criar campanha na Meta",
+        codigo_meta: campanha?.error?.code ?? null,
         detalhe: campanha
       }, 400);
     }
