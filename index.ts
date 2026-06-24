@@ -741,15 +741,9 @@ function montarTargetingMeta(avancadas: any) {
   const idadeMax =
     numeroOpcional(avancadas?.idade_max);
 
-  if (idadeMin !== null) {
-    targeting.age_min =
-      Math.max(18, Math.min(65, idadeMin));
-  }
-
-  if (idadeMax !== null) {
-    targeting.age_max =
-      Math.max(18, Math.min(65, idadeMax));
-  }
+  // Meta exige age_min e age_max; usa 18/65 como default quando não informado
+  targeting.age_min = idadeMin !== null ? Math.max(18, Math.min(65, idadeMin)) : 18;
+  targeting.age_max = idadeMax !== null ? Math.max(18, Math.min(65, idadeMax)) : 65;
 
   const genero =
     numeroOpcional(avancadas?.genero);
