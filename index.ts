@@ -11619,7 +11619,7 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       }
       imagemBase64 = result?.data?.[0]?.b64_json || "";
     } else {
-      // Usa DALL-E 3 somente com texto — retorna URL e converte para base64
+      // Usa gpt-image-1 somente com texto
       const resp = await fetch("https://api.openai.com/v1/images/generations", {
         method: "POST",
         headers: {
@@ -11627,26 +11627,20 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          model: "dall-e-3",
+          model: "gpt-image-1",
           prompt,
           n: 1,
-          size: "1024x1024"
+          size: "1024x1024",
+          output_format: "png"
         })
       });
 
       const result: any = await resp.json();
       if (!resp.ok) {
-        console.error("GERAR BANNER DALL-E-3 ERROR:", result?.error?.message);
+        console.error("GERAR BANNER GPT-IMAGE-1 TEXT ERROR:", result?.error?.message);
         return c.json({ error: result?.error?.message || "Erro ao gerar banner." }, 500);
       }
-
-      // API retorna URL; baixa e converte para base64
-      const imageUrl = result?.data?.[0]?.url || "";
-      if (imageUrl) {
-        const imgResp = await fetch(imageUrl);
-        const imgBuffer = await imgResp.arrayBuffer();
-        imagemBase64 = Buffer.from(imgBuffer).toString("base64");
-      }
+      imagemBase64 = result?.data?.[0]?.b64_json || "";
     }
 
     if (!imagemBase64) return c.json({ error: "A IA não retornou uma imagem. Tente novamente." }, 500);
