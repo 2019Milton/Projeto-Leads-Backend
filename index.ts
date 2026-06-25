@@ -2988,153 +2988,88 @@ async function obterContaAnunciosSelecionadaIdUsuario(
 
 
 
+async function sincronizarCampanhasUsuario(
+  usuarioId: number,
+  token: string,
+  contaAnunciosId: string
+) {
+  const campanhasMeta = await fetch(
+    `https://graph.facebook.com/v19.0/${contaAnunciosId}/campaigns?fields=id,name,status,effective_status,objective&limit=500&access_token=${token}`
+  ).then(r => r.json());
+
+  if (!campanhasMeta.data) return;
+
+  for (const campanha of campanhasMeta.data) {
+    const statusFinal =
+      campanha.status || campanha.effective_status || "UNKNOWN";
+
+    const existe = await client.query(
+      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+      [campanha.id, usuarioId]
+    );
+
+    if (existe.rows.length > 0) {
+      await client.query(
+        `UPDATE campanhas
+         SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
+         WHERE campaign_id = $4 AND usuario_id = $5`,
+        [campanha.name, statusFinal, contaAnunciosId, campanha.id, usuarioId]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, atualizado_em)
+         VALUES ($1,$2,$3,$4,$5,'meta',NOW())`,
+        [usuarioId, campanha.id, contaAnunciosId, campanha.name, statusFinal]
+      );
+    }
+  }
+
+  await client.query(
+    `UPDATE meta_conexoes SET ultimo_sync = NOW() WHERE usuario_id = $1`,
+    [usuarioId]
+  );
+
+  console.log(
+    `✅ Sync usuário ${usuarioId}: ${campanhasMeta.data.length} campanhas`
+  );
+}
+
 async function sincronizarTodasCampanhas() {
 
   try {
 
     console.log("🔄 AUTO SYNC INICIADO");
 
-    // 🔥 BUSCA TODOS USUÁRIOS COM META
     const usuarios = await client.query(`
       SELECT DISTINCT ON (usuario_id)
         usuario_id,
         access_token,
         conta_anuncios_id
       FROM meta_conexoes
+      WHERE conta_anuncios_id IS NOT NULL
       ORDER BY usuario_id, id DESC
     `);
 
     for (const user of usuarios.rows) {
 
       try {
-
-        const token = user.access_token;
-
-        // 🔥 CONTAS
-        const contaAds =
-          await obterContaAnuncios(
-            token,
-            user.conta_anuncios_id
-          );
-        
-        if (!contaAds) {
-
-          console.log(
-            `⚠️ Usuário ${user.usuario_id} sem conta de anúncios`
-          );
-        
-          continue;
-        }
-                
-        const adAccountId = contaAds.id;
-
-        // 🔥 CAMPANHAS
-        const campanhasMeta = await fetch(
-          `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?fields=id,name,status,effective_status,objective&limit=500&access_token=${token}`
-        ).then(r => r.json());
-
-        if (!campanhasMeta.data) {
-          continue;
-        }
-
-        for (const campanha of campanhasMeta.data) {
-
-          const statusFinal =
-            campanha.status ||
-            campanha.effective_status ||
-            "UNKNOWN";
-
-          const existe = await client.query(
-            `
-            SELECT id
-            FROM campanhas
-            WHERE campaign_id = $1
-            AND usuario_id = $2
-            `,
-            [campanha.id, user.usuario_id]
-          );
-
-          if (existe.rows.length > 0) {
-
-            await client.query(
-              `
-              UPDATE campanhas
-              SET
-                nome = $1,
-                status = $2,
-                conta_anuncios_id = $3,
-                atualizado_em = NOW()
-              WHERE campaign_id = $4
-              AND usuario_id = $5
-              `,
-              [
-                campanha.name,
-                statusFinal,
-                adAccountId,
-                campanha.id,
-                user.usuario_id
-              ]
-            );
-
-          } else {
-
-            await client.query(
-              `
-              INSERT INTO campanhas (
-                usuario_id,
-                campaign_id,
-                conta_anuncios_id,
-                nome,
-                status,
-                origem,
-                atualizado_em
-              )
-              VALUES ($1,$2,$3,$4,$5,$6,NOW())
-              `,
-              [
-                user.usuario_id,
-                campanha.id,
-                adAccountId,
-                campanha.name,
-                statusFinal,
-                "meta"
-              ]
-            );
-          }
-        }
-
-        // 🔥 ATUALIZA ÚLTIMO SYNC
-        await client.query(
-          `
-          UPDATE meta_conexoes
-          SET ultimo_sync = NOW()
-          WHERE usuario_id = $1
-          `,
-          [user.usuario_id]
-        );
-
-        console.log(
-          `✅ Sync usuário ${user.usuario_id}`
-        );
-
-      } catch (err) {
-
-        console.error(
-          "ERRO USUÁRIO:",
+        await sincronizarCampanhasUsuario(
           user.usuario_id,
-          err
+          user.access_token,
+          user.conta_anuncios_id
         );
+      } catch (err) {
+        console.error("ERRO USUÁRIO:", user.usuario_id, err);
       }
+
+      // pequena pausa entre usuários para não sobrecarregar a API da Meta
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     console.log("🚀 AUTO SYNC FINALIZADO");
 
   } catch (err) {
-
-    console.error(
-      "ERRO AUTO SYNC:",
-      err
-    );
+    console.error("ERRO AUTO SYNC:", err);
   }
 }
 
@@ -3919,6 +3854,15 @@ app.post("/meta/conta-anuncios", authMiddleware, async (c) => {
       WHERE id = $2
       `,
       [conta.id, conn.rows[0].id]
+    );
+
+    // importa campanhas existentes da Meta em background (primeira conexão)
+    sincronizarCampanhasUsuario(
+      user.id,
+      conn.rows[0].access_token,
+      conta.id
+    ).catch(err =>
+      console.error("Erro importação inicial Meta:", err)
     );
 
     return c.json({
@@ -12273,12 +12217,10 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
 
 
 
-// 🔄 AUTO SYNC A CADA 5 MIN
-//setInterval(() => {
-
-//  sincronizarTodasCampanhas();
-
-//}, 1000 * 60 * 5);
+// 🔄 AUTO SYNC A CADA 4 HORAS (com delay de 2s entre usuários para não sobrecarregar a Meta API)
+setInterval(() => {
+  sincronizarTodasCampanhas();
+}, 1000 * 60 * 60 * 4);
 
 
 /* =========================
