@@ -11597,7 +11597,7 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       formData.append("prompt", prompt);
       formData.append("n", "1");
       formData.append("size", "1024x1024");
-      formData.append("output_format", "b64_json");
+      formData.append("output_format", "png");
 
       for (let i = 0; i < imagensBase64.length; i++) {
         const { data, tipo } = imagensBase64[i];
