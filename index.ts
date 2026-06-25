@@ -11575,8 +11575,10 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
     const prompt = textoOpcional(body.prompt);
     if (!prompt) return c.json({ error: "Descreva o banner antes de gerar." }, 400);
 
+    const modoEditar: boolean = body.modo === "editar";
+
     const imagensBase64: Array<{ data: string; tipo: string }> = Array.isArray(body.imagens_base64)
-      ? body.imagens_base64.slice(0, 4)
+      ? body.imagens_base64.slice(0, modoEditar ? 1 : 4)
       : [];
 
     // Respeita o provider do usuário — geração de imagem só é suportada pela OpenAI,
@@ -11588,22 +11590,55 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
 
     if (!openaiKey) return c.json({ error: "Geração de imagem não configurada. Configure a chave OpenAI." }, 400);
 
+    // Cria PNG RGBA 1x1 totalmente transparente para uso como máscara no modo editar.
+    // A máscara com alpha=0 instrui o modelo que a área inteira está disponível para edição.
+    function criarMascaraTransparente(): Blob {
+      // PNG mínimo 1x1 RGBA totalmente transparente (44 bytes)
+      const bytes = new Uint8Array([
+        0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a, // PNG signature
+        0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,  // IHDR chunk (13 bytes)
+        0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,  // width=1, height=1
+        0x08,0x06,0x00,0x00,0x00,                  // bit depth=8, colorType=6 (RGBA)
+        0x1f,0x15,0xc4,0x89,                       // CRC
+        0x00,0x00,0x00,0x0a,0x49,0x44,0x41,0x54,  // IDAT chunk (10 bytes)
+        0x08,0xd7,0x63,0x60,0x00,0x00,0x00,0x02,  // compressed: 1 transparent pixel
+        0x00,0x01,0xe2,0x21,0xbc,0x33,             // Adler32 + CRC
+        0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,  // IEND chunk
+        0xae,0x42,0x60,0x82                        // CRC
+      ]);
+      return new Blob([bytes], { type: "image/png" });
+    }
+
     let imagemBase64 = "";
 
     if (imagensBase64.length > 0) {
-      // Usa gpt-image-1 com imagens de referência via multipart
       const formData = new FormData();
       formData.append("model", "gpt-image-1");
-      formData.append("prompt", prompt);
       formData.append("n", "1");
       formData.append("size", "1024x1024");
       formData.append("output_format", "png");
 
-      for (let i = 0; i < imagensBase64.length; i++) {
-        const { data, tipo } = imagensBase64[i];
+      if (modoEditar && imagensBase64.length === 1) {
+        // Modo editar: prompt reforça que a imagem original deve ser mantida como base
+        const promptEdicao = `Editing task on the provided image: ${prompt}
+
+IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL original elements, colors, composition, and style. Only add, modify, or remove exactly what is described above. Do NOT recreate the image from scratch. The result must look like a natural modification of the original image.`;
+        formData.append("prompt", promptEdicao);
+
+        const { data, tipo } = imagensBase64[0];
         const buffer = Buffer.from(data, "base64");
         const blob = new Blob([buffer], { type: tipo || "image/png" });
-        formData.append("image", blob, `ref_${i + 1}.png`);
+        formData.append("image", blob, "base.png");
+        formData.append("mask", criarMascaraTransparente(), "mask.png");
+      } else {
+        // Modo gerar com referências visuais
+        formData.append("prompt", prompt);
+        for (let i = 0; i < imagensBase64.length; i++) {
+          const { data, tipo } = imagensBase64[i];
+          const buffer = Buffer.from(data, "base64");
+          const blob = new Blob([buffer], { type: tipo || "image/png" });
+          formData.append("image", blob, `ref_${i + 1}.png`);
+        }
       }
 
       const resp = await fetch("https://api.openai.com/v1/images/edits", {
