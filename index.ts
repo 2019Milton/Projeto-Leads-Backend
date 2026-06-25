@@ -11094,6 +11094,36 @@ app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
 app.get("/ia/resumo-diario", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const periodoParam =
+      String(c.req.query("periodo") || "diario")
+        .toLowerCase();
+
+    const periodo =
+      ["diario", "semanal", "mensal"].includes(periodoParam)
+        ? periodoParam
+        : "diario";
+
+    const diasPeriodo =
+      periodo === "mensal"
+        ? 30
+        : periodo === "semanal"
+        ? 7
+        : 1;
+
+    const tituloPeriodo =
+      periodo === "mensal"
+        ? "Resumo mensal"
+        : periodo === "semanal"
+        ? "Resumo semanal"
+        : "Resumo diario";
+
+    const focoPeriodo =
+      periodo === "mensal"
+        ? "do mes"
+        : periodo === "semanal"
+        ? "da semana"
+        : "de hoje";
+
     const limite =
       limitarRequisicao(c, `ia:${user.id}`, 20, 60 * 1000);
 
@@ -11121,19 +11151,20 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
           criado_em
         FROM leads
         WHERE usuario_id = $1
+        AND criado_em >= NOW() - ($2::int * INTERVAL '1 day')
         ORDER BY criado_em DESC
         LIMIT 80
         `,
-        [user.id]
+        [user.id, diasPeriodo]
       );
 
     const leads =
       leadsResult.rows;
     const fallback =
       sugestaoIAFallback(
-        "Resumo diario IA Ouro",
-        "Priorize leads recentes, quentes e parados ha mais tempo.",
-        "Focar nos 5 leads com maior chance de conversa hoje.",
+        `${tituloPeriodo} IA Ouro`,
+        `Priorize leads ${focoPeriodo}, quentes e parados ha mais tempo.`,
+        `Focar nos 5 leads com maior chance de conversa ${focoPeriodo}.`,
         [],
         [],
         leads.slice(0, 5).map((lead: any) => ({
@@ -11148,14 +11179,18 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 
     const usoIA =
       await gerarSugestaoComercialOpenAI(
-        "Gerar resumo diario do corretor com os 5 leads que ele deve focar hoje e o motivo.",
-        { leads },
+        `Gerar ${tituloPeriodo.toLowerCase()} do corretor com os 5 leads que ele deve focar ${focoPeriodo} e o motivo.`,
+        {
+          periodo,
+          dias_periodo: diasPeriodo,
+          leads
+        },
         fallback
       );
 
     await registrarUsoIA(
       Number(user.id),
-      "resumo_diario",
+      `resumo_${periodo}`,
       "usuario",
       user.id,
       usoIA.custo_estimado,
@@ -11164,7 +11199,11 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
       usoIA.provider || "openai"
     );
 
-    return c.json({ sugestao: usoIA.sugestao });
+    return c.json({
+      periodo,
+      dias_periodo: diasPeriodo,
+      sugestao: usoIA.sugestao
+    });
   } catch (err) {
     console.error("ERRO IA RESUMO DIARIO:", err);
     return c.json({ error: "Erro ao gerar resumo diario com IA" }, 500);
