@@ -11597,6 +11597,7 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       formData.append("prompt", prompt);
       formData.append("n", "1");
       formData.append("size", "1024x1024");
+      formData.append("output_format", "b64_json");
 
       for (let i = 0; i < imagensBase64.length; i++) {
         const { data, tipo } = imagensBase64[i];
@@ -11618,7 +11619,7 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       }
       imagemBase64 = result?.data?.[0]?.b64_json || "";
     } else {
-      // Usa DALL-E 3 somente com texto
+      // Usa DALL-E 3 somente com texto — retorna URL e converte para base64
       const resp = await fetch("https://api.openai.com/v1/images/generations", {
         method: "POST",
         headers: {
@@ -11629,8 +11630,7 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
           model: "dall-e-3",
           prompt,
           n: 1,
-          size: "1024x1024",
-          response_format: "b64_json"
+          size: "1024x1024"
         })
       });
 
@@ -11639,7 +11639,14 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
         console.error("GERAR BANNER DALL-E-3 ERROR:", result?.error?.message);
         return c.json({ error: result?.error?.message || "Erro ao gerar banner." }, 500);
       }
-      imagemBase64 = result?.data?.[0]?.b64_json || "";
+
+      // API retorna URL; baixa e converte para base64
+      const imageUrl = result?.data?.[0]?.url || "";
+      if (imageUrl) {
+        const imgResp = await fetch(imageUrl);
+        const imgBuffer = await imgResp.arrayBuffer();
+        imagemBase64 = Buffer.from(imgBuffer).toString("base64");
+      }
     }
 
     if (!imagemBase64) return c.json({ error: "A IA não retornou uma imagem. Tente novamente." }, 500);
