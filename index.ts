@@ -2240,24 +2240,34 @@ function sugestaoIAFallback(
 async function gerarSugestaoComercialOpenAI(
   objetivo: string,
   dados: any,
-  fallback: any
+  fallback: any,
+  providerPreferido: string = "auto"
 ) {
   const iaConf = await buscarConfigIA();
+  const iaProvider =
+    ["auto", "openai", "anthropic"].includes(providerPreferido)
+      ? providerPreferido
+      : "auto";
   const systemMsg =
-    "Voce e uma IA comercial para corretores imobiliarios. Gere respostas curtas, naturais, praticas e prontas para uso. Responda somente no JSON solicitado, em portugues do Brasil.";
+    "Voce e uma IA comercial senior para corretores imobiliarios. Use somente os dados reais recebidos. Nao invente nomes, telefones, campanhas, motivos ou numeros. Se algum dado estiver ausente, diga que nao ha informacao suficiente. Gere respostas curtas, naturais, praticas e prontas para uso. Responda somente no JSON solicitado, em portugues do Brasil.";
   const schemaDescricao =
     `Retorne SOMENTE JSON valido com esta estrutura exata (sem texto antes ou depois):
 {"titulo":"string","resumo":"string","acao_principal":"string","mensagens":["string"],"motivos":["string"],"campos":[{"chave":"string","valor":"string"}],"recomendacoes":["string"]}`;
   const userText = JSON.stringify({ objetivo, dados });
 
-  const parseSugestao = (texto: string) => {
+  const parseSugestao = (texto: string, provider: string) => {
     const limpo = texto.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-    return { ...fallback, ...JSON.parse(limpo), disponivel: true };
+    return {
+      ...fallback,
+      ...JSON.parse(limpo),
+      disponivel: true,
+      origem: provider
+    };
   };
 
   // ── Tenta OpenAI ──────────────────────────────────────────────
   const openaiKey = Bun.env.OPENAI_API_KEY;
-  if (openaiKey) {
+  if (openaiKey && (iaProvider === "auto" || iaProvider === "openai")) {
     try {
       const modelo =
         textoOpcional(iaConf?.modelo) ||
@@ -2327,7 +2337,7 @@ async function gerarSugestaoComercialOpenAI(
           : (data?.choices?.[0]?.message?.content || "");
         if (texto) {
           return {
-            sugestao: parseSugestao(texto),
+            sugestao: parseSugestao(texto, "openai"),
             usage: data?.usage || null,
             custo_estimado: calcularCustoEstimadoOpenAI(data?.usage),
             provider: "openai"
@@ -2343,7 +2353,7 @@ async function gerarSugestaoComercialOpenAI(
 
   // ── Fallback: Anthropic ───────────────────────────────────────
   const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
-  if (anthropicKey) {
+  if (anthropicKey && (iaProvider === "auto" || iaProvider === "anthropic")) {
     try {
       const anthropicModelo =
         textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
@@ -2369,7 +2379,7 @@ async function gerarSugestaoComercialOpenAI(
           const inTok = Number(data?.usage?.input_tokens || 0);
           const outTok = Number(data?.usage?.output_tokens || 0);
           return {
-            sugestao: parseSugestao(texto),
+            sugestao: parseSugestao(texto, "anthropic"),
             usage: { input_tokens: inTok, output_tokens: outTok },
             custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }),
             provider: "anthropic"
@@ -2384,7 +2394,16 @@ async function gerarSugestaoComercialOpenAI(
   }
 
   // Sem IA disponível
-  return { sugestao: fallback, usage: null, custo_estimado: IA_CUSTO_ESTIMADO_PADRAO, provider: "fallback" };
+  return {
+    sugestao: {
+      ...fallback,
+      disponivel: false,
+      origem: "fallback"
+    },
+    usage: null,
+    custo_estimado: 0,
+    provider: "fallback"
+  };
 }
 
 
@@ -11033,10 +11052,15 @@ app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
           id,
           nome,
           telefone,
+          email,
           status,
           campanha,
           observacao,
           motivo_perda,
+          score,
+          score_manual,
+          data_contato,
+          observacao_agendamento,
           criado_em
         FROM leads
         WHERE usuario_id = $1
@@ -11049,6 +11073,21 @@ app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
 
     const leads =
       leadsResult.rows;
+    const leadsContexto =
+      leads.map((lead: any) => ({
+        id: lead.id,
+        nome: lead.nome || null,
+        telefone: lead.telefone || null,
+        email: lead.email || null,
+        status: lead.status || null,
+        campanha: lead.campanha || null,
+        motivo_perda: lead.motivo_perda || null,
+        observacao: lead.observacao || null,
+        score: lead.score_manual || lead.score || null,
+        data_contato: lead.data_contato || null,
+        observacao_agendamento: lead.observacao_agendamento || null,
+        criado_em: lead.criado_em
+      }));
 
     const fallback =
       sugestaoIAFallback(
@@ -11068,10 +11107,20 @@ app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
 
     const usoIA =
       await gerarSugestaoComercialOpenAI(
-        "Criar uma campanha de reativacao em lote com mensagens diferentes por perfil.",
-        { leads },
-        fallback
+        "Criar uma campanha de reativacao em lote usando os dados reais de cada lead. Gere mensagens diferentes por perfil, mencione campanha, observacao ou motivo de perda somente quando existir nos dados. Nao invente nomes, campanhas ou interesses. Priorize leads com telefone, perda reversivel, contato antigo ou score mais quente.",
+        {
+          total_leads: leadsContexto.length,
+          leads: leadsContexto
+        },
+        fallback,
+        (user as any).ia_provider || "auto"
       );
+
+    if (usoIA.provider === "fallback") {
+      return c.json({
+        error: "Nenhuma IA configurada respondeu agora. Verifique OpenAI/Anthropic no painel administrativo."
+      }, 503);
+    }
 
     await registrarUsoIA(
       Number(user.id),
@@ -11143,11 +11192,15 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
           id,
           nome,
           telefone,
+          email,
           status,
           campanha,
           observacao,
           score,
+          score_manual,
           motivo_perda,
+          data_contato,
+          observacao_agendamento,
           criado_em
         FROM leads
         WHERE usuario_id = $1
@@ -11160,6 +11213,28 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 
     const leads =
       leadsResult.rows;
+    const leadsContexto =
+      leads.map((lead: any) => ({
+        id: lead.id,
+        nome: lead.nome || null,
+        telefone: lead.telefone || null,
+        email: lead.email || null,
+        status: lead.status || null,
+        campanha: lead.campanha || null,
+        observacao: lead.observacao || null,
+        motivo_perda: lead.motivo_perda || null,
+        score: lead.score_manual || lead.score || null,
+        data_contato: lead.data_contato || null,
+        observacao_agendamento: lead.observacao_agendamento || null,
+        criado_em: lead.criado_em
+      }));
+    const totaisPorStatus =
+      leadsContexto.reduce((acc: Record<string, number>, lead: any) => {
+        const status =
+          String(lead.status || "sem_status");
+        acc[status] = (acc[status] || 0) + 1;
+        return acc;
+      }, {});
     const fallback =
       sugestaoIAFallback(
         `${tituloPeriodo} IA Ouro`,
@@ -11179,14 +11254,23 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 
     const usoIA =
       await gerarSugestaoComercialOpenAI(
-        `Gerar ${tituloPeriodo.toLowerCase()} do corretor com os 5 leads que ele deve focar ${focoPeriodo} e o motivo.`,
+        `Gerar ${tituloPeriodo.toLowerCase()} inteligente do corretor. Analise os leads reais ${focoPeriodo}, escolha ate 5 prioridades e explique por que cada uma merece atencao. Considere status, score, campanha, observacao, motivo de perda, telefone, data de criacao e agendamento. Nao invente leads nem use placeholders como "Nome do Lead". Se houver poucos dados, seja transparente e recomende acoes praticas.`,
         {
           periodo,
           dias_periodo: diasPeriodo,
-          leads
+          total_leads: leadsContexto.length,
+          totais_por_status: totaisPorStatus,
+          leads: leadsContexto
         },
-        fallback
+        fallback,
+        (user as any).ia_provider || "auto"
       );
+
+    if (usoIA.provider === "fallback") {
+      return c.json({
+        error: "Nenhuma IA configurada respondeu agora. Verifique OpenAI/Anthropic no painel administrativo."
+      }, 503);
+    }
 
     await registrarUsoIA(
       Number(user.id),
