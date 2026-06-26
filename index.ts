@@ -6265,6 +6265,13 @@ await client.query(`
 `);
 
 await client.query(`
+  ALTER TABLE railway_billing_config
+    ADD COLUMN IF NOT EXISTS limite_alerta_usd NUMERIC(10,2) DEFAULT 5.00,
+    ADD COLUMN IF NOT EXISTS ultima_notif_custo_data DATE,
+    ADD COLUMN IF NOT EXISTS ultima_notif_cobranca_data DATE;
+`);
+
+await client.query(`
   CREATE TABLE IF NOT EXISTS railway_billing_historico (
     id SERIAL PRIMARY KEY,
     ciclo_mes DATE NOT NULL UNIQUE,
@@ -11824,6 +11831,7 @@ app.put("/admin/railway-billing", authMiddleware, async (c) => {
         proxima_fatura_base = COALESCE($5, proxima_fatura_base),
         proxima_fatura_data = COALESCE($6, proxima_fatura_data),
         observacoes = COALESCE($7, observacoes),
+        limite_alerta_usd = COALESCE($8, limite_alerta_usd),
         atualizado_em = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -11839,7 +11847,10 @@ app.put("/admin/railway-billing", authMiddleware, async (c) => {
           ? null
           : Number(body.proxima_fatura_base),
         body.proxima_fatura_data || null,
-        body.observacoes ?? null
+        body.observacoes ?? null,
+        body.limite_alerta_usd === undefined
+          ? null
+          : Number(body.limite_alerta_usd)
       ]
     );
 
@@ -14288,6 +14299,77 @@ function agendarLembretes() {
 }
 
 agendarLembretes();
+
+
+/* =========================
+   🔔 ALERTAS RAILWAY
+========================= */
+
+async function verificarAlertasRailway() {
+  try {
+    const cfg = await client.query(`SELECT * FROM railway_billing_config WHERE id = 1 LIMIT 1`);
+    if (!cfg.rows.length) return;
+    const b = cfg.rows[0];
+
+    const admins = await client.query(`SELECT id FROM usuarios WHERE tipo = 'super_admin'`);
+    if (!admins.rows.length) return;
+
+    const hoje = new Date().toISOString().slice(0, 10);
+
+    // Alerta de dia de cobrança
+    const dataFatura = b.proxima_fatura_data ? String(b.proxima_fatura_data).slice(0, 10) : null;
+    const ultimaNotifCobranca = b.ultima_notif_cobranca_data ? String(b.ultima_notif_cobranca_data).slice(0, 10) : null;
+
+    if (dataFatura === hoje && ultimaNotifCobranca !== hoje) {
+      const base = Number(b.proxima_fatura_base || 0);
+      const moeda = b.moeda || "USD";
+      const valorFmt = new Intl.NumberFormat(moeda === "BRL" ? "pt-BR" : "en-US", {
+        style: "currency", currency: moeda
+      }).format(base);
+
+      for (const admin of admins.rows) {
+        await client.query(
+          `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+           VALUES ($1, 'railway_cobranca_dia', $2, $3)`,
+          [
+            admin.id,
+            "Railway: fatura vence hoje",
+            `Hoje é o dia de cobrança da Railway. Valor base esperado: ${valorFmt}. Confira sua fatura no painel Railway.`
+          ]
+        );
+      }
+      await client.query(`UPDATE railway_billing_config SET ultima_notif_cobranca_data = $1 WHERE id = 1`, [hoje]);
+    }
+
+    // Alerta de custo estimado alto
+    const limiteUsd = Number(b.limite_alerta_usd || 5);
+    const mem = process.memoryUsage();
+    const rssMb = mem.rss / 1024 / 1024;
+    const custoRamEstimado = (rssMb / 1024) * 10;
+    const ultimaNotifCusto = b.ultima_notif_custo_data ? String(b.ultima_notif_custo_data).slice(0, 10) : null;
+
+    if (custoRamEstimado > limiteUsd && ultimaNotifCusto !== hoje) {
+      for (const admin of admins.rows) {
+        await client.query(
+          `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+           VALUES ($1, 'railway_custo_alto', $2, $3)`,
+          [
+            admin.id,
+            "Railway: custo estimado acima do limite",
+            `O custo estimado de RAM está em US$ ${custoRamEstimado.toFixed(2)}/mês (RSS: ${rssMb.toFixed(0)} MB), acima do limite configurado de US$ ${limiteUsd.toFixed(2)}. Acesse Recursos Railway para detalhes.`
+          ]
+        );
+      }
+      await client.query(`UPDATE railway_billing_config SET ultima_notif_custo_data = $1 WHERE id = 1`, [hoje]);
+    }
+  } catch (err) {
+    console.error("ERRO verificarAlertasRailway:", err);
+  }
+}
+
+// Verifica a cada hora
+setInterval(verificarAlertasRailway, 60 * 60 * 1000);
+verificarAlertasRailway();
 
 
 /* =========================
