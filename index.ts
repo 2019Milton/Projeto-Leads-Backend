@@ -4142,8 +4142,6 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
       bid_strategy: bidStrategy,
 
-      daily_budget: daily_budget || 2000,
-
       start_time: inicio
         ? new Date(inicio).toISOString()
         : new Date(Date.now() + 60000).toISOString(),
@@ -4158,6 +4156,11 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
       access_token: token
     };
+
+    // Só define budget no adset quando NÃO há CBO (com CBO o budget fica na campanha)
+    if (daily_budget) {
+      payloadAdset.daily_budget = daily_budget;
+    }
 
     if (fim) {
       payloadAdset.end_time =
