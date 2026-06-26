@@ -6459,7 +6459,8 @@ await client.query(`
   INSERT INTO nichos (slug, nome, cor) VALUES
     ('imoveis',     'Imóveis',          '#2563EB'),
     ('saude',       'Planos de Saúde',  '#DC2626'),
-    ('suplementos', 'Suplementos',      '#EA580C')
+    ('suplementos', 'Suplementos',      '#EA580C'),
+    ('saas',        'Plataforma / SaaS','#7C3AED')
   ON CONFLICT (slug) DO UPDATE SET cor = EXCLUDED.cor, nome = EXCLUDED.nome;
 `);
 
@@ -11358,6 +11359,20 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       interesses: "musculacao, fitness, suplementacao, treino, academia, nutricao esportiva, whey protein",
       idadeMin: "18", idadeMax: "45",
       obrigadoTextoSufixo: "nossa equipe vai te ajudar a escolher o suplemento ideal"
+    },
+    saas: {
+      topicoDefault: "plataforma de gestao de leads",
+      especialidade: "software SaaS, plataformas digitais e ferramentas para vendas e marketing no Brasil",
+      v1titulo: "Pare de perder leads por falta de organizacao",
+      v1texto: "crie urgencia em torno do prejuizo financeiro de perder leads por desorganizacao, enfatize quanto dinheiro e desperdicado sem uma ferramenta adequada",
+      v2titulo: "Imagine saber exatamente qual campanha trouxe cada cliente",
+      v2texto: "evoque o desejo de controle total, clareza nos resultados e crescimento previsivel do negocio",
+      v3titulo: "IA + Meta Ads + CRM em uma so plataforma",
+      v3texto: "destaque diferenciais tecnicos: integracao com Meta, IA para criar campanhas, gestao de leads automatica e custo por lead visivel em tempo real",
+      perguntas: "Voce ja anuncia no Facebook ou Instagram?\nComo voce organiza seus leads hoje?\nQuantos leads voce recebe por mes em media?",
+      interesses: "marketing digital, gestao de leads, Facebook Ads, CRM, vendas online, automacao de marketing, empreendedorismo",
+      idadeMin: "25", idadeMax: "55",
+      obrigadoTextoSufixo: "nossa equipe vai te mostrar como a plataforma pode transformar seus resultados"
     }
   };
 
@@ -13110,7 +13125,7 @@ app.put("/usuario/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 3
+      nicho_ids.length > 4
     ) {
       return c.json(
         { error: "Informe entre 1 e 3 nichos" },
@@ -13183,7 +13198,7 @@ app.put("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 3
+      nicho_ids.length > 4
     ) {
       return c.json(
         { error: "Informe entre 1 e 3 nichos" },
