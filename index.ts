@@ -3969,7 +3969,6 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
 
     // CBO: orçamento gerenciado pela campanha em vez de cada adset
     if (cbo) {
-      payloadCampanha.budget_rebalance_flag = true;
       if (dailyBudgetCampanha) {
         payloadCampanha.daily_budget = dailyBudgetCampanha;
       }
