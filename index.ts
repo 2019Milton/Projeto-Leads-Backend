@@ -774,8 +774,10 @@ function montarTargetingMeta(avancadas: any) {
   const plataformas =
     listaOpcional(avancadas?.plataformas);
 
+  const FACEBOOK_POSITIONS_DEPRECATED = ["video_feeds"];
   const facebookPositions =
-    listaOpcional(avancadas?.facebook_positions);
+    listaOpcional(avancadas?.facebook_positions)
+      .filter((p: string) => !FACEBOOK_POSITIONS_DEPRECATED.includes(p));
 
   if (
     facebookPositions.length &&
