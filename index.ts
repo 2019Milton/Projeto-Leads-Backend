@@ -9410,6 +9410,21 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
 
 // 🔹 criar lead
+// 🧪 TESTE TEMPORÁRIO — enviar notif WhatsApp para leads de hoje
+app.post("/dev/testar-notif-leads-hoje", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const leads = await client.query(
+    `SELECT nome, telefone, email, campanha FROM leads
+     WHERE usuario_id = $1 AND DATE(criado_em AT TIME ZONE 'America/Sao_Paulo') = CURRENT_DATE AT TIME ZONE 'America/Sao_Paulo'
+     ORDER BY criado_em DESC LIMIT 10`,
+    [user.id]
+  );
+  for (const lead of leads.rows) {
+    await notificarNovoLeadWhatsApp(user.id, lead);
+  }
+  return c.json({ enviados: leads.rows.length, leads: leads.rows.map((l: any) => l.nome) });
+});
+
 app.post("/leads", authMiddleware, async (c) => {
   try {
     const body = await c.req.json();
