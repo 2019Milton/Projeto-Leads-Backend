@@ -6038,6 +6038,29 @@ app.post("/webhook/meta", async (c) => {
               "usuário:",
               usuarioId
             );
+
+            // 📲 notificação WhatsApp para o dono da campanha
+            const usuarioNotif = await client.query(
+              `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
+              [usuarioId]
+            );
+            const u = usuarioNotif.rows[0];
+            if (u?.whatsapp && u?.notif_whatsapp_lead !== false) {
+              const agora = new Date().toLocaleString("pt-BR", {
+                timeZone: "America/Sao_Paulo",
+                day: "2-digit", month: "2-digit",
+                hour: "2-digit", minute: "2-digit"
+              });
+              const msg =
+                `🎯 *Novo lead chegou!*\n\n` +
+                `👤 *Nome:* ${nome || "Não informado"}\n` +
+                `📞 *Telefone:* ${telefone || "Não informado"}\n` +
+                `📧 *E-mail:* ${email || "Não informado"}\n` +
+                `📣 *Campanha:* ${nomeCampanha}\n` +
+                `⏰ *Horário:* ${agora}\n\n` +
+                `Acesse a plataforma para ver todos os detalhes.`;
+              enviarLembreteWhatsApp(u.whatsapp, msg).catch(() => {});
+            }
           }
         }
       }
@@ -6534,6 +6557,11 @@ await client.query(`
 await client.query(`
   ALTER TABLE usuarios
     ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(20);
+`);
+
+await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS notif_whatsapp_lead BOOLEAN DEFAULT TRUE;
 `);
 
 await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS data_contato DATE;`);
@@ -7135,6 +7163,22 @@ app.patch("/usuarios/me/whatsapp", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO WHATSAPP:", err);
     return c.json({ error: "Erro ao salvar WhatsApp" }, 500);
+  }
+});
+
+// 🔹 ligar/desligar notificação WhatsApp de novo lead
+app.patch("/usuarios/me/notif-whatsapp-lead", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { ativo } = await c.req.json();
+    await client.query(
+      `UPDATE usuarios SET notif_whatsapp_lead = $1 WHERE id = $2`,
+      [ativo !== false, user.id]
+    );
+    return c.json({ ok: true, notif_whatsapp_lead: ativo !== false });
+  } catch (err) {
+    console.error("ERRO NOTIF WHATSAPP LEAD:", err);
+    return c.json({ error: "Erro ao atualizar preferência" }, 500);
   }
 });
 
