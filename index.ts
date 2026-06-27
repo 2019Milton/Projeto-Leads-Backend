@@ -7655,7 +7655,16 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
     if (userNichos.length > 0) {
       const norm = (t: string) =>
         String(t).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      const saasNicho = userNichos.find(n => n.slug === "saas" || norm(n.nome).includes("saas") || norm(n.nome).includes("plataforma"));
       for (const c of campanhas.rows as any[]) {
+        // Migra nicho legado "Plataforma" para o nicho SaaS atual do usuário
+        if (saasNicho && c.nicho_nome && /^plataforma$/i.test(c.nicho_nome.trim())) {
+          c.nicho_id   = saasNicho.id;
+          c.nicho_slug = saasNicho.slug;
+          c.nicho_nome = saasNicho.nome;
+          c.nicho_cor  = saasNicho.cor;
+          continue;
+        }
         if (c.nicho_id || c.nicho_slug) continue;
         const nomeLower = norm(c.nome || "");
         for (const nicho of userNichos) {
