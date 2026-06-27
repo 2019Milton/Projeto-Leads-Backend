@@ -6040,27 +6040,7 @@ app.post("/webhook/meta", async (c) => {
             );
 
             // 📲 notificação WhatsApp para o dono da campanha
-            const usuarioNotif = await client.query(
-              `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
-              [usuarioId]
-            );
-            const u = usuarioNotif.rows[0];
-            if (u?.whatsapp && u?.notif_whatsapp_lead !== false) {
-              const agora = new Date().toLocaleString("pt-BR", {
-                timeZone: "America/Sao_Paulo",
-                day: "2-digit", month: "2-digit",
-                hour: "2-digit", minute: "2-digit"
-              });
-              const msg =
-                `🎯 *Novo lead chegou!*\n\n` +
-                `👤 *Nome:* ${nome || "Não informado"}\n` +
-                `📞 *Telefone:* ${telefone || "Não informado"}\n` +
-                `📧 *E-mail:* ${email || "Não informado"}\n` +
-                `📣 *Campanha:* ${nomeCampanha}\n` +
-                `⏰ *Horário:* ${agora}\n\n` +
-                `Acesse a plataforma para ver todos os detalhes.`;
-              enviarLembreteWhatsApp(u.whatsapp, msg).catch(() => {});
-            }
+            notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
           }
         }
       }
@@ -9444,6 +9424,8 @@ app.post("/leads", authMiddleware, async (c) => {
       "INSERT INTO leads (nome, telefone, email, usuario_id) VALUES ($1,$2,$3,$4)",
       [body.nome, body.telefone, body.email, user.id]
     );
+
+    notificarNovoLeadWhatsApp(user.id, { nome: body.nome, telefone: body.telefone, email: body.email });
 
     return c.json({ message: "Lead salvo com sucesso" });
   } catch (err) {
@@ -13665,6 +13647,36 @@ app.patch("/campanhas/:id/nicho", authMiddleware, async (c) => {
 /* =========================
    ⏰ CRON — LEMBRETES DE CONTATO
 ========================= */
+
+async function notificarNovoLeadWhatsApp(
+  usuarioId: number,
+  dados: { nome?: string | null; telefone?: string | null; email?: string | null; campanha?: string | null }
+) {
+  try {
+    const row = await client.query(
+      `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+    const u = row.rows[0];
+    if (!u?.whatsapp || u?.notif_whatsapp_lead === false) return;
+    const agora = new Date().toLocaleString("pt-BR", {
+      timeZone: "America/Sao_Paulo",
+      day: "2-digit", month: "2-digit",
+      hour: "2-digit", minute: "2-digit"
+    });
+    const msg =
+      `🎯 *Novo lead chegou!*\n\n` +
+      `👤 *Nome:* ${dados.nome || "Não informado"}\n` +
+      `📞 *Telefone:* ${dados.telefone || "Não informado"}\n` +
+      `📧 *E-mail:* ${dados.email || "Não informado"}\n` +
+      (dados.campanha ? `📣 *Campanha:* ${dados.campanha}\n` : "") +
+      `⏰ *Horário:* ${agora}\n\n` +
+      `Acesse a plataforma para ver todos os detalhes.`;
+    enviarLembreteWhatsApp(u.whatsapp, msg).catch(() => {});
+  } catch (e) {
+    console.error("Erro notif lead WhatsApp:", e);
+  }
+}
 
 async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
   const instanceId = Bun.env.ZAPI_INSTANCE_ID;
