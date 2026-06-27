@@ -7696,12 +7696,15 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         String(campanha.status || "").toUpperCase() !== "DELETED"
       ) {
         try {
-          const [insightsTotais, insightsGrafico] = await Promise.all([
+          const [insightsTotais, insightsGrafico, insightsHoje] = await Promise.all([
             fetch(
               `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&date_preset=last_30d&access_token=${token}`
             ).then(r => r.json()),
             fetch(
               `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,ctr&time_increment=1&date_preset=last_30d&access_token=${token}`
+            ).then(r => r.json()),
+            fetch(
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=spend&date_preset=today&access_token=${token}`
             ).then(r => r.json())
           ]);
 
@@ -7722,9 +7725,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
               impressoes: Number(d.impressions || 0)
             }));
 
-            // último entry do gráfico diário = hoje (Meta usa timezone da conta, evita bug de UTC)
-            const ultimoDia = diasGrafico[diasGrafico.length - 1];
-            gastoHojeCampanha = Number(ultimoDia?.spend || 0);
+            gastoHojeCampanha = Number(insightsHoje.data?.[0]?.spend || 0);
 
             metaDisponivel = true;
           }
