@@ -7016,12 +7016,13 @@ app.post("/login", async (c) => {
 app.get("/usuarios/me", authMiddleware, async (c) => {
   const user: any = c.get("user");
   return c.json({
-    id:        user.id,
-    email:     user.email,
-    nome:      user.nome,
-    sobrenome: user.sobrenome,
-    whatsapp:  user.whatsapp || null,
-    tipo:      user.tipo
+    id:                   user.id,
+    email:                user.email,
+    nome:                 user.nome,
+    sobrenome:            user.sobrenome,
+    whatsapp:             user.whatsapp || null,
+    notif_whatsapp_lead:  user.notif_whatsapp_lead !== false,
+    tipo:                 user.tipo
   });
 });
 
