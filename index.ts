@@ -9410,20 +9410,19 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
 
 // 🔹 criar lead
-// 🧪 TESTE TEMPORÁRIO — enviar notif WhatsApp para leads de hoje
+// 🧪 TESTE TEMPORÁRIO — enviar notif WhatsApp para leads das últimas 24h
 app.post("/dev/testar-notif-leads-hoje", authMiddleware, async (c) => {
   const user: any = c.get("user");
   const leads = await client.query(
-    `SELECT nome, telefone, email, campanha, criado_em FROM leads
-     WHERE usuario_id = $1
-     ORDER BY criado_em DESC LIMIT 5`,
+    `SELECT nome, telefone, email, campanha FROM leads
+     WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '24 hours'
+     ORDER BY criado_em DESC`,
     [user.id]
   );
-  return c.json({
-    usuario_id: user.id,
-    agora_db: new Date().toISOString(),
-    leads: leads.rows
-  });
+  for (const lead of leads.rows) {
+    await notificarNovoLeadWhatsApp(user.id, lead);
+  }
+  return c.json({ enviados: leads.rows.length, leads: leads.rows.map((l: any) => l.nome) });
 });
 
 app.post("/leads", authMiddleware, async (c) => {
