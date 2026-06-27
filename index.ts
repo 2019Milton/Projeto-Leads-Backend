@@ -9411,20 +9411,6 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
 // 🔹 criar lead
 // 🧪 TESTE TEMPORÁRIO — enviar notif WhatsApp para leads das últimas 24h
-app.post("/dev/testar-notif-leads-hoje", authMiddleware, async (c) => {
-  const user: any = c.get("user");
-  const leads = await client.query(
-    `SELECT nome, telefone, email, campanha FROM leads
-     WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '24 hours'
-     ORDER BY criado_em DESC`,
-    [user.id]
-  );
-  for (const lead of leads.rows) {
-    await notificarNovoLeadWhatsApp(user.id, lead);
-  }
-  return c.json({ enviados: leads.rows.length, leads: leads.rows.map((l: any) => l.nome) });
-});
-
 app.post("/leads", authMiddleware, async (c) => {
   try {
     const body = await c.req.json();
@@ -13710,7 +13696,6 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
 
   const phone = numero.startsWith("55") ? numero : `55${numero}`;
   const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
-  console.log(`📲 Z-API: enviando para ${phone}...`);
 
   try {
     const res = await fetch(`https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`, {
@@ -13722,7 +13707,7 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
       body: JSON.stringify({ phone, message: mensagem })
     });
     const body = await res.json();
-    console.log(`📲 Z-API resposta [${res.status}]:`, JSON.stringify(body));
+    if (!res.ok) console.error("Z-API erro:", res.status, JSON.stringify(body));
   } catch (e) {
     console.error("ERRO Z-API:", e);
   }
