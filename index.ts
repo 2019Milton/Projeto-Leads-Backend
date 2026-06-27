@@ -9414,15 +9414,16 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 app.post("/dev/testar-notif-leads-hoje", authMiddleware, async (c) => {
   const user: any = c.get("user");
   const leads = await client.query(
-    `SELECT nome, telefone, email, campanha FROM leads
-     WHERE usuario_id = $1 AND DATE(criado_em AT TIME ZONE 'America/Sao_Paulo') = CURRENT_DATE AT TIME ZONE 'America/Sao_Paulo'
-     ORDER BY criado_em DESC LIMIT 10`,
+    `SELECT nome, telefone, email, campanha, criado_em FROM leads
+     WHERE usuario_id = $1
+     ORDER BY criado_em DESC LIMIT 5`,
     [user.id]
   );
-  for (const lead of leads.rows) {
-    await notificarNovoLeadWhatsApp(user.id, lead);
-  }
-  return c.json({ enviados: leads.rows.length, leads: leads.rows.map((l: any) => l.nome) });
+  return c.json({
+    usuario_id: user.id,
+    agora_db: new Date().toISOString(),
+    leads: leads.rows
+  });
 });
 
 app.post("/leads", authMiddleware, async (c) => {
