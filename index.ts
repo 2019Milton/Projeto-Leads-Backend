@@ -7703,22 +7703,19 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           } else {
             dados = insightsTotais.data?.[0] || {};
 
-            const hoje = new Date().toISOString().split("T")[0];
+            const diasGrafico = insightsGrafico.data || [];
 
-            grafico =
-              (insightsGrafico.data || []).map((d: any) => ({
-                data: d.date_start,
-                clicks: Number(d.clicks || 0),
-                ctr: Number(d.ctr || 0),
-                gasto: Number(d.spend || 0),
-                impressoes: Number(d.impressions || 0)
-              }));
+            grafico = diasGrafico.map((d: any) => ({
+              data: d.date_start,
+              clicks: Number(d.clicks || 0),
+              ctr: Number(d.ctr || 0),
+              gasto: Number(d.spend || 0),
+              impressoes: Number(d.impressions || 0)
+            }));
 
-            gastoHojeCampanha = Number(
-              (insightsGrafico.data || [])
-                .find((d: any) => d.date_start === hoje)
-                ?.spend || 0
-            );
+            // último entry do gráfico diário = hoje (Meta usa timezone da conta, evita bug de UTC)
+            const ultimoDia = diasGrafico[diasGrafico.length - 1];
+            gastoHojeCampanha = Number(ultimoDia?.spend || 0);
 
             metaDisponivel = true;
           }
