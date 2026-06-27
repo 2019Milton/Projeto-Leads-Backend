@@ -1102,6 +1102,26 @@ function calcularScoreLead(
     base.push("+5 Email informado");
   }
 
+  if (lead.status === "primeiro_contato") {
+    pontos += 15;
+    base.push("+15 Atendimento iniciado");
+  }
+
+  if (lead.status === "em_conversa") {
+    pontos += 30;
+    base.push("+30 Lead em conversa");
+  }
+
+  if (lead.status === "fechado") {
+    pontos += 60;
+    base.push("+60 Lead fechado");
+  }
+
+  if (lead.status === "perdido") {
+    pontos -= 40;
+    base.push("-40 Lead marcado como perdido");
+  }
+
   if (
     textoComercial.includes("visita") ||
     textoComercial.includes("agendar") ||
@@ -9938,9 +9958,21 @@ app.put("/leads/:id", authMiddleware, async (c) => {
       );
     }
 
+    const leadAtualizado =
+      result.rows[0];
+    const scoreData =
+      calcularScoreLead(leadAtualizado);
+
+    leadAtualizado.score =
+      scoreData.score;
+    leadAtualizado.score_base =
+      scoreData.base;
+    leadAtualizado.score_pontos =
+      scoreData.pontos;
+
     return c.json({
       success: true,
-      lead: result.rows[0]
+      lead: leadAtualizado
     });
 
   } catch (err) {
