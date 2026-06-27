@@ -13709,12 +13709,16 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
   }
 
   const phone = numero.startsWith("55") ? numero : `55${numero}`;
+  const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
   console.log(`📲 Z-API: enviando para ${phone}...`);
 
   try {
     const res = await fetch(`https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(clientToken ? { "Client-Token": clientToken } : {})
+      },
       body: JSON.stringify({ phone, message: mensagem })
     });
     const body = await res.json();
