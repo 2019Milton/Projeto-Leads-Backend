@@ -33,10 +33,18 @@ const META_OAUTH_STATE_TTL_MINUTES =
   Number(Bun.env.META_OAUTH_STATE_TTL_MINUTES) ||
   10;
 
-const RESEND_FROM_EMAIL =
-  Bun.env.RESEND_FROM_EMAIL ||
-  Bun.env.RESEND_FROM ||
-  "Plataforma de Leads <onboarding@resend.dev>";
+const PLATAFORMA_CONTATO_EMAIL =
+  Bun.env.PLATAFORMA_CONTATO_EMAIL ||
+  "contato@plataformadeleads.com.br";
+
+const PLATAFORMA_FROM_EMAIL =
+  Bun.env.PLATAFORMA_FROM_EMAIL ||
+  `Plataforma de Leads <${PLATAFORMA_CONTATO_EMAIL}>`;
+
+const FEEDBACK_DESTINO_EMAIL =
+  Bun.env.FEEDBACK_DESTINO_EMAIL ||
+  Bun.env.SUPPORT_EMAIL ||
+  PLATAFORMA_CONTATO_EMAIL;
 
 const SENHA_FORTE =
   /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
@@ -491,6 +499,15 @@ function textoOpcional(value: unknown) {
   return String(value ?? "").trim();
 }
 
+function escaparHtmlEmail(value: unknown) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 function numeroOpcional(value: unknown) {
   if (
     value === null ||
@@ -847,7 +864,7 @@ async function enviarEmailResetSenha(
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      from: RESEND_FROM_EMAIL,
+      from: PLATAFORMA_FROM_EMAIL,
       to: email,
       subject: "Troca de senha - Plataforma de Leads",
       html: `
@@ -6685,7 +6702,7 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
         ? "Serviço de email não configurado. Configure RESEND_API_KEY no Railway."
         : err instanceof Error &&
           err.message === "RESEND_EMAIL_SEND_FAILED"
-        ? "Não foi possível enviar o email de troca de senha. Verifique RESEND_FROM_EMAIL e o domínio no Resend."
+        ? "Não foi possível enviar o email de troca de senha. Verifique PLATAFORMA_FROM_EMAIL e o domínio no Resend."
         : "Erro ao solicitar troca de senha";
 
     return c.json({
@@ -12444,6 +12461,10 @@ app.post("/feedback", authMiddleware, async (c: any) => {
   };
 
   const tipoLabel = tiposValidos[tipo] || "📩 Mensagem";
+  const mensagemSegura =
+    escaparHtmlEmail(mensagem.trim());
+  const emailUsuario =
+    escaparHtmlEmail(user.email);
 
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -12452,18 +12473,19 @@ app.post("/feedback", authMiddleware, async (c: any) => {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      from: RESEND_FROM_EMAIL,
-      to: "pereira.notlim@gmail.com",
+      from: PLATAFORMA_FROM_EMAIL,
+      to: FEEDBACK_DESTINO_EMAIL,
+      reply_to: user.email,
       subject: `${tipoLabel} — Plataforma de Leads`,
       html: `
         <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:560px;">
           <h2 style="margin-bottom:4px;">${tipoLabel}</h2>
           <p style="color:#6b7280;font-size:13px;margin-top:0;">Plataforma de Leads</p>
           <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;">
-          <p><strong>De:</strong> ${user.email}</p>
+          <p><strong>De:</strong> ${emailUsuario}</p>
           <p><strong>Tipo:</strong> ${tipoLabel}</p>
           <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;">
-          <p style="white-space:pre-wrap;">${mensagem.trim().replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>
+          <p style="white-space:pre-wrap;">${mensagemSegura}</p>
         </div>
       `
     })
