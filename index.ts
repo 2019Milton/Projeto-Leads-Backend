@@ -856,6 +856,16 @@ async function enviarEmailResetSenha(
 
   const primeiroNome =
     nome?.trim() || "tudo bem";
+  const primeiroNomeSeguro =
+    escaparHtmlEmail(primeiroNome);
+  const resetUrlSeguro =
+    escaparHtmlEmail(resetUrl);
+  const siteUrl =
+    obterFrontendUrl();
+  const siteUrlSeguro =
+    escaparHtmlEmail(siteUrl);
+  const contatoEmailSeguro =
+    escaparHtmlEmail(PLATAFORMA_CONTATO_EMAIL);
 
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -866,19 +876,61 @@ async function enviarEmailResetSenha(
     body: JSON.stringify({
       from: PLATAFORMA_FROM_EMAIL,
       to: email,
-      subject: "Troca de senha - Plataforma de Leads",
+      reply_to: PLATAFORMA_CONTATO_EMAIL,
+      subject: "Redefinicao de senha - Plataforma de Leads",
+      text: [
+        "Plataforma de Leads",
+        "Gestao Inteligente de Clientes",
+        "",
+        `Ola, ${primeiroNome}.`,
+        "",
+        "Recebemos uma solicitacao para redefinir a senha da sua conta na Plataforma de Leads.",
+        `Para criar uma nova senha, acesse: ${resetUrl}`,
+        "",
+        `Esse link expira em ${RESET_PASSWORD_TTL_MINUTES} minutos e so pode ser usado uma vez.`,
+        "Se voce nao solicitou essa alteracao, ignore este email. Sua senha atual continuara valida.",
+        "",
+        `Site oficial: ${siteUrl}`,
+        `Contato: ${PLATAFORMA_CONTATO_EMAIL}`
+      ].join("\n"),
       html: `
-        <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827">
-          <h2>Troca de senha</h2>
-          <p>Olá, ${primeiroNome}.</p>
-          <p>Recebemos uma solicitação para trocar a senha da sua conta.</p>
-          <p>
-            <a href="${resetUrl}" style="display:inline-block;background:#2563eb;color:white;padding:12px 18px;border-radius:8px;text-decoration:none">
-              Criar nova senha
-            </a>
-          </p>
-          <p>Esse link expira em ${RESET_PASSWORD_TTL_MINUTES} minutos.</p>
-          <p>Se você não solicitou essa troca, ignore este email.</p>
+        <div style="margin:0;padding:0;background:#f6f8fb;font-family:Arial,sans-serif;color:#111827;">
+          <div style="max-width:620px;margin:0 auto;padding:28px 16px;">
+            <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+              <div style="background:#050816;padding:22px 26px;color:#ffffff;">
+                <h1 style="font-size:22px;line-height:1.3;margin:0;">Plataforma de Leads</h1>
+                <p style="margin:6px 0 0;color:#9ca3af;font-size:13px;letter-spacing:.04em;text-transform:uppercase;">Gestao Inteligente de Clientes</p>
+              </div>
+
+              <div style="padding:28px 26px;line-height:1.6;">
+                <h2 style="font-size:20px;margin:0 0 14px;color:#111827;">Redefinicao de senha</h2>
+                <p style="margin:0 0 14px;">Ola, ${primeiroNomeSeguro}.</p>
+                <p style="margin:0 0 18px;">Recebemos uma solicitacao para redefinir a senha da sua conta na Plataforma de Leads.</p>
+
+                <p style="margin:24px 0;">
+                  <a href="${resetUrlSeguro}" style="display:inline-block;background:#2563eb;color:#ffffff;padding:13px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">
+                    Criar nova senha
+                  </a>
+                </p>
+
+                <p style="margin:0 0 14px;color:#374151;">Esse link expira em <strong>${RESET_PASSWORD_TTL_MINUTES} minutos</strong> e so pode ser usado uma vez.</p>
+
+                <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:14px 16px;margin:20px 0;">
+                  <p style="margin:0 0 8px;font-weight:bold;color:#111827;">Nao foi voce?</p>
+                  <p style="margin:0;color:#4b5563;">Se voce nao solicitou essa alteracao, ignore este email. Sua senha atual continuara valida.</p>
+                </div>
+
+                <p style="margin:0 0 8px;color:#6b7280;font-size:13px;">Se o botao nao funcionar, copie e cole este link no navegador:</p>
+                <p style="margin:0 0 20px;word-break:break-all;font-size:13px;">
+                  <a href="${resetUrlSeguro}" style="color:#2563eb;">${resetUrlSeguro}</a>
+                </p>
+
+                <hr style="border:none;border-top:1px solid #e5e7eb;margin:22px 0;">
+                <p style="margin:0;color:#6b7280;font-size:13px;">Site oficial: <a href="${siteUrlSeguro}" style="color:#2563eb;">${siteUrlSeguro}</a></p>
+                <p style="margin:4px 0 0;color:#6b7280;font-size:13px;">Contato: <a href="mailto:${contatoEmailSeguro}" style="color:#2563eb;">${contatoEmailSeguro}</a></p>
+              </div>
+            </div>
+          </div>
         </div>
       `
     })
