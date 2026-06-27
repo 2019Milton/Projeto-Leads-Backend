@@ -13696,20 +13696,29 @@ async function notificarNovoLeadWhatsApp(
 async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
   const instanceId = Bun.env.ZAPI_INSTANCE_ID;
   const token      = Bun.env.ZAPI_TOKEN;
-  if (!instanceId || !token) return;
+
+  if (!instanceId || !token) {
+    console.warn("⚠️ Z-API: ZAPI_INSTANCE_ID ou ZAPI_TOKEN não configurados");
+    return;
+  }
 
   const numero = String(telefone).replace(/\D/g, "");
-  if (!numero) return;
+  if (!numero) {
+    console.warn("⚠️ Z-API: número vazio, envio cancelado");
+    return;
+  }
+
+  const phone = numero.startsWith("55") ? numero : `55${numero}`;
+  console.log(`📲 Z-API: enviando para ${phone}...`);
 
   try {
-    await fetch(`https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`, {
+    const res = await fetch(`https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        phone: numero.startsWith("55") ? numero : `55${numero}`,
-        message: mensagem
-      })
+      body: JSON.stringify({ phone, message: mensagem })
     });
+    const body = await res.json();
+    console.log(`📲 Z-API resposta [${res.status}]:`, JSON.stringify(body));
   } catch (e) {
     console.error("ERRO Z-API:", e);
   }
