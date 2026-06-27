@@ -7677,6 +7677,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
       let dados: any = {};
       let grafico: any[] = [];
+      let gastoHojeCampanha = 0;
       let metaDisponivel = false;
       let erroMeta: string | null = null;
 
@@ -7702,6 +7703,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           } else {
             dados = insightsTotais.data?.[0] || {};
 
+            const hoje = new Date().toISOString().split("T")[0];
+
             grafico =
               (insightsGrafico.data || []).map((d: any) => ({
                 data: d.date_start,
@@ -7710,6 +7713,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
                 gasto: Number(d.spend || 0),
                 impressoes: Number(d.impressions || 0)
               }));
+
+            gastoHojeCampanha = Number(
+              (insightsGrafico.data || [])
+                .find((d: any) => d.date_start === hoje)
+                ?.spend || 0
+            );
 
             metaDisponivel = true;
           }
@@ -7836,6 +7845,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         cliques: dados.clicks || 0,
         alcance: dados.reach || 0,
         gasto: dados.spend || 0,
+        gasto_hoje: gastoHojeCampanha,
         cpc: dados.cpc || 0,
         ctr: dados.ctr || 0,
 
