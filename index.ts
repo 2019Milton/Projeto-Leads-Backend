@@ -9987,6 +9987,27 @@ app.put("/leads/:id", authMiddleware, async (c) => {
 
 
 
+// 🔹 excluir lead
+app.delete("/leads/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "ID inválido" }, 400);
+
+    const result = await client.query(
+      `DELETE FROM leads WHERE id = $1 AND usuario_id = $2 RETURNING id`,
+      [id, user.id]
+    );
+
+    if (!result.rows.length) return c.json({ error: "Lead não encontrado ou sem permissão" }, 404);
+
+    return c.json({ message: "Lead excluído com sucesso" });
+  } catch (err) {
+    console.error("ERRO AO EXCLUIR LEAD:", err);
+    return c.json({ error: "Erro ao excluir lead" }, 500);
+  }
+});
+
 // 🔹 agendar data de contato do lead
 app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
   try {
