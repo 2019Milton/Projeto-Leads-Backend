@@ -5896,6 +5896,42 @@ app.post("/meta/desconectar", authMiddleware, async (c) => {
 });
 
 
+// 🔥 WEBHOOK Z-API — eventos de conexão/desconexão
+app.post("/webhook/zapi", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const tipo = body?.type || body?.event || "";
+
+    if (tipo === "DisconnectedCallback" || tipo === "disconnected") {
+      console.warn("[z-api webhook] instância desconectada — enviando alerta por e-mail");
+
+      const adminEmail = Bun.env.PLATAFORMA_CONTATO_EMAIL || "pereira.notlim@gmail.com";
+      const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+
+      if (Bun.env.RESEND_API_KEY) {
+        await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            from: PLATAFORMA_FROM_EMAIL,
+            to: adminEmail,
+            subject: "⚠️ WhatsApp desconectado — Plataforma de Leads",
+            text: `Atenção!\n\nSua instância Z-API (WhatsApp) foi desconectada em ${agora}.\n\nAs notificações de novos leads estão pausadas até você reconectar.\n\nAcesse https://app.z-api.io e reconecte sua instância.\n\nPlataforma de Leads`
+          })
+        }).catch((e: any) => console.error("[z-api webhook] erro ao enviar e-mail:", e));
+      }
+    }
+
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error("[z-api webhook] erro:", e);
+    return c.json({ ok: true }); // sempre retorna 200 para o Z-API não retentar
+  }
+});
+
 // 🔥 WEBHOOK META VERIFY
 app.get("/webhook/meta", async (c) => {
 
