@@ -6129,7 +6129,7 @@ app.post("/webhook/meta", async (c) => {
             );
 
             // 📲 notificação WhatsApp para o dono da campanha
-            notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+            await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
           }
         }
       }
@@ -9515,7 +9515,7 @@ app.post("/leads", authMiddleware, async (c) => {
       [body.nome, body.telefone, body.email, user.id]
     );
 
-    notificarNovoLeadWhatsApp(user.id, { nome: body.nome, telefone: body.telefone, email: body.email });
+    await notificarNovoLeadWhatsApp(user.id, { nome: body.nome, telefone: body.telefone, email: body.email });
 
     return c.json({ message: "Lead salvo com sucesso" });
   } catch (err) {
@@ -13766,6 +13766,7 @@ async function notificarNovoLeadWhatsApp(
     );
     const u = row.rows[0];
     if (!u?.whatsapp || u?.notif_whatsapp_lead === false) return;
+    console.log(`[notif-lead] enviando para usuário ${usuarioId} (${u.whatsapp})`);
     const agora = new Date().toLocaleString("pt-BR", {
       timeZone: "America/Sao_Paulo",
       day: "2-digit", month: "2-digit",
@@ -13779,7 +13780,7 @@ async function notificarNovoLeadWhatsApp(
       (dados.campanha ? `📣 *Campanha:* ${dados.campanha}\n` : "") +
       `⏰ *Horário:* ${agora}\n\n` +
       `Acesse a plataforma para ver todos os detalhes.`;
-    enviarLembreteWhatsApp(u.whatsapp, msg).catch(() => {});
+    await enviarLembreteWhatsApp(u.whatsapp, msg);
   } catch (e) {
     console.error("Erro notif lead WhatsApp:", e);
   }
@@ -13813,9 +13814,13 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
       body: JSON.stringify({ phone, message: mensagem })
     });
     const body = await res.json();
-    if (!res.ok) console.error("Z-API erro:", res.status, JSON.stringify(body));
+    if (res.ok) {
+      console.log(`[z-api] ✅ enviado para ${phone}`);
+    } else {
+      console.error(`[z-api] ❌ erro ${res.status}:`, JSON.stringify(body));
+    }
   } catch (e) {
-    console.error("ERRO Z-API:", e);
+    console.error("[z-api] ❌ exceção:", e);
   }
 }
 
