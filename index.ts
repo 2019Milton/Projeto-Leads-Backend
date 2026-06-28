@@ -13765,9 +13765,7 @@ async function notificarNovoLeadWhatsApp(
       [usuarioId]
     );
     const u = row.rows[0];
-    console.log(`[notif-lead] usuário ${usuarioId} — whatsapp: ${u?.whatsapp || "não definido"} — notif_ativo: ${u?.notif_whatsapp_lead}`);
-    if (!u?.whatsapp) { console.log("[notif-lead] cancelado: sem whatsapp"); return; }
-    if (u?.notif_whatsapp_lead === false) { console.log("[notif-lead] cancelado: notificação desativada"); return; }
+    if (!u?.whatsapp || u?.notif_whatsapp_lead === false) return;
     const agora = new Date().toLocaleString("pt-BR", {
       timeZone: "America/Sao_Paulo",
       day: "2-digit", month: "2-digit",
@@ -13781,7 +13779,7 @@ async function notificarNovoLeadWhatsApp(
       (dados.campanha ? `📣 *Campanha:* ${dados.campanha}\n` : "") +
       `⏰ *Horário:* ${agora}\n\n` +
       `Acesse a plataforma para ver todos os detalhes.`;
-    enviarLembreteWhatsApp(u.whatsapp, msg).catch((e) => console.error("[notif-lead] erro ao enviar:", e));
+    enviarLembreteWhatsApp(u.whatsapp, msg).catch(() => {});
   } catch (e) {
     console.error("Erro notif lead WhatsApp:", e);
   }
@@ -13804,7 +13802,6 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
 
   const phone = numero.startsWith("55") ? numero : `55${numero}`;
   const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
-  console.log(`[z-api] enviando para ${phone} | clientToken: ${clientToken ? "presente" : "AUSENTE"}`);
 
   try {
     const res = await fetch(`https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`, {
@@ -13816,7 +13813,7 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
       body: JSON.stringify({ phone, message: mensagem })
     });
     const body = await res.json();
-    console.log(`[z-api] resposta ${res.status}:`, JSON.stringify(body));
+    if (!res.ok) console.error("Z-API erro:", res.status, JSON.stringify(body));
   } catch (e) {
     console.error("ERRO Z-API:", e);
   }
