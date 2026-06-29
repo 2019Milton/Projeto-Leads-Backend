@@ -3778,6 +3778,15 @@ app.get("/auth/meta/callback", async (c) => {
       [usuarioId, access_token]
     );
 
+    // Espelha no hub genérico de conexões
+    await client.query(
+      `INSERT INTO plataforma_conexoes (usuario_id, plataforma, status, access_token, conectado_em, atualizado_em)
+       VALUES ($1, 'meta', 'conectado', $2, NOW(), NOW())
+       ON CONFLICT (usuario_id, plataforma)
+       DO UPDATE SET status = 'conectado', access_token = $2, atualizado_em = NOW()`,
+      [usuarioId, access_token]
+    );
+
     return c.html(`
       <script>
         if (window.opener) {
@@ -6086,6 +6095,112 @@ app.post("/meta/desconectar", authMiddleware, async (c) => {
 });
 
 
+// =============================================
+//   🔌 HUB DE CONEXÕES — multi-plataforma
+// =============================================
+
+const PLATAFORMAS_DISPONIVEIS = [
+  "meta",
+  "google",
+  "tiktok",
+  "linkedin",
+  "kwai",
+  "formulario",
+] as const;
+
+app.get("/conexoes", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    // Meta: usa tabela legada meta_conexoes
+    const metaConn = await client.query(
+      `SELECT conta_anuncios_id, instagram_username, conectado_em
+       FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+      [user.id]
+    );
+
+    // Demais plataformas
+    const outrasConn = await client.query(
+      `SELECT plataforma, status, dados_conta, conectado_em
+       FROM plataforma_conexoes WHERE usuario_id = $1`,
+      [user.id]
+    );
+
+    const mapaOutras = new Map(
+      outrasConn.rows.map((r: any) => [r.plataforma, r])
+    );
+
+    const conexoes = PLATAFORMAS_DISPONIVEIS.map((plataforma) => {
+      if (plataforma === "formulario") {
+        return { plataforma, status: "conectado", conta: null, conectado_em: null };
+      }
+      if (plataforma === "meta") {
+        const m = metaConn.rows[0];
+        return {
+          plataforma,
+          status: m ? "conectado" : "desconectado",
+          conta: m
+            ? { conta_anuncios_id: m.conta_anuncios_id, instagram_username: m.instagram_username }
+            : null,
+          conectado_em: m?.conectado_em ?? null,
+        };
+      }
+      const r = mapaOutras.get(plataforma);
+      return {
+        plataforma,
+        status: r?.status ?? "desconectado",
+        conta: r?.dados_conta ?? null,
+        conectado_em: r?.conectado_em ?? null,
+      };
+    });
+
+    return c.json({ conexoes });
+  } catch (err) {
+    console.error("ERRO GET /conexoes:", err);
+    return c.json({ error: "Erro ao listar conexoes" }, 500);
+  }
+});
+
+app.delete("/conexoes/:plataforma", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const plataforma = c.req.param("plataforma");
+
+    if (!PLATAFORMAS_DISPONIVEIS.includes(plataforma as any)) {
+      return c.json({ error: "Plataforma invalida" }, 400);
+    }
+
+    if (plataforma === "formulario") {
+      return c.json({ error: "Formulario proprio nao pode ser desconectado" }, 400);
+    }
+
+    if (plataforma === "meta") {
+      // Revoga token na Meta e remove da tabela legada
+      const conn = await client.query(
+        `SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+        [user.id]
+      );
+      const token = conn.rows[0]?.access_token;
+      if (token) {
+        await fetch(`https://graph.facebook.com/v19.0/me/permissions?access_token=${token}`, {
+          method: "DELETE",
+        }).catch(() => {});
+      }
+      await client.query(`DELETE FROM meta_conexoes WHERE usuario_id = $1`, [user.id]);
+    } else {
+      await client.query(
+        `DELETE FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = $2`,
+        [user.id, plataforma]
+      );
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO DELETE /conexoes:", err);
+    return c.json({ error: "Erro ao desconectar plataforma" }, 500);
+  }
+});
+
 // 🔥 WEBHOOK Z-API — eventos de conexão/desconexão
 app.post("/webhook/zapi", async (c) => {
   try {
@@ -6898,6 +7013,36 @@ await client.query(`
     ON campanhas_rascunho(criador_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_rascunho_corretor
     ON campanhas_rascunho(corretor_id, status);
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS plataforma_conexoes (
+    id               SERIAL PRIMARY KEY,
+    usuario_id       INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    plataforma       TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'conectado'
+                       CHECK (status IN ('conectado', 'desconectado', 'erro')),
+    access_token     TEXT,
+    refresh_token    TEXT,
+    token_expira_em  TIMESTAMP,
+    dados_conta      JSONB,
+    conectado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(usuario_id, plataforma)
+  );
+  CREATE INDEX IF NOT EXISTS idx_plataforma_conexoes_usuario
+    ON plataforma_conexoes(usuario_id);
+`);
+
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS plataforma TEXT DEFAULT 'meta',
+    ADD COLUMN IF NOT EXISTS campanha_id INTEGER REFERENCES campanhas(id) ON DELETE SET NULL;
+`);
+
+await client.query(`
+  ALTER TABLE campanhas
+    ADD COLUMN IF NOT EXISTS plataforma TEXT DEFAULT 'meta';
 `);
 
 /* =========================
