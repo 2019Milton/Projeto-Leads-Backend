@@ -1696,6 +1696,197 @@ function detectarSinaisIA(lead: any, ml: any) {
   return { sinais, riscos };
 }
 
+function contextoNicho(lead: any) {
+  const slug = String(lead?.nicho_slug || "").toLowerCase();
+  const nome = String(lead?.nicho_nome || "").toLowerCase();
+
+  const isImoveis    = slug.includes("imovel") || slug.includes("imóvel") || nome.includes("imóv") || nome.includes("imovel");
+  const isSaude      = slug.includes("saude")  || slug.includes("saúde")  || nome.includes("saúde") || nome.includes("saude");
+  const isSuplemento = slug.includes("suplement") || nome.includes("suplement");
+  const isSaas       = slug.includes("saas") || slug.includes("plataforma") || nome.includes("saas") || nome.includes("plataforma");
+  const isEducacao   = slug.includes("educa") || nome.includes("educa") || nome.includes("curso") || nome.includes("ensino");
+  const isAuto       = slug.includes("auto") || nome.includes("auto") || nome.includes("veículo") || nome.includes("veiculo") || nome.includes("carro");
+  const isConsorcio  = slug.includes("consorcio") || slug.includes("consórcio") || nome.includes("consórcio") || nome.includes("consorcio");
+
+  if (isImoveis) return {
+    nicho: "Imóveis",
+    produto: "imóvel",
+    produto_pl: "imóveis",
+    verbo_interesse: "comprar ou alugar",
+    qualificadores: ["faixa de valor", "região preferida", "prazo para decisão", "financiamento ou entrada própria"],
+    perguntas: [
+      "Você pretende comprar, alugar ou apenas pesquisar por enquanto?",
+      "Qual faixa de valor ou parcela mensal fica confortável?",
+      "Tem uma região preferida ou bairros que deseja evitar?",
+      "Pretende usar financiamento, entrada própria ou outro formato?",
+      "Qual prazo ideal para visitar ou decidir?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse e queria te ajudar a avançar. Qual melhor horário para falarmos hoje sobre o imóvel e uma possível visita?`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Recebi seu interesse e queria entender melhor o que você procura. Qual região, faixa de valor e prazo ideal para você?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Passando para confirmar se ainda faz sentido eu te enviar algumas opções de imóveis dentro do que você procura.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que nosso contato ficou parado, mas talvez ainda faça sentido te ajudar. Quer que eu te envie opções atualizadas de imóveis?`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para confirmar se ainda existe interesse. Se fizer sentido, posso retomar com imóveis mais alinhados para você.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades de imóveis?`,
+    system: "Você é uma IA comercial especializada em imóveis. Analise o lead, priorize a ação do corretor e, quando o status for perdido, foque em recuperação. Use linguagem focada em visitas, financiamento, região e perfil do imóvel."
+  };
+
+  if (isSaude) return {
+    nicho: "Planos de Saúde",
+    produto: "plano de saúde",
+    produto_pl: "planos de saúde",
+    verbo_interesse: "contratar um plano",
+    qualificadores: ["quantidade de vidas/dependentes", "faixa etária", "valor máximo de mensalidade", "cobertura necessária", "região/cidade"],
+    perguntas: [
+      "Quantas pessoas serão cobertas pelo plano (titular + dependentes)?",
+      "Qual a faixa etária do titular e dos dependentes?",
+      "Tem preferência por alguma operadora ou tipo de cobertura?",
+      "Qual o valor mensal máximo que fica confortável?",
+      "Precisa de cobertura para alguma especialidade ou procedimento específico?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi que você tem interesse em um plano de saúde. Posso te apresentar as melhores opções para o seu perfil hoje?`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para te indicar o melhor plano de saúde, me ajuda com uma info: qual a quantidade de pessoas e faixa etária que precisam de cobertura?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse em contratar um plano de saúde? Posso te enviar opções atualizadas sem compromisso.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que você demonstrou interesse em plano de saúde. Tenho novas opções que podem se encaixar melhor no seu orçamento. Posso te mostrar?`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse em plano de saúde. Se quiser, posso retomar com opções mais alinhadas ao seu perfil.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para oportunidades em planos de saúde?`,
+    system: "Você é uma IA comercial especializada em planos de saúde. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em número de vidas, faixa etária, cobertura e mensalidade."
+  };
+
+  if (isSuplemento) return {
+    nicho: "Suplementos",
+    produto: "suplemento",
+    produto_pl: "suplementos",
+    verbo_interesse: "comprar suplementos",
+    qualificadores: ["objetivo (ganho de massa, emagrecimento, etc.)", "suplementos de interesse", "frequência de treino", "orçamento"],
+    perguntas: [
+      "Qual seu objetivo principal? (ganho de massa, emagrecimento, desempenho...)",
+      "Já usa algum suplemento atualmente?",
+      "Com que frequência você treina por semana?",
+      "Tem alguma restrição alimentar ou alergia?",
+      "Qual orçamento mensal você tem disponível para suplementação?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse nos nossos suplementos. Qual é o seu objetivo principal — ganho de massa, emagrecimento ou desempenho? Assim consigo te indicar o melhor!`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para te ajudar a escolher o suplemento certo, me conta: qual seu objetivo e com que frequência você treina?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse em suplementação? Posso te enviar algumas opções de acordo com o seu objetivo.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Temos novidades e promoções nos suplementos que você pode gostar. Qual era seu objetivo mesmo? Posso te mandar opções atualizadas!`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse em suplementação. Se quiser, posso te enviar opções sem compromisso.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para oportunidades em suplementos?`,
+    system: "Você é uma IA comercial especializada em suplementos esportivos e nutrição. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em objetivo do cliente, frequência de treino e produto ideal."
+  };
+
+  if (isSaas) return {
+    nicho: "Plataforma / SaaS",
+    produto: "plataforma",
+    produto_pl: "plataformas",
+    verbo_interesse: "usar a plataforma",
+    qualificadores: ["tamanho da equipe/empresa", "caso de uso principal", "ferramentas atuais", "orçamento", "prazo para decisão"],
+    perguntas: [
+      "Qual é o principal problema ou processo que você quer resolver com a plataforma?",
+      "Quantas pessoas na sua equipe usariam a ferramenta?",
+      "Atualmente você usa alguma outra ferramenta para isso?",
+      "Qual o prazo ideal para começar a usar?",
+      "Já tem orçamento aprovado para contratar uma solução?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi que você tem interesse na plataforma. Posso fazer uma demonstração rápida hoje para você ver como podemos ajudar no seu processo?`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para entender como a plataforma pode te ajudar, me conta: qual é o principal desafio que você quer resolver com uma ferramenta como a nossa?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse na plataforma? Posso te enviar um material explicando como ela funciona na prática.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que você demonstrou interesse na nossa plataforma. Temos melhorias novas que podem se encaixar bem no que você precisava. Que tal uma demo rápida?`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda faz sentido conhecer a plataforma. Posso retomar com informações mais alinhadas ao seu caso de uso.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para oportunidades na plataforma?`,
+    system: "Você é uma IA comercial especializada em plataformas SaaS e software. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em caso de uso, tamanho de equipe, ferramentas atuais e ROI da solução."
+  };
+
+  if (isEducacao) return {
+    nicho: "Educação",
+    produto: "curso",
+    produto_pl: "cursos",
+    verbo_interesse: "se matricular",
+    qualificadores: ["área de interesse", "nível de experiência", "disponibilidade de horário", "formato (online/presencial)", "orçamento"],
+    perguntas: [
+      "Qual área ou habilidade você quer desenvolver?",
+      "Já tem alguma experiência no tema?",
+      "Prefere aulas ao vivo, gravadas ou presenciais?",
+      "Qual horário tem disponível para estudar?",
+      "Tem orçamento aprovado para investir no curso?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse no curso. Qual é o seu objetivo principal com essa formação? Assim consigo te indicar a melhor turma!`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para te ajudar a escolher o curso certo, me conta: qual área quer desenvolver e qual horário tem disponível?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse em se qualificar nessa área? Posso te enviar detalhes do curso sem compromisso.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Temos novas turmas com horários que podem se encaixar melhor para você. Ainda tem interesse em se qualificar?`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse no curso. Se quiser, posso retomar com as opções atualizadas.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades de cursos?`,
+    system: "Você é uma IA comercial especializada em educação e cursos. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em objetivo de aprendizagem, disponibilidade de horário e formato do curso."
+  };
+
+  if (isAuto) return {
+    nicho: "Automóveis",
+    produto: "veículo",
+    produto_pl: "veículos",
+    verbo_interesse: "comprar um veículo",
+    qualificadores: ["tipo de veículo", "faixa de preço", "novo ou seminovo", "forma de pagamento", "prazo"],
+    perguntas: [
+      "Você prefere veículo novo ou seminovo?",
+      "Qual faixa de preço ou prestação mensal fica confortável?",
+      "Tem algum modelo ou marca de preferência?",
+      "Pretende dar algum veículo como entrada?",
+      "Qual prazo ideal para fechar negócio?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse em um veículo. Qual modelo você tem em mente? Posso verificar a disponibilidade e te apresentar as melhores condições hoje!`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para te ajudar a encontrar o veículo certo, me conta: você prefere novo ou seminovo e qual faixa de valor fica confortável?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse em adquirir um veículo? Posso te enviar algumas opções dentro do que você procura.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Temos novos veículos com condições especiais. Ainda tem interesse? Posso te apresentar opções atualizadas!`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse em um veículo. Posso retomar com opções mais alinhadas ao que você busca.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades de veículos?`,
+    system: "Você é uma IA comercial especializada em automóveis e veículos. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em modelo, ano, forma de pagamento e necessidade do cliente."
+  };
+
+  if (isConsorcio) return {
+    nicho: "Consórcio",
+    produto: "consórcio",
+    produto_pl: "consórcios",
+    verbo_interesse: "contratar um consórcio",
+    qualificadores: ["bem desejado (imóvel, veículo...)", "valor da carta", "prazo do grupo", "parcela máxima"],
+    perguntas: [
+      "Qual bem você quer adquirir com o consórcio? (imóvel, carro, moto...)",
+      "Qual o valor da carta de crédito que você precisa?",
+      "Qual parcela mensal fica dentro do seu orçamento?",
+      "Tem preferência por um prazo específico do grupo?",
+      "Você já participou de algum consórcio antes?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse em consórcio. Qual bem você quer conquistar? Assim consigo te apresentar as melhores condições disponíveis!`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para te indicar o melhor consórcio, me conta: qual o bem desejado e o valor de carta que você precisa?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse em consórcio? Posso te enviar simulações sem compromisso.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que você tinha interesse em consórcio. Temos grupos com condições especiais que podem te atender bem. Posso te mostrar?`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse em consórcio. Posso retomar com simulações atualizadas para você.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para oportunidades em consórcio?`,
+    system: "Você é uma IA comercial especializada em consórcio. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada no bem desejado, valor da carta, prazo do grupo e parcela."
+  };
+
+  // Genérico — sem nicho identificado
+  const nichoNome = lead?.nicho_nome || "produto/serviço";
+  return {
+    nicho: nichoNome,
+    produto: nichoNome,
+    produto_pl: nichoNome,
+    verbo_interesse: "contratar",
+    qualificadores: ["perfil do cliente", "orçamento", "prazo", "necessidade específica"],
+    perguntas: [
+      "O que te motivou a entrar em contato?",
+      "Qual é a sua principal necessidade no momento?",
+      "Qual orçamento você tem disponível?",
+      "Qual o prazo ideal para você tomar uma decisão?",
+      "Tem alguma dúvida específica que posso esclarecer agora?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse e queria te ajudar a avançar. Qual melhor horário para conversarmos hoje?`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Recebi seu interesse e queria entender melhor o que você procura. Pode me contar um pouco mais sobre sua necessidade?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Passando para confirmar se ainda faz sentido eu te enviar mais informações sobre o que você estava buscando.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que nosso contato ficou parado. Ainda posso te ajudar? Me conta o que você precisava e retomamos de onde paramos.`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para confirmar se ainda existe interesse. Se fizer sentido, posso retomar com opções mais alinhadas para você.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades?`,
+    system: `Você é uma IA comercial especializada em ${nichoNome}. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem clara, objetiva e focada nas necessidades do cliente.`
+  };
+}
+
 function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
   const scoreData =
     lead?.score_pontos !== undefined
@@ -1708,6 +1899,8 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
 
   const score = scoreData.score || "morno";
   const { sinais, riscos } = detectarSinaisIA(lead, ml);
+  const ctx = contextoNicho(lead);
+  const nomeDisplay = lead?.nome || "tudo bem";
 
   const prioridade =
     ml?.disponivel && ml.probabilidade_conversao >= 70
@@ -1720,17 +1913,17 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
 
   const proximaAcao =
     prioridade === "alta"
-      ? "Chamar no WhatsApp hoje e tentar agendar uma visita ou conversa objetiva."
+      ? `Chamar no WhatsApp hoje e tentar avançar a conversa sobre ${ctx.produto}.`
       : prioridade === "media"
-      ? "Enviar uma mensagem curta de qualificacao e confirmar faixa de valor, regiao e prazo."
-      : "Nutrir com uma abordagem leve antes de insistir em visita ou proposta.";
+      ? `Enviar mensagem curta para qualificar: ${ctx.qualificadores.slice(0, 2).join(" e ")}.`
+      : `Nutrir com abordagem leve antes de insistir em proposta de ${ctx.produto}.`;
 
   const mensagemWhatsapp =
     prioridade === "alta"
-      ? `Oi ${lead?.nome || "tudo bem"}! Vi seu interesse e queria te ajudar a avancar. Qual melhor horario para falarmos hoje sobre o imovel e uma possivel visita?`
+      ? ctx.msg_quente(nomeDisplay)
       : prioridade === "media"
-      ? `Oi ${lead?.nome || "tudo bem"}! Recebi seu interesse e queria entender melhor o que voce procura. Qual regiao, faixa de valor e prazo ideal para voce?`
-      : `Oi ${lead?.nome || "tudo bem"}! Passando para confirmar se ainda faz sentido eu te enviar algumas opcoes de imoveis dentro do que voce procura.`;
+      ? ctx.msg_morno(nomeDisplay)
+      : ctx.msg_frio(nomeDisplay);
 
   const leadPerdido =
     lead?.status === "perdido";
@@ -1766,27 +1959,19 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
     !leadPerdido
       ? proximaAcao
       : chanceRecuperacao === "alta"
-      ? "Reabrir a conversa hoje com uma mensagem curta, personalizada e sem pressao."
+      ? `Reabrir a conversa hoje com mensagem curta e personalizada sobre ${ctx.produto}.`
       : chanceRecuperacao === "media"
-      ? "Fazer uma tentativa leve de retomada e validar se ainda existe interesse."
-      : "Manter no historico ou arquivar depois de revisar o motivo da perda.";
+      ? `Fazer tentativa leve de retomada e validar se ainda há interesse em ${ctx.produto}.`
+      : "Manter no histórico ou arquivar depois de revisar o motivo da perda.";
 
   const mensagemWhatsappFinal =
     !leadPerdido
       ? mensagemWhatsapp
       : chanceRecuperacao === "alta"
-      ? `Oi ${lead?.nome || "tudo bem"}! Vi que nosso contato ficou parado, mas talvez ainda faca sentido te ajudar. Quer que eu te envie opcoes atualizadas dentro do que voce estava buscando?`
+      ? ctx.msg_rec_alta(nomeDisplay)
       : chanceRecuperacao === "media"
-      ? `Oi ${lead?.nome || "tudo bem"}! Passando para confirmar se ainda existe interesse. Se fizer sentido, posso retomar com opcoes mais alinhadas para voce.`
-      : `Oi ${lead?.nome || "tudo bem"}! So confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades?`;
-
-  const perguntas = [
-    "Voce pretende comprar, alugar ou apenas pesquisar por enquanto?",
-    "Qual faixa de valor ou parcela mensal fica confortavel?",
-    "Tem uma regiao preferida ou bairros que deseja evitar?",
-    "Pretende usar financiamento, entrada propria ou outro formato?",
-    "Qual prazo ideal para visitar ou decidir?"
-  ];
+      ? ctx.msg_rec_media(nomeDisplay)
+      : ctx.msg_rec_baixa(nomeDisplay);
 
   return {
     disponivel: true,
@@ -1795,23 +1980,23 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
     prioridade,
     resumo:
       leadPerdido && chanceRecuperacao === "alta"
-        ? "Lead perdido com boa chance de recuperacao; vale retomar com abordagem curta."
+        ? `Lead perdido com boa chance de recuperação em ${ctx.nicho}; vale retomar com abordagem curta.`
         : leadPerdido && chanceRecuperacao === "media"
-        ? "Lead perdido com chance moderada; tente validar interesse antes de insistir."
+        ? `Lead perdido com chance moderada em ${ctx.nicho}; valide o interesse antes de insistir.`
         : leadPerdido
-        ? "Lead perdido com baixa chance; melhor manter historico organizado ou arquivar."
+        ? `Lead perdido com baixa chance em ${ctx.nicho}; mantenha o histórico organizado.`
         : prioridade === "alta"
-        ? "Lead com bons sinais comerciais e recomendacao de contato rapido."
+        ? `Lead com bons sinais comerciais em ${ctx.nicho}; recomendado contato rápido.`
         : prioridade === "media"
-        ? "Lead com potencial, mas ainda precisa de qualificacao antes da abordagem forte."
-        : "Lead com baixa prioridade no momento; melhor nutrir ou validar interesse.",
+        ? `Lead com potencial em ${ctx.nicho}, mas ainda precisa de qualificação antes da abordagem forte.`
+        : `Lead com baixa prioridade em ${ctx.nicho} no momento; melhor nutrir ou validar interesse.`,
     proxima_acao: proximaAcaoFinal,
     mensagem_whatsapp: mensagemWhatsappFinal,
-    perguntas_qualificacao: perguntas,
-    sinais: sinais.length ? sinais : ["dados ainda limitados para uma analise profunda"],
+    perguntas_qualificacao: ctx.perguntas,
+    sinais: sinais.length ? sinais : ["dados ainda limitados para uma análise profunda"],
     riscos,
     explicacao:
-      "A IA Ouro cruza a classificacao Frio/Morno/Quente, sinais do cadastro, respostas do formulario, historico do lead e previsao do ML quando disponivel. Ela entrega resumo, prioridade, proxima acao e mensagem pronta para reduzir tempo de atendimento.",
+      `A IA Ouro cruza a classificação Frio/Morno/Quente, sinais do cadastro, respostas do formulário e previsão do ML (quando disponível) com foco no nicho ${ctx.nicho}. Ela entrega resumo, prioridade, próxima ação e mensagem pronta para reduzir tempo de atendimento.`,
     score_regras: score,
     pontos_regras: scoreData.pontos || 0,
     recuperacao: leadPerdido
@@ -1982,19 +2167,24 @@ async function gerarAnaliseIAOpenAI(
       Array.isArray(lead?.respostas_qualificacao)
         ? lead.respostas_qualificacao
         : [],
+    nicho_nome: lead?.nicho_nome || null,
+    nicho_slug: lead?.nicho_slug || null,
     criado_em: lead?.criado_em || null,
     ml
   };
 
+  const ctx = contextoNicho(lead);
   const iaConf = await buscarConfigIA();
   const systemMsg =
-    "Voce e uma IA comercial para uma plataforma imobiliaria. Analise o lead, priorize a acao do corretor e, quando o status for perdido, foque em recuperacao. Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso. IMPORTANTE: o campo mensagem_whatsapp deve conter somente texto puro, sem emojis ou caracteres especiais.";
+    `${ctx.system} Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso. IMPORTANTE: as mensagens de WhatsApp devem ser naturais, personalizadas ao nicho "${ctx.nicho}" e sem emojis ou caracteres especiais. As perguntas de qualificacao devem focar em: ${ctx.qualificadores.join(", ")}.`;
   const schemaDescricao =
     `Retorne SOMENTE JSON valido com esta estrutura exata (sem texto antes ou depois):
 {"prioridade":"alta"|"media"|"baixa","resumo":"string","proxima_acao":"string","mensagem_whatsapp":"string","perguntas_qualificacao":["string"],"sinais":["string"],"riscos":["string"],"explicacao":"string","recuperacao":{"chance":"alta"|"media"|"baixa"|"nao_aplicavel","motivo_perda":"string","recomendacao":"string"}}`;
   const userText = JSON.stringify({
     lead: payloadLead,
-    objetivo: "Gerar analise comercial, proxima acao, mensagem de WhatsApp e recuperacao quando aplicavel."
+    nicho: ctx.nicho,
+    produto: ctx.produto,
+    objetivo: `Gerar analise comercial focada em ${ctx.nicho}, proxima acao, mensagem de WhatsApp personalizada para o nicho e recuperacao quando aplicavel.`
   });
 
   const parseAnalise = (texto: string) => {
