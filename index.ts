@@ -6105,6 +6105,9 @@ const PLATAFORMAS_DISPONIVEIS = [
   "tiktok",
   "linkedin",
   "kwai",
+  "pinterest",
+  "snapchat",
+  "microsoft",
   "formulario",
 ] as const;
 
@@ -9895,6 +9898,25 @@ app.post("/leads", authMiddleware, async (c) => {
   }
 });
 
+// 🔹 leads por plataforma (stats para o dashboard)
+app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const result = await client.query(
+      `SELECT COALESCE(plataforma, 'meta') AS plataforma, COUNT(*)::int AS total
+       FROM leads
+       WHERE usuario_id = $1
+       GROUP BY COALESCE(plataforma, 'meta')
+       ORDER BY total DESC`,
+      [user.id]
+    );
+    return c.json(result.rows);
+  } catch (err) {
+    console.error("ERRO stats plataformas:", err);
+    return c.json({ error: "Erro ao carregar stats" }, 500);
+  }
+});
+
 // 🔹 listar leads
 app.get("/leads", authMiddleware, async (c) => {
 
@@ -9930,7 +9952,8 @@ app.get("/leads", authMiddleware, async (c) => {
         n.nome AS nicho_nome,
         n.cor  AS nicho_cor,
         l.data_contato,
-        l.observacao_agendamento
+        l.observacao_agendamento,
+        COALESCE(l.plataforma, 'meta') AS plataforma
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
       WHERE l.usuario_id = $1
