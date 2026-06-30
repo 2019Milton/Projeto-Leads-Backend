@@ -6350,9 +6350,9 @@ app.get("/conexoes", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
 
-    // Meta: usa tabela legada meta_conexoes
+    // Meta: usa tabela legada meta_conexoes (nao tem coluna conectado_em, usa criado_em)
     const metaConn = await client.query(
-      `SELECT conta_anuncios_id, instagram_username, conectado_em
+      `SELECT conta_anuncios_id, instagram_username, criado_em AS conectado_em
        FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
       [user.id]
     );
