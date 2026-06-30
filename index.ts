@@ -3895,44 +3895,49 @@ app.get("/auth/:plataforma/login", async (c) => {
   const cfg = OAUTH_PROVEDORES[plataforma];
   if (!cfg) return c.text("Plataforma nao suporta conexao OAuth", 404);
 
-  const token = c.req.query("token");
-  if (!token) return c.text("Token nao enviado", 400);
+  try {
+    const token = c.req.query("token");
+    if (!token) return c.text("Token nao enviado", 400);
 
-  const usuario = decodificarTokenUsuario(token);
-  if (!usuario?.id) return c.text("Token invalido ou expirado", 401);
+    const usuario = decodificarTokenUsuario(token);
+    if (!usuario?.id) return c.text("Token invalido ou expirado", 401);
 
-  const clientId    = Bun.env[cfg.clientIdEnv];
-  const redirectUri = Bun.env[cfg.redirectUriEnv];
+    const clientId    = Bun.env[cfg.clientIdEnv];
+    const redirectUri = Bun.env[cfg.redirectUriEnv];
 
-  if (!clientId || !redirectUri || !cfg.authUrl) {
-    return c.text(
-      `Integracao com ${plataforma} ainda nao configurada (credenciais pendentes de aprovacao da plataforma).`,
-      503
+    if (!clientId || !redirectUri || !cfg.authUrl) {
+      return c.text(
+        `Integracao com ${plataforma} ainda nao configurada (credenciais pendentes de aprovacao da plataforma).`,
+        503
+      );
+    }
+
+    const state = gerarOAuthStateGenerico();
+    const stateHash = hashOAuthStateGenerico(state);
+
+    await client.query(
+      `DELETE FROM plataforma_oauth_states WHERE expira_em <= NOW() OR usado_em IS NOT NULL`
     );
+    await client.query(
+      `INSERT INTO plataforma_oauth_states (state_hash, usuario_id, plataforma, expira_em)
+       VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
+      [stateHash, usuario.id, plataforma, META_OAUTH_STATE_TTL_MINUTES]
+    );
+
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: cfg.scope,
+      state,
+      ...(cfg.extraAuthParams || {}),
+    });
+
+    return c.redirect(`${cfg.authUrl}?${params.toString()}`);
+  } catch (err) {
+    console.error(`ERRO /auth/${plataforma}/login:`, err);
+    return c.text("Token invalido ou expirado", 401);
   }
-
-  const state = gerarOAuthStateGenerico();
-  const stateHash = hashOAuthStateGenerico(state);
-
-  await client.query(
-    `DELETE FROM plataforma_oauth_states WHERE expira_em <= NOW() OR usado_em IS NOT NULL`
-  );
-  await client.query(
-    `INSERT INTO plataforma_oauth_states (state_hash, usuario_id, plataforma, expira_em)
-     VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
-    [stateHash, usuario.id, plataforma, META_OAUTH_STATE_TTL_MINUTES]
-  );
-
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    response_type: "code",
-    scope: cfg.scope,
-    state,
-    ...(cfg.extraAuthParams || {}),
-  });
-
-  return c.redirect(`${cfg.authUrl}?${params.toString()}`);
 });
 
 app.get("/auth/:plataforma/callback", async (c) => {
