@@ -3805,6 +3805,236 @@ app.get("/auth/meta/callback", async (c) => {
 
 
 /* =========================
+   🔌 OAUTH GENÉRICO — demais plataformas de anúncio
+   Google, TikTok, LinkedIn, Pinterest, Snapchat, Microsoft, Kwai.
+   Aguardando credenciais aprovadas por cada rede. Quando o
+   client_id/secret/redirect_uri de uma plataforma forem configurados
+   nas envs (ver *_CLIENT_ID/*_CLIENT_SECRET/*_REDIRECT_URI abaixo),
+   o fluxo de conexao passa a funcionar sem mais nenhuma mudanca aqui.
+========================= */
+
+const OAUTH_PROVEDORES: Record<string, {
+  authUrl: string;
+  tokenUrl: string;
+  scope: string;
+  clientIdEnv: string;
+  clientSecretEnv: string;
+  redirectUriEnv: string;
+  extraAuthParams?: Record<string, string>;
+}> = {
+  google: {
+    authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: "https://oauth2.googleapis.com/token",
+    scope: "https://www.googleapis.com/auth/adwords",
+    clientIdEnv: "GOOGLE_ADS_CLIENT_ID",
+    clientSecretEnv: "GOOGLE_ADS_CLIENT_SECRET",
+    redirectUriEnv: "GOOGLE_ADS_REDIRECT_URI",
+    extraAuthParams: { access_type: "offline", prompt: "consent" },
+  },
+  tiktok: {
+    authUrl: "https://business-api.tiktok.com/portal/auth",
+    tokenUrl: "https://business-api.tiktok.com/open_api/v1.3/oauth2/access_token/",
+    scope: "",
+    clientIdEnv: "TIKTOK_ADS_APP_ID",
+    clientSecretEnv: "TIKTOK_ADS_APP_SECRET",
+    redirectUriEnv: "TIKTOK_ADS_REDIRECT_URI",
+  },
+  linkedin: {
+    authUrl: "https://www.linkedin.com/oauth/v2/authorization",
+    tokenUrl: "https://www.linkedin.com/oauth/v2/accessToken",
+    scope: "r_ads r_ads_reporting rw_ads",
+    clientIdEnv: "LINKEDIN_ADS_CLIENT_ID",
+    clientSecretEnv: "LINKEDIN_ADS_CLIENT_SECRET",
+    redirectUriEnv: "LINKEDIN_ADS_REDIRECT_URI",
+  },
+  pinterest: {
+    authUrl: "https://www.pinterest.com/oauth/",
+    tokenUrl: "https://api.pinterest.com/v5/oauth/token",
+    scope: "ads:read,ads:write",
+    clientIdEnv: "PINTEREST_ADS_APP_ID",
+    clientSecretEnv: "PINTEREST_ADS_APP_SECRET",
+    redirectUriEnv: "PINTEREST_ADS_REDIRECT_URI",
+  },
+  snapchat: {
+    authUrl: "https://accounts.snapchat.com/login/oauth2/authorize",
+    tokenUrl: "https://accounts.snapchat.com/login/oauth2/access_token",
+    scope: "snapchat-marketing-api",
+    clientIdEnv: "SNAPCHAT_ADS_CLIENT_ID",
+    clientSecretEnv: "SNAPCHAT_ADS_CLIENT_SECRET",
+    redirectUriEnv: "SNAPCHAT_ADS_REDIRECT_URI",
+  },
+  microsoft: {
+    authUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+    tokenUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    scope: "https://ads.microsoft.com/msads.manage offline_access",
+    clientIdEnv: "MICROSOFT_ADS_CLIENT_ID",
+    clientSecretEnv: "MICROSOFT_ADS_CLIENT_SECRET",
+    redirectUriEnv: "MICROSOFT_ADS_REDIRECT_URI",
+  },
+  kwai: {
+    // Kwai ainda nao publica um fluxo OAuth self-service documentado;
+    // authUrl/tokenUrl ficam vazios de proposito ate isso existir.
+    authUrl: "",
+    tokenUrl: "",
+    scope: "",
+    clientIdEnv: "KWAI_ADS_CLIENT_ID",
+    clientSecretEnv: "KWAI_ADS_CLIENT_SECRET",
+    redirectUriEnv: "KWAI_ADS_REDIRECT_URI",
+  },
+};
+
+function gerarOAuthStateGenerico() {
+  return base64Url(randomBytes(32));
+}
+function hashOAuthStateGenerico(state: string) {
+  return assinarPayload(`plataforma-oauth-state:${state}`);
+}
+
+app.get("/auth/:plataforma/login", async (c) => {
+  const plataforma = c.req.param("plataforma");
+  const cfg = OAUTH_PROVEDORES[plataforma];
+  if (!cfg) return c.text("Plataforma nao suporta conexao OAuth", 404);
+
+  const token = c.req.query("token");
+  if (!token) return c.text("Token nao enviado", 400);
+
+  const usuario = decodificarTokenUsuario(token);
+  if (!usuario?.id) return c.text("Token invalido ou expirado", 401);
+
+  const clientId    = Bun.env[cfg.clientIdEnv];
+  const redirectUri = Bun.env[cfg.redirectUriEnv];
+
+  if (!clientId || !redirectUri || !cfg.authUrl) {
+    return c.text(
+      `Integracao com ${plataforma} ainda nao configurada (credenciais pendentes de aprovacao da plataforma).`,
+      503
+    );
+  }
+
+  const state = gerarOAuthStateGenerico();
+  const stateHash = hashOAuthStateGenerico(state);
+
+  await client.query(
+    `DELETE FROM plataforma_oauth_states WHERE expira_em <= NOW() OR usado_em IS NOT NULL`
+  );
+  await client.query(
+    `INSERT INTO plataforma_oauth_states (state_hash, usuario_id, plataforma, expira_em)
+     VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
+    [stateHash, usuario.id, plataforma, META_OAUTH_STATE_TTL_MINUTES]
+  );
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: cfg.scope,
+    state,
+    ...(cfg.extraAuthParams || {}),
+  });
+
+  return c.redirect(`${cfg.authUrl}?${params.toString()}`);
+});
+
+app.get("/auth/:plataforma/callback", async (c) => {
+  const plataforma = c.req.param("plataforma");
+  const cfg = OAUTH_PROVEDORES[plataforma];
+  if (!cfg) return c.text("Plataforma nao suporta conexao OAuth", 404);
+
+  try {
+    const code  = c.req.query("code");
+    const state = c.req.query("state");
+    if (!state) return c.text("State nao recebido", 400);
+    if (!code)  return c.text("Erro: code nao recebido", 400);
+
+    const clientId     = Bun.env[cfg.clientIdEnv];
+    const clientSecret = Bun.env[cfg.clientSecretEnv];
+    const redirectUri   = Bun.env[cfg.redirectUriEnv];
+
+    if (!clientId || !clientSecret || !redirectUri) {
+      return c.text(`Configuracao de ${plataforma} incompleta`, 500);
+    }
+
+    const stateHash = hashOAuthStateGenerico(state);
+    const db = await client.connect();
+    let usuarioId: number | null = null;
+
+    try {
+      await db.query("BEGIN");
+
+      const stateResult = await db.query(
+        `SELECT id, usuario_id FROM plataforma_oauth_states
+         WHERE state_hash = $1 AND plataforma = $2 AND usado_em IS NULL AND expira_em > NOW()
+         LIMIT 1 FOR UPDATE`,
+        [stateHash, plataforma]
+      );
+
+      if (stateResult.rows.length === 0) {
+        await db.query("ROLLBACK");
+        return c.text("State invalido ou expirado", 401);
+      }
+
+      usuarioId = Number(stateResult.rows[0].usuario_id);
+
+      await db.query(
+        `UPDATE plataforma_oauth_states SET usado_em = NOW() WHERE id = $1`,
+        [stateResult.rows[0].id]
+      );
+
+      await db.query("COMMIT");
+    } catch (err) {
+      await db.query("ROLLBACK");
+      throw err;
+    } finally {
+      db.release();
+    }
+
+    const tokenRes = await fetch(cfg.tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    const access_token = tokenData.access_token;
+
+    if (!tokenRes.ok || !access_token) {
+      console.error(`ERRO TOKEN ${plataforma.toUpperCase()}:`, tokenData);
+      return c.text(`Erro ao obter token de ${plataforma}`, 502);
+    }
+
+    if (!usuarioId) {
+      return c.text("Usuario invalido", 401);
+    }
+
+    await client.query(
+      `INSERT INTO plataforma_conexoes (usuario_id, plataforma, status, access_token, conectado_em, atualizado_em)
+       VALUES ($1, $2, 'conectado', $3, NOW(), NOW())
+       ON CONFLICT (usuario_id, plataforma)
+       DO UPDATE SET status = 'conectado', access_token = $3, atualizado_em = NOW()`,
+      [usuarioId, plataforma, access_token]
+    );
+
+    return c.html(`
+      <script>
+        if (window.opener) {
+          window.opener.postMessage({ type: "plataforma_conectada", plataforma: "${plataforma}" }, "*");
+        }
+        window.close();
+      </script>
+    `);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`ERRO CALLBACK ${plataforma.toUpperCase()}:`, msg, err);
+    return c.text(`Erro ao conectar ${plataforma}: ${msg}`);
+  }
+});
+
+/* =========================
    📷 INSTAGRAM LOGIN (Business Login)
 ========================= */
 
@@ -6548,6 +6778,24 @@ await client.query(`
 await client.query(`
   CREATE INDEX IF NOT EXISTS idx_meta_oauth_states_hash
   ON meta_oauth_states (state_hash);
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS plataforma_oauth_states (
+    id SERIAL PRIMARY KEY,
+    state_hash TEXT NOT NULL,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    plataforma TEXT NOT NULL,
+    expira_em TIMESTAMP NOT NULL,
+    usado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(state_hash, plataforma)
+  );
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_plataforma_oauth_states_hash
+  ON plataforma_oauth_states (state_hash);
 `);
 
 await client.query(`
