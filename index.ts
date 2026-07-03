@@ -2816,6 +2816,8 @@ const authMiddleware = async (c: any, next: any) => {
         u.admin_id,
         u.ia_limite_mensal,
         u.ia_custo_limite_mensal,
+        u.whatsapp,
+        COALESCE(u.notif_whatsapp_lead, true) AS notif_whatsapp_lead,
         COALESCE(u.ia_ativo, true) AS ia_ativo,
         COALESCE(u.ia_provider, 'auto') AS ia_provider,
         COALESCE(u.ativo, true) AS ativo,
