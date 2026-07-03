@@ -5495,6 +5495,12 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
       Object.values(upload.images || {})?.[0] as any;
 
     const hash = primeiraImagem?.hash;
+    const urlImagem =
+      primeiraImagem?.url ||
+      primeiraImagem?.url_128 ||
+      primeiraImagem?.permalink_url ||
+      primeiraImagem?.original_url ||
+      null;
 
     if (!hash) {
 
@@ -5507,7 +5513,7 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
     return c.json({
       sucesso: true,
       hash,
-      url: (primeiraImagem?.url || primeiraImagem?.url_128) ?? null
+      url: urlImagem
     });
 
   } catch (err: any) {
@@ -5806,6 +5812,32 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
     );
 
     // 💾 UPDATE CAMPANHA
+    const configuracoesPersistidas = {
+      ...(configuracoes_avancadas || {}),
+      texto,
+      cta,
+      page_id,
+      form_id,
+      imageHash: hashes[0] || imageHash || null,
+      imageHashes: hashes,
+      imagens_urls: Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [],
+      image_urls: Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [],
+      creative_id: creative.id,
+      ad_id: ad.id,
+      adset_id,
+      image_hash: hashes[0] || imageHash || null,
+      image_hashes: hashes,
+      criativo: {
+        creative_id: creative.id,
+        image_hash: hashes[0] || imageHash || null,
+        image_hashes: hashes,
+        carrossel: isCarrossel,
+        titulo: tituloAnuncio,
+        descricao: descricaoAnuncio,
+        link: linkDestino
+      }
+    };
+
     const update = await client.query(
       `
       UPDATE campanhas
@@ -5815,13 +5847,9 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         form_id = $3,
         page_id = $4,
         daily_budget = $5,
-        configuracoes_avancadas = configuracoes_avancadas || jsonb_build_object(
-          'texto', $8::text,
-          'cta', $9::text,
-          'imagens_urls', $10::jsonb
-        )
-      WHERE CAST(campaign_id AS TEXT) = $6
-      AND usuario_id = $7
+        configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $6::jsonb
+      WHERE CAST(campaign_id AS TEXT) = $7
+      AND usuario_id = $8
       `,
       [
         adset_id,
@@ -5829,11 +5857,9 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         form_id,
         page_id,
         numeroOpcional(daily_budget),
+        JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
-        usuarioId,
-        texto ?? null,
-        cta ?? null,
-        JSON.stringify(Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [])
+        usuarioId
       ]
     );
 
@@ -8642,6 +8668,21 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       `
       SELECT
         c.*,
+        ci.tipo_imovel,
+        ci.finalidade,
+        ci.valor_min,
+        ci.valor_max,
+        ci.regiao,
+        cs.operadora,
+        cs.tipo_plano,
+        cs.faixa_etaria_min,
+        cs.faixa_etaria_max,
+        cs.cobertura,
+        cs.acomodacao,
+        cp.produto,
+        cp.objetivo AS objetivo_nicho,
+        cp.marca,
+        cp.publico_alvo,
         dono.email AS criado_por_email,
         dono.nome AS criado_por_nome,
         dono.sobrenome AS criado_por_sobrenome,
@@ -8663,6 +8704,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
+      LEFT JOIN campanhas_imoveis ci
+        ON ci.campanha_id = c.id
+      LEFT JOIN campanhas_saude cs
+        ON cs.campanha_id = c.id
+      LEFT JOIN campanhas_suplementos cp
+        ON cp.campanha_id = c.id
       WHERE
         (
           c.usuario_id = $1
@@ -8984,6 +9031,25 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         "mensagemErroPagamento:", mensagemErroPagamento
       );
 
+      const configuracoesCampanha = {
+        ...(campanha.configuracoes_avancadas || {}),
+        tipo_imovel: campanha.tipo_imovel ?? campanha.configuracoes_avancadas?.tipo_imovel,
+        finalidade: campanha.finalidade ?? campanha.configuracoes_avancadas?.finalidade,
+        valor_min: campanha.valor_min ?? campanha.configuracoes_avancadas?.valor_min,
+        valor_max: campanha.valor_max ?? campanha.configuracoes_avancadas?.valor_max,
+        regiao: campanha.regiao ?? campanha.configuracoes_avancadas?.regiao,
+        operadora: campanha.operadora ?? campanha.configuracoes_avancadas?.operadora,
+        tipo_plano: campanha.tipo_plano ?? campanha.configuracoes_avancadas?.tipo_plano,
+        faixa_etaria_min: campanha.faixa_etaria_min ?? campanha.configuracoes_avancadas?.faixa_etaria_min,
+        faixa_etaria_max: campanha.faixa_etaria_max ?? campanha.configuracoes_avancadas?.faixa_etaria_max,
+        cobertura: campanha.cobertura ?? campanha.configuracoes_avancadas?.cobertura,
+        acomodacao: campanha.acomodacao ?? campanha.configuracoes_avancadas?.acomodacao,
+        produto: campanha.produto ?? campanha.configuracoes_avancadas?.produto,
+        objetivo: campanha.objetivo_nicho ?? campanha.configuracoes_avancadas?.objetivo,
+        marca: campanha.marca ?? campanha.configuracoes_avancadas?.marca,
+        publico_alvo: campanha.publico_alvo ?? campanha.configuracoes_avancadas?.publico_alvo
+      };
+
       metricas.push({
         id: campanha.id,
         nome: campanha.nome,
@@ -9008,7 +9074,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         recebida_por_encaminhamento:
           Number(campanha.usuario_id) !== Number(user.id),
         configuracoes_avancadas:
-          campanha.configuracoes_avancadas || {},
+          configuracoesCampanha,
         daily_budget:
           campanha.daily_budget || null,
 
