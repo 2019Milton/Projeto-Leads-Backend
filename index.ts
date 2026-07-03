@@ -5191,7 +5191,7 @@ app.post("/meta/formulario", authMiddleware, async (c) => {
 
     const perguntasExtras =
       listaOpcional(avancadas.perguntas)
-        .slice(0, 10)
+        .slice(0, 4)
         .map((pergunta, index) => ({
           type: "CUSTOM",
           key: `qualificacao_${index + 1}`,
@@ -10997,7 +10997,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         { type: "FULL_NAME" },
         { type: "EMAIL" },
         { type: "PHONE" },
-        ...perguntasExtras.slice(0, 10).map((pergunta: string, index: number) => ({
+        ...perguntasExtras.slice(0, 4).map((pergunta: string, index: number) => ({
           type: "CUSTOM",
           key: `qualificacao_${index + 1}`,
           label: pergunta
@@ -16282,7 +16282,7 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
 
     if (pagina?.access_token) {
       const perguntasExtras = Array.isArray(cfgFormulario.perguntas_customizadas)
-        ? cfgFormulario.perguntas_customizadas.slice(0, 10).map((q: string, i: number) => ({
+        ? cfgFormulario.perguntas_customizadas.slice(0, 4).map((q: string, i: number) => ({
             type: "CUSTOM", key: `qualificacao_${i + 1}`, label: q
           }))
         : [];
