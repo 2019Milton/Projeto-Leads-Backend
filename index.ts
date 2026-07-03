@@ -10148,29 +10148,13 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
     const ad_id =
       campanhaBanco.rows[0]?.ad_id;
 
-    const contaAnunciosUsuarioAtual =
-      await obterContaAnunciosSelecionadaIdUsuario(
-        user.id
-      ).catch(() => null);
-
-    const campanhaNaContaDoUsuarioAtual =
-      contaAnunciosUsuarioAtual &&
-      campanhaBanco.rows[0].conta_anuncios_id &&
-      String(contaAnunciosUsuarioAtual) ===
-        String(campanhaBanco.rows[0].conta_anuncios_id);
-
-    const tokenOwnerUserId =
-      campanhaNaContaDoUsuarioAtual
-        ? user.id
-        : campanhaBanco.rows[0].usuario_id;
-
     console.log("ADSET:", adset_id);
 
     console.log("AD:", ad_id);
 
 
 
-    // 🔐 TOKEN
+    // 🔐 TOKEN — sempre usa a conta Meta do próprio usuário que está publicando
     const conn = await client.query(
       `
       SELECT access_token
@@ -10179,7 +10163,7 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       ORDER BY id DESC
       LIMIT 1
       `,
-      [tokenOwnerUserId]
+      [user.id]
     );
 
     if (conn.rows.length === 0) {
