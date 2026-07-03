@@ -681,6 +681,82 @@ function urlOpcional(value: unknown, fallback: string) {
   return fallback;
 }
 
+function mensagemErroMeta(resposta: any, fallback: string) {
+  return (
+    resposta?.error?.error_user_msg ||
+    resposta?.error?.message ||
+    resposta?.detalhe?.error_user_msg ||
+    resposta?.detalhe?.message ||
+    resposta?.message ||
+    resposta?.error ||
+    fallback
+  );
+}
+
+async function registrarErroPublicacaoCampanha(
+  campanhaId: number,
+  mensagem: string
+) {
+  await client.query(
+    `
+    UPDATE campanhas
+    SET
+      configuracoes_avancadas =
+        COALESCE(configuracoes_avancadas, '{}'::jsonb) ||
+        jsonb_build_object(
+          'ultimo_erro_publicacao', $1::text,
+          'ultimo_erro_publicacao_em', NOW()
+        ),
+      atualizado_em = NOW()
+    WHERE id = $2
+    `,
+    [mensagem, campanhaId]
+  );
+}
+
+async function limparErroPublicacaoCampanha(campanhaId: number) {
+  await client.query(
+    `
+    UPDATE campanhas
+    SET
+      configuracoes_avancadas =
+        COALESCE(configuracoes_avancadas, '{}'::jsonb) -
+        'ultimo_erro_publicacao' -
+        'ultimo_erro_publicacao_em',
+      atualizado_em = NOW()
+    WHERE id = $1
+    `,
+    [campanhaId]
+  );
+}
+
+async function enviarImagemMetaPorUrl(
+  token: string,
+  adAccountId: string,
+  urlImagem: string
+) {
+  const body = new URLSearchParams();
+  body.set("url", urlImagem);
+  body.set("access_token", token);
+
+  const upload = await fetch(
+    `https://graph.facebook.com/v19.0/${adAccountId}/adimages`,
+    {
+      method: "POST",
+      body
+    }
+  ).then(r => r.json());
+
+  const primeiraImagem =
+    upload?.images &&
+    (Object.values(upload.images || {})?.[0] as any);
+
+  return {
+    hash: primeiraImagem?.hash || null,
+    resposta: upload
+  };
+}
+
 function montarTargetingMeta(avancadas: any) {
   const pais =
     textoOpcional(avancadas?.pais)
@@ -9216,6 +9292,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         metricas_origem: metaDisponivel ? "meta" : "local",
         meta_disponivel: metaDisponivel,
         erro_meta: erroMeta,
+        erro_publicacao:
+          campanha.configuracoes_avancadas?.ultimo_erro_publicacao || null,
         erro_pagamento: mensagemErroPagamento || null,
         veiculacao: veiculacaoStatus,
         veiculacao_label: traduzirVeiculacaoMeta(veiculacaoStatus),
@@ -10041,7 +10119,7 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
 
     const campanhaBanco = await client.query(
       `
-      SELECT id, adset_id, ad_id, usuario_id
+      SELECT id, adset_id, ad_id, usuario_id, conta_anuncios_id
       FROM campanhas
       WHERE campaign_id = $1
       AND (
@@ -10070,9 +10148,21 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
     const ad_id =
       campanhaBanco.rows[0]?.ad_id;
 
-    // Usa o token do dono original da campanha (corretores receptores não têm Meta conectada)
+    const contaAnunciosUsuarioAtual =
+      await obterContaAnunciosSelecionadaIdUsuario(
+        user.id
+      ).catch(() => null);
+
+    const campanhaNaContaDoUsuarioAtual =
+      contaAnunciosUsuarioAtual &&
+      campanhaBanco.rows[0].conta_anuncios_id &&
+      String(contaAnunciosUsuarioAtual) ===
+        String(campanhaBanco.rows[0].conta_anuncios_id);
+
     const tokenOwnerUserId =
-      campanhaBanco.rows[0].usuario_id;
+      campanhaNaContaDoUsuarioAtual
+        ? user.id
+        : campanhaBanco.rows[0].usuario_id;
 
     console.log("ADSET:", adset_id);
 
@@ -10730,6 +10820,524 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     return c.json({
       error: "Erro ao editar campanha"
     }, 500);
+  }
+});
+
+
+app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
+
+  let campanhaId = 0;
+  let campaignMetaId: string | null = null;
+  let token = "";
+
+  const falhar = async (
+    mensagem: string,
+    detalhe: any = null,
+    status = 400
+  ) => {
+    if (campanhaId) {
+      await registrarErroPublicacaoCampanha(campanhaId, mensagem);
+    }
+
+    if (campaignMetaId && token) {
+      await fetch(
+        `https://graph.facebook.com/v19.0/${campaignMetaId}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ access_token: token })
+        }
+      ).catch(() => null);
+    }
+
+    return c.json({
+      error: mensagem,
+      detalhe
+    }, status);
+  };
+
+  try {
+
+    const user: any = c.get("user");
+
+    campanhaId =
+      Number(c.req.param("id"));
+
+    if (!Number.isFinite(campanhaId) || campanhaId <= 0) {
+      return c.json({
+        error: "Campanha inválida"
+      }, 400);
+    }
+
+    const campanhaRes = await client.query(
+      `
+      SELECT c.*
+      FROM campanhas c
+      WHERE c.id = $1
+      AND (
+        c.usuario_id = $2
+        OR EXISTS (
+          SELECT 1
+          FROM campanha_corretores cc
+          WHERE cc.campanha_id = c.id
+          AND cc.usuario_id = $2
+        )
+      )
+      LIMIT 1
+      `,
+      [campanhaId, user.id]
+    );
+
+    if (!campanhaRes.rows.length) {
+      return c.json({
+        error: "Campanha não disponível para este usuário"
+      }, 404);
+    }
+
+    const campanha = campanhaRes.rows[0];
+    const cfg = campanha.configuracoes_avancadas || {};
+
+    const conn = await client.query(
+      `
+      SELECT access_token, conta_anuncios_id
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    if (!conn.rows.length) {
+      return await falhar(
+        "Meta não conectada. Conecte sua conta Meta antes de publicar esta campanha."
+      );
+    }
+
+    token = conn.rows[0].access_token;
+
+    const contaAds =
+      await obterContaAnuncios(
+        token,
+        conn.rows[0].conta_anuncios_id
+      );
+
+    if (!contaAds) {
+      return await falhar(
+        "Nenhuma conta de anúncios encontrada na Meta conectada."
+      );
+    }
+
+    const adAccountId = contaAds.id;
+
+    const pages = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+    ).then(r => r.json());
+
+    if (!Array.isArray(pages.data) || !pages.data.length) {
+      return await falhar(
+        "Nenhuma Página do Facebook encontrada na Meta conectada. Configure uma página antes de publicar."
+      );
+    }
+
+    let page =
+      pages.data.find((p: any) => p.id === textoOpcional(cfg.page_id)) ||
+      pages.data[0];
+
+    const pageId =
+      page.id;
+
+    const pageToken =
+      page.access_token;
+
+    if (!pageId || !pageToken) {
+      return await falhar(
+        "A Página selecionada não retornou token de acesso. Reconecte a Meta e tente novamente."
+      );
+    }
+
+    const valorOrcamento =
+      Number(campanha.daily_budget || cfg.daily_budget || cfg.orcamento_diario_centavos || 0) ||
+      Math.round(Number(cfg.orcamento || cfg.orcamento_diario || 20) * 100);
+
+    const dailyBudget =
+      Math.max(100, Math.round(valorOrcamento));
+
+    const categoriaEspecial =
+      textoOpcional(cfg.categoria_especial);
+
+    const payloadCampanha: any = {
+      name: campanha.nome || cfg.nome || "Campanha Leads Plataforma",
+      objective: "OUTCOME_LEADS",
+      status: "ACTIVE",
+      special_ad_categories: categoriaEspecial ? [categoriaEspecial] : [],
+      is_adset_budget_sharing_enabled: false,
+      access_token: token
+    };
+
+    if (cfg.cbo ?? true) {
+      payloadCampanha.daily_budget = dailyBudget;
+    }
+
+    const campanhaMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/campaigns`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadCampanha)
+      }
+    ).then(r => r.json());
+
+    if (!campanhaMeta.id) {
+      return await falhar(
+        mensagemErroMeta(campanhaMeta, "Erro ao criar campanha na Meta"),
+        campanhaMeta
+      );
+    }
+
+    campaignMetaId = campanhaMeta.id;
+
+    const perguntasExtras =
+      Array.isArray(cfg.perguntas)
+        ? cfg.perguntas
+        : Array.isArray(cfg.perguntas_qualificacao)
+          ? cfg.perguntas_qualificacao
+          : [];
+
+    const payloadFormulario: any = {
+      name: `Form ${campanha.nome || "Leads"} ${Date.now()}`,
+      locale: "pt_BR",
+      questions: [
+        { type: "FULL_NAME" },
+        { type: "EMAIL" },
+        { type: "PHONE" },
+        ...perguntasExtras.slice(0, 10).map((pergunta: string, index: number) => ({
+          type: "CUSTOM",
+          key: `qualificacao_${index + 1}`,
+          label: pergunta
+        }))
+      ],
+      privacy_policy: {
+        url: urlOpcional(cfg.privacidade_url || cfg.url_privacidade, "https://google.com"),
+        link_text:
+          textoOpcional(cfg.privacidade_texto) ||
+          "Política de Privacidade"
+      },
+      thank_you_page: {
+        title:
+          textoOpcional(cfg.obrigado_titulo) ||
+          textoOpcional(cfg.mensagem_agradecimento_titulo) ||
+          "Obrigado!",
+        body:
+          textoOpcional(cfg.obrigado_texto) ||
+          textoOpcional(cfg.mensagem_agradecimento) ||
+          "Recebemos seus dados 🚀",
+        button_type: "VIEW_WEBSITE",
+        button_text:
+          textoOpcional(cfg.obrigado_botao) ||
+          "Ver mais",
+        website_url: urlOpcional(
+          cfg.obrigado_url || cfg.url_privacidade || cfg.privacidade_url,
+          "https://google.com"
+        )
+      },
+      access_token: pageToken
+    };
+
+    if (cfg.formulario_qualidade) {
+      payloadFormulario.is_optimized_for_quality = true;
+    }
+
+    const formMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${pageId}/leadgen_forms`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadFormulario)
+      }
+    ).then(r => r.json());
+
+    if (!formMeta.id) {
+      return await falhar(
+        mensagemErroMeta(formMeta, "Erro ao criar formulário de leads na Meta"),
+        formMeta
+      );
+    }
+
+    const targeting =
+      montarTargetingMeta(cfg);
+
+    if (
+      [
+        "HOUSING",
+        "CREDIT",
+        "EMPLOYMENT"
+      ].includes(categoriaEspecial)
+    ) {
+      delete targeting.age_min;
+      delete targeting.age_max;
+      delete targeting.genders;
+    }
+
+    const payloadAdset: any = {
+      name: `AdSet ${campanha.nome || "Leads"} ${Date.now()}`,
+      campaign_id: campanhaMeta.id,
+      billing_event: "IMPRESSIONS",
+      optimization_goal: "LEAD_GENERATION",
+      destination_type: "ON_AD",
+      bid_strategy:
+        textoOpcional(cfg.bid_strategy) ||
+        "LOWEST_COST_WITHOUT_CAP",
+      start_time: new Date(Date.now() + 60000).toISOString(),
+      targeting,
+      promoted_object: {
+        page_id: pageId
+      },
+      status: "ACTIVE",
+      access_token: token
+    };
+
+    if (!(cfg.cbo ?? true)) {
+      payloadAdset.daily_budget = dailyBudget;
+    }
+
+    const bidAmount =
+      numeroOpcional(cfg.bid_amount);
+
+    if (
+      bidAmount !== null &&
+      payloadAdset.bid_strategy !== "LOWEST_COST_WITHOUT_CAP"
+    ) {
+      payloadAdset.bid_amount =
+        Math.round(bidAmount * 100);
+    }
+
+    const fim =
+      textoOpcional(cfg.fim);
+
+    if (fim) {
+      payloadAdset.end_time =
+        new Date(fim).toISOString();
+    }
+
+    const adsetMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadAdset)
+      }
+    ).then(r => r.json());
+
+    if (!adsetMeta.id) {
+      return await falhar(
+        mensagemErroMeta(adsetMeta, "Erro ao criar conjunto de anúncios na Meta"),
+        adsetMeta
+      );
+    }
+
+    const imageUrls =
+      [
+        ...(Array.isArray(cfg.imagens_urls) ? cfg.imagens_urls : []),
+        ...(Array.isArray(cfg.image_urls) ? cfg.image_urls : [])
+      ].filter(Boolean);
+
+    const hashes: string[] = [];
+
+    for (const urlImagem of imageUrls) {
+      const uploadImagem =
+        await enviarImagemMetaPorUrl(token, adAccountId, String(urlImagem));
+
+      if (uploadImagem.hash) {
+        hashes.push(uploadImagem.hash);
+      }
+    }
+
+    if (!hashes.length) {
+      if (Array.isArray(cfg.imageHashes)) {
+        hashes.push(...cfg.imageHashes.filter(Boolean));
+      } else if (cfg.imageHash) {
+        hashes.push(cfg.imageHash);
+      }
+    }
+
+    if (!hashes.length) {
+      return await falhar(
+        "Imagem da campanha não encontrada. Edite a campanha e adicione uma imagem antes de publicar."
+      );
+    }
+
+    const linkDestino =
+      urlOpcional(cfg.link, "https://google.com");
+
+    const tituloAnuncio =
+      textoOpcional(cfg.titulo) ||
+      campanha.nome ||
+      "Saiba mais";
+
+    const descricaoAnuncio =
+      textoOpcional(cfg.descricao) ||
+      "Entre em contato agora";
+
+    const ctaType =
+      textoOpcional(cfg.cta) ||
+      "LEARN_MORE";
+
+    const isCarrossel =
+      hashes.length > 1;
+
+    const linkDataBase: Record<string, any> = {
+      message:
+        textoOpcional(cfg.texto) ||
+        textoOpcional(campanha.texto) ||
+        "Entre em contato agora"
+    };
+
+    if (isCarrossel) {
+      linkDataBase.child_attachments = hashes.map((hash, index) => ({
+        link: linkDestino,
+        image_hash: hash,
+        name: index === 0 ? tituloAnuncio : `Slide ${index + 1}`,
+        description: descricaoAnuncio,
+        call_to_action: {
+          type: ctaType,
+          value: { lead_gen_form_id: formMeta.id }
+        }
+      }));
+      linkDataBase.multi_share_end_card = false;
+    } else {
+      linkDataBase.link = linkDestino;
+      linkDataBase.image_hash = hashes[0];
+      linkDataBase.name = tituloAnuncio;
+      linkDataBase.description = descricaoAnuncio;
+      linkDataBase.call_to_action = {
+        type: ctaType,
+        value: { lead_gen_form_id: formMeta.id }
+      };
+    }
+
+    const objectStorySpec: Record<string, any> = {
+      page_id: pageId,
+      link_data: linkDataBase
+    };
+
+    if (Array.isArray(cfg.plataformas) && cfg.plataformas.includes("instagram")) {
+      const instagramActorId =
+        textoOpcional(cfg.instagram_actor_id) ||
+        (await listarContasInstagramAnuncio(token, adAccountId))[0]?.id ||
+        null;
+
+      if (instagramActorId) {
+        objectStorySpec.instagram_actor_id = instagramActorId;
+      }
+    }
+
+    const creativeMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: `Criativo Leads ${Date.now()}`,
+          object_story_spec: objectStorySpec,
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    if (!creativeMeta.id) {
+      return await falhar(
+        mensagemErroMeta(creativeMeta, "Erro ao criar criativo na Meta"),
+        creativeMeta
+      );
+    }
+
+    const adMeta = await fetch(
+      `https://graph.facebook.com/v19.0/${adAccountId}/ads`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: `Anúncio Leads ${Date.now()}`,
+          adset_id: adsetMeta.id,
+          creative: {
+            creative_id: creativeMeta.id
+          },
+          status: "ACTIVE",
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    if (!adMeta.id) {
+      return await falhar(
+        mensagemErroMeta(adMeta, "Erro ao criar anúncio na Meta"),
+        adMeta
+      );
+    }
+
+    const configuracoesPublicadas = {
+      ...cfg,
+      page_id: pageId,
+      form_id: formMeta.id,
+      creative_id: creativeMeta.id,
+      adset_id: adsetMeta.id,
+      ad_id: adMeta.id,
+      imageHashes: hashes,
+      imageHash: hashes[0] || null,
+      publicado_por_usuario_id: user.id,
+      publicado_em: new Date().toISOString()
+    };
+
+    await client.query(
+      `
+      UPDATE campanhas
+      SET
+        campaign_id = $1,
+        adset_id = $2,
+        ad_id = $3,
+        form_id = $4,
+        page_id = $5,
+        conta_anuncios_id = $6,
+        status = 'ACTIVE',
+        origem = 'plataforma',
+        daily_budget = $7,
+        configuracoes_avancadas = $8,
+        atualizado_em = NOW()
+      WHERE id = $9
+      `,
+      [
+        campanhaMeta.id,
+        adsetMeta.id,
+        adMeta.id,
+        formMeta.id,
+        pageId,
+        adAccountId,
+        dailyBudget,
+        JSON.stringify(configuracoesPublicadas),
+        campanhaId
+      ]
+    );
+
+    await limparErroPublicacaoCampanha(campanhaId);
+
+    return c.json({
+      sucesso: true,
+      campaign_id: campanhaMeta.id,
+      adset_id: adsetMeta.id,
+      ad_id: adMeta.id,
+      form_id: formMeta.id
+    });
+
+  } catch (err: any) {
+
+    console.error("PUBLICAR CAMPANHA RECEBIDA:", err);
+
+    return await falhar(
+      err?.message || "Erro ao publicar campanha recebida",
+      err,
+      500
+    );
   }
 });
 
