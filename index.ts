@@ -3162,6 +3162,7 @@ function diagnosticarVeiculacaoMeta(
 }
 
 // Extrai o saldo numérico de strings como "Saldo disponível (R$0,00 BRL)"
+// ou "Saldo disponível (-R$91,46 BRL)" — preserva o sinal negativo.
 function extrairSaldoDisponivelMeta(displayString?: string | null) {
   if (!displayString) return null;
 
@@ -3173,7 +3174,14 @@ function extrairSaldoDisponivelMeta(displayString?: string | null) {
     match[1].replace(/\./g, "").replace(",", ".")
   );
 
-  return Number.isNaN(saldo) ? null : saldo;
+  if (Number.isNaN(saldo)) return null;
+
+  // Verifica se há um "-" em qualquer posição antes dos dígitos capturados,
+  // cobrindo formatos como "-R$91,46 BRL)" e "(-R$91,46 BRL)".
+  const posDigitos = displayString.indexOf(match[1]);
+  const negativo = displayString.slice(0, posDigitos).includes("-");
+
+  return negativo ? -saldo : saldo;
 }
 
 function extrairLeadsActionsMeta(actions: any[] = []) {
@@ -3993,23 +4001,49 @@ app.get("/auth/:plataforma/callback", async (c) => {
       db.release();
     }
 
-    const tokenRes = await fetch(cfg.tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: redirectUri,
-        client_id: clientId,
-        client_secret: clientSecret,
-      }),
-    });
-    const tokenData = await tokenRes.json();
-    const access_token = tokenData.access_token;
+    // TikTok usa JSON body e estrutura de resposta diferente do padrão OAuth2
+    let access_token: string;
+    let refresh_token: string | null = null;
+    let dadosConta: Record<string, any> = {};
 
-    if (!tokenRes.ok || !access_token) {
-      console.error(`ERRO TOKEN ${plataforma.toUpperCase()}:`, tokenData);
-      return c.text(`Erro ao obter token de ${plataforma}`, 502);
+    if (plataforma === "tiktok") {
+      const tokenRes = await fetch(cfg.tokenUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          app_id: clientId,
+          auth_code: code,
+          secret: clientSecret,
+        }),
+      });
+      const tokenData = await tokenRes.json() as any;
+      if (tokenData.code !== 0 || !tokenData.data?.access_token) {
+        console.error("ERRO TOKEN TIKTOK:", tokenData);
+        return c.text("Erro ao obter token TikTok", 502);
+      }
+      access_token = tokenData.data.access_token;
+      refresh_token = tokenData.data.refresh_token ?? null;
+      const advertiserIds: string[] = tokenData.data.advertiser_ids ?? [];
+      dadosConta = { advertiser_ids: advertiserIds };
+    } else {
+      const tokenRes = await fetch(cfg.tokenUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+          client_secret: clientSecret,
+        }),
+      });
+      const tokenData = await tokenRes.json() as any;
+      if (!tokenRes.ok || !tokenData.access_token) {
+        console.error(`ERRO TOKEN ${plataforma.toUpperCase()}:`, tokenData);
+        return c.text(`Erro ao obter token de ${plataforma}`, 502);
+      }
+      access_token = tokenData.access_token;
+      refresh_token = tokenData.refresh_token ?? null;
     }
 
     if (!usuarioId) {
@@ -4017,11 +4051,13 @@ app.get("/auth/:plataforma/callback", async (c) => {
     }
 
     await client.query(
-      `INSERT INTO plataforma_conexoes (usuario_id, plataforma, status, access_token, conectado_em, atualizado_em)
-       VALUES ($1, $2, 'conectado', $3, NOW(), NOW())
+      `INSERT INTO plataforma_conexoes
+         (usuario_id, plataforma, status, access_token, refresh_token, dados_conta, conectado_em, atualizado_em)
+       VALUES ($1, $2, 'conectado', $3, $4, $5, NOW(), NOW())
        ON CONFLICT (usuario_id, plataforma)
-       DO UPDATE SET status = 'conectado', access_token = $3, atualizado_em = NOW()`,
-      [usuarioId, plataforma, access_token]
+       DO UPDATE SET status = 'conectado', access_token = $3, refresh_token = $4,
+                     dados_conta = $5, atualizado_em = NOW()`,
+      [usuarioId, plataforma, access_token, refresh_token, JSON.stringify(dadosConta)]
     );
 
     return c.html(`
@@ -4036,6 +4072,240 @@ app.get("/auth/:plataforma/callback", async (c) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`ERRO CALLBACK ${plataforma.toUpperCase()}:`, msg, err);
     return c.text(`Erro ao conectar ${plataforma}: ${msg}`);
+  }
+});
+
+/* =========================
+   🎵 TIKTOK ADS
+========================= */
+
+const tiktokSyncEmAndamento = new Set<number>();
+
+const TIKTOK_API = "https://business-api.tiktok.com/open_api/v1.3";
+
+function tiktokHeaders(token: string) {
+  return { "Access-Token": token, "Content-Type": "application/json" };
+}
+
+// Lista contas de anunciante vinculadas ao token
+app.get("/tiktok/anunciantes", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conn = await client.query(
+      `SELECT access_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows.length) return c.json({ error: "TikTok nao conectado" }, 400);
+
+    const token = conn.rows[0].access_token;
+    const dadosConta = conn.rows[0].dados_conta ?? {};
+    const advertiserIds: string[] = dadosConta.advertiser_ids ?? [];
+
+    if (!advertiserIds.length) {
+      return c.json({ error: "Nenhuma conta de anunciante encontrada" }, 400);
+    }
+
+    const clientId = Bun.env.TIKTOK_ADS_APP_ID;
+    const clientSecret = Bun.env.TIKTOK_ADS_APP_SECRET;
+    if (!clientId || !clientSecret) return c.json({ error: "Credenciais TikTok nao configuradas" }, 500);
+
+    const params = new URLSearchParams({
+      app_id: clientId,
+      secret: clientSecret,
+      access_token: token,
+    });
+    const res = await fetch(`${TIKTOK_API}/oauth2/advertiser/get/?${params}`);
+    const data = await res.json() as any;
+
+    if (data.code !== 0) {
+      console.error("ERRO TIKTOK ANUNCIANTES:", data);
+      return c.json({ error: "Erro ao buscar anunciantes TikTok" }, 502);
+    }
+
+    return c.json({ anunciantes: data.data?.list ?? [] });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/anunciantes:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Salva o anunciante selecionado pelo usuário
+app.post("/tiktok/selecionar-anunciante", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const { advertiser_id } = await c.req.json();
+    if (!advertiser_id) return c.json({ error: "advertiser_id obrigatorio" }, 400);
+
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object('advertiser_id', $1::text),
+           atualizado_em = NOW()
+       WHERE usuario_id = $2 AND plataforma = 'tiktok'`,
+      [String(advertiser_id), user.id]
+    );
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/selecionar-anunciante:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Sincroniza campanhas e leads do TikTok Ads
+app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    if (tiktokSyncEmAndamento.has(user.id)) {
+      return c.json({ error: "Sincronizacao TikTok ja em andamento" }, 429);
+    }
+    tiktokSyncEmAndamento.add(user.id);
+
+    const conn = await client.query(
+      `SELECT access_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows.length) return c.json({ error: "TikTok nao conectado" }, 400);
+
+    const token = conn.rows[0].access_token;
+    const dadosConta = conn.rows[0].dados_conta ?? {};
+    const advertiserId = dadosConta.advertiser_id;
+
+    if (!advertiserId) {
+      return c.json({ error: "Selecione a conta de anunciante TikTok antes de sincronizar" }, 400);
+    }
+
+    // 🔥 BUSCA CAMPANHAS
+    const campanhasRes = await fetch(
+      `${TIKTOK_API}/campaign/get/?advertiser_id=${advertiserId}&fields=["campaign_id","campaign_name","status","objective_type"]&page_size=100`,
+      { headers: tiktokHeaders(token) }
+    );
+    const campanhasData = await campanhasRes.json() as any;
+
+    if (campanhasData.code !== 0) {
+      console.error("ERRO CAMPANHAS TIKTOK:", campanhasData);
+      return c.json({ error: "Erro ao buscar campanhas TikTok", detalhe: campanhasData.message }, 502);
+    }
+
+    const campanhas = campanhasData.data?.list ?? [];
+    console.log("TIKTOK CAMPANHAS:", campanhas.length);
+
+    for (const campanha of campanhas) {
+      const existe = await client.query(
+        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+        [String(campanha.campaign_id), user.id]
+      );
+
+      if (existe.rows.length > 0) {
+        await client.query(
+          `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
+           WHERE campaign_id = $3 AND usuario_id = $4`,
+          [campanha.campaign_name, campanha.status, String(campanha.campaign_id), user.id]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
+           VALUES ($1, $2, $3, $4, $5, 'tiktok', 'tiktok', NOW())`,
+          [user.id, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.status]
+        );
+      }
+    }
+
+    // 🔥 BUSCA LEADS (últimos 30 dias)
+    const trintaDiasAtras = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const startTime = Math.floor(trintaDiasAtras.getTime() / 1000);
+
+    let page = 1;
+    let totalLeads = 0;
+    let hasMore = true;
+
+    while (hasMore) {
+      const leadsRes = await fetch(
+        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&start_time=${startTime}&page=${page}&page_size=100`,
+        { headers: tiktokHeaders(token) }
+      );
+      const leadsData = await leadsRes.json() as any;
+
+      if (leadsData.code !== 0) {
+        console.error("ERRO LEADS TIKTOK:", leadsData);
+        break;
+      }
+
+      const leadsList = leadsData.data?.list ?? [];
+      const pageInfo = leadsData.data?.page_info ?? {};
+      hasMore = page < Math.ceil((pageInfo.total_number ?? 0) / 100);
+      page++;
+
+      for (const lead of leadsList) {
+        const leadId = String(lead.lead_id);
+        const formId = String(lead.form_id ?? "");
+
+        const jaExiste = await client.query(
+          `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+          [leadId, user.id]
+        );
+        if (jaExiste.rows.length > 0) continue;
+
+        // Identifica campanha pelo form_id, se disponível
+        let nomeCampanha = "Campanha TikTok";
+        let nichoId: number | null = null;
+        if (formId) {
+          const campRow = await client.query(
+            `SELECT nome, nicho_id FROM campanhas WHERE form_id = $1 AND usuario_id = $2 LIMIT 1`,
+            [formId, user.id]
+          );
+          if (campRow.rows.length) {
+            nomeCampanha = campRow.rows[0].nome;
+            nichoId = campRow.rows[0].nicho_id ?? null;
+          }
+        }
+
+        let nome = "";
+        let email = "";
+        let telefone = "";
+        const respostasQualificacao: any[] = [];
+
+        for (const field of lead.fields ?? []) {
+          const key = (field.name ?? "").toUpperCase();
+          if (key === "FULL_NAME" || key === "FIRST_NAME") nome = field.value ?? "";
+          else if (key === "EMAIL") email = field.value ?? "";
+          else if (key === "PHONE_NUMBER") telefone = field.value ?? "";
+          else respostasQualificacao.push({ pergunta: field.name, resposta: field.value ?? "" });
+        }
+
+        const criadoEm = lead.submit_time
+          ? new Date(Number(lead.submit_time) * 1000).toISOString()
+          : null;
+
+        await client.query(
+          `INSERT INTO leads
+             (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+              origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
+          [
+            user.id, leadId, nome || "Lead TikTok", email, telefone,
+            nomeCampanha, String(advertiserId),
+            JSON.stringify(respostasQualificacao), nichoId, criadoEm
+          ]
+        );
+
+        await notificarNovoLeadWhatsApp(user.id, { nome, telefone, email, campanha: nomeCampanha });
+        totalLeads++;
+      }
+    }
+
+    await client.query(
+      `UPDATE plataforma_conexoes SET atualizado_em = NOW()
+       WHERE usuario_id = $1 AND plataforma = 'tiktok'`,
+      [user.id]
+    );
+
+    return c.json({ sucesso: true, campanhas: campanhas.length, leads_novos: totalLeads });
+  } catch (err: any) {
+    console.error("ERRO TIKTOK SINCRONIZAR:", err);
+    return c.json({ error: "Erro ao sincronizar TikTok" }, 500);
+  } finally {
+    tiktokSyncEmAndamento.delete(user.id);
   }
 });
 
@@ -5236,7 +5506,8 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
 
     return c.json({
       sucesso: true,
-      hash
+      hash,
+      url: (primeiraImagem?.url || primeiraImagem?.url_128) ?? null
     });
 
   } catch (err: any) {
@@ -5268,7 +5539,8 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       configuracoes_avancadas,
       daily_budget,
       imageHash,
-      imageHashes
+      imageHashes,
+      imageUrls
     } = await c.req.json();
 
     const usuarioId =
@@ -5542,7 +5814,12 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         ad_id = $2,
         form_id = $3,
         page_id = $4,
-        daily_budget = $5
+        daily_budget = $5,
+        configuracoes_avancadas = configuracoes_avancadas || jsonb_build_object(
+          'texto', $8::text,
+          'cta', $9::text,
+          'imagens_urls', $10::jsonb
+        )
       WHERE CAST(campaign_id AS TEXT) = $6
       AND usuario_id = $7
       `,
@@ -5553,7 +5830,10 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         page_id,
         numeroOpcional(daily_budget),
         String(campaign_id),
-        usuarioId
+        usuarioId,
+        texto ?? null,
+        cta ?? null,
+        JSON.stringify(Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [])
       ]
     );
 
@@ -5924,9 +6204,18 @@ app.get(
         conta.currency
       );
 
-    const saldoPrePago = extrairSaldoDisponivelMeta(
-      conta.funding_source_details?.display_string
-    );
+    const saldoDisplayString =
+      conta.funding_source_details?.display_string ?? null;
+
+    console.log("[saldo-meta]", {
+      balance_bruto: conta.balance,
+      display_string: saldoDisplayString,
+      currency: conta.currency,
+      account_status: conta.account_status,
+      is_prepay: conta.is_prepay_account,
+    });
+
+    const saldoPrePago = extrairSaldoDisponivelMeta(saldoDisplayString);
 
     const saldoManual =
       saldoPrePago !== null
@@ -5972,6 +6261,7 @@ app.get(
         saldo_pre_pago: saldoPrePago,
         saldo_pendente_api: saldoApi,
         saldo_bruto_api: conta.balance ?? null,
+        saldo_display_string: saldoDisplayString,
         saldo_origem:
           pagamentoManual && saldoPrePago !== null
             ? "saldo_pre_pago"
@@ -6436,6 +6726,124 @@ app.delete("/conexoes/:plataforma", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO DELETE /conexoes:", err);
     return c.json({ error: "Erro ao desconectar plataforma" }, 500);
+  }
+});
+
+/* =========================
+   🎵 WEBHOOK TIKTOK — leads em tempo real
+========================= */
+
+// TikTok envia GET para verificação do endpoint (challenge)
+app.get("/webhook/tiktok", async (c) => {
+  const challenge = c.req.query("challenge");
+  if (challenge) return c.text(challenge);
+  return c.text("TikTok webhook ativo");
+});
+
+app.post("/webhook/tiktok", async (c) => {
+  try {
+    const body = await c.req.json() as any;
+    console.log("WEBHOOK TIKTOK RECEBIDO:", JSON.stringify(body));
+
+    // TikTok envia um array de eventos em data
+    const eventos = Array.isArray(body) ? body : [body];
+
+    for (const evento of eventos) {
+      if (evento.event_type !== "LEAD_GENERATION_NEW_LEAD") continue;
+
+      const advertiserId = String(evento.advertiser_id ?? "");
+      const leadId       = String(evento.lead_id ?? "");
+      const formId       = String(evento.form_id ?? "");
+
+      if (!leadId || !advertiserId) continue;
+
+      // Identifica o usuário pela conta de anunciante
+      const conn = await client.query(
+        `SELECT usuario_id, access_token
+         FROM plataforma_conexoes
+         WHERE plataforma = 'tiktok'
+           AND dados_conta->>'advertiser_id' = $1
+         LIMIT 1`,
+        [advertiserId]
+      );
+      if (!conn.rows.length) {
+        console.log("TikTok webhook: anunciante nao identificado:", advertiserId);
+        continue;
+      }
+
+      const usuarioId = Number(conn.rows[0].usuario_id);
+      const token     = conn.rows[0].access_token;
+
+      const jaExiste = await client.query(
+        `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+        [leadId, usuarioId]
+      );
+      if (jaExiste.rows.length > 0) continue;
+
+      // Busca os dados completos do lead
+      const leadRes = await fetch(
+        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_id=${leadId}`,
+        { headers: tiktokHeaders(token) }
+      );
+      const leadData = await leadRes.json() as any;
+
+      if (leadData.code !== 0 || !leadData.data?.list?.length) {
+        console.error("TIKTOK WEBHOOK: erro ao buscar lead:", leadData);
+        continue;
+      }
+
+      const lead = leadData.data.list[0];
+
+      let nomeCampanha = "Campanha TikTok";
+      let nichoId: number | null = null;
+      if (formId) {
+        const campRow = await client.query(
+          `SELECT nome, nicho_id FROM campanhas WHERE form_id = $1 AND usuario_id = $2 LIMIT 1`,
+          [formId, usuarioId]
+        );
+        if (campRow.rows.length) {
+          nomeCampanha = campRow.rows[0].nome;
+          nichoId = campRow.rows[0].nicho_id ?? null;
+        }
+      }
+
+      let nome = "";
+      let email = "";
+      let telefone = "";
+      const respostasQualificacao: any[] = [];
+
+      for (const field of lead.fields ?? []) {
+        const key = (field.name ?? "").toUpperCase();
+        if (key === "FULL_NAME" || key === "FIRST_NAME") nome = field.value ?? "";
+        else if (key === "EMAIL") email = field.value ?? "";
+        else if (key === "PHONE_NUMBER") telefone = field.value ?? "";
+        else respostasQualificacao.push({ pergunta: field.name, resposta: field.value ?? "" });
+      }
+
+      const criadoEm = lead.submit_time
+        ? new Date(Number(lead.submit_time) * 1000).toISOString()
+        : null;
+
+      await client.query(
+        `INSERT INTO leads
+           (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
+        [
+          usuarioId, leadId, nome || "Lead TikTok", email, telefone,
+          nomeCampanha, advertiserId,
+          JSON.stringify(respostasQualificacao), nichoId, criadoEm
+        ]
+      );
+
+      console.log("✅ TIKTOK LEAD SALVO:", leadId, "usuario:", usuarioId);
+      await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK TIKTOK:", err);
+    return c.json({ error: "Erro webhook TikTok" }, 500);
   }
 });
 
@@ -9443,14 +9851,9 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       status
     } = await c.req.json();
 
-    const contaAnunciosId =
-      await obterContaAnunciosSelecionadaIdUsuario(
-        user.id
-      );
-
     const campanhaBanco = await client.query(
       `
-      SELECT id, adset_id, ad_id
+      SELECT id, adset_id, ad_id, usuario_id
       FROM campanhas
       WHERE campaign_id = $1
       AND (
@@ -9462,10 +9865,9 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
           AND cc.usuario_id = $2
         )
       )
-      AND conta_anuncios_id = $3
       LIMIT 1
       `,
-      [campaign_id, user.id, contaAnunciosId]
+      [campaign_id, user.id]
     );
 
     if (!campanhaBanco.rows.length) {
@@ -9473,18 +9875,22 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
         error: "Campanha não disponível para este usuário"
       }, 404);
     }
-    
+
     const adset_id =
       campanhaBanco.rows[0]?.adset_id;
-    
+
     const ad_id =
       campanhaBanco.rows[0]?.ad_id;
-    
+
+    // Usa o token do dono original da campanha (corretores receptores não têm Meta conectada)
+    const tokenOwnerUserId =
+      campanhaBanco.rows[0].usuario_id;
+
     console.log("ADSET:", adset_id);
-    
+
     console.log("AD:", ad_id);
 
-    
+
 
     // 🔐 TOKEN
     const conn = await client.query(
@@ -9495,7 +9901,7 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       ORDER BY id DESC
       LIMIT 1
       `,
-      [user.id]
+      [tokenOwnerUserId]
     );
 
     if (conn.rows.length === 0) {
