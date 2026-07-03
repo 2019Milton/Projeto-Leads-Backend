@@ -7537,6 +7537,24 @@ await client.query(`
 `);
 
 await client.query(`
+  CREATE TABLE IF NOT EXISTS campanha_corretores_historico (
+    campanha_id INTEGER NOT NULL REFERENCES campanhas(id) ON DELETE CASCADE,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'enviado',
+    atualizado_em TIMESTAMP DEFAULT NOW(),
+    enviado_por_usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+    PRIMARY KEY (campanha_id, usuario_id)
+  );
+`);
+
+await client.query(`
+  ALTER TABLE campanha_corretores_historico
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'enviado',
+    ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS enviado_por_usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL;
+`);
+
+await client.query(`
   INSERT INTO campanha_corretores (campanha_id, usuario_id)
   SELECT id, encaminhada_para_usuario_id
   FROM campanhas
@@ -7559,6 +7577,8 @@ await client.query(`
     ON campanhas(encaminhada_para_usuario_id);
   CREATE INDEX IF NOT EXISTS idx_campanha_corretores_usuario
     ON campanha_corretores(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_campanha_corretores_historico_usuario
+    ON campanha_corretores_historico(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_meta_conexoes_usuario_id
     ON meta_conexoes(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_leads_conta_anuncios_id
@@ -8363,7 +8383,24 @@ app.get("/campanhas", authMiddleware, async (c) => {
             WHERE cc.campanha_id = c.id
           ),
           '[]'
-        ) AS corretores_encaminhados
+        ) AS corretores_encaminhados,
+        COALESCE(
+          (
+            SELECT json_agg(json_build_object(
+              'id', cor.id,
+              'nome', cor.nome,
+              'sobrenome', cor.sobrenome,
+              'email', cor.email,
+              'status', ch.status,
+              'atualizado_em', ch.atualizado_em
+            ) ORDER BY ch.atualizado_em DESC)
+            FROM campanha_corretores_historico ch
+            INNER JOIN usuarios cor
+              ON cor.id = ch.usuario_id
+            WHERE ch.campanha_id = c.id
+          ),
+          '[]'
+        ) AS corretores_envio_historico
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
@@ -8577,6 +8614,24 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
 
       await conn.query("BEGIN");
 
+      const corretoresAtivosAntes = await conn.query(
+        `
+        SELECT usuario_id
+        FROM campanha_corretores
+        WHERE campanha_id = $1
+        `,
+        [campanhaId]
+      );
+
+      const idsAtivosAntes = corretoresAtivosAntes.rows
+        .map((row: any) => Number(row.usuario_id))
+        .filter((id: number) => Number.isFinite(id));
+
+      const idsSelecionados = new Set(corretorIds);
+      const idsCancelados = idsAtivosAntes.filter(
+        (id: number) => !idsSelecionados.has(id)
+      );
+
       await conn.query(
         `
         DELETE FROM campanha_corretores
@@ -8593,6 +8648,46 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
           ON CONFLICT DO NOTHING
           `,
           [campanhaId, corretorId]
+        );
+
+        await conn.query(
+          `
+          INSERT INTO campanha_corretores_historico (
+            campanha_id,
+            usuario_id,
+            status,
+            atualizado_em,
+            enviado_por_usuario_id
+          )
+          VALUES ($1, $2, 'enviado', NOW(), $3)
+          ON CONFLICT (campanha_id, usuario_id)
+          DO UPDATE SET
+            status = 'enviado',
+            atualizado_em = NOW(),
+            enviado_por_usuario_id = EXCLUDED.enviado_por_usuario_id
+          `,
+          [campanhaId, corretorId, user.id]
+        );
+      }
+
+      if (idsCancelados.length) {
+        await conn.query(
+          `
+          INSERT INTO campanha_corretores_historico (
+            campanha_id,
+            usuario_id,
+            status,
+            atualizado_em,
+            enviado_por_usuario_id
+          )
+          SELECT $1, UNNEST($2::int[]), 'cancelado', NOW(), $3
+          ON CONFLICT (campanha_id, usuario_id)
+          DO UPDATE SET
+            status = 'cancelado',
+            atualizado_em = NOW(),
+            enviado_por_usuario_id = EXCLUDED.enviado_por_usuario_id
+          `,
+          [campanhaId, idsCancelados, user.id]
         );
       }
 
@@ -8700,7 +8795,24 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
             WHERE cc.campanha_id = c.id
           ),
           '[]'
-        ) AS corretores_encaminhados
+        ) AS corretores_encaminhados,
+        COALESCE(
+          (
+            SELECT json_agg(json_build_object(
+              'id', cor.id,
+              'nome', cor.nome,
+              'sobrenome', cor.sobrenome,
+              'email', cor.email,
+              'status', ch.status,
+              'atualizado_em', ch.atualizado_em
+            ) ORDER BY ch.atualizado_em DESC)
+            FROM campanha_corretores_historico ch
+            INNER JOIN usuarios cor
+              ON cor.id = ch.usuario_id
+            WHERE ch.campanha_id = c.id
+          ),
+          '[]'
+        ) AS corretores_envio_historico
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
@@ -9067,6 +9179,16 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           (campanha.corretores_encaminhados || []).map((cor: any) => ({
             id: cor.id,
             email: cor.email,
+            nome:
+              [cor.nome, cor.sobrenome]
+                .filter(Boolean).join(" ") || cor.email
+          })),
+        corretores_envio_historico:
+          (campanha.corretores_envio_historico || []).map((cor: any) => ({
+            id: cor.id,
+            email: cor.email,
+            status: cor.status,
+            atualizado_em: cor.atualizado_em,
             nome:
               [cor.nome, cor.sobrenome]
                 .filter(Boolean).join(" ") || cor.email
