@@ -8049,7 +8049,8 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
 
     if (
       user.tipo !== "admin_corretor" &&
-      user.tipo !== "super_admin"
+      user.tipo !== "super_admin" &&
+      user.tipo !== "criador_campanha"
     ) {
       return c.json({
         error: "Apenas administradores podem encaminhar campanhas"
@@ -8072,27 +8073,39 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
         ? [Number(body.corretor_id)]
         : [];
 
+    const usuarioEnviaSemVinculo =
+      user.tipo === "super_admin" ||
+      user.tipo === "criador_campanha";
+
+    const usuarioPodeEnviarCampanhaDeQualquerDono =
+      user.tipo === "super_admin";
+
     const campanha = await client.query(
       `
       SELECT id
       FROM campanhas
       WHERE id = $1
-      AND usuario_id = $2
+      AND (
+        usuario_id = $2
+        OR $3::boolean = true
+      )
       LIMIT 1
       `,
-      [campanhaId, user.id]
+      [campanhaId, user.id, usuarioPodeEnviarCampanhaDeQualquerDono]
     );
 
     if (!campanha.rows.length) {
       return c.json({
-        error: "Campanha não encontrada para este Admin Corretor"
+        error: usuarioEnviaSemVinculo
+          ? "Campanha não encontrada"
+          : "Campanha não encontrada para este Admin Corretor"
       }, 404);
     }
 
     if (corretorIds.length) {
 
       const corretores =
-        user.tipo === "admin_corretor"
+        !usuarioEnviaSemVinculo
           ? await client.query(
               `
               SELECT id
@@ -8109,7 +8122,7 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
               SELECT id
               FROM usuarios
               WHERE id = ANY($1::int[])
-              AND tipo = 'corretor'
+              AND tipo NOT IN ('suporte', 'super_admin', 'master')
               AND COALESCE(ativo, true) = true
               `,
               [corretorIds]
@@ -8117,7 +8130,9 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
 
       if (corretores.rows.length !== corretorIds.length) {
         return c.json({
-          error: "Selecione apenas corretores vinculados e ativos"
+          error: usuarioEnviaSemVinculo
+            ? "Selecione apenas usuários ativos"
+            : "Selecione apenas corretores vinculados e ativos"
         }, 400);
       }
     }
@@ -14593,7 +14608,7 @@ app.get("/usuarios/corretores-disponiveis", authMiddleware, async (c) => {
     const resultado = await client.query(
       `SELECT id, nome, sobrenome, email, tipo, plano, ativo
        FROM usuarios
-       WHERE tipo IN ('corretor', 'admin_corretor')
+       WHERE tipo IN ('corretor', 'admin_corretor', 'corretor_receptor')
          AND COALESCE(ativo, true) = true
        ORDER BY nome ASC`
     );
