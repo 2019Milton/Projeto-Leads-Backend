@@ -605,10 +605,9 @@ function erroMetaIdade(resposta: any) {
     mensagem.includes("age_max") ||
     mensagem.includes("minimum age") ||
     mensagem.includes("idade") ||
-    (
-      mensagem.includes("age") &&
-      mensagem.includes("targeting")
-    )
+    (mensagem.includes("age") && mensagem.includes("targeting")) ||
+    // "Sugestão ao criar" = Meta pedindo público mais amplo (Advantage+)
+    (mensagem.includes("sugest") && mensagem.includes("conjunto"))
   );
 }
 
@@ -653,9 +652,11 @@ async function enviarPayloadMetaComFallbackBid(
     delete retryPayload.targeting.age_min;
     delete retryPayload.targeting.age_max;
     delete retryPayload.targeting.genders;
+    // Remove interesses detalhados — Meta pode rejeitar combinações restritivas
+    delete retryPayload.targeting.flexible_spec;
 
     console.warn(
-      `${contexto}: Meta rejeitou idade/genero do publico, tentando novamente com publico amplo`,
+      `${contexto}: Meta rejeitou idade/genero/interesses do publico, tentando novamente com publico amplo`,
       resposta?.error || resposta
     );
 
