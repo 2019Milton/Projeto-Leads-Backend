@@ -557,7 +557,7 @@ function prepararControleCustoMeta(
 
   if (!bidStrategyExigeValor(bidStrategy)) {
     return {
-      bidStrategy,
+      bidStrategy: null,
       bidAmount: null
     };
   }
@@ -570,7 +570,7 @@ function prepararControleCustoMeta(
   }
 
   return {
-    bidStrategy: "LOWEST_COST_WITHOUT_CAP",
+    bidStrategy: null,
     bidAmount: null
   };
 }
@@ -5060,8 +5060,6 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
       destination_type: "ON_AD",
 
-      bid_strategy: bidStrategy,
-
       start_time: inicio
         ? new Date(inicio).toISOString()
         : new Date(Date.now() + 60000).toISOString(),
@@ -5076,6 +5074,10 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
       access_token: token
     };
+
+    if (bidStrategy) {
+      payloadAdset.bid_strategy = bidStrategy;
+    }
 
     // Só define budget no adset quando NÃO há CBO (com CBO o budget fica na campanha)
     if (daily_budget) {
@@ -10933,9 +10935,12 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     const payloadAdset: any = {
       targeting,
-      bid_strategy: bidStrategy,
       access_token: token
     };
+
+    if (bidStrategy) {
+      payloadAdset.bid_strategy = bidStrategy;
+    }
 
     if (dailyBudget !== null) {
       payloadAdset.daily_budget = dailyBudget;
@@ -11284,8 +11289,6 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       billing_event: "IMPRESSIONS",
       optimization_goal: "LEAD_GENERATION",
       destination_type: "ON_AD",
-      bid_strategy:
-        controleCusto.bidStrategy,
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
       promoted_object: {
@@ -11294,6 +11297,11 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       status: "ACTIVE",
       access_token: token
     };
+
+    if (controleCusto.bidStrategy) {
+      payloadAdset.bid_strategy =
+        controleCusto.bidStrategy;
+    }
 
     if (!(cfg.cbo ?? true)) {
       payloadAdset.daily_budget = dailyBudget;
@@ -16469,7 +16477,6 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
       billing_event: "IMPRESSIONS",
       optimization_goal: "LEAD_GENERATION",
       destination_type: "ON_AD",
-      bid_strategy: controleCustoRascunho.bidStrategy,
       daily_budget: cfgPublico.orcamento_diario_centavos || cfgCampanha.orcamento_diario_centavos || 2000,
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
@@ -16477,6 +16484,11 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
       status: "PAUSED",
       access_token: token
     };
+
+    if (controleCustoRascunho.bidStrategy) {
+      payloadAdset.bid_strategy =
+        controleCustoRascunho.bidStrategy;
+    }
 
     if (
       controleCustoRascunho.bidAmount !== null &&
