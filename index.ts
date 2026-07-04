@@ -10983,6 +10983,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     const {
       usuario_id,
+      campanha_local_id,
       campaign_id,
       daily_budget,
       configuracoes_avancadas
@@ -10993,6 +10994,21 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     if (!usuarioId) {
       return negarAcessoConta(c);
+    }
+
+    // Campanha ainda não publicada na Meta (duplicada ou rascunho): salva só localmente
+    if (!campaign_id && campanha_local_id) {
+      const avancadas = configuracoes_avancadas || {};
+      const dailyBudget = numeroOpcional(daily_budget);
+      await client.query(
+        `UPDATE campanhas
+         SET configuracoes_avancadas = $1,
+             daily_budget = COALESCE($2, daily_budget),
+             atualizado_em = NOW()
+         WHERE id = $3 AND usuario_id = $4`,
+        [JSON.stringify(avancadas), dailyBudget, campanha_local_id, usuarioId]
+      );
+      return c.json({ sucesso: true });
     }
 
     const contaAnunciosId =
