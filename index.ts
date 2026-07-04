@@ -6077,30 +6077,45 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       objectStorySpec.instagram_actor_id = instagramActorId;
     }
 
-    const creative = await fetch(
-      `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
-      {
-        method: "POST",
+    const criarCreativo = async (spec: Record<string, any>) =>
+      fetch(
+        `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: `Criativo Leads ${Date.now()}`,
+            object_story_spec: spec,
+            access_token: token
+          })
+        }
+      ).then(r => r.json());
 
-        headers: {
-          "Content-Type": "application/json"
-        },
+    let creative = await criarCreativo(objectStorySpec);
 
-        body: JSON.stringify({
+    // Se falhou por instagram_actor_id inválido, tenta sem ele
+    if (!creative.id) {
+      const erroCreativo = String(
+        creative?.error?.error_user_msg ||
+        creative?.error?.message ||
+        ""
+      ).toLowerCase();
 
-          name: `Criativo Leads ${Date.now()}`,
-
-          object_story_spec: objectStorySpec,
-
-          access_token: token
-        })
+      if (
+        erroCreativo.includes("instagram_actor_id") ||
+        erroCreativo.includes("instagram account")
+      ) {
+        console.warn(
+          "CREATIVE: instagram_actor_id inválido, tentando sem Instagram:",
+          creative?.error
+        );
+        const specSemInstagram = { ...objectStorySpec };
+        delete specSemInstagram.instagram_actor_id;
+        creative = await criarCreativo(specSemInstagram);
       }
-    ).then(r => r.json());
+    }
 
-    console.log(
-      "CREATIVE RESPONSE:",
-      creative
-    );
+    console.log("CREATIVE RESPONSE:", creative);
 
     if (!creative.id) {
 
