@@ -10986,7 +10986,8 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       campanha_local_id,
       campaign_id,
       daily_budget,
-      configuracoes_avancadas
+      configuracoes_avancadas,
+      nome
     } = await c.req.json();
 
     const usuarioId =
@@ -11000,13 +11001,15 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     if (!campaign_id && campanha_local_id) {
       const avancadas = configuracoes_avancadas || {};
       const dailyBudget = numeroOpcional(daily_budget);
+      const nomeLocal = textoOpcional(nome);
       await client.query(
         `UPDATE campanhas
          SET configuracoes_avancadas = $1,
              daily_budget = COALESCE($2, daily_budget),
+             nome = COALESCE($3, nome),
              atualizado_em = NOW()
-         WHERE id = $3 AND usuario_id = $4`,
-        [JSON.stringify(avancadas), dailyBudget, campanha_local_id, usuarioId]
+         WHERE id = $4 AND usuario_id = $5`,
+        [JSON.stringify(avancadas), dailyBudget, nomeLocal, campanha_local_id, usuarioId]
       );
       return c.json({ sucesso: true });
     }
@@ -11157,18 +11160,33 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       }, 400);
     }
 
+    const nomeNovo = textoOpcional(nome);
+
+    if (nomeNovo) {
+      await fetch(
+        `https://graph.facebook.com/v19.0/${campaign_id}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: nomeNovo, access_token: token })
+        }
+      ).catch(() => null);
+    }
+
     await client.query(
       `
       UPDATE campanhas
       SET
         configuracoes_avancadas = $1,
         daily_budget = COALESCE($2, daily_budget),
+        nome = COALESCE($3, nome),
         atualizado_em = NOW()
-      WHERE id = $3
+      WHERE id = $4
       `,
       [
         JSON.stringify(avancadas),
         dailyBudget,
+        nomeNovo,
         campanhaBanco.rows[0].id
       ]
     );
