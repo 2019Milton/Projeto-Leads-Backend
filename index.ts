@@ -575,6 +575,56 @@ function prepararControleCustoMeta(
   };
 }
 
+function erroMetaBidAmount(resposta: any) {
+  const mensagem = String(
+    resposta?.error?.error_user_msg ||
+    resposta?.error?.message ||
+    resposta?.error ||
+    ""
+  ).toLowerCase();
+
+  return (
+    mensagem.includes("bid_amount") ||
+    mensagem.includes("valor do lance") ||
+    mensagem.includes("lance obrigatório") ||
+    mensagem.includes("lowest_cost_with_bid_cap") ||
+    mensagem.includes("target_cost")
+  );
+}
+
+async function enviarPayloadMetaComFallbackBid(
+  url: string,
+  payload: Record<string, any>,
+  contexto = "META"
+) {
+  const enviar = async (body: Record<string, any>) =>
+    fetch(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }
+    ).then(r => r.json());
+
+  let resposta = await enviar(payload);
+
+  if (erroMetaBidAmount(resposta)) {
+    const retryPayload = { ...payload };
+    delete retryPayload.bid_strategy;
+    delete retryPayload.bid_amount;
+
+    console.warn(
+      `${contexto}: Meta rejeitou controle de lance, tentando novamente sem bid_strategy/bid_amount`,
+      resposta?.error || resposta
+    );
+
+    resposta = await enviar(retryPayload);
+  }
+
+  return resposta;
+}
+
 function listaOpcional(value: unknown) {
   return Array.isArray(value)
     ? value
@@ -5121,14 +5171,11 @@ app.post("/meta/adset", authMiddleware, async (c) => {
       }
     }
 
-    let adset = await fetch(
+    let adset = await enviarPayloadMetaComFallbackBid(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadAdset)
-      }
-    ).then(r => r.json());
+      payloadAdset,
+      "ADSET"
+    );
 
     console.log(
       "ADSET PAYLOAD:",
@@ -5153,14 +5200,11 @@ app.post("/meta/adset", authMiddleware, async (c) => {
           "ADSET: attribution_spec rejeitada pela Meta, tentando sem ela..."
         );
         delete payloadAdset.attribution_spec;
-        adset = await fetch(
+        adset = await enviarPayloadMetaComFallbackBid(
           `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payloadAdset)
-          }
-        ).then(r => r.json());
+          payloadAdset,
+          "ADSET_RETRY_ATTRIBUTION"
+        );
         console.log("ADSET RETRY RESPONSE:", adset);
       }
     }
@@ -10968,14 +11012,11 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       }
     }
 
-    const adsetRes = await fetch(
+    const adsetRes = await enviarPayloadMetaComFallbackBid(
       `https://graph.facebook.com/v19.0/${adsetId}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadAdset)
-      }
-    ).then(r => r.json());
+      payloadAdset,
+      "EDITAR_ADSET"
+    );
 
     console.log(
       "EDITAR CAMPANHA PAYLOAD:",
@@ -11323,14 +11364,11 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         new Date(fim).toISOString();
     }
 
-    const adsetMeta = await fetch(
+    const adsetMeta = await enviarPayloadMetaComFallbackBid(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadAdset)
-      }
-    ).then(r => r.json());
+      payloadAdset,
+      "PUBLICAR_RECEBIDA_ADSET"
+    );
 
     if (!adsetMeta.id) {
       return await falhar(
@@ -16498,10 +16536,11 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
         Math.round(controleCustoRascunho.bidAmount * 100);
     }
 
-    const adsetMeta = await fetch(
+    const adsetMeta = await enviarPayloadMetaComFallbackBid(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payloadAdset) }
-    ).then(r => r.json());
+      payloadAdset,
+      "ATIVAR_RASCUNHO_ADSET"
+    );
 
     if (adsetMeta.error) {
       return c.json({ error: "Erro ao criar adset no Meta", detalhe: adsetMeta, campaign_id: campanhaMeta.id }, 400);
