@@ -587,6 +587,10 @@ function erroMetaBidAmount(resposta: any) {
     mensagem.includes("bid_amount") ||
     mensagem.includes("valor do lance") ||
     mensagem.includes("lance obrigatório") ||
+    mensagem.includes("lance obrigatórios") ||
+    mensagem.includes("restrições de lance") ||
+    mensagem.includes("bid value") ||
+    mensagem.includes("bid restriction") ||
     mensagem.includes("lowest_cost_with_bid_cap") ||
     mensagem.includes("target_cost")
   );
@@ -600,11 +604,14 @@ function erroMetaIdade(resposta: any) {
     ""
   ).toLowerCase();
 
+  // Usa regex com \b para evitar falsos positivos como "publicidade" contendo "idade"
+  const temIdade = /\bidade\b/.test(mensagem);
+
   return (
     mensagem.includes("age_min") ||
     mensagem.includes("age_max") ||
     mensagem.includes("minimum age") ||
-    mensagem.includes("idade") ||
+    temIdade ||
     (mensagem.includes("age") && mensagem.includes("targeting")) ||
     // "Sugestão ao criar" = Meta pedindo público mais amplo (Advantage+)
     (mensagem.includes("sugest") && mensagem.includes("conjunto"))
