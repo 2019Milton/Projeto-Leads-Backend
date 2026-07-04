@@ -11021,7 +11021,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     const campanhaBanco = await client.query(
       `
-      SELECT id, adset_id
+      SELECT id, adset_id, ad_id, form_id, configuracoes_avancadas
       FROM campanhas
       WHERE campaign_id = $1
       AND (
@@ -11171,6 +11171,154 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           body: JSON.stringify({ name: nomeNovo, access_token: token })
         }
       ).catch(() => null);
+    }
+
+    // 🎨 ATUALIZAR CRIATIVO se campos visuais foram alterados
+    try {
+      const adId = campanhaBanco.rows[0]?.ad_id;
+      const formId = campanhaBanco.rows[0]?.form_id;
+      const cfgBanco = campanhaBanco.rows[0]?.configuracoes_avancadas || {};
+
+      const pageId =
+        textoOpcional(avancadas.page_id) ||
+        textoOpcional(cfgBanco.page_id);
+
+      const texto =
+        textoOpcional(avancadas.texto) ||
+        textoOpcional(cfgBanco.texto) ||
+        "Quer mais clientes? 🚀";
+
+      const tituloAnuncio =
+        textoOpcional(avancadas.titulo) ||
+        textoOpcional(cfgBanco.titulo) || "";
+
+      const descricaoAnuncio =
+        textoOpcional(avancadas.descricao) ||
+        textoOpcional(cfgBanco.descricao) || "";
+
+      const linkDestino =
+        textoOpcional(avancadas.link) ||
+        textoOpcional(cfgBanco.link) || "";
+
+      const ctaType =
+        textoOpcional(avancadas.cta) ||
+        textoOpcional(cfgBanco.cta) || "LEARN_MORE";
+
+      const imageHash =
+        textoOpcional(avancadas.imageHash) ||
+        textoOpcional(avancadas.image_hash) ||
+        textoOpcional(cfgBanco.imageHash) ||
+        textoOpcional(cfgBanco.image_hash) || "";
+
+      const imageHashes: string[] =
+        (Array.isArray(avancadas.imageHashes) && avancadas.imageHashes.length
+          ? avancadas.imageHashes
+          : Array.isArray(cfgBanco.imageHashes) && cfgBanco.imageHashes.length
+          ? cfgBanco.imageHashes
+          : imageHash ? [imageHash] : []
+        ).filter(Boolean);
+
+      const videoId =
+        textoOpcional(avancadas.video_id) ||
+        textoOpcional(avancadas.videoId) ||
+        textoOpcional(cfgBanco.video_id) ||
+        textoOpcional(cfgBanco.videoId) || "";
+
+      if (adId && pageId && formId) {
+        const isCarrossel = imageHashes.length > 1;
+
+        const ctaPayload: any = {
+          type: ctaType,
+          value: { lead_gen_form_id: formId }
+        };
+
+        let objectStorySpec: Record<string, any>;
+
+        if (videoId) {
+          objectStorySpec = {
+            page_id: pageId,
+            video_data: {
+              video_id: videoId,
+              title: tituloAnuncio,
+              message: texto,
+              call_to_action: ctaPayload,
+              ...(imageHashes[0] ? { image_hash: imageHashes[0] } : {})
+            }
+          };
+        } else if (isCarrossel) {
+          objectStorySpec = {
+            page_id: pageId,
+            link_data: {
+              message: texto,
+              multi_share_end_card: false,
+              child_attachments: imageHashes.map((hash, i) => ({
+                link: linkDestino,
+                image_hash: hash,
+                name: i === 0 ? tituloAnuncio : `Slide ${i + 1}`,
+                description: descricaoAnuncio,
+                call_to_action: ctaPayload
+              }))
+            }
+          };
+        } else {
+          objectStorySpec = {
+            page_id: pageId,
+            link_data: {
+              message: texto,
+              link: linkDestino,
+              image_hash: imageHashes[0] || "",
+              name: tituloAnuncio,
+              description: descricaoAnuncio,
+              call_to_action: ctaPayload
+            }
+          };
+        }
+
+        // Instagram actor
+        const instagramActorId =
+          textoOpcional(avancadas.instagram_actor_id) ||
+          textoOpcional(cfgBanco.instagram_actor_id);
+
+        if (instagramActorId) {
+          objectStorySpec.instagram_actor_id = instagramActorId;
+        }
+
+        const novoCreativo = await fetch(
+          `https://graph.facebook.com/v19.0/${contaAnunciosId}/adcreatives`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              name: `Criativo Leads ${Date.now()}`,
+              object_story_spec: objectStorySpec,
+              access_token: token
+            })
+          }
+        ).then(r => r.json());
+
+        if (novoCreativo?.id) {
+          await fetch(
+            `https://graph.facebook.com/v19.0/${adId}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                creative: { creative_id: novoCreativo.id },
+                access_token: token
+              })
+            }
+          ).catch(() => null);
+
+          avancadas.creative_id = novoCreativo.id;
+          if (avancadas.criativo) {
+            avancadas.criativo.creative_id = novoCreativo.id;
+          }
+        } else {
+          console.warn("EDITAR CAMPANHA: criativo não atualizado na Meta:", novoCreativo?.error);
+        }
+      }
+    } catch (errCreativo) {
+      console.warn("EDITAR CAMPANHA: erro ao atualizar criativo (ignorado):", errCreativo);
     }
 
     await client.query(
