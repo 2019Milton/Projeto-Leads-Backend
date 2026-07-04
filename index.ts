@@ -5605,6 +5605,128 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
 });
 
 
+app.post("/meta/upload-video", authMiddleware, async (c) => {
+
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+
+    const video = body.get("video") as File;
+    const usuario_id = body.get("usuario_id");
+    const nomeInformado =
+      String(body.get("nome") || video?.name || "video-campanha.mp4");
+
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    if (!video) {
+      return c.json({
+        error: "Vídeo não enviado"
+      }, 400);
+    }
+
+    const conn = await client.query(
+      `
+      SELECT access_token, conta_anuncios_id
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [usuarioId]
+    );
+
+    if (conn.rows.length === 0) {
+      return c.json({
+        error: "Meta não conectada"
+      }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+    let contaAnunciosId = conn.rows[0].conta_anuncios_id;
+
+    if (!contaAnunciosId) {
+      contaAnunciosId = await obterContaAnunciosSelecionadaIdUsuario(usuarioId);
+    }
+
+    const contaAds =
+      await obterContaAnuncios(
+        token,
+        contaAnunciosId
+      );
+
+    if (!contaAds) {
+      return c.json({
+        error: "Conta de anúncios não encontrada. Selecione a conta Meta no painel de conexão."
+      }, 400);
+    }
+
+    const metaForm = new FormData();
+
+    metaForm.append(
+      "source",
+      video,
+      nomeInformado
+    );
+
+    metaForm.append(
+      "access_token",
+      token
+    );
+
+    const response = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAds.id}/advideos`,
+      {
+        method: "POST",
+        body: metaForm
+      }
+    );
+
+    const texto = await response.text();
+    let upload: any = {};
+
+    try {
+      upload = JSON.parse(texto);
+    } catch (_) {
+      upload = { raw: texto };
+    }
+
+    if (!response.ok || !upload.id) {
+      const metaMsg =
+        upload?.error?.error_user_msg ||
+        upload?.error?.message ||
+        "Erro ao enviar vídeo para a Meta";
+
+      return c.json({
+        error: metaMsg,
+        detalhe: upload
+      }, 400);
+    }
+
+    return c.json({
+      sucesso: true,
+      video_id: upload.id,
+      videoId: upload.id,
+      video_nome: nomeInformado,
+      video_tipo: video.type || "",
+      video_tamanho: video.size || 0
+    });
+
+  } catch (err: any) {
+
+    console.error("UPLOAD VIDEO:", err?.message || err);
+
+    return c.json({
+      error: err?.message || "Erro upload vídeo"
+    }, 500);
+  }
+});
+
+
 
 app.post("/meta/anuncio", authMiddleware, async (c) => {
 
@@ -5624,7 +5746,11 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       daily_budget,
       imageHash,
       imageHashes,
-      imageUrls
+      imageUrls,
+      video_id,
+      videoId,
+      video_url,
+      videoUrl
     } = await c.req.json();
 
     const usuarioId =
@@ -5705,6 +5831,18 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       textoOpcional(avancadas.descricao) ||
       "Entre em contato agora";
 
+    const videoMetaId =
+      textoOpcional(video_id) ||
+      textoOpcional(videoId) ||
+      textoOpcional(avancadas.video_id) ||
+      textoOpcional(avancadas.videoId);
+
+    const videoMetaUrl =
+      textoOpcional(video_url) ||
+      textoOpcional(videoUrl) ||
+      textoOpcional(avancadas.video_url) ||
+      textoOpcional(avancadas.videoUrl);
+
     // 🔥 CRIATIVO
     const hashes: string[] =
       Array.isArray(imageHashes) && imageHashes.length > 0
@@ -5766,10 +5904,23 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       }
     }
 
-    const objectStorySpec: Record<string, any> = {
-      page_id,
-      link_data: linkDataBase
-    };
+    const objectStorySpec: Record<string, any> = videoMetaId
+      ? {
+          page_id,
+          video_data: {
+            video_id: videoMetaId,
+            title: tituloAnuncio,
+            message: texto || "Quer mais clientes? 🚀",
+            call_to_action: {
+              type: ctaType,
+              value: { lead_gen_form_id: form_id }
+            }
+          }
+        }
+      : {
+          page_id,
+          link_data: linkDataBase
+        };
 
     if (instagramActorId) {
       objectStorySpec.instagram_actor_id = instagramActorId;
@@ -5900,6 +6051,10 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       imageHashes: hashes,
       imagens_urls: Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [],
       image_urls: Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [],
+      video_id: videoMetaId || null,
+      videoId: videoMetaId || null,
+      video_url: videoMetaUrl || null,
+      videoUrl: videoMetaUrl || null,
       creative_id: creative.id,
       ad_id: ad.id,
       adset_id,
@@ -5909,7 +6064,10 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         creative_id: creative.id,
         image_hash: hashes[0] || imageHash || null,
         image_hashes: hashes,
+        video_id: videoMetaId || null,
+        video_url: videoMetaUrl || null,
         carrossel: isCarrossel,
+        tipo: videoMetaId ? "video" : isCarrossel ? "carrossel" : "imagem",
         titulo: tituloAnuncio,
         descricao: descricaoAnuncio,
         link: linkDestino
