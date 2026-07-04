@@ -546,6 +546,35 @@ function bidStrategyExigeValor(value: unknown) {
   );
 }
 
+function prepararControleCustoMeta(
+  strategyValue: unknown,
+  amountValue: unknown
+) {
+  const bidStrategy =
+    normalizarBidStrategyMeta(strategyValue);
+  const bidAmount =
+    numeroOpcional(amountValue);
+
+  if (!bidStrategyExigeValor(bidStrategy)) {
+    return {
+      bidStrategy,
+      bidAmount: null
+    };
+  }
+
+  if (bidAmount !== null && bidAmount > 0) {
+    return {
+      bidStrategy,
+      bidAmount
+    };
+  }
+
+  return {
+    bidStrategy: "LOWEST_COST_WITHOUT_CAP",
+    bidAmount: null
+  };
+}
+
 function listaOpcional(value: unknown) {
   return Array.isArray(value)
     ? value
@@ -5014,11 +5043,11 @@ app.post("/meta/adset", authMiddleware, async (c) => {
     const fim =
       textoOpcional(avancadas.fim);
 
-    const bidStrategy =
-      normalizarBidStrategyMeta(avancadas.bid_strategy);
-
-    const bidAmount =
-      numeroOpcional(avancadas.bid_amount);
+    const { bidStrategy, bidAmount } =
+      prepararControleCustoMeta(
+        avancadas.bid_strategy,
+        avancadas.bid_amount
+      );
 
     const payloadAdset: any = {
       name: `AdSet Leads ${Date.now()}`,
@@ -10887,11 +10916,11 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       delete targeting.genders;
     }
 
-    const bidStrategy =
-      normalizarBidStrategyMeta(avancadas.bid_strategy);
-
-    const bidAmount =
-      numeroOpcional(avancadas.bid_amount);
+    const { bidStrategy, bidAmount } =
+      prepararControleCustoMeta(
+        avancadas.bid_strategy,
+        avancadas.bid_amount
+      );
 
     const inicio =
       textoOpcional(avancadas.inicio);
@@ -11243,6 +11272,12 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       delete targeting.genders;
     }
 
+    const controleCusto =
+      prepararControleCustoMeta(
+        cfg.bid_strategy,
+        cfg.bid_amount
+      );
+
     const payloadAdset: any = {
       name: `AdSet ${campanha.nome || "Leads"} ${Date.now()}`,
       campaign_id: campanhaMeta.id,
@@ -11250,7 +11285,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       optimization_goal: "LEAD_GENERATION",
       destination_type: "ON_AD",
       bid_strategy:
-        normalizarBidStrategyMeta(cfg.bid_strategy),
+        controleCusto.bidStrategy,
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
       promoted_object: {
@@ -11264,15 +11299,12 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       payloadAdset.daily_budget = dailyBudget;
     }
 
-    const bidAmount =
-      numeroOpcional(cfg.bid_amount);
-
     if (
-      bidAmount !== null &&
+      controleCusto.bidAmount !== null &&
       bidStrategyExigeValor(payloadAdset.bid_strategy)
     ) {
       payloadAdset.bid_amount =
-        Math.round(bidAmount * 100);
+        Math.round(controleCusto.bidAmount * 100);
     }
 
     const fim =
@@ -16425,13 +16457,19 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
       targeting.custom_audiences = publicosPersonalizados;
     }
 
+    const controleCustoRascunho =
+      prepararControleCustoMeta(
+        cfgCampanha.bid_strategy,
+        cfgCampanha.bid_amount
+      );
+
     const payloadAdset: any = {
       name: `AdSet ${rascunho.nome} ${Date.now()}`,
       campaign_id: campanhaMeta.id,
       billing_event: "IMPRESSIONS",
       optimization_goal: "LEAD_GENERATION",
       destination_type: "ON_AD",
-      bid_strategy: textoOpcional(cfgCampanha.bid_strategy) || "LOWEST_COST_WITHOUT_CAP",
+      bid_strategy: controleCustoRascunho.bidStrategy,
       daily_budget: cfgPublico.orcamento_diario_centavos || cfgCampanha.orcamento_diario_centavos || 2000,
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
@@ -16439,6 +16477,14 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
       status: "PAUSED",
       access_token: token
     };
+
+    if (
+      controleCustoRascunho.bidAmount !== null &&
+      bidStrategyExigeValor(payloadAdset.bid_strategy)
+    ) {
+      payloadAdset.bid_amount =
+        Math.round(controleCustoRascunho.bidAmount * 100);
+    }
 
     const adsetMeta = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
