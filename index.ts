@@ -524,6 +524,28 @@ function numeroOpcional(value: unknown) {
     : null;
 }
 
+const ESTRATEGIAS_BID_COM_VALOR = new Set([
+  "LOWEST_COST_WITH_BID_CAP",
+  "COST_CAP",
+  "TARGET_COST"
+]);
+
+function normalizarBidStrategyMeta(value: unknown) {
+  const strategy = textoOpcional(value).toUpperCase();
+
+  if (!strategy || strategy === "AUTOMATICO" || strategy === "AUTO") {
+    return "LOWEST_COST_WITHOUT_CAP";
+  }
+
+  return strategy;
+}
+
+function bidStrategyExigeValor(value: unknown) {
+  return ESTRATEGIAS_BID_COM_VALOR.has(
+    normalizarBidStrategyMeta(value)
+  );
+}
+
 function listaOpcional(value: unknown) {
   return Array.isArray(value)
     ? value
@@ -4993,8 +5015,7 @@ app.post("/meta/adset", authMiddleware, async (c) => {
       textoOpcional(avancadas.fim);
 
     const bidStrategy =
-      textoOpcional(avancadas.bid_strategy) ||
-      "LOWEST_COST_WITHOUT_CAP";
+      normalizarBidStrategyMeta(avancadas.bid_strategy);
 
     const bidAmount =
       numeroOpcional(avancadas.bid_amount);
@@ -5039,7 +5060,7 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
     if (
       bidAmount !== null &&
-      bidStrategy !== "LOWEST_COST_WITHOUT_CAP"
+      bidStrategyExigeValor(bidStrategy)
     ) {
       payloadAdset.bid_amount =
         Math.round(bidAmount * 100);
@@ -10867,8 +10888,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     }
 
     const bidStrategy =
-      textoOpcional(avancadas.bid_strategy) ||
-      "LOWEST_COST_WITHOUT_CAP";
+      normalizarBidStrategyMeta(avancadas.bid_strategy);
 
     const bidAmount =
       numeroOpcional(avancadas.bid_amount);
@@ -10894,7 +10914,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     if (
       bidAmount !== null &&
-      bidStrategy !== "LOWEST_COST_WITHOUT_CAP"
+      bidStrategyExigeValor(bidStrategy)
     ) {
       payloadAdset.bid_amount =
         Math.round(bidAmount * 100);
@@ -11230,8 +11250,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       optimization_goal: "LEAD_GENERATION",
       destination_type: "ON_AD",
       bid_strategy:
-        textoOpcional(cfg.bid_strategy) ||
-        "LOWEST_COST_WITHOUT_CAP",
+        normalizarBidStrategyMeta(cfg.bid_strategy),
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
       promoted_object: {
@@ -11250,7 +11269,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     if (
       bidAmount !== null &&
-      payloadAdset.bid_strategy !== "LOWEST_COST_WITHOUT_CAP"
+      bidStrategyExigeValor(payloadAdset.bid_strategy)
     ) {
       payloadAdset.bid_amount =
         Math.round(bidAmount * 100);
