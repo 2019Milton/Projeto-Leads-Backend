@@ -592,6 +592,26 @@ function erroMetaBidAmount(resposta: any) {
   );
 }
 
+function erroMetaIdade(resposta: any) {
+  const mensagem = String(
+    resposta?.error?.error_user_msg ||
+    resposta?.error?.message ||
+    resposta?.error ||
+    ""
+  ).toLowerCase();
+
+  return (
+    mensagem.includes("age_min") ||
+    mensagem.includes("age_max") ||
+    mensagem.includes("minimum age") ||
+    mensagem.includes("idade") ||
+    (
+      mensagem.includes("age") &&
+      mensagem.includes("targeting")
+    )
+  );
+}
+
 async function enviarPayloadMetaComFallbackBid(
   url: string,
   payload: Record<string, any>,
@@ -616,6 +636,26 @@ async function enviarPayloadMetaComFallbackBid(
 
     console.warn(
       `${contexto}: Meta rejeitou controle de lance, tentando novamente sem bid_strategy/bid_amount`,
+      resposta?.error || resposta
+    );
+
+    resposta = await enviar(retryPayload);
+  }
+
+  if (erroMetaIdade(resposta) && payload.targeting) {
+    const retryPayload = {
+      ...payload,
+      targeting: {
+        ...payload.targeting
+      }
+    };
+
+    delete retryPayload.targeting.age_min;
+    delete retryPayload.targeting.age_max;
+    delete retryPayload.targeting.genders;
+
+    console.warn(
+      `${contexto}: Meta rejeitou idade/genero do publico, tentando novamente com publico amplo`,
       resposta?.error || resposta
     );
 
