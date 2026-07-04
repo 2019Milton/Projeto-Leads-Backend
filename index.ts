@@ -14391,8 +14391,38 @@ app.post("/ia/chat-leads", authMiddleware, async (c) => {
     const limite = limitarRequisicao(c, `ia-chat:${user.id}`, 30, 60 * 1000);
     if (limite) return limite;
 
-    const { mensagem, contexto } = await c.req.json();
-    if (!mensagem?.trim()) return c.json({ error: "Mensagem vazia" }, 400);
+    const body = await c.req.json();
+
+    // Valida e normaliza mensagem
+    const mensagemRaw = String(body.mensagem || "").trim();
+    if (!mensagemRaw) return c.json({ error: "Mensagem vazia" }, 400);
+    if (mensagemRaw.length > 800) return c.json({ error: "Mensagem muito longa" }, 400);
+    const mensagem = mensagemRaw;
+
+    // Extrai apenas campos conhecidos do contexto — nunca usar contexto bruto do frontend
+    const ctxRaw = body.contexto || {};
+    const contexto = {
+      secao_ativa:  String(ctxRaw.secao_ativa  || "").slice(0, 40),
+      nicho_ativo:  String(ctxRaw.nicho_ativo  || "").slice(0, 60),
+      nichos:       Array.isArray(ctxRaw.nichos)
+        ? ctxRaw.nichos.map((n: any) => String(n).slice(0, 40)).slice(0, 10)
+        : [],
+      campanhas: {
+        total:    Number(ctxRaw.campanhas?.total   || 0),
+        ativas:   Number(ctxRaw.campanhas?.ativas  || 0),
+        pausadas: Number(ctxRaw.campanhas?.pausadas || 0)
+      },
+      leads: {
+        total:   Number(ctxRaw.leads?.total   || 0),
+        novos:   Number(ctxRaw.leads?.novos   || 0),
+        perdidos: Number(ctxRaw.leads?.perdidos || 0)
+      }
+    };
+
+    // Seções válidas de navegação (whitelist)
+    const SECOES_VALIDAS = new Set([
+      "dashboard","integracoes","campanhas","leads","suporte","informacoes"
+    ]);
 
     const systemPrompt = `Você é o ChatIALeads, assistente virtual da Plataforma de Leads (plataformadeleads.com.br). Você conhece CADA botão, campo e seção da plataforma e guia os usuários com instruções exatas e práticas.
 
@@ -14586,11 +14616,19 @@ Seu plano atual, recursos disponíveis, limites (campanhas, leads, IA) e o que e
 
     // Extrai acao de navegação do padrão [NAVEGAR:secao:Label]
     let acao: { secao: string; label: string } | null = null;
-    const navMatch = resposta.match(/\[NAVEGAR:(\w+):([^\]]+)\]/);
+    const navMatch = resposta.match(/\[NAVEGAR:(\w+):([^\]]{1,60})\]/);
     if (navMatch) {
-      acao = { secao: navMatch[1], label: navMatch[2] };
+      const secaoCandidata = navMatch[1].toLowerCase();
+      if (SECOES_VALIDAS.has(secaoCandidata)) {
+        // Label: só texto (sem HTML — strip tags e limita comprimento)
+        const labelLimpa = navMatch[2].replace(/[<>"'&]/g, "").trim().slice(0, 50);
+        acao = { secao: secaoCandidata, label: labelLimpa || "Abrir" };
+      }
       resposta = resposta.replace(/\[NAVEGAR:[^\]]+\]/g, "").trim();
     }
+
+    // Limita tamanho da resposta final
+    if (resposta.length > 1200) resposta = resposta.slice(0, 1200) + "…";
 
     return c.json({ resposta, acao });
 
