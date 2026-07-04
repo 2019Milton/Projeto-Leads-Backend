@@ -5877,7 +5877,34 @@ app.post("/meta/upload-video", authMiddleware, async (c) => {
   }
 });
 
+// Aguarda vídeo ficar pronto na Meta (processa de forma assíncrona após upload)
+async function aguardarVideoMetaReady(
+  token: string,
+  videoId: string,
+  maxTentativas = 12,
+  intervaloMs = 5000
+): Promise<boolean> {
+  for (let i = 0; i < maxTentativas; i++) {
+    try {
+      const res = await fetch(
+        `https://graph.facebook.com/v19.0/${videoId}?fields=status&access_token=${token}`
+      ).then(r => r.json());
 
+      const videoStatus = res?.status?.video_status;
+      if (videoStatus === "ready") return true;
+      if (res.error) {
+        console.warn(`[video-ready] erro na verificação de status:`, res.error);
+        return false;
+      }
+      console.log(`[video-ready] tentativa ${i + 1}: status = ${videoStatus}, aguardando...`);
+    } catch (e) {
+      console.warn(`[video-ready] erro tentativa ${i + 1}:`, e);
+    }
+    await new Promise(r => setTimeout(r, intervaloMs));
+  }
+  console.warn(`[video-ready] timeout: vídeo ${videoId} não ficou pronto em ${maxTentativas * intervaloMs / 1000}s`);
+  return false;
+}
 
 app.post("/meta/anuncio", authMiddleware, async (c) => {
 
@@ -5993,6 +6020,11 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       textoOpcional(videoUrl) ||
       textoOpcional(avancadas.video_url) ||
       textoOpcional(avancadas.videoUrl);
+
+    // Se há vídeo, aguarda ficar pronto antes de criar o criativo
+    if (videoMetaId) {
+      await aguardarVideoMetaReady(token, videoMetaId);
+    }
 
     // 🔥 CRIATIVO
     const hashes: string[] =
