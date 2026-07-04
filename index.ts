@@ -4032,7 +4032,7 @@ app.get("/auth/meta/callback", async (c) => {
     return c.html(`
       <script>
         if (window.opener) {
-          window.opener.postMessage({ type: "meta_conectado" }, "*");
+          window.opener.postMessage({ type: "meta_conectado" }, "${obterFrontendUrl()}");
         }
         window.close();
       </script>
@@ -4297,7 +4297,7 @@ app.get("/auth/:plataforma/callback", async (c) => {
     return c.html(`
       <script>
         if (window.opener) {
-          window.opener.postMessage({ type: "plataforma_conectada", plataforma: "${plataforma}" }, "*");
+          window.opener.postMessage({ type: "plataforma_conectada", plataforma: "${plataforma}" }, "${obterFrontendUrl()}");
         }
         window.close();
       </script>
@@ -4703,7 +4703,7 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       return c.html(`
         <script>
           if (window.opener) {
-            window.opener.postMessage({ type: "instagram_erro", erro: "Conecte sua conta Meta antes de vincular o Instagram." }, "*");
+            window.opener.postMessage({ type: "instagram_erro", erro: "Conecte sua conta Meta antes de vincular o Instagram." }, "${obterFrontendUrl()}");
           }
           window.close();
         </script>
@@ -4774,7 +4774,7 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       return c.html(`
         <script>
           if (window.opener) {
-            window.opener.postMessage({ type: "instagram_erro", erro: "Não foi possível obter os dados da conta do Instagram." }, "*");
+            window.opener.postMessage({ type: "instagram_erro", erro: "Não foi possível obter os dados da conta do Instagram." }, "${obterFrontendUrl()}");
           }
           window.close();
         </script>
@@ -4806,7 +4806,7 @@ app.get("/auth/meta/instagram/callback", async (c) => {
     return c.html(`
       <script>
         if (window.opener) {
-          window.opener.postMessage({ type: "instagram_conectado" }, "*");
+          window.opener.postMessage({ type: "instagram_conectado" }, "${obterFrontendUrl()}");
         }
         window.close();
       </script>
@@ -7208,6 +7208,20 @@ app.get("/webhook/tiktok", async (c) => {
 });
 
 app.post("/webhook/tiktok", async (c) => {
+  // Validate webhook secret if configured (TikTok sends Authorization header)
+  const tiktokSecret = Bun.env.TIKTOK_WEBHOOK_SECRET;
+  if (tiktokSecret) {
+    const auth = c.req.header("authorization") || "";
+    const provided = auth.replace(/^Bearer\s+/i, "").trim();
+    if (
+      !provided ||
+      provided.length !== tiktokSecret.length ||
+      !timingSafeEqual(Buffer.from(provided), Buffer.from(tiktokSecret))
+    ) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+  }
+
   try {
     const body = await c.req.json() as any;
     console.log("WEBHOOK TIKTOK RECEBIDO:", JSON.stringify(body));
@@ -7316,6 +7330,15 @@ app.post("/webhook/tiktok", async (c) => {
 
 // 🔥 WEBHOOK Z-API — eventos de conexão/desconexão
 app.post("/webhook/zapi", async (c) => {
+  // Validate shared secret if configured
+  const zapiSecret = Bun.env.ZAPI_WEBHOOK_SECRET;
+  if (zapiSecret) {
+    const headerToken = c.req.header("x-webhook-token") || c.req.header("authorization")?.replace("Bearer ", "");
+    if (!headerToken || !timingSafeEqual(Buffer.from(headerToken), Buffer.from(zapiSecret))) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+  }
+
   try {
     const body = await c.req.json().catch(() => ({}));
     const tipo = body?.type || body?.event || "";
@@ -8517,14 +8540,15 @@ app.post("/auth/reset-senha", async (c) => {
   }
 });
 
-app.get("/login-test", async (c) => {
+app.post("/login-test", async (c) => {
   if (Bun.env.ALLOW_LOGIN_TEST !== "true") {
     return c.json({ error: "Rota desativada" }, 404);
   }
 
   try {
-    const email = c.req.query("email");
-    const senha = c.req.query("senha");
+    const body = await c.req.json().catch(() => ({}));
+    const email = body.email;
+    const senha = body.senha;
 
     if (!email || !senha) {
       return c.json({ error: "Email e senha obrigatórios" }, 400);
