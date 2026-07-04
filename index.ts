@@ -8863,7 +8863,10 @@ app.get("/campanhas", authMiddleware, async (c) => {
       ) nd ON true
       WHERE
         (
-          c.usuario_id = $1
+          (
+            c.usuario_id = $1
+            AND (c.origem = 'manual' OR c.conta_anuncios_id = $2)
+          )
           OR EXISTS (
             SELECT 1
             FROM campanha_corretores cc2
@@ -8871,11 +8874,7 @@ app.get("/campanhas", authMiddleware, async (c) => {
             AND cc2.usuario_id = $1
           )
         )
-        AND (
-          c.origem = 'manual'
-          OR c.conta_anuncios_id = $2
-        )
-        AND ($3::text IS NULL OR n.slug = $3)
+        AND ($3::text IS NULL OR COALESCE(n.slug, nd.slug) = $3)
       ORDER BY c.id DESC
       `,
       [user.id, contaAnunciosId ?? null, nichoSlug ?? null]
@@ -9265,17 +9264,16 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         ON cp.campanha_id = c.id
       WHERE
         (
-          c.usuario_id = $1
+          (
+            c.usuario_id = $1
+            AND ($2::text IS NULL OR c.conta_anuncios_id = $2)
+          )
           OR EXISTS (
             SELECT 1
             FROM campanha_corretores cc2
             WHERE cc2.campanha_id = c.id
             AND cc2.usuario_id = $1
           )
-        )
-        AND (
-          $2::text IS NULL
-          OR c.conta_anuncios_id = $2
         )
       ORDER BY c.id DESC
       `,
