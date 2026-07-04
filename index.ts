@@ -5877,24 +5877,26 @@ app.post("/meta/upload-video", authMiddleware, async (c) => {
   }
 });
 
-// Aguarda vídeo ficar pronto na Meta (processa de forma assíncrona após upload)
+// Aguarda vídeo ficar pronto na Meta e retorna o thumbnail URL gerado automaticamente
 async function aguardarVideoMetaReady(
   token: string,
   videoId: string,
   maxTentativas = 12,
   intervaloMs = 5000
-): Promise<boolean> {
+): Promise<{ ready: boolean; picture: string | null }> {
   for (let i = 0; i < maxTentativas; i++) {
     try {
       const res = await fetch(
-        `https://graph.facebook.com/v19.0/${videoId}?fields=status&access_token=${token}`
+        `https://graph.facebook.com/v19.0/${videoId}?fields=status,picture&access_token=${token}`
       ).then(r => r.json());
 
       const videoStatus = res?.status?.video_status;
-      if (videoStatus === "ready") return true;
+      if (videoStatus === "ready") {
+        return { ready: true, picture: res.picture || null };
+      }
       if (res.error) {
         console.warn(`[video-ready] erro na verificação de status:`, res.error);
-        return false;
+        return { ready: false, picture: null };
       }
       console.log(`[video-ready] tentativa ${i + 1}: status = ${videoStatus}, aguardando...`);
     } catch (e) {
@@ -5903,7 +5905,7 @@ async function aguardarVideoMetaReady(
     await new Promise(r => setTimeout(r, intervaloMs));
   }
   console.warn(`[video-ready] timeout: vídeo ${videoId} não ficou pronto em ${maxTentativas * intervaloMs / 1000}s`);
-  return false;
+  return { ready: false, picture: null };
 }
 
 app.post("/meta/anuncio", authMiddleware, async (c) => {
@@ -6021,9 +6023,11 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       textoOpcional(avancadas.video_url) ||
       textoOpcional(avancadas.videoUrl);
 
-    // Se há vídeo, aguarda ficar pronto antes de criar o criativo
+    // Se há vídeo, aguarda ficar pronto e captura o thumbnail gerado pela Meta
+    let videoThumbnailUrl: string | null = null;
     if (videoMetaId) {
-      await aguardarVideoMetaReady(token, videoMetaId);
+      const { picture } = await aguardarVideoMetaReady(token, videoMetaId);
+      videoThumbnailUrl = picture;
     }
 
     // 🔥 CRIATIVO
@@ -6087,23 +6091,26 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       }
     }
 
+    const videoData: Record<string, any> = {
+      video_id: videoMetaId,
+      title: tituloAnuncio,
+      message: texto || "Quer mais clientes? 🚀",
+      call_to_action: {
+        type: ctaType,
+        value: { lead_gen_form_id: form_id }
+      }
+    };
+
+    // Meta exige image_hash ou image_url no video_data
+    if (hashes[0]) {
+      videoData.image_hash = hashes[0];
+    } else if (videoThumbnailUrl) {
+      videoData.image_url = videoThumbnailUrl;
+    }
+
     const objectStorySpec: Record<string, any> = videoMetaId
-      ? {
-          page_id,
-          video_data: {
-            video_id: videoMetaId,
-            title: tituloAnuncio,
-            message: texto || "Quer mais clientes? 🚀",
-            call_to_action: {
-              type: ctaType,
-              value: { lead_gen_form_id: form_id }
-            }
-          }
-        }
-      : {
-          page_id,
-          link_data: linkDataBase
-        };
+      ? { page_id, video_data: videoData }
+      : { page_id, link_data: linkDataBase };
 
     if (instagramActorId) {
       objectStorySpec.instagram_actor_id = instagramActorId;
