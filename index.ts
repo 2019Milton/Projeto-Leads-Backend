@@ -636,12 +636,19 @@ async function enviarPayloadMetaComFallbackBid(
   let resposta = await enviar(payload);
 
   if (erroMetaBidAmount(resposta)) {
+    const tinhaStrategy = !!payload.bid_strategy;
     const retryPayload = { ...payload };
     delete retryPayload.bid_strategy;
     delete retryPayload.bid_amount;
 
+    if (!tinhaStrategy) {
+      // Sem estratégia no payload, Meta pode estar defaultando para algo que exige valor.
+      // Força LOWEST_COST_WITHOUT_CAP explicitamente para evitar isso.
+      retryPayload.bid_strategy = "LOWEST_COST_WITHOUT_CAP";
+    }
+
     console.warn(
-      `${contexto}: Meta rejeitou controle de lance, tentando novamente sem bid_strategy/bid_amount`,
+      `${contexto}: Meta rejeitou controle de lance, tentando novamente${tinhaStrategy ? " sem bid_strategy" : " com LOWEST_COST_WITHOUT_CAP explícito"}`,
       resposta?.error || resposta
     );
 
