@@ -7573,6 +7573,7 @@ app.post("/webhook/meta", async (c) => {
                 email,
                 telefone,
                 origem,
+                plataforma,
                 status,
                 campanha,
                 conta_anuncios_id,
@@ -7580,7 +7581,7 @@ app.post("/webhook/meta", async (c) => {
                 nicho_id,
                 criado_em
               )
-              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,COALESCE($12::timestamptz, NOW()))
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13::timestamptz, NOW()))
               `,
               [
                 usuarioId,
@@ -7588,6 +7589,7 @@ app.post("/webhook/meta", async (c) => {
                 nome || "Lead Facebook",
                 email,
                 telefone,
+                "meta",
                 "meta",
                 "novo",
                 nomeCampanha,
@@ -10432,13 +10434,14 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               campanha,
               conta_anuncios_id,
               origem,
+              plataforma,
               status,
               respostas_qualificacao,
               nicho_id,
               criado_em
             )
             VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()
             )
             `,
             [
@@ -10449,6 +10452,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
               fields.phone_number || "",
               nomeCampanha,
               adAccountId,
+              "meta",
               "meta",
               "novo",
               JSON.stringify(respostasQualificacao),
@@ -11909,7 +11913,7 @@ app.post("/leads", authMiddleware, async (c) => {
     }
 
     await client.query(
-      "INSERT INTO leads (nome, telefone, email, usuario_id) VALUES ($1,$2,$3,$4)",
+      "INSERT INTO leads (nome, telefone, email, usuario_id, origem, plataforma) VALUES ($1,$2,$3,$4,'manual','formulario')",
       [body.nome, body.telefone, body.email, user.id]
     );
 
@@ -11977,7 +11981,7 @@ app.get("/leads", authMiddleware, async (c) => {
         n.cor  AS nicho_cor,
         l.data_contato,
         l.observacao_agendamento,
-        COALESCE(l.plataforma, 'meta') AS plataforma
+        COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
       WHERE l.usuario_id = $1
