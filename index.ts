@@ -11926,6 +11926,61 @@ app.post("/leads", authMiddleware, async (c) => {
   }
 });
 
+// 🔔 TESTE DE NOTIFICAÇÃO WHATSAPP
+app.post("/teste/notif-whatsapp", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const row = await client.query(
+      `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
+      [user.id]
+    );
+    const u = row.rows[0];
+    if (!u?.whatsapp) {
+      return c.json({ erro: "Nenhum número de WhatsApp cadastrado no perfil." }, 400);
+    }
+
+    const numero = String(u.whatsapp).replace(/\D/g, "");
+    const phone = numero.startsWith("55") ? numero : `55${numero}`;
+
+    const instanceId  = Bun.env.ZAPI_INSTANCE_ID;
+    const token       = Bun.env.ZAPI_TOKEN;
+    const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
+
+    if (!instanceId || !token) {
+      return c.json({ erro: "ZAPI_INSTANCE_ID ou ZAPI_TOKEN não configurados no servidor." }, 500);
+    }
+
+    const agora = new Date().toLocaleString("pt-BR", {
+      timeZone: "America/Sao_Paulo",
+      day: "2-digit", month: "2-digit",
+      hour: "2-digit", minute: "2-digit"
+    });
+
+    const msg = `✅ *Teste de notificação — Plataforma de Leads*\n\nSe você recebeu esta mensagem, as notificações de novos leads estão funcionando corretamente.\n\n⏰ ${agora}`;
+
+    const res = await fetch(
+      `https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(clientToken ? { "Client-Token": clientToken } : {})
+        },
+        body: JSON.stringify({ phone, message: msg })
+      }
+    );
+
+    const resposta = await res.json().catch(() => ({}));
+    if (res.ok) {
+      return c.json({ ok: true, phone, resposta });
+    } else {
+      return c.json({ erro: "Z-API retornou erro", status: res.status, resposta }, 500);
+    }
+  } catch (err: any) {
+    return c.json({ erro: err?.message || "Erro desconhecido" }, 500);
+  }
+});
+
 // 🔹 leads por plataforma (stats para o dashboard)
 app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
   try {
