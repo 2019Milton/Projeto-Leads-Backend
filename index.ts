@@ -16386,6 +16386,80 @@ app.get("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
   }
 });
 
+// 👁️ preview real do anúncio (como aparece na Meta) para exibir no drawer de detalhes
+app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    const adFormat =
+      String(c.req.query("ad_format") || "DESKTOP_FEED_STANDARD");
+
+    const campRes = await client.query(
+      `SELECT c.id, c.usuario_id, c.ad_id, c.status
+       FROM campanhas c
+       WHERE c.id = $1
+         AND (c.usuario_id = $2 OR EXISTS (
+           SELECT 1 FROM campanha_corretores cc
+           WHERE cc.campanha_id = c.id AND cc.usuario_id = $2
+         ))`,
+      [campanhaId, user.id]
+    );
+
+    if (campRes.rows.length === 0) {
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const campanha = campRes.rows[0];
+
+    if (!campanha.ad_id) {
+      return c.json({
+        error: "Esta campanha ainda não tem um anúncio publicado na Meta"
+      }, 400);
+    }
+
+    const conn = await client.query(
+      `SELECT access_token
+       FROM meta_conexoes
+       WHERE usuario_id = $1
+       ORDER BY id DESC
+       LIMIT 1`,
+      [campanha.usuario_id]
+    );
+
+    const token = conn.rows[0]?.access_token || null;
+
+    if (!token) {
+      return c.json({
+        error: "Meta não conectada para esta campanha"
+      }, 400);
+    }
+
+    const previewRes = await fetch(
+      `https://graph.facebook.com/v19.0/${campanha.ad_id}/previews?ad_format=${encodeURIComponent(adFormat)}&access_token=${token}`
+    );
+
+    const previewData: any = await previewRes.json();
+
+    const previewHtml = previewData?.data?.[0]?.body || null;
+
+    if (!previewRes.ok || !previewHtml) {
+      console.error("ERRO PREVIEW ANUNCIO META:", previewData?.error || previewData);
+      return c.json({
+        error:
+          previewData?.error?.error_user_msg ||
+          previewData?.error?.message ||
+          "Não foi possível carregar o preview deste anúncio na Meta"
+      }, 400);
+    }
+
+    return c.json({ preview_html: previewHtml });
+
+  } catch (err) {
+    console.error("ERRO GET /campanhas/:id/preview-anuncio:", err);
+    return c.json({ error: "Erro ao buscar preview do anúncio" }, 500);
+  }
+});
+
 // atualizar detalhes do nicho de uma campanha
 app.put("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
   try {
