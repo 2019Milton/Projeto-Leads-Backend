@@ -7990,7 +7990,8 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS configuracoes_avancadas JSONB,
     ADD COLUMN IF NOT EXISTS encaminhada_para_usuario_id INTEGER,
     ADD COLUMN IF NOT EXISTS encaminhada_em TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS daily_budget INTEGER;
+    ADD COLUMN IF NOT EXISTS daily_budget INTEGER,
+    ADD COLUMN IF NOT EXISTS origem_campanha_id INTEGER REFERENCES campanhas(id) ON DELETE SET NULL;
 `);
 
 await client.query(`
@@ -8041,6 +8042,8 @@ await client.query(`
     ON campanhas(conta_anuncios_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_encaminhada_usuario_id
     ON campanhas(encaminhada_para_usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_campanhas_origem_campanha_id
+    ON campanhas(origem_campanha_id);
   CREATE INDEX IF NOT EXISTS idx_campanha_corretores_usuario
     ON campanha_corretores(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_campanha_corretores_historico_usuario
@@ -8139,6 +8142,124 @@ await client.query(`
   CREATE INDEX IF NOT EXISTS idx_usuario_nichos_usuario
     ON usuario_nichos(usuario_id);
 `);
+
+// Copia os dados de nicho (imóveis/saúde/suplementos) de uma campanha para outra.
+// Usado tanto ao duplicar quanto ao encaminhar campanhas (cópia independente).
+async function copiarDadosNichoCampanha(
+  dbClient: any,
+  origCampanhaId: number,
+  novaCampanhaId: number,
+  nichoSlug: string | null
+) {
+  if (nichoSlug === "imoveis") {
+    const r = await dbClient.query(
+      `SELECT tipo_imovel, finalidade, valor_min, valor_max, regiao
+       FROM campanhas_imoveis WHERE campanha_id = $1`,
+      [origCampanhaId]
+    );
+    if (r.rows.length > 0) {
+      const d = r.rows[0];
+      await dbClient.query(
+        `INSERT INTO campanhas_imoveis
+           (campanha_id, tipo_imovel, finalidade, valor_min, valor_max, regiao)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [novaCampanhaId, d.tipo_imovel, d.finalidade, d.valor_min, d.valor_max, d.regiao]
+      );
+    }
+  } else if (nichoSlug === "saude") {
+    const r = await dbClient.query(
+      `SELECT operadora, tipo_plano, faixa_etaria_min, faixa_etaria_max, cobertura, acomodacao
+       FROM campanhas_saude WHERE campanha_id = $1`,
+      [origCampanhaId]
+    );
+    if (r.rows.length > 0) {
+      const d = r.rows[0];
+      await dbClient.query(
+        `INSERT INTO campanhas_saude
+           (campanha_id, operadora, tipo_plano, faixa_etaria_min,
+            faixa_etaria_max, cobertura, acomodacao)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [novaCampanhaId, d.operadora, d.tipo_plano, d.faixa_etaria_min,
+         d.faixa_etaria_max, d.cobertura, d.acomodacao]
+      );
+    }
+  } else if (nichoSlug === "suplementos") {
+    const r = await dbClient.query(
+      `SELECT produto, objetivo, marca, publico_alvo
+       FROM campanhas_suplementos WHERE campanha_id = $1`,
+      [origCampanhaId]
+    );
+    if (r.rows.length > 0) {
+      const d = r.rows[0];
+      await dbClient.query(
+        `INSERT INTO campanhas_suplementos
+           (campanha_id, produto, objetivo, marca, publico_alvo)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [novaCampanhaId, d.produto, d.objetivo, d.marca, d.publico_alvo]
+      );
+    }
+  }
+}
+
+// 🔀 Migração única: campanhas encaminhadas antes desta versão apenas linkavam
+// (campanha_corretores) para a MESMA linha do dono original — editar a campanha
+// original também alterava o que o corretor via. Agora cada corretor recebe uma
+// cópia própria e independente (origem_campanha_id aponta para a original).
+try {
+  const encaminhamentosSemCopia = await client.query(`
+    SELECT cc.campanha_id, cc.usuario_id
+    FROM campanha_corretores cc
+    WHERE NOT EXISTS (
+      SELECT 1 FROM campanhas cop
+      WHERE cop.origem_campanha_id = cc.campanha_id
+      AND cop.usuario_id = cc.usuario_id
+    )
+  `);
+
+  for (const vinculo of encaminhamentosSemCopia.rows) {
+    const origRes = await client.query(
+      `SELECT c.*, n.slug AS nicho_slug
+       FROM campanhas c
+       LEFT JOIN nichos n ON n.id = c.nicho_id
+       WHERE c.id = $1`,
+      [vinculo.campanha_id]
+    );
+
+    const orig = origRes.rows[0];
+
+    if (!orig) continue;
+
+    const novaCopia = await client.query(
+      `INSERT INTO campanhas
+         (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, origem_campanha_id, criado_em)
+       VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, NOW())
+       RETURNING id`,
+      [
+        vinculo.usuario_id,
+        orig.nome,
+        orig.nicho_id ?? null,
+        orig.daily_budget ?? null,
+        orig.configuracoes_avancadas ?? null,
+        vinculo.campanha_id
+      ]
+    );
+
+    await copiarDadosNichoCampanha(
+      client,
+      vinculo.campanha_id,
+      novaCopia.rows[0].id,
+      orig.nicho_slug
+    );
+  }
+
+  if (encaminhamentosSemCopia.rows.length) {
+    console.log(
+      `MIGRAÇÃO CAMPANHAS ENCAMINHADAS: ${encaminhamentosSemCopia.rows.length} cópia(s) independente(s) criada(s).`
+    );
+  }
+} catch (err) {
+  console.error("ERRO MIGRAÇÃO CÓPIAS DE CAMPANHAS ENCAMINHADAS:", err);
+}
 
 await client.query(`
   ALTER TABLE usuarios
@@ -8833,9 +8954,10 @@ app.get("/campanhas", authMiddleware, async (c) => {
         COALESCE(n.slug, nd.slug) AS nicho_slug,
         COALESCE(n.nome, nd.nome) AS nicho_nome,
         COALESCE(n.cor,  nd.cor)  AS nicho_cor,
-        dono.email     AS criado_por_email,
-        dono.nome      AS criado_por_nome,
-        dono.sobrenome AS criado_por_sobrenome,
+        COALESCE(dono_origem.email,     dono.email)     AS criado_por_email,
+        COALESCE(dono_origem.nome,      dono.nome)      AS criado_por_nome,
+        COALESCE(dono_origem.sobrenome, dono.sobrenome) AS criado_por_sobrenome,
+        (c.origem_campanha_id IS NOT NULL) AS recebida_por_encaminhamento,
         COALESCE(
           (
             SELECT json_agg(json_build_object(
@@ -8844,10 +8966,10 @@ app.get("/campanhas", authMiddleware, async (c) => {
               'sobrenome', cor.sobrenome,
               'email', cor.email
             ))
-            FROM campanha_corretores cc
+            FROM campanhas cop
             INNER JOIN usuarios cor
-              ON cor.id = cc.usuario_id
-            WHERE cc.campanha_id = c.id
+              ON cor.id = cop.usuario_id
+            WHERE cop.origem_campanha_id = c.id
           ),
           '[]'
         ) AS corretores_encaminhados,
@@ -8871,6 +8993,10 @@ app.get("/campanhas", authMiddleware, async (c) => {
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
+      LEFT JOIN campanhas origem_c
+        ON origem_c.id = c.origem_campanha_id
+      LEFT JOIN usuarios dono_origem
+        ON dono_origem.id = origem_c.usuario_id
       LEFT JOIN nichos n
         ON n.id = c.nicho_id
       LEFT JOIN LATERAL (
@@ -8888,18 +9014,8 @@ app.get("/campanhas", authMiddleware, async (c) => {
         LIMIT 1
       ) nd ON true
       WHERE
-        (
-          (
-            c.usuario_id = $1
-            AND (c.origem = 'manual' OR c.conta_anuncios_id = $2)
-          )
-          OR EXISTS (
-            SELECT 1
-            FROM campanha_corretores cc2
-            WHERE cc2.campanha_id = c.id
-            AND cc2.usuario_id = $1
-          )
-        )
+        c.usuario_id = $1
+        AND (c.origem = 'manual' OR c.conta_anuncios_id = $2)
         AND ($3::text IS NULL OR COALESCE(n.slug, nd.slug) = $3)
       ORDER BY c.id DESC
       `,
@@ -9019,11 +9135,12 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
 
     const campanha = await client.query(
       `
-      SELECT id
-      FROM campanhas
-      WHERE id = $1
+      SELECT c.*, n.slug AS nicho_slug
+      FROM campanhas c
+      LEFT JOIN nichos n ON n.id = c.nicho_id
+      WHERE c.id = $1
       AND (
-        usuario_id = $2
+        c.usuario_id = $2
         OR $3::boolean = true
       )
       LIMIT 1
@@ -9038,6 +9155,8 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
           : "Campanha não encontrada para este Admin Corretor"
       }, 404);
     }
+
+    const orig = campanha.rows[0];
 
     if (corretorIds.length) {
 
@@ -9134,6 +9253,44 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
           `,
           [campanhaId, corretorId, user.id]
         );
+
+        // 🔀 Cópia independente: o corretor recebe seu próprio registro,
+        // sem vínculo com a campanha original — editar a original nunca
+        // mais afeta o que o corretor vê ou publica na conta Meta dele.
+        const copiaExistente = await conn.query(
+          `
+          SELECT id FROM campanhas
+          WHERE origem_campanha_id = $1 AND usuario_id = $2
+          LIMIT 1
+          `,
+          [campanhaId, corretorId]
+        );
+
+        if (!copiaExistente.rows.length) {
+          const novaCopia = await conn.query(
+            `
+            INSERT INTO campanhas
+              (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, origem_campanha_id, criado_em)
+            VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, NOW())
+            RETURNING id
+            `,
+            [
+              corretorId,
+              orig.nome,
+              orig.nicho_id ?? null,
+              orig.daily_budget ?? null,
+              orig.configuracoes_avancadas ?? null,
+              campanhaId
+            ]
+          );
+
+          await copiarDadosNichoCampanha(
+            conn,
+            campanhaId,
+            novaCopia.rows[0].id,
+            orig.nicho_slug
+          );
+        }
       }
 
       if (idsCancelados.length) {
@@ -9244,9 +9401,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         cp.objetivo AS objetivo_nicho,
         cp.marca,
         cp.publico_alvo,
-        dono.email AS criado_por_email,
-        dono.nome AS criado_por_nome,
-        dono.sobrenome AS criado_por_sobrenome,
+        COALESCE(dono_origem.email,     dono.email)     AS criado_por_email,
+        COALESCE(dono_origem.nome,      dono.nome)      AS criado_por_nome,
+        COALESCE(dono_origem.sobrenome, dono.sobrenome) AS criado_por_sobrenome,
         COALESCE(
           (
             SELECT json_agg(json_build_object(
@@ -9255,10 +9412,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
               'sobrenome', cor.sobrenome,
               'email', cor.email
             ))
-            FROM campanha_corretores cc
+            FROM campanhas cop
             INNER JOIN usuarios cor
-              ON cor.id = cc.usuario_id
-            WHERE cc.campanha_id = c.id
+              ON cor.id = cop.usuario_id
+            WHERE cop.origem_campanha_id = c.id
           ),
           '[]'
         ) AS corretores_encaminhados,
@@ -9282,6 +9439,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       FROM campanhas c
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
+      LEFT JOIN campanhas origem_c
+        ON origem_c.id = c.origem_campanha_id
+      LEFT JOIN usuarios dono_origem
+        ON dono_origem.id = origem_c.usuario_id
       LEFT JOIN campanhas_imoveis ci
         ON ci.campanha_id = c.id
       LEFT JOIN campanhas_saude cs
@@ -9289,18 +9450,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       LEFT JOIN campanhas_suplementos cp
         ON cp.campanha_id = c.id
       WHERE
-        (
-          (
-            c.usuario_id = $1
-            AND ($2::text IS NULL OR c.conta_anuncios_id = $2)
-          )
-          OR EXISTS (
-            SELECT 1
-            FROM campanha_corretores cc2
-            WHERE cc2.campanha_id = c.id
-            AND cc2.usuario_id = $1
-          )
-        )
+        c.usuario_id = $1
+        AND (c.origem = 'manual' OR $2::text IS NULL OR c.conta_anuncios_id = $2)
       ORDER BY c.id DESC
       `,
       [user.id, contaAnunciosId]
@@ -9659,7 +9810,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
                 .filter(Boolean).join(" ") || cor.email
           })),
         recebida_por_encaminhamento:
-          Number(campanha.usuario_id) !== Number(user.id),
+          Boolean(campanha.origem_campanha_id),
         configuracoes_avancadas:
           configuracoesCampanha,
         daily_budget:
@@ -10513,15 +10664,7 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       SELECT id, adset_id, ad_id, usuario_id, conta_anuncios_id
       FROM campanhas
       WHERE campaign_id = $1
-      AND (
-        usuario_id = $2
-        OR EXISTS (
-          SELECT 1
-          FROM campanha_corretores cc
-          WHERE cc.campanha_id = campanhas.id
-          AND cc.usuario_id = $2
-        )
-      )
+      AND usuario_id = $2
       LIMIT 1
       `,
       [campaign_id, user.id]
@@ -11430,15 +11573,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       SELECT c.*
       FROM campanhas c
       WHERE c.id = $1
-      AND (
-        c.usuario_id = $2
-        OR EXISTS (
-          SELECT 1
-          FROM campanha_corretores cc
-          WHERE cc.campanha_id = c.id
-          AND cc.usuario_id = $2
-        )
-      )
+      AND c.usuario_id = $2
       LIMIT 1
       `,
       [campanhaId, user.id]
@@ -16272,54 +16407,12 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
     );
     const novaId = novaRes.rows[0].id;
 
-    if (orig.nicho_slug === "imoveis") {
-      const r = await client.query(
-        `SELECT tipo_imovel, finalidade, valor_min, valor_max, regiao
-         FROM campanhas_imoveis WHERE campanha_id = $1`,
-        [campanhaId]
-      );
-      if (r.rows.length > 0) {
-        const d = r.rows[0];
-        await client.query(
-          `INSERT INTO campanhas_imoveis
-             (campanha_id, tipo_imovel, finalidade, valor_min, valor_max, regiao)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [novaId, d.tipo_imovel, d.finalidade, d.valor_min, d.valor_max, d.regiao]
-        );
-      }
-    } else if (orig.nicho_slug === "saude") {
-      const r = await client.query(
-        `SELECT operadora, tipo_plano, faixa_etaria_min, faixa_etaria_max, cobertura, acomodacao
-         FROM campanhas_saude WHERE campanha_id = $1`,
-        [campanhaId]
-      );
-      if (r.rows.length > 0) {
-        const d = r.rows[0];
-        await client.query(
-          `INSERT INTO campanhas_saude
-             (campanha_id, operadora, tipo_plano, faixa_etaria_min,
-              faixa_etaria_max, cobertura, acomodacao)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [novaId, d.operadora, d.tipo_plano, d.faixa_etaria_min,
-           d.faixa_etaria_max, d.cobertura, d.acomodacao]
-        );
-      }
-    } else if (orig.nicho_slug === "suplementos") {
-      const r = await client.query(
-        `SELECT produto, objetivo, marca, publico_alvo
-         FROM campanhas_suplementos WHERE campanha_id = $1`,
-        [campanhaId]
-      );
-      if (r.rows.length > 0) {
-        const d = r.rows[0];
-        await client.query(
-          `INSERT INTO campanhas_suplementos
-             (campanha_id, produto, objetivo, marca, publico_alvo)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [novaId, d.produto, d.objetivo, d.marca, d.publico_alvo]
-        );
-      }
-    }
+    await copiarDadosNichoCampanha(
+      client,
+      campanhaId,
+      novaId,
+      orig.nicho_slug
+    );
 
     return c.json({ id: novaId });
   } catch (err) {
@@ -16339,10 +16432,7 @@ app.get("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
        FROM campanhas c
        LEFT JOIN nichos n ON n.id = c.nicho_id
        WHERE c.id = $1
-         AND (c.usuario_id = $2 OR EXISTS (
-           SELECT 1 FROM campanha_corretores cc
-           WHERE cc.campanha_id = c.id AND cc.usuario_id = $2
-         ))`,
+         AND c.usuario_id = $2`,
       [campanhaId, user.id]
     );
 
@@ -16398,10 +16488,7 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       `SELECT c.id, c.usuario_id, c.ad_id, c.status, c.conta_anuncios_id
        FROM campanhas c
        WHERE c.id = $1
-         AND (c.usuario_id = $2 OR EXISTS (
-           SELECT 1 FROM campanha_corretores cc
-           WHERE cc.campanha_id = c.id AND cc.usuario_id = $2
-         ))`,
+         AND c.usuario_id = $2`,
       [campanhaId, user.id]
     );
 
