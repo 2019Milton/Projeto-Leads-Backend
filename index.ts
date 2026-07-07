@@ -6462,6 +6462,7 @@ app.get(
         paginas: paginasSemConta,
         tos_aceitas: tosAceitas,
         instagram: instagramSemConta,
+        instagram_utilizavel_na_conta: null,
         metricas: {
           campanhas: 0,
           campanhas_ativas: 0,
@@ -6533,6 +6534,15 @@ app.get(
     // (permite anunciar no Instagram mesmo sem vinculo direto com a Pagina)
     const contasInstagramAnuncio =
       await listarContasInstagramAnuncio(token, adAccountId);
+
+    // O Instagram "conectado" (via Página ou login avulso) só funciona de fato
+    // no anúncio se aparecer entre os ativos liberados para ESTA conta de
+    // anúncios — senão a Meta recusa o instagram_actor_id na publicação.
+    const instagramUtilizavelNaConta =
+      Boolean(instagram?.id) &&
+      contasInstagramAnuncio.some(
+        (conta: any) => String(conta.id) === String(instagram.id)
+      );
 
     // 🔥 MÉTRICAS
 
@@ -6769,6 +6779,8 @@ app.get(
       tos_aceitas: tosAceitas,
 
       instagram,
+
+      instagram_utilizavel_na_conta: instagramUtilizavelNaConta,
 
       contas_instagram_anuncio: contasInstagramAnuncio.map((conta: any) => ({
         id: conta.id,
