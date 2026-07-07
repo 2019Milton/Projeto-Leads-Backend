@@ -16395,7 +16395,7 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       String(c.req.query("ad_format") || "DESKTOP_FEED_STANDARD");
 
     const campRes = await client.query(
-      `SELECT c.id, c.usuario_id, c.ad_id, c.status
+      `SELECT c.id, c.usuario_id, c.ad_id, c.status, c.conta_anuncios_id
        FROM campanhas c
        WHERE c.id = $1
          AND (c.usuario_id = $2 OR EXISTS (
@@ -16452,7 +16452,31 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       }, 400);
     }
 
-    return c.json({ preview_html: previewHtml });
+    // 🔗 link real do anúncio (post publicado) para abrir em outra aba
+    let linkAnuncio: string | null = null;
+
+    try {
+      const creativeRes = await fetch(
+        `https://graph.facebook.com/v19.0/${campanha.ad_id}?fields=creative{effective_object_story_id}&access_token=${token}`
+      );
+      const creativeData: any = await creativeRes.json();
+      const storyId = creativeData?.creative?.effective_object_story_id || null;
+
+      linkAnuncio = storyId
+        ? `https://www.facebook.com/${storyId}`
+        : null;
+    } catch (errCreative) {
+      console.error("ERRO LINK REAL ANUNCIO META:", errCreative);
+    }
+
+    if (!linkAnuncio) {
+      const actId = String(campanha.conta_anuncios_id || "").replace(/^act_/, "");
+      linkAnuncio = actId
+        ? `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${encodeURIComponent(actId)}&selected_ad_ids=${encodeURIComponent(campanha.ad_id)}`
+        : null;
+    }
+
+    return c.json({ preview_html: previewHtml, link_anuncio: linkAnuncio });
 
   } catch (err) {
     console.error("ERRO GET /campanhas/:id/preview-anuncio:", err);
