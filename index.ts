@@ -8906,10 +8906,14 @@ app.patch("/usuarios/me/whatsapp", authMiddleware, async (c) => {
     const user: any = c.get("user");
     const { whatsapp } = await c.req.json();
     const numero = String(whatsapp || "").replace(/\D/g, "").slice(0, 20) || null;
-    await client.query(
-      `UPDATE usuarios SET whatsapp = $1 WHERE id = $2`,
+    const resultado = await client.query(
+      `UPDATE usuarios SET whatsapp = $1 WHERE id = $2 RETURNING id, whatsapp`,
       [numero, user.id]
     );
+    console.log("DEBUG WHATSAPP SAVE:", { userId: user.id, numero, rowCount: resultado.rowCount, row: resultado.rows[0] });
+    if (resultado.rowCount === 0) {
+      return c.json({ error: "Usuário não encontrado para atualizar" }, 404);
+    }
     return c.json({ ok: true, whatsapp: numero });
   } catch (err) {
     console.error("ERRO WHATSAPP:", err);
