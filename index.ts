@@ -3042,7 +3042,7 @@ const masterMiddleware = async (c: any, next: any) => {
 async function listarContasAnuncios(token: string) {
 
   const adAccounts = await fetch(
-    `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account&access_token=${token}`
+    `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account,business{id,name}&access_token=${token}`
   ).then(r => r.json());
 
   console.log(
@@ -6731,6 +6731,8 @@ app.get(
         status: conta.account_status,
         motivo_desativacao: conta.disable_reason || null,
         moeda: conta.currency || null,
+        business_id: conta.business?.id || null,
+        business_nome: conta.business?.name || null,
         saldo:
           pagamentoManual
             ? saldoManual
