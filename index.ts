@@ -15270,6 +15270,25 @@ app.put("/admin/usuarios/:id/tipo", authMiddleware, async (c) => {
 
   const { tipo } = await c.req.json();
 
+  const tiposPermitidos = [
+    "admin_corretor",
+    "corretor",
+    "corretor_receptor"
+  ];
+
+  if (!tiposPermitidos.includes(tipo)) {
+    return c.json({ error: "Tipo inválido" }, 400);
+  }
+
+  const alvo = await client.query(
+    `SELECT id FROM usuarios WHERE id = $1`,
+    [id]
+  );
+
+  if (alvo.rows.length === 0) {
+    return c.json({ error: "Usuário não encontrado" }, 404);
+  }
+
   await client.query(
     `
     UPDATE usuarios
