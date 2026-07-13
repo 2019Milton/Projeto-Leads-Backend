@@ -1077,6 +1077,79 @@ function montarTargetingMeta(avancadas: any) {
   return targeting;
 }
 
+const FAIXAS_ETARIAS_TIKTOK = [
+  { min: 18, max: 24, valor: "AGE_18_24" },
+  { min: 25, max: 34, valor: "AGE_25_34" },
+  { min: 35, max: 44, valor: "AGE_35_44" },
+  { min: 45, max: 54, valor: "AGE_45_54" },
+  { min: 55, max: 100, valor: "AGE_55_100" }
+];
+
+// Função irmã de montarTargetingMeta() — recebe o mesmo "configuracoes_avancadas"
+// (pais/localidades/idade/genero são compartilhados entre redes na criação de
+// campanha multi-plataforma; interesses ficam em interesses_detalhados_tiktok
+// porque as taxonomias de interesse do Meta e da TikTok não são equivalentes).
+//
+// ASSUMPTION: nomes de campo (location_ids/age_groups/gender/interest_category_ids)
+// conforme documentação pública do adgroup/create — confirmar contra o SDK oficial
+// (github.com/tiktok/tiktok-business-api-sdk) na Fase 2B.
+function montarTargetingTikTok(avancadas: any) {
+  const targeting: any = {};
+
+  const localidades =
+    Array.isArray(avancadas?.localidades)
+      ? avancadas.localidades
+      : [];
+
+  targeting.location_ids =
+    localidades
+      .map((local: any) => textoOpcional(local?.key))
+      .filter(Boolean);
+
+  const idadeMin = numeroOpcional(avancadas?.idade_min) ?? 18;
+  const idadeMax = numeroOpcional(avancadas?.idade_max) ?? 100;
+
+  const ageGroups =
+    FAIXAS_ETARIAS_TIKTOK
+      .filter(faixa => faixa.max >= idadeMin && faixa.min <= idadeMax)
+      .map(faixa => faixa.valor);
+
+  targeting.age_groups =
+    ageGroups.length
+      ? ageGroups
+      : FAIXAS_ETARIAS_TIKTOK.map(f => f.valor);
+
+  const genero = numeroOpcional(avancadas?.genero);
+
+  targeting.gender =
+    genero === 1
+      ? "GENDER_MALE"
+      : genero === 2
+      ? "GENDER_FEMALE"
+      : "GENDER_UNLIMITED";
+
+  const interesses =
+    Array.isArray(avancadas?.interesses_detalhados_tiktok)
+      ? avancadas.interesses_detalhados_tiktok
+          .map((interesse: any) => textoOpcional(interesse?.id))
+          .filter(Boolean)
+          .slice(0, 20)
+      : [];
+
+  if (interesses.length) {
+    targeting.interest_category_ids = interesses;
+  }
+
+  return targeting;
+}
+
+// Formata Date no padrão "YYYY-MM-DD HH:mm:ss" que a TikTok Business API espera
+// (diferente do ISO 8601 usado pelo Graph API da Meta).
+function formatarDataHoraTikTok(data: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${data.getUTCFullYear()}-${pad(data.getUTCMonth() + 1)}-${pad(data.getUTCDate())} ${pad(data.getUTCHours())}:${pad(data.getUTCMinutes())}:${pad(data.getUTCSeconds())}`;
+}
+
 async function enviarEmailResetSenha(
   email: string,
   nome: string | null,
@@ -4391,19 +4464,27 @@ async function tiktokFetch(
   }
 }
 
-// Busca token + conta de anúncios (advertiser_id) já selecionada pelo usuário
+// Busca token + conta de anúncios (advertiser_id) + identidade já selecionadas pelo usuário
 async function obterConexaoTikTok(
   usuarioId: number
-): Promise<{ token: string; advertiserId: string | null } | null> {
+): Promise<{
+  token: string;
+  advertiserId: string | null;
+  identityId: string | null;
+  identityType: string | null;
+} | null> {
   const conn = await client.query(
     `SELECT access_token, dados_conta FROM plataforma_conexoes
      WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
     [usuarioId]
   );
   if (!conn.rows.length) return null;
+  const dadosConta = conn.rows[0].dados_conta ?? {};
   return {
     token: conn.rows[0].access_token,
-    advertiserId: conn.rows[0].dados_conta?.advertiser_id ?? null
+    advertiserId: dadosConta.advertiser_id ?? null,
+    identityId: dadosConta.identity_id ?? null,
+    identityType: dadosConta.identity_type ?? null
   };
 }
 
@@ -5149,6 +5230,373 @@ app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO BUSCA LOCALIZACAO TIKTOK:", err);
     return c.json({ error: "Erro ao buscar localização TikTok" }, 500);
+  }
+});
+
+// Cria a Campanha na TikTok Ads (equivalente ao /meta/campanha)
+app.post("/tiktok/campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id,
+      nome,
+      configuracoes_avancadas,
+      nicho_id,
+      daily_budget,
+      publicacao_grupo_id
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "TikTok não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios TikTok antes de criar a campanha" }, 400);
+    }
+
+    // ASSUMPTION: enum objective_type ("LEAD_GENERATION") e nomes de campo de
+    // orçamento (budget_mode/budget) conforme documentação pública do
+    // campaign/create — confirmar contra o SDK oficial na Fase 2B.
+    const payloadCampanha: any = {
+      advertiser_id: conexao.advertiserId,
+      campaign_name: nome || "Campanha Leads Plataforma",
+      objective_type: "LEAD_GENERATION",
+      budget_mode: daily_budget ? "BUDGET_MODE_DAY" : "BUDGET_MODE_INFINITE",
+      operation_status: "DISABLE"
+    };
+
+    if (daily_budget) {
+      payloadCampanha.budget = numeroOpcional(daily_budget);
+    }
+
+    const resposta = await tiktokFetch("/campaign/create/", conexao.token, {
+      method: "POST",
+      body: payloadCampanha
+    });
+
+    if (!resposta.ok || !resposta.data?.data?.campaign_id) {
+      console.error("ERRO CAMPANHA TIKTOK:", resposta.data);
+      return c.json({
+        error: resposta.error || "Erro ao criar campanha na TikTok",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    const campaignId = String(resposta.data.data.campaign_id);
+
+    await client.query(
+      `INSERT INTO campanhas (
+        usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
+        configuracoes_avancadas, nicho_id, plataforma, publicacao_grupo_id
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'tiktok',$9)`,
+      [
+        usuarioId,
+        campaignId,
+        conexao.advertiserId,
+        nome || "Campanha Plataforma",
+        "PAUSED",
+        "plataforma",
+        JSON.stringify(configuracoes_avancadas || {}),
+        nicho_id ?? null,
+        textoOpcional(publicacao_grupo_id) || null
+      ]
+    );
+
+    return c.json({ id: campaignId, campaign_id: campaignId });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/campanha:", err);
+    return c.json({ error: "Erro ao criar campanha TikTok" }, 500);
+  }
+});
+
+// Cria o Grupo de Anúncios (Ad Group) na TikTok Ads (equivalente ao /meta/adset)
+app.post("/tiktok/adgroup", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id,
+      campaign_id,
+      daily_budget,
+      configuracoes_avancadas
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id não enviado" }, 400);
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "TikTok não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios TikTok antes de criar o grupo de anúncios" }, 400);
+    }
+
+    const avancadas = configuracoes_avancadas || {};
+    const targeting = montarTargetingTikTok(avancadas);
+
+    if (!targeting.location_ids?.length) {
+      return c.json({ error: "Selecione ao menos uma localização para segmentar a campanha TikTok" }, 400);
+    }
+
+    const orcamento = numeroOpcional(daily_budget);
+    if (!orcamento || orcamento <= 0) {
+      return c.json({ error: "Orçamento diário é obrigatório para o grupo de anúncios TikTok" }, 400);
+    }
+
+    const inicio = textoOpcional(avancadas.inicio);
+    const fim = textoOpcional(avancadas.fim);
+
+    // ASSUMPTION: nomes de campo (placement_type/billing_event/schedule_type) e enums
+    // conforme documentação pública do adgroup/create — confirmar na Fase 2B.
+    const payloadAdgroup: any = {
+      advertiser_id: conexao.advertiserId,
+      campaign_id: String(campaign_id),
+      adgroup_name: `AdGroup Leads ${Date.now()}`,
+      promotion_type: "LEAD_GENERATION",
+      placement_type: "PLACEMENT_TYPE_AUTOMATIC",
+      targeting,
+      budget_mode: "BUDGET_MODE_DAY",
+      budget: orcamento,
+      billing_event: "CPM",
+      optimization_goal: "LEAD_GENERATION",
+      schedule_start_time: formatarDataHoraTikTok(
+        inicio ? new Date(inicio) : new Date(Date.now() + 60000)
+      ),
+      operation_status: "DISABLE"
+    };
+
+    if (fim) {
+      payloadAdgroup.schedule_type = "SCHEDULE_START_END";
+      payloadAdgroup.schedule_end_time = formatarDataHoraTikTok(new Date(fim));
+    } else {
+      payloadAdgroup.schedule_type = "SCHEDULE_FROM_NOW";
+    }
+
+    const resposta = await tiktokFetch("/adgroup/create/", conexao.token, {
+      method: "POST",
+      body: payloadAdgroup
+    });
+
+    if (!resposta.ok || !resposta.data?.data?.adgroup_id) {
+      console.error("ERRO ADGROUP TIKTOK:", resposta.data);
+      return c.json({
+        error: resposta.error || "Erro ao criar grupo de anúncios na TikTok",
+        detalhe: resposta.data,
+        targeting_enviado: targeting
+      }, 400);
+    }
+
+    return c.json({ adgroup_id: String(resposta.data.data.adgroup_id) });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/adgroup:", err);
+    return c.json({ error: "Erro ao criar grupo de anúncios TikTok" }, 500);
+  }
+});
+
+// Lista os formulários instantâneos (Instant Form) já existentes do anunciante conectado.
+// Diferente do Meta, a TikTok não cria formulário via API neste fluxo — o usuário escolhe
+// um já criado no TikTok Ads Manager. Se a listagem falhar (endpoint incerto até validação
+// na Fase 2B), devolve lista vazia com aviso em vez de erro, para o frontend usar o campo
+// de ID manual como alternativa (a UI já foi desenhada prevendo esse fallback).
+app.get("/tiktok/formularios", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await obterConexaoTikTok(user.id);
+    if (!conexao) return c.json({ error: "TikTok nao conectado" }, 400);
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anunciante TikTok antes de listar formularios" }, 400);
+    }
+
+    // ASSUMPTION MAIS ARRISCADA DE TODA A FASE 2A: endpoint e formato de listagem de
+    // Instant Forms — confirmar contra o SDK oficial na Fase 2B.
+    const params = new URLSearchParams({ advertiser_id: conexao.advertiserId });
+    const resposta = await tiktokFetch(`/page/lead_gen/get/?${params}`, conexao.token);
+
+    if (!resposta.ok) {
+      console.warn("TIKTOK FORMULARIOS: listagem indisponivel, frontend deve oferecer ID manual:", resposta.error);
+      return c.json({
+        formularios: [],
+        aviso: "Não foi possível listar formulários existentes. Informe o ID manualmente."
+      });
+    }
+
+    const formularios = Array.isArray(resposta.data?.data?.pages)
+      ? resposta.data.data.pages
+      : Array.isArray(resposta.data?.data)
+      ? resposta.data.data
+      : [];
+
+    return c.json({ formularios });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/formularios:", err);
+    return c.json({
+      formularios: [],
+      aviso: "Não foi possível listar formulários existentes. Informe o ID manualmente."
+    });
+  }
+});
+
+// Cria o Anúncio (criativo + ad) na TikTok Ads (equivalente ao /meta/anuncio) —
+// é aqui que a linha de campanhas recebe adset_id/ad_id/form_id, mesmo padrão do Meta.
+app.post("/tiktok/anuncio", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id,
+      campaign_id,
+      adgroup_id,
+      form_id,
+      identity_id,
+      identity_type,
+      texto,
+      cta,
+      configuracoes_avancadas,
+      daily_budget,
+      image_ids,
+      image_id,
+      video_id
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    if (!form_id) {
+      return c.json({ error: "form_id (Instant Form) não enviado" }, 400);
+    }
+    if (!adgroup_id) {
+      return c.json({ error: "adgroup_id não enviado" }, 400);
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "TikTok não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios TikTok antes de publicar o anúncio" }, 400);
+    }
+
+    const identidadeId = textoOpcional(identity_id) || conexao.identityId;
+    const identidadeTipo = textoOpcional(identity_type) || conexao.identityType;
+
+    if (!identidadeId || !identidadeTipo) {
+      return c.json({ error: "Selecione a identidade (perfil TikTok) antes de publicar o anúncio" }, 400);
+    }
+
+    const avancadas = configuracoes_avancadas || {};
+    const tituloAnuncio = textoOpcional(avancadas.titulo) || "Saiba mais";
+
+    const imagens: string[] =
+      Array.isArray(image_ids) && image_ids.length
+        ? image_ids
+        : image_id
+        ? [image_id]
+        : [];
+
+    if (!imagens.length && !video_id) {
+      return c.json({ error: "Envie ao menos uma imagem ou vídeo para o anúncio TikTok" }, 400);
+    }
+
+    // ASSUMPTION MAIS ARRISCADA: como a TikTok amarra o Instant Form ao criativo do
+    // anúncio. Aqui assumimos um campo "page_id" no objeto de criativo (a TikTok chama
+    // o Instant Form internamente de "page" nos endpoints de lead gen) — confirmar o
+    // campo exato contra o SDK oficial na Fase 2B; sem isso o anúncio pode não vincular
+    // ao formulário certo mesmo sendo aceito pela API.
+    const criativo: any = {
+      ad_name: `Anuncio Leads ${Date.now()}`,
+      ad_format: video_id ? "SINGLE_VIDEO" : imagens.length > 1 ? "CAROUSEL_ADS" : "SINGLE_IMAGE",
+      identity_id: identidadeId,
+      identity_type: identidadeTipo,
+      ad_text: texto || "Quer mais clientes? 🚀",
+      call_to_action: cta || "LEARN_MORE",
+      page_id: String(form_id)
+    };
+
+    if (video_id) {
+      criativo.video_id = video_id;
+    } else {
+      criativo.image_ids = imagens;
+    }
+
+    const resposta = await tiktokFetch("/ad/create/", conexao.token, {
+      method: "POST",
+      body: {
+        advertiser_id: conexao.advertiserId,
+        adgroup_id: String(adgroup_id),
+        creatives: [criativo]
+      }
+    });
+
+    const adId =
+      Array.isArray(resposta.data?.data?.ad_ids)
+        ? resposta.data.data.ad_ids[0]
+        : resposta.data?.data?.ad_id;
+
+    if (!resposta.ok || !adId) {
+      console.error("ERRO ANUNCIO TIKTOK:", resposta.data);
+      return c.json({
+        error: resposta.error || "Erro ao criar anúncio na TikTok",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    // 💾 grava tudo no banco — mesmo padrão do /meta/anuncio (page_id fica NULL pra
+    // linhas TikTok, já que não existe Página do Facebook aqui; identity/form vão no JSONB)
+    const configuracoesPersistidas = {
+      ...avancadas,
+      texto,
+      cta,
+      form_id: String(form_id),
+      identity_id: identidadeId,
+      identity_type: identidadeTipo,
+      image_ids: imagens,
+      video_id: video_id || null,
+      criativo: {
+        ad_id: String(adId),
+        tipo: video_id ? "video" : imagens.length > 1 ? "carrossel" : "imagem",
+        titulo: tituloAnuncio,
+        image_ids: imagens,
+        video_id: video_id || null
+      }
+    };
+
+    await client.query(
+      `UPDATE campanhas
+       SET adset_id = $1,
+           ad_id = $2,
+           form_id = $3,
+           daily_budget = $4,
+           configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $5::jsonb,
+           atualizado_em = NOW()
+       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'tiktok'`,
+      [
+        String(adgroup_id),
+        String(adId),
+        String(form_id),
+        numeroOpcional(daily_budget),
+        JSON.stringify(configuracoesPersistidas),
+        String(campaign_id),
+        usuarioId
+      ]
+    );
+
+    return c.json({ id: String(adId), ad_id: String(adId) });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/anuncio:", err);
+    return c.json({ error: "Erro ao criar anúncio TikTok", detalhe: err?.message || err }, 500);
   }
 });
 
