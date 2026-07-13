@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { Pool } from "pg";
 import bcrypt from "bcryptjs";
 import { Buffer } from "node:buffer";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 const app = new Hono();
 
@@ -4369,6 +4369,44 @@ function tiktokHeaders(token: string) {
   return { "Access-Token": token, "Content-Type": "application/json" };
 }
 
+// Wrapper fino que já trata o envelope {code, message, data} uniforme da TikTok Business API
+async function tiktokFetch(
+  endpoint: string,
+  token: string,
+  opts: { method?: string; body?: any } = {}
+): Promise<{ ok: boolean; data: any; error: string | null }> {
+  try {
+    const res = await fetch(`${TIKTOK_API}${endpoint}`, {
+      method: opts.method || "GET",
+      headers: tiktokHeaders(token),
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    const data = await res.json() as any;
+    if (data.code !== 0) {
+      return { ok: false, data, error: data.message || "Erro na API do TikTok" };
+    }
+    return { ok: true, data, error: null };
+  } catch (err: any) {
+    return { ok: false, data: null, error: err?.message || "Erro de rede ao chamar a API do TikTok" };
+  }
+}
+
+// Busca token + conta de anúncios (advertiser_id) já selecionada pelo usuário
+async function obterConexaoTikTok(
+  usuarioId: number
+): Promise<{ token: string; advertiserId: string | null } | null> {
+  const conn = await client.query(
+    `SELECT access_token, dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+    [usuarioId]
+  );
+  if (!conn.rows.length) return null;
+  return {
+    token: conn.rows[0].access_token,
+    advertiserId: conn.rows[0].dados_conta?.advertiser_id ?? null
+  };
+}
+
 // Lista contas de anunciante vinculadas ao token
 app.get("/tiktok/anunciantes", authMiddleware, async (c) => {
   const user: any = c.get("user");
@@ -4588,6 +4626,341 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
     return c.json({ error: "Erro ao sincronizar TikTok" }, 500);
   } finally {
     tiktokSyncEmAndamento.delete(user.id);
+  }
+});
+
+// Pausa/ativa uma campanha TikTok (cascata: campanha + adgroup + anúncio)
+app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id, status } = await c.req.json();
+
+    if (!campaign_id || !["ACTIVE", "PAUSED"].includes(status)) {
+      return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
+    }
+
+    const campanhaBanco = await client.query(
+      `SELECT id, adset_id, ad_id
+       FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+    }
+
+    const { adset_id, ad_id } = campanhaBanco.rows[0];
+
+    const conexao = await obterConexaoTikTok(user.id);
+    if (!conexao) {
+      return c.json({ error: "TikTok não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
+    }
+
+    // ASSUMPTION: enum operation_status "ENABLE"/"DISABLE" e endpoints separados
+    // por tipo de objeto — confirmar contra o SDK oficial na Fase 2B.
+    const operationStatus = status === "ACTIVE" ? "ENABLE" : "DISABLE";
+
+    const campanhaRes = await tiktokFetch("/campaign/update/status/", conexao.token, {
+      method: "POST",
+      body: {
+        advertiser_id: conexao.advertiserId,
+        campaign_ids: [String(campaign_id)],
+        operation_status: operationStatus
+      }
+    });
+
+    if (!campanhaRes.ok) {
+      return c.json({ error: campanhaRes.error || "Erro ao alterar campanha no TikTok" }, 400);
+    }
+
+    if (adset_id) {
+      const adgroupRes = await tiktokFetch("/adgroup/update/status/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          adgroup_ids: [String(adset_id)],
+          operation_status: operationStatus
+        }
+      });
+      console.log("TOGGLE ADGROUP TIKTOK:", adgroupRes);
+    }
+
+    if (ad_id) {
+      const adRes = await tiktokFetch("/ad/update/status/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          ad_ids: [String(ad_id)],
+          operation_status: operationStatus
+        }
+      });
+      console.log("TOGGLE AD TIKTOK:", adRes);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = $1, atualizado_em = NOW() WHERE id = $2`,
+      [status, campanhaBanco.rows[0].id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/toggle-campanha:", err);
+    return c.json({ error: "Erro ao alterar campanha" }, 500);
+  }
+});
+
+// Exclui (marca como DELETED) uma campanha TikTok — tolera campanha já sumida na TikTok
+app.post("/tiktok/excluir-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id } = await c.req.json();
+
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id obrigatorio" }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
+    }
+
+    const conexao = await obterConexaoTikTok(user.id);
+
+    if (conexao?.advertiserId) {
+      const del = await tiktokFetch("/campaign/update/status/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          campaign_ids: [String(campaign_id)],
+          operation_status: "DELETE"
+        }
+      });
+
+      if (!del.ok) {
+        // Tolera campanha já removida/inexistente na TikTok — mesmo espírito do
+        // Meta: não trava o usuário por causa de um objeto que já sumiu do lado de lá.
+        const msg = (del.error || "").toLowerCase();
+        const naoPertenceMaisTikTok =
+          msg.includes("not exist") ||
+          msg.includes("not found") ||
+          msg.includes("invalid campaign") ||
+          msg.includes("does not exist");
+
+        if (!naoPertenceMaisTikTok) {
+          return c.json({ error: del.error || "Erro ao excluir no TikTok" }, 400);
+        }
+        console.log("EXCLUIR TIKTOK: campanha não encontrada na TikTok, removendo localmente:", campaign_id);
+      }
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = 'DELETED', atualizado_em = NOW() WHERE id = $1`,
+      [campanha.rows[0].id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/excluir-campanha:", err);
+    return c.json({ error: "Erro ao excluir campanha" }, 500);
+  }
+});
+
+// Restaura (volta pra PAUSED) uma campanha TikTok excluída no histórico local
+app.post("/tiktok/restaurar-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id } = await c.req.json();
+
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id obrigatorio" }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id, adset_id, ad_id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok' AND UPPER(status) = 'DELETED'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({ error: "Campanha excluída não encontrada para este usuário" }, 404);
+    }
+
+    const conexao = await obterConexaoTikTok(user.id);
+    let aviso: string | null = null;
+
+    if (conexao?.advertiserId) {
+      // Reaplica status "pausado" (nunca ativo direto) em campanha + adgroup + anúncio,
+      // mesma cautela que o restaurar do Meta.
+      const alvos: Array<{ endpoint: string; campo: string; id: string | null }> = [
+        { endpoint: "/campaign/update/status/", campo: "campaign_ids", id: String(campaign_id) },
+        { endpoint: "/adgroup/update/status/", campo: "adgroup_ids", id: campanha.rows[0].adset_id },
+        { endpoint: "/ad/update/status/", campo: "ad_ids", id: campanha.rows[0].ad_id }
+      ];
+
+      for (const alvo of alvos) {
+        if (!alvo.id) continue;
+        const res = await tiktokFetch(alvo.endpoint, conexao.token, {
+          method: "POST",
+          body: {
+            advertiser_id: conexao.advertiserId,
+            [alvo.campo]: [alvo.id],
+            operation_status: "DISABLE"
+          }
+        });
+        if (!res.ok && !aviso) {
+          aviso = "O TikTok não permitiu recuperar a campanha original. Ela ficou restaurada apenas na plataforma.";
+        }
+      }
+    } else {
+      aviso = "TikTok não conectada. A campanha foi restaurada apenas no histórico local.";
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = 'PAUSED', atualizado_em = NOW() WHERE id = $1`,
+      [campanha.rows[0].id]
+    );
+
+    return c.json({ sucesso: true, aviso });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/restaurar-campanha:", err);
+    return c.json({ error: "Erro ao restaurar campanha" }, 500);
+  }
+});
+
+// Upload de imagem de criativo para a TikTok Ads (equivalente ao /meta/upload-imagem)
+app.post("/tiktok/upload-imagem", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+
+    const imagem = body.get("imagem") as File;
+    const usuario_id = body.get("usuario_id");
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+    if (!imagem) {
+      return c.json({ error: "Imagem não enviada" }, 400);
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "TikTok não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
+    }
+
+    // ASSUMPTION: endpoint/campos de multipart conforme documentação pública —
+    // confirmar contra o SDK oficial (github.com/tiktok/tiktok-business-api-sdk) na Fase 2B.
+    const tiktokForm = new FormData();
+    tiktokForm.append("advertiser_id", conexao.advertiserId);
+    tiktokForm.append("upload_type", "UPLOAD_BY_FILE");
+    tiktokForm.append("image_file", imagem, imagem.name);
+
+    const response = await fetch(`${TIKTOK_API}/file/image/ad/upload/`, {
+      method: "POST",
+      headers: { "Access-Token": conexao.token },
+      body: tiktokForm
+    });
+
+    const texto = await response.text();
+    let upload: any = {};
+    try { upload = JSON.parse(texto); } catch (_) { upload = { raw: texto }; }
+
+    if (upload.code !== 0 || !upload.data?.image_id) {
+      console.error("ERRO UPLOAD IMAGEM TIKTOK:", upload);
+      return c.json({ error: upload.message || "Erro ao enviar imagem para o TikTok", detalhe: upload }, 400);
+    }
+
+    return c.json({
+      sucesso: true,
+      image_id: upload.data.image_id,
+      url: upload.data.image_url || upload.data.url || null
+    });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/upload-imagem:", err?.message || err);
+    return c.json({ error: err?.message || "Erro upload imagem TikTok" }, 500);
+  }
+});
+
+// Upload de vídeo de criativo para a TikTok Ads (equivalente ao /meta/upload-video)
+app.post("/tiktok/upload-video", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+
+    const video = body.get("video") as File;
+    const usuario_id = body.get("usuario_id");
+    const nomeInformado = String(body.get("nome") || video?.name || "video-campanha.mp4");
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+    if (!video) {
+      return c.json({ error: "Vídeo não enviado" }, 400);
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "TikTok não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
+    }
+
+    // ASSUMPTION: TikTok exige video_signature (MD5 do arquivo) no upload de vídeo —
+    // confirmar contra o SDK oficial na Fase 2B.
+    const bytes = new Uint8Array(await video.arrayBuffer());
+    const signature = createHash("md5").update(bytes).digest("hex");
+
+    const tiktokForm = new FormData();
+    tiktokForm.append("advertiser_id", conexao.advertiserId);
+    tiktokForm.append("upload_type", "UPLOAD_BY_FILE");
+    tiktokForm.append("video_signature", signature);
+    tiktokForm.append("video_file", video, nomeInformado);
+
+    const response = await fetch(`${TIKTOK_API}/file/video/ad/upload/`, {
+      method: "POST",
+      headers: { "Access-Token": conexao.token },
+      body: tiktokForm
+    });
+
+    const texto = await response.text();
+    let upload: any = {};
+    try { upload = JSON.parse(texto); } catch (_) { upload = { raw: texto }; }
+
+    const videoData = Array.isArray(upload.data) ? upload.data[0] : upload.data;
+
+    if (upload.code !== 0 || !videoData?.video_id) {
+      console.error("ERRO UPLOAD VIDEO TIKTOK:", upload);
+      return c.json({ error: upload.message || "Erro ao enviar vídeo para o TikTok", detalhe: upload }, 400);
+    }
+
+    return c.json({
+      sucesso: true,
+      video_id: videoData.video_id,
+      video_nome: nomeInformado,
+      video_tipo: video.type || "",
+      video_tamanho: video.size || 0
+    });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/upload-video:", err?.message || err);
+    return c.json({ error: err?.message || "Erro upload vídeo TikTok" }, 500);
   }
 });
 
@@ -8401,7 +8774,8 @@ await client.query(`
 
 await client.query(`
   ALTER TABLE campanhas
-    ADD COLUMN IF NOT EXISTS plataforma TEXT DEFAULT 'meta';
+    ADD COLUMN IF NOT EXISTS plataforma TEXT DEFAULT 'meta',
+    ADD COLUMN IF NOT EXISTS publicacao_grupo_id TEXT;
 `);
 
 /* =========================
