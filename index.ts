@@ -14383,15 +14383,21 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       ? `5. NAO repita nem parafraseie de forma proxima estes titulos ja gerados anteriormente para este usuario: ${titulosAnteriores.map(t => `"${t}"`).join(", ")}. Crie titulos totalmente diferentes deles.\n\n`
       : "\n";
 
+    const instrucaoContexto = contexto
+      ? `INFORMACOES FORNECIDAS PELO USUARIO (trate como fatos reais, nao invente nada que contradiga isto):\n"${contexto}"\n\n` +
+        `Antes de escrever qualquer coisa, extraia TODOS os detalhes explicitos ou implicitos deste texto: tipo de plano/produto, operadora ou marca, cobertura, publico-alvo, faixa de preco/valor, regiao, condicoes especiais (ex: sem carencia, para autonomos, com desconto, etc.) e qualquer outro diferencial mencionado. Use CADA detalhe encontrado no titulo, texto, descricao e nos campos opcionais de nicho correspondentes das 3 variacoes — nao ignore nenhuma informacao fornecida. Apenas o que o usuario NAO especificou deve ser complementado por voce de forma criativa e persuasiva, sem jamais contradizer o que foi informado.\n\n`
+      : "";
+
     const prompt =
       `Produto/servico: "${topico}"\n` +
       `Nicho: ${cfg.especialidade}\n\n` +
+      instrucaoContexto +
       `Crie 3 anuncios Meta Ads com estilos COMPLETAMENTE DIFERENTES para captar leads desse produto.\n\n` +
       `REGRAS OBRIGATORIAS:\n` +
       `1. O titulo NUNCA pode ser o nome do produto. Deve ser uma frase de impacto.\n` +
       `2. PROIBIDO usar: "Conheca X", "Atendimento rapido e personalizado", "com atendimento especializado".\n` +
       `3. Cada variacao deve ter titulo, texto e descricao totalmente diferentes das outras.\n` +
-      `4. Use os detalhes especificos do produto e do nicho para criar copy relevante e unico.\n` +
+      `4. Use os detalhes especificos do produto e do nicho para criar copy relevante e unico — se o usuario informou detalhes no contexto, eles tem prioridade sobre os exemplos genericos abaixo.\n` +
       instrucaoTitulosAnteriores +
       `v1 — URGENCIA E ESCASSEZ:\n` +
       `  Titulo exemplo (apenas inspiracao de tom — PROIBIDO copiar as mesmas palavras ou estrutura, crie um titulo com vocabulario novo): "${v1tituloEx}"\n` +
@@ -14412,11 +14418,10 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `obrigado_titulo, obrigado_botao, obrigado_texto,\n` +
       `cbo (true se houver multiplos publicos para testar, false para campanha simples),\n` +
       `attribution_spec (janela de atribuicao recomendada: "1d_click", "7d_click", "28d_click", "1d_click_1d_view", "7d_click_1d_view" — use "7d_click_1d_view" como padrao).\n\n` +
-      `Campos opcionais de nicho: preencha SOMENTE se o contexto do usuario trouxer a informacao de forma clara.\n` +
+      `Campos opcionais de nicho: preencha SEMPRE que a informacao estiver disponivel no contexto do usuario, mesmo que de forma indireta ou implicita — nao deixe de preencher um campo por excesso de cautela. Deixe vazio APENAS quando o usuario realmente nao deu nenhuma pista sobre aquele campo.\n` +
       `Para imoveis: nicho_tipo_imovel (residencial|comercial|rural), nicho_finalidade (venda|locacao), nicho_valor_min, nicho_valor_max.\n` +
       `Para saude: nicho_operadora, nicho_tipo_plano (individual|familiar|empresarial), nicho_cobertura (basica|intermediaria|premium), nicho_acomodacao (enfermaria|apartamento).\n` +
-      `Para suplementos: nicho_produto (whey|creatina|pre_workout|bcaa|multivitaminico|colageno|outro), nicho_objetivo (ganho_massa|emagrecimento|performance|saude), nicho_marca, nicho_publico_alvo (iniciantes|intermediario|avancado).\n` +
-      `Se o usuario informou esses detalhes, use-os nos 3 conteudos e tambem nos campos opcionais de nicho. Se nao informou, deixe vazio.\n\n` +
+      `Para suplementos: nicho_produto (whey|creatina|pre_workout|bcaa|multivitaminico|colageno|outro), nicho_objetivo (ganho_massa|emagrecimento|performance|saude), nicho_marca, nicho_publico_alvo (iniciantes|intermediario|avancado).\n\n` +
       `Retorne SOMENTE JSON valido sem texto antes ou depois:\n` +
       `{"v1":{...todos os campos...},"v2":{...},"v3":{...}}`;
 
@@ -14424,6 +14429,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Voce e um redator publicitario criativo especializado em Meta Ads para ${cfg.especialidade}. ` +
       "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
       "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
+      "Quando o usuario fornecer um contexto com detalhes especificos do plano/produto (operadora, cobertura, publico-alvo, condicoes, preco, regiao, etc.), esses detalhes sao prioridade absoluta: use TODOS eles nos anuncios e nos campos opcionais de nicho, e complemente com criatividade apenas o que faltar, sem contradizer o que foi informado. " +
       "Retorne SOMENTE JSON valido.";
 
     const iaProvider: string = (user as any).ia_provider || "auto";
