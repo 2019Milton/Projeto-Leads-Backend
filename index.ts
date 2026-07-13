@@ -2119,6 +2119,18 @@ function contextoNicho(lead: any) {
   };
 }
 
+function estagioKanbanContexto(status: string) {
+  const estagios: Record<string, { label: string; objetivo: string }> = {
+    novo: { label: "Novo", objetivo: "ainda não houve contato; foco em abordagem inicial e qualificação" },
+    primeiro_contato: { label: "Primeiro contato", objetivo: "já houve um primeiro contato; não repetir apresentação, avançar para qualificar ou agendar" },
+    em_conversa: { label: "Em conversa", objetivo: "negociação em andamento; foco em remover objeções e avançar para o fechamento" },
+    fechado: { label: "Fechado (cliente)", objetivo: "negócio já fechado; foco em pós-venda, satisfação, upsell ou indicação, sem tom de venda ativa" },
+    perdido: { label: "Perdido", objetivo: "negócio perdido; avaliar chance de recuperação antes de nova abordagem" }
+  };
+  const chave = estagios[status] ? status : "novo";
+  return { chave, ...estagios[chave] };
+}
+
 function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
   const scoreData =
     lead?.score_pontos !== undefined
@@ -2133,6 +2145,8 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
   const { sinais, riscos } = detectarSinaisIA(lead, ml);
   const ctx = contextoNicho(lead);
   const nomeDisplay = lead?.nome || "tudo bem";
+  const estagioCtx = estagioKanbanContexto(lead?.status || "novo");
+  const estagio = estagioCtx.chave;
 
   const prioridade =
     ml?.disponivel && ml.probabilidade_conversao >= 70
@@ -2150,12 +2164,33 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
       ? `Enviar mensagem curta para qualificar: ${ctx.qualificadores.slice(0, 2).join(" e ")}.`
       : `Nutrir com abordagem leve antes de insistir em proposta de ${ctx.produto}.`;
 
+  const msgContinuacao = (nome: string, estagioAtual: string) =>
+    estagioAtual === "em_conversa"
+      ? `Oi ${nome}! Continuando nossa conversa sobre ${ctx.produto}: consegue me confirmar se ainda faz sentido avançarmos? Posso esclarecer o que estiver faltando para fecharmos.`
+      : `Oi ${nome}! Voltando ao nosso contato sobre ${ctx.produto}. Ainda faz sentido continuarmos? Me conta se ficou alguma dúvida que eu possa resolver agora.`;
+
   const mensagemWhatsapp =
-    prioridade === "alta"
+    estagio !== "novo"
+      ? msgContinuacao(nomeDisplay, estagio)
+      : prioridade === "alta"
       ? ctx.msg_quente(nomeDisplay)
       : prioridade === "media"
       ? ctx.msg_morno(nomeDisplay)
       : ctx.msg_frio(nomeDisplay);
+
+  const leadFechado = estagio === "fechado";
+
+  const perguntasPosVenda = [
+    `Como está sua experiência até agora com ${ctx.produto}?`,
+    "Tem algo que ainda precisa de ajuste ou suporte?",
+    "Você indicaria para alguém próximo?"
+  ];
+
+  const mensagemPosVenda = (nome: string) =>
+    `Oi ${nome}! Passando para saber como está sendo sua experiência com ${ctx.produto}. Posso te ajudar com mais alguma coisa, ou você conhece alguém que também possa se interessar?`;
+
+  const proximaAcaoPosVenda =
+    `Confirmar a satisfação do cliente com ${ctx.produto} e avaliar oportunidade de upsell ou indicação.`;
 
   const leadPerdido =
     lead?.status === "perdido";
@@ -2188,7 +2223,9 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
       : "baixa";
 
   const proximaAcaoFinal =
-    !leadPerdido
+    leadFechado
+      ? proximaAcaoPosVenda
+      : !leadPerdido
       ? proximaAcao
       : chanceRecuperacao === "alta"
       ? `Reabrir a conversa hoje com mensagem curta e personalizada sobre ${ctx.produto}.`
@@ -2197,7 +2234,9 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
       : "Manter no histórico ou arquivar depois de revisar o motivo da perda.";
 
   const mensagemWhatsappFinal =
-    !leadPerdido
+    leadFechado
+      ? mensagemPosVenda(nomeDisplay)
+      : !leadPerdido
       ? mensagemWhatsapp
       : chanceRecuperacao === "alta"
       ? ctx.msg_rec_alta(nomeDisplay)
@@ -2205,30 +2244,35 @@ function gerarAnaliseIAOuroLead(lead: any, ml: any = null) {
       ? ctx.msg_rec_media(nomeDisplay)
       : ctx.msg_rec_baixa(nomeDisplay);
 
+  const prioridadeFinal = leadFechado ? "baixa" : prioridade;
+
   return {
     disponivel: true,
     nivel: "ouro",
     titulo: "IA Ouro",
-    prioridade,
+    prioridade: prioridadeFinal,
+    estagio_kanban: estagioCtx.label,
     resumo:
-      leadPerdido && chanceRecuperacao === "alta"
+      leadFechado
+        ? `Cliente convertido em ${ctx.nicho}; sem venda pendente, foco agora é pós-venda e relacionamento.`
+        : leadPerdido && chanceRecuperacao === "alta"
         ? `Lead perdido com boa chance de recuperação em ${ctx.nicho}; vale retomar com abordagem curta.`
         : leadPerdido && chanceRecuperacao === "media"
         ? `Lead perdido com chance moderada em ${ctx.nicho}; valide o interesse antes de insistir.`
         : leadPerdido
         ? `Lead perdido com baixa chance em ${ctx.nicho}; mantenha o histórico organizado.`
         : prioridade === "alta"
-        ? `Lead com bons sinais comerciais em ${ctx.nicho}; recomendado contato rápido.`
+        ? `Lead em "${estagioCtx.label}" com bons sinais comerciais em ${ctx.nicho}; recomendado contato rápido.`
         : prioridade === "media"
-        ? `Lead com potencial em ${ctx.nicho}, mas ainda precisa de qualificação antes da abordagem forte.`
-        : `Lead com baixa prioridade em ${ctx.nicho} no momento; melhor nutrir ou validar interesse.`,
+        ? `Lead em "${estagioCtx.label}" com potencial em ${ctx.nicho}, mas ainda precisa de qualificação antes da abordagem forte.`
+        : `Lead em "${estagioCtx.label}" com baixa prioridade em ${ctx.nicho} no momento; melhor nutrir ou validar interesse.`,
     proxima_acao: proximaAcaoFinal,
     mensagem_whatsapp: mensagemWhatsappFinal,
-    perguntas_qualificacao: ctx.perguntas,
+    perguntas_qualificacao: leadFechado ? perguntasPosVenda : ctx.perguntas,
     sinais: sinais.length ? sinais : ["dados ainda limitados para uma análise profunda"],
     riscos,
     explicacao:
-      `A IA Ouro cruza a classificação Frio/Morno/Quente, sinais do cadastro, respostas do formulário e previsão do ML (quando disponível) com foco no nicho ${ctx.nicho}. Ela entrega resumo, prioridade, próxima ação e mensagem pronta para reduzir tempo de atendimento.`,
+      `A IA Ouro cruza a classificação Frio/Morno/Quente, sinais do cadastro, respostas do formulário, o estágio atual no funil (${estagioCtx.label}) e previsão do ML (quando disponível) com foco no nicho ${ctx.nicho}. Ela entrega resumo, prioridade, próxima ação e mensagem pronta para reduzir tempo de atendimento.`,
     score_regras: score,
     pontos_regras: scoreData.pontos || 0,
     recuperacao: leadPerdido
@@ -2406,9 +2450,11 @@ async function gerarAnaliseIAOpenAI(
   };
 
   const ctx = contextoNicho(lead);
+  const estagioCtx = estagioKanbanContexto(lead?.status || "novo");
   const iaConf = await buscarConfigIA();
   const systemMsg =
-    `${ctx.system} Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso. IMPORTANTE: as mensagens de WhatsApp devem ser naturais, personalizadas ao nicho "${ctx.nicho}" e sem emojis ou caracteres especiais. As perguntas de qualificacao devem focar em: ${ctx.qualificadores.join(", ")}.`;
+    `${ctx.system} Responda somente no JSON solicitado, em portugues do Brasil, com texto curto, pratico e pronto para uso. IMPORTANTE: as mensagens de WhatsApp devem ser naturais, personalizadas ao nicho "${ctx.nicho}" e sem emojis ou caracteres especiais. As perguntas de qualificacao devem focar em: ${ctx.qualificadores.join(", ")}. ` +
+    `O lead esta atualmente no estagio "${estagioCtx.label}" do funil (kanban): ${estagioCtx.objetivo}. Ajuste obrigatoriamente a proxima_acao e a mensagem_whatsapp para esse momento exato da jornada do lead — nunca trate um lead que ja teve contato como se fosse a primeira abordagem, e nunca sugira continuar vendendo um lead que ja esta no estagio "Fechado (cliente)" (nesse caso foque em pos-venda, satisfacao, upsell ou indicacao).`;
   const schemaDescricao =
     `Retorne SOMENTE JSON valido com esta estrutura exata (sem texto antes ou depois):
 {"prioridade":"alta"|"media"|"baixa","resumo":"string","proxima_acao":"string","mensagem_whatsapp":"string","perguntas_qualificacao":["string"],"sinais":["string"],"riscos":["string"],"explicacao":"string","recuperacao":{"chance":"alta"|"media"|"baixa"|"nao_aplicavel","motivo_perda":"string","recomendacao":"string"}}`;
@@ -2416,7 +2462,9 @@ async function gerarAnaliseIAOpenAI(
     lead: payloadLead,
     nicho: ctx.nicho,
     produto: ctx.produto,
-    objetivo: `Gerar analise comercial focada em ${ctx.nicho}, proxima acao, mensagem de WhatsApp personalizada para o nicho e recuperacao quando aplicavel.`
+    estagio_kanban: estagioCtx.label,
+    objetivo_estagio: estagioCtx.objetivo,
+    objetivo: `Gerar analise comercial focada em ${ctx.nicho}, proxima acao, mensagem de WhatsApp personalizada para o nicho e para o estagio atual do funil, e recuperacao quando aplicavel.`
   });
 
   const parseAnalise = (texto: string) => {
@@ -14107,13 +14155,19 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const contexto = textoOpcional(body.contexto) || "";
   const nicho: string = textoOpcional(body.campanha?.nicho) || textoOpcional(body.nicho) || "imoveis";
+  const titulosAnteriores: string[] = Array.isArray(body.titulos_anteriores)
+    ? body.titulos_anteriores
+        .filter((t: unknown) => typeof t === "string" && t.trim())
+        .map((t: string) => t.trim().slice(0, 60))
+        .slice(0, 9)
+    : [];
 
   const nichoConfig: Record<string, {
     topicoDefault: string;
     especialidade: string;
-    v1titulo: string; v1texto: string;
-    v2titulo: string; v2texto: string;
-    v3titulo: string; v3texto: string;
+    v1exemplos: string[]; v1texto: string;
+    v2exemplos: string[]; v2texto: string;
+    v3exemplos: string[]; v3texto: string;
     perguntas: string;
     interesses: string;
     idadeMin: string; idadeMax: string;
@@ -14122,11 +14176,23 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     imoveis: {
       topicoDefault: "imovel imobiliario",
       especialidade: "imoveis no Brasil",
-      v1titulo: "Ultimas unidades! Reserve hoje mesmo",
+      v1exemplos: [
+        "Ultimas unidades! Reserve hoje mesmo",
+        "Restam poucas unidades disponiveis",
+        "Sua vaga nesse empreendimento pode acabar"
+      ],
       v1texto: "crie senso de urgencia, medo de perder a oportunidade",
-      v2titulo: "Sua familia merece um lar assim",
+      v2exemplos: [
+        "Sua familia merece um lar assim",
+        "O lar dos seus sonhos esta mais perto do que imagina",
+        "Imagine sua familia morando aqui"
+      ],
       v2texto: "evoque emocao, sonho realizado, qualidade de vida",
-      v3titulo: "Localizacao + seguranca + conforto",
+      v3exemplos: [
+        "Localizacao + seguranca + conforto",
+        "Tudo que voce procura em um imovel, num so lugar",
+        "Estrutura completa pensada para o seu dia a dia"
+      ],
       v3texto: "destaque beneficios concretos e diferenciais especificos",
       perguntas: "Qual regiao voce procura?\nQual faixa de investimento?\nPretende financiar?",
       interesses: "imoveis, casa propria, financiamento imobiliario, apartamento",
@@ -14136,11 +14202,23 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     saude: {
       topicoDefault: "plano de saude",
       especialidade: "planos de saude no Brasil",
-      v1titulo: "Sua saude nao pode esperar",
+      v1exemplos: [
+        "Sua saude nao pode esperar",
+        "Nao deixe para contratar um plano so quando precisar",
+        "Fique protegido antes que seja tarde"
+      ],
       v1texto: "crie urgencia em torno da importancia de estar protegido, risco de ficar sem plano",
-      v2titulo: "Cuide de quem voce ama com o plano certo",
+      v2exemplos: [
+        "Cuide de quem voce ama com o plano certo",
+        "Tranquilidade para voce e sua familia",
+        "Proteger quem voce ama comeca aqui"
+      ],
       v2texto: "evoque emocao, protecao da familia, tranquilidade e seguranca",
-      v3titulo: "Cobertura completa, preco justo",
+      v3exemplos: [
+        "Cobertura completa, preco justo",
+        "Rede credenciada ampla e mensalidade que cabe no bolso",
+        "Plano completo sem burocracia"
+      ],
       v3texto: "destaque beneficios concretos: rede credenciada, sem carencia, preco acessivel",
       perguntas: "Voce possui plano de saude atualmente?\nQuantas pessoas seriam incluidas no plano?\nQual regiao voce mora?",
       interesses: "plano de saude, saude e bem-estar, convenio medico, seguro saude, consulta medica",
@@ -14150,11 +14228,23 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     suplementos: {
       topicoDefault: "suplemento alimentar",
       especialidade: "suplementos e nutricao esportiva no Brasil",
-      v1titulo: "Resultados reais em menos tempo",
+      v1exemplos: [
+        "Resultados reais em menos tempo",
+        "Estoque limitado nos kits promocionais",
+        "Ultimas unidades com preco especial"
+      ],
       v1texto: "crie urgencia em torno de evolucao fisica, estoque limitado ou promocao por tempo limitado",
-      v2titulo: "Seu corpo merece o melhor combustivel",
+      v2exemplos: [
+        "Seu corpo merece o melhor combustivel",
+        "Transforme seu corpo, supere seus limites",
+        "O empurrao que faltava para sua evolucao"
+      ],
       v2texto: "evoque motivacao, transformacao corporal, superacao de limites",
-      v3titulo: "Qualidade comprovada, entrega rapida",
+      v3exemplos: [
+        "Qualidade comprovada, entrega rapida",
+        "Formula testada, resultado comprovado",
+        "Composicao pura, sem enrolacao"
+      ],
       v3texto: "destaque composicao, pureza, certificacoes e diferencial do produto",
       perguntas: "Qual e seu principal objetivo: ganho de massa ou emagrecimento?\nVoce ja usa suplementos atualmente?\nCom que frequencia voce treina?",
       interesses: "musculacao, fitness, suplementacao, treino, academia, nutricao esportiva, whey protein",
@@ -14164,11 +14254,23 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     saas: {
       topicoDefault: "plataforma de gestao de leads",
       especialidade: "software SaaS, plataformas digitais e ferramentas para vendas e marketing no Brasil",
-      v1titulo: "Pare de perder leads por falta de organizacao",
+      v1exemplos: [
+        "Pare de perder leads por falta de organizacao",
+        "Cada lead perdido e dinheiro jogado fora",
+        "Voce ainda esta perdendo vendas por desorganizacao?"
+      ],
       v1texto: "crie urgencia em torno do prejuizo financeiro de perder leads por desorganizacao, enfatize quanto dinheiro e desperdicado sem uma ferramenta adequada",
-      v2titulo: "Imagine saber exatamente qual campanha trouxe cada cliente",
+      v2exemplos: [
+        "Imagine saber exatamente qual campanha trouxe cada cliente",
+        "Controle total do seu funil de vendas, sem planilha",
+        "Clareza total sobre de onde vem cada cliente"
+      ],
       v2texto: "evoque o desejo de controle total, clareza nos resultados e crescimento previsivel do negocio",
-      v3titulo: "IA + Meta Ads + CRM em uma so plataforma",
+      v3exemplos: [
+        "IA + Meta Ads + CRM em uma so plataforma",
+        "Automacao, IA e gestao de leads no mesmo lugar",
+        "Tudo que sua equipe de vendas precisa, integrado"
+      ],
       v3texto: "destaque diferenciais tecnicos: integracao com Meta, IA para criar campanhas, gestao de leads automatica e custo por lead visivel em tempo real",
       perguntas: "Voce ja anuncia no Facebook ou Instagram?\nComo voce organiza seus leads hoje?\nQuantos leads voce recebe por mes em media?",
       interesses: "marketing digital, gestao de leads, Facebook Ads, CRM, vendas online, automacao de marketing, empreendedorismo",
@@ -14178,15 +14280,23 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   };
 
   const cfg = nichoConfig[nicho] || nichoConfig["imoveis"];
+  const sortear = (lista: string[]) => lista[Math.floor(Math.random() * lista.length)];
+  const v1tituloEx = sortear(cfg.v1exemplos);
+  const v2tituloEx = sortear(cfg.v2exemplos);
+  const v3tituloEx = sortear(cfg.v3exemplos);
   const topico = contexto || cfg.topicoDefault;
 
   const fallbackVariacoes = (t: string) =>
-    [1, 2, 3].map(() => ({
-      titulo: t.slice(0, 40),
-      nome_campanha: t.slice(0, 40),
-      texto: `Conheca ${t}. Atendimento rapido e personalizado.`,
+    [
+      { titulo: v1tituloEx, texto: `${t}: ${cfg.v1texto}.`, cta: "SIGN_UP" },
+      { titulo: v2tituloEx, texto: `${t}: ${cfg.v2texto}.`, cta: "LEARN_MORE" },
+      { titulo: v3tituloEx, texto: `${t}: ${cfg.v3texto}.`, cta: "APPLY_NOW" }
+    ].map(({ titulo, texto, cta }) => ({
+      titulo: titulo.slice(0, 40),
+      nome_campanha: titulo.slice(0, 40),
+      texto,
       descricao: `${t} com atendimento especializado.`,
-      cta: "SIGN_UP",
+      cta,
       perguntas: cfg.perguntas,
       interesses: cfg.interesses,
       localidade: "",
@@ -14269,6 +14379,10 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     const bloqueio = await motivoBloqueioIA(user);
     if (bloqueio) return c.json({ error: bloqueio }, 403);
 
+    const instrucaoTitulosAnteriores = titulosAnteriores.length
+      ? `5. NAO repita nem parafraseie de forma proxima estes titulos ja gerados anteriormente para este usuario: ${titulosAnteriores.map(t => `"${t}"`).join(", ")}. Crie titulos totalmente diferentes deles.\n\n`
+      : "\n";
+
     const prompt =
       `Produto/servico: "${topico}"\n` +
       `Nicho: ${cfg.especialidade}\n\n` +
@@ -14277,17 +14391,18 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `1. O titulo NUNCA pode ser o nome do produto. Deve ser uma frase de impacto.\n` +
       `2. PROIBIDO usar: "Conheca X", "Atendimento rapido e personalizado", "com atendimento especializado".\n` +
       `3. Cada variacao deve ter titulo, texto e descricao totalmente diferentes das outras.\n` +
-      `4. Use os detalhes especificos do produto e do nicho para criar copy relevante e unico.\n\n` +
+      `4. Use os detalhes especificos do produto e do nicho para criar copy relevante e unico.\n` +
+      instrucaoTitulosAnteriores +
       `v1 — URGENCIA E ESCASSEZ:\n` +
-      `  Titulo exemplo: "${cfg.v1titulo}"\n` +
+      `  Titulo exemplo (apenas inspiracao de tom — PROIBIDO copiar as mesmas palavras ou estrutura, crie um titulo com vocabulario novo): "${v1tituloEx}"\n` +
       `  Texto: ${cfg.v1texto}\n` +
       `  cta: SIGN_UP\n\n` +
       `v2 — EMOCIONAL:\n` +
-      `  Titulo exemplo: "${cfg.v2titulo}"\n` +
+      `  Titulo exemplo (apenas inspiracao de tom — PROIBIDO copiar as mesmas palavras ou estrutura, crie um titulo com vocabulario novo): "${v2tituloEx}"\n` +
       `  Texto: ${cfg.v2texto}\n` +
       `  cta: LEARN_MORE\n\n` +
       `v3 — RACIONAL E OBJETIVO:\n` +
-      `  Titulo exemplo: "${cfg.v3titulo}"\n` +
+      `  Titulo exemplo (apenas inspiracao de tom — PROIBIDO copiar as mesmas palavras ou estrutura, crie um titulo com vocabulario novo): "${v3tituloEx}"\n` +
       `  Texto: ${cfg.v3texto}\n` +
       `  cta: APPLY_NOW\n\n` +
       `Campos de cada variacao:\n` +
