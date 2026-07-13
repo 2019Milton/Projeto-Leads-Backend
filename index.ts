@@ -6056,16 +6056,27 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
       if (dailyBudgetCampanha) {
         payloadCampanha.daily_budget = dailyBudgetCampanha;
       }
+
+      // Com CBO a estrategia de lance precisa estar na campanha (nao no adset);
+      // sem isso a Meta pode rejeitar exigindo valor de lance mesmo em "menor custo possivel".
+      const { bidStrategy, bidAmount } =
+        prepararControleCustoMeta(
+          configuracoes_avancadas?.bid_strategy,
+          configuracoes_avancadas?.bid_amount
+        );
+
+      payloadCampanha.bid_strategy = bidStrategy || "LOWEST_COST_WITHOUT_CAP";
+
+      if (bidAmount !== null && bidStrategyExigeValor(payloadCampanha.bid_strategy)) {
+        payloadCampanha.bid_amount = Math.round(bidAmount * 100);
+      }
     }
 
-    const campanha = await fetch(
+    const campanha = await enviarPayloadMetaComFallbackBid(
       `https://graph.facebook.com/v19.0/${adAccountId}/campaigns`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadCampanha)
-      }
-    ).then(r => r.json());
+      payloadCampanha,
+      "CAMPANHA"
+    );
 
     if (!campanha.id) {
 
@@ -12355,7 +12366,30 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       access_token: token
     };
 
-    if (bidStrategy) {
+    // Com CBO a estrategia de lance vive na campanha, nao no adset.
+    if (avancadas.cbo) {
+      const payloadCampanhaLance: any = {
+        bid_strategy: bidStrategy || "LOWEST_COST_WITHOUT_CAP",
+        access_token: token
+      };
+
+      if (bidAmount !== null && bidStrategyExigeValor(payloadCampanhaLance.bid_strategy)) {
+        payloadCampanhaLance.bid_amount = Math.round(bidAmount * 100);
+      }
+
+      const campanhaLanceRes = await enviarPayloadMetaComFallbackBid(
+        `https://graph.facebook.com/v19.0/${campaign_id}`,
+        payloadCampanhaLance,
+        "EDITAR_CAMPANHA_LANCE"
+      );
+
+      if (campanhaLanceRes.error) {
+        return c.json({
+          error: campanhaLanceRes.error,
+          targeting_enviado: targeting
+        }, 400);
+      }
+    } else if (bidStrategy) {
       payloadAdset.bid_strategy = bidStrategy;
     }
 
@@ -12365,7 +12399,8 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     if (
       bidAmount !== null &&
-      bidStrategyExigeValor(bidStrategy)
+      bidStrategyExigeValor(bidStrategy) &&
+      !avancadas.cbo
     ) {
       payloadAdset.bid_amount =
         Math.round(bidAmount * 100);
@@ -12744,16 +12779,24 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     if (cfg.cbo ?? true) {
       payloadCampanha.daily_budget = dailyBudget;
+
+      // Com CBO a estrategia de lance precisa estar na campanha (nao no adset);
+      // sem isso a Meta pode rejeitar exigindo valor de lance mesmo em "menor custo possivel".
+      const { bidStrategy, bidAmount } =
+        prepararControleCustoMeta(cfg.bid_strategy, cfg.bid_amount);
+
+      payloadCampanha.bid_strategy = bidStrategy || "LOWEST_COST_WITHOUT_CAP";
+
+      if (bidAmount !== null && bidStrategyExigeValor(payloadCampanha.bid_strategy)) {
+        payloadCampanha.bid_amount = Math.round(bidAmount * 100);
+      }
     }
 
-    const campanhaMeta = await fetch(
+    const campanhaMeta = await enviarPayloadMetaComFallbackBid(
       `https://graph.facebook.com/v19.0/${adAccountId}/campaigns`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadCampanha)
-      }
-    ).then(r => r.json());
+      payloadCampanha,
+      "PUBLICAR_RECEBIDA_CAMPANHA"
+    );
 
     if (!campanhaMeta.id) {
       return await falhar(
