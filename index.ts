@@ -4964,6 +4964,194 @@ app.post("/tiktok/upload-video", authMiddleware, async (c) => {
   }
 });
 
+// Lista identidades (perfil TikTok / usuário customizado) disponíveis do anunciante conectado
+// — equivalente à Página do Facebook, mas é um objeto próprio da TikTok Business API.
+app.get("/tiktok/identidades", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await obterConexaoTikTok(user.id);
+    if (!conexao) return c.json({ error: "TikTok nao conectado" }, 400);
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anunciante TikTok antes de buscar identidades" }, 400);
+    }
+
+    // ASSUMPTION: shape de /identity/get/ (identity_id/identity_type/display_name) —
+    // confirmar contra o SDK oficial (github.com/tiktok/tiktok-business-api-sdk) na Fase 2B.
+    const params = new URLSearchParams({ advertiser_id: conexao.advertiserId });
+    const resposta = await tiktokFetch(`/identity/get/?${params}`, conexao.token);
+
+    if (!resposta.ok) {
+      console.error("ERRO TIKTOK IDENTIDADES:", resposta.data);
+      return c.json({ error: resposta.error || "Erro ao buscar identidades TikTok" }, 502);
+    }
+
+    const identidades = Array.isArray(resposta.data?.data?.identity_list)
+      ? resposta.data.data.identity_list
+      : Array.isArray(resposta.data?.data)
+      ? resposta.data.data
+      : [];
+
+    return c.json({ identidades });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/identidades:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Salva a identidade (perfil TikTok) escolhida pelo usuário para publicar os anúncios
+app.post("/tiktok/selecionar-identidade", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const { identity_id, identity_type } = await c.req.json();
+    if (!identity_id || !identity_type) {
+      return c.json({ error: "identity_id e identity_type obrigatorios" }, 400);
+    }
+
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb)
+         || jsonb_build_object('identity_id', $1::text, 'identity_type', $2::text),
+           atualizado_em = NOW()
+       WHERE usuario_id = $3 AND plataforma = 'tiktok'`,
+      [String(identity_id), String(identity_type), user.id]
+    );
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/selecionar-identidade:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Busca de interesses para segmentação (equivalente ao /meta/direcionamento/interesses)
+app.post("/tiktok/direcionamento/interesses", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, busca } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const termo = textoOpcional(busca).slice(0, 80);
+    if (termo.length < 2) {
+      return c.json({ data: [] });
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Conecte a TikTok antes de buscar interesses" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios TikTok antes de buscar interesses" }, 400);
+    }
+
+    // ASSUMPTION: /interest_category/list/ retorna a árvore inteira de categorias de
+    // interesse (a API não parece expor busca por termo nesse endpoint), então o filtro
+    // por substring é feito aqui no backend. Confirmar na Fase 2B se existe um endpoint
+    // mais direto de busca por palavra-chave (ex.: interest_keyword/recommend/).
+    const params = new URLSearchParams({ advertiser_id: conexao.advertiserId });
+    const resposta = await tiktokFetch(`/interest_category/list/?${params}`, conexao.token);
+
+    if (!resposta.ok) {
+      return c.json({
+        error: resposta.error || "Erro ao buscar interesses na TikTok",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    const termoBusca = termo.toLowerCase();
+    const categorias = Array.isArray(resposta.data?.data?.interest_category_list)
+      ? resposta.data.data.interest_category_list
+      : Array.isArray(resposta.data?.data)
+      ? resposta.data.data
+      : [];
+
+    const data = categorias
+      .map((cat: any) => ({
+        id: textoOpcional(cat.interest_category_id ?? cat.id),
+        nome: textoOpcional(cat.name),
+        caminho: listaOpcional(cat.path ?? [])
+      }))
+      .filter((cat: any) =>
+        cat.id &&
+        cat.nome &&
+        cat.nome.toLowerCase().includes(termoBusca)
+      )
+      .slice(0, 12);
+
+    return c.json({ data });
+  } catch (err) {
+    console.error("ERRO BUSCA INTERESSES TIKTOK:", err);
+    return c.json({ error: "Erro ao buscar interesses TikTok" }, 500);
+  }
+});
+
+// Busca de localizações para segmentação (equivalente ao /meta/direcionamento/localizacao)
+app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, busca } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const termo = textoOpcional(busca).slice(0, 80);
+    if (termo.length < 2) {
+      return c.json({ data: [] });
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Conecte a TikTok antes de buscar localizações" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios TikTok antes de buscar localizações" }, 400);
+    }
+
+    // ASSUMPTION: /region/ retorna a árvore inteira de localidades disponíveis pro
+    // advertiser (sem busca por termo nativa), então o filtro por substring é feito
+    // aqui no backend. Confirmar o shape exato (campos de nível/hierarquia) na Fase 2B.
+    const params = new URLSearchParams({ advertiser_id: conexao.advertiserId });
+    const resposta = await tiktokFetch(`/region/?${params}`, conexao.token);
+
+    if (!resposta.ok) {
+      return c.json({
+        error: resposta.error || "Erro ao buscar localizações na TikTok",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    const termoBusca = termo.toLowerCase();
+    const locais = Array.isArray(resposta.data?.data?.region_list)
+      ? resposta.data.data.region_list
+      : Array.isArray(resposta.data?.data)
+      ? resposta.data.data
+      : [];
+
+    const data = locais
+      .map((local: any) => ({
+        key: textoOpcional(local.region_code ?? local.id),
+        nome: textoOpcional(local.region_name ?? local.name),
+        tipo: textoOpcional(local.level ?? local.type),
+        pais: textoOpcional(local.country_code ?? local.pais)
+      }))
+      .filter((local: any) =>
+        local.key &&
+        local.nome &&
+        local.nome.toLowerCase().includes(termoBusca)
+      )
+      .slice(0, 10);
+
+    return c.json({ data });
+  } catch (err) {
+    console.error("ERRO BUSCA LOCALIZACAO TIKTOK:", err);
+    return c.json({ error: "Erro ao buscar localização TikTok" }, 500);
+  }
+});
+
 /* =========================
    📷 INSTAGRAM LOGIN (Business Login)
 ========================= */
