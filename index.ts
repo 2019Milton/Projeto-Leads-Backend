@@ -4623,6 +4623,27 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
         (soma, row) => soma + Number(row.metrics?.costMicros ?? 0), 0
       );
 
+      // Status de pagamento: consulta best-effort — nem toda conta expoe billing_setup
+      // (ex: contas gerenciadas so pelo billing do MCC), entao falha aqui nao quebra o resto.
+      let pagamento: { status: string | null; texto: string } = {
+        status: null,
+        texto: "Não identificado",
+      };
+      try {
+        const billingResults = await googleAdsQuery(
+          customerId, accessToken,
+          "SELECT billing_setup.status FROM billing_setup"
+        );
+        const statusBilling = (billingResults[0] as any)?.billingSetup?.status ?? null;
+        pagamento = {
+          status: statusBilling,
+          texto: statusBilling === "APPROVED" ? "Aprovado"
+            : statusBilling === "PENDING" ? "Pendente"
+            : statusBilling === "CANCELLED" ? "Cancelado"
+            : "Não identificado",
+        };
+      } catch (_) {}
+
       return c.json({
         ...base,
         conta: contaInfo ? {
@@ -4632,10 +4653,11 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
           status: contaInfo.status || null,
         } : null,
         gasto_hoje: gastoMicros / 1_000_000,
+        pagamento,
       });
     } catch (errApi: any) {
       console.error("ERRO /google/status-completo (API Google):", errApi.message);
-      return c.json({ ...base, conta: null, gasto_hoje: null, aviso: "Nao foi possivel consultar dados ao vivo do Google Ads" });
+      return c.json({ ...base, conta: null, gasto_hoje: null, pagamento: null, aviso: "Nao foi possivel consultar dados ao vivo do Google Ads" });
     }
   } catch (err: any) {
     console.error("ERRO /google/status-completo:", err);
