@@ -3521,7 +3521,11 @@ function diagnosticarVeiculacaoMeta(
 function extrairSaldoDisponivelMeta(displayString?: string | null) {
   if (!displayString) return null;
 
-  const match = displayString.match(/([\d.,]+)\s*[A-Z]{3}\)/);
+  // Aceita tanto o formato antigo ("-R$91,46 BRL)") quanto o novo, com o
+  // simbolo da moeda e parenteses aninhados entre o valor e o codigo
+  // ("Saldo disponivel (49,99 R$ (BRL))") — por isso [^\d]*? entre o
+  // numero e o codigo de 3 letras, em vez de exigir apenas espaco.
+  const match = displayString.match(/([\d.,]+)[^\d]*?[A-Z]{3}\)/);
 
   if (!match) return null;
 
