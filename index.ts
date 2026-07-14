@@ -589,6 +589,13 @@ function erroMetaBidAmount(resposta: any) {
     mensagem.includes("lance obrigatório") ||
     mensagem.includes("lance obrigatórios") ||
     mensagem.includes("restrições de lance") ||
+    // Meta às vezes usa "licitação" (PT-PT) em vez de "lance" (PT-BR) na mesma mensagem.
+    mensagem.includes("valor de licitação") ||
+    mensagem.includes("licitação obrigatório") ||
+    mensagem.includes("licitação obrigatórios") ||
+    mensagem.includes("restrições de licitação") ||
+    mensagem.includes("limite de licitação") ||
+    mensagem.includes("campo de licitação") ||
     mensagem.includes("bid value") ||
     mensagem.includes("bid restriction") ||
     mensagem.includes("lowest_cost_with_bid_cap") ||
