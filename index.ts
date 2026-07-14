@@ -4562,6 +4562,86 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
   }
 });
 
+// Resumo da conta conectada: dados da conta, gasto de hoje e contagens locais
+app.get("/google/status-completo", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conn = await client.query(
+      `SELECT refresh_token, dados_conta, conectado_em FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows.length || !conn.rows[0].refresh_token) {
+      return c.json({ conectado: false });
+    }
+
+    const dadosConta = conn.rows[0].dados_conta ?? {};
+    const customerId = dadosConta.customer_id;
+
+    const [campanhasCount, leadsHojeCount] = await Promise.all([
+      client.query(
+        `SELECT COUNT(*) FILTER (WHERE status = 'ENABLED') AS ativas, COUNT(*) AS total
+         FROM campanhas WHERE usuario_id = $1 AND plataforma = 'google'`,
+        [user.id]
+      ),
+      client.query(
+        `SELECT COUNT(*) AS total FROM leads
+         WHERE usuario_id = $1 AND plataforma = 'google' AND criado_em::date = CURRENT_DATE`,
+        [user.id]
+      ),
+    ]);
+
+    const base = {
+      conectado: true,
+      conta_selecionada: Boolean(customerId),
+      campanhas_ativas: Number(campanhasCount.rows[0]?.ativas ?? 0),
+      campanhas_total: Number(campanhasCount.rows[0]?.total ?? 0),
+      leads_hoje: Number(leadsHojeCount.rows[0]?.total ?? 0),
+    };
+
+    if (!customerId || !Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ ...base, conta: null, gasto_hoje: null });
+    }
+
+    try {
+      const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
+
+      const [contaResults, gastoResults] = await Promise.all([
+        googleAdsQuery(
+          customerId, accessToken,
+          "SELECT customer.descriptive_name, customer.currency_code, customer.time_zone, customer.status FROM customer LIMIT 1"
+        ),
+        googleAdsQuery(
+          customerId, accessToken,
+          "SELECT metrics.cost_micros FROM campaign WHERE segments.date DURING TODAY"
+        ),
+      ]);
+
+      const contaInfo = (contaResults[0] as any)?.customer ?? null;
+      const gastoMicros = (gastoResults as any[]).reduce(
+        (soma, row) => soma + Number(row.metrics?.costMicros ?? 0), 0
+      );
+
+      return c.json({
+        ...base,
+        conta: contaInfo ? {
+          nome: contaInfo.descriptiveName || customerId,
+          moeda: contaInfo.currencyCode || null,
+          fuso_horario: contaInfo.timeZone || null,
+          status: contaInfo.status || null,
+        } : null,
+        gasto_hoje: gastoMicros / 1_000_000,
+      });
+    } catch (errApi: any) {
+      console.error("ERRO /google/status-completo (API Google):", errApi.message);
+      return c.json({ ...base, conta: null, gasto_hoje: null, aviso: "Nao foi possivel consultar dados ao vivo do Google Ads" });
+    }
+  } catch (err: any) {
+    console.error("ERRO /google/status-completo:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
 // Sincroniza campanhas e leads (Lead Form Extensions) do Google Ads
 app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
   const user: any = c.get("user");
