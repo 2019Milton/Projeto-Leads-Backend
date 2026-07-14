@@ -4594,6 +4594,7 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
     const base = {
       conectado: true,
       conta_selecionada: Boolean(customerId),
+      customer_id: customerId ? String(customerId) : null,
       campanhas_ativas: Number(campanhasCount.rows[0]?.ativas ?? 0),
       campanhas_total: Number(campanhasCount.rows[0]?.total ?? 0),
       leads_hoje: Number(leadsHojeCount.rows[0]?.total ?? 0),
