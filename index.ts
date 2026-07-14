@@ -4431,6 +4431,284 @@ app.get("/auth/:plataforma/callback", async (c) => {
 });
 
 /* =========================
+   🔴 GOOGLE ADS
+   ATENCAO: GOOGLE_ADS_API_VERSION precisa ser conferida periodicamente —
+   o Google descontinua versoes antigas da API cerca de 1 ano apos o
+   lancamento. Ver https://developers.google.com/google-ads/api/docs/release-notes
+========================= */
+
+const googleSyncEmAndamento = new Set<number>();
+
+const GOOGLE_ADS_API_VERSION = "v19";
+const GOOGLE_ADS_API = `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}`;
+
+async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: Bun.env.GOOGLE_ADS_CLIENT_ID || "",
+      client_secret: Bun.env.GOOGLE_ADS_CLIENT_SECRET || "",
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data = await res.json() as any;
+  if (!res.ok || !data.access_token) {
+    console.error("ERRO REFRESH TOKEN GOOGLE:", data);
+    throw new Error(data.error_description || "Erro ao renovar token do Google Ads");
+  }
+  return data.access_token;
+}
+
+function googleAdsHeaders(accessToken: string) {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    "developer-token": Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN || "",
+    "Content-Type": "application/json",
+  };
+}
+
+async function googleAdsQuery(customerId: string, accessToken: string, gaql: string) {
+  const res = await fetch(
+    `${GOOGLE_ADS_API}/customers/${customerId}/googleAds:search`,
+    {
+      method: "POST",
+      headers: googleAdsHeaders(accessToken),
+      body: JSON.stringify({ query: gaql }),
+    }
+  );
+  const data = await res.json() as any;
+  if (!res.ok) {
+    console.error("ERRO GOOGLE ADS QUERY:", customerId, data);
+    throw new Error(data?.error?.message || "Erro ao consultar Google Ads");
+  }
+  return data.results ?? [];
+}
+
+// Lista as contas do Google Ads acessiveis pelo usuario conectado
+app.get("/google/contas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ error: "Developer token do Google Ads nao configurado" }, 500);
+    }
+
+    const conn = await client.query(
+      `SELECT refresh_token FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows.length || !conn.rows[0].refresh_token) {
+      return c.json({ error: "Google Ads nao conectado" }, 400);
+    }
+
+    const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
+
+    const listRes = await fetch(`${GOOGLE_ADS_API}/customers:listAccessibleCustomers`, {
+      headers: googleAdsHeaders(accessToken),
+    });
+    const listData = await listRes.json() as any;
+    if (!listRes.ok) {
+      console.error("ERRO GOOGLE ADS CONTAS:", listData);
+      return c.json({ error: "Erro ao buscar contas do Google Ads", detalhe: listData?.error?.message }, 502);
+    }
+
+    const resourceNames: string[] = listData.resourceNames ?? [];
+    const contas: { customer_id: string; nome: string }[] = [];
+
+    for (const resourceName of resourceNames) {
+      const customerId = resourceName.split("/")[1];
+      try {
+        const results = await googleAdsQuery(
+          customerId, accessToken,
+          "SELECT customer.id, customer.descriptive_name FROM customer LIMIT 1"
+        );
+        const nome = (results[0] as any)?.customer?.descriptiveName || customerId;
+        contas.push({ customer_id: customerId, nome });
+      } catch (_) {
+        contas.push({ customer_id: customerId, nome: customerId });
+      }
+    }
+
+    return c.json({ contas });
+  } catch (err: any) {
+    console.error("ERRO /google/contas:", err);
+    return c.json({ error: err.message || "Erro interno" }, 500);
+  }
+});
+
+// Salva a conta do Google Ads selecionada pelo usuario
+app.post("/google/selecionar-conta", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const { customer_id } = await c.req.json();
+    if (!customer_id) return c.json({ error: "customer_id obrigatorio" }, 400);
+
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object('customer_id', $1::text),
+           atualizado_em = NOW()
+       WHERE usuario_id = $2 AND plataforma = 'google'`,
+      [String(customer_id), user.id]
+    );
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /google/selecionar-conta:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Sincroniza campanhas e leads (Lead Form Extensions) do Google Ads
+app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    if (googleSyncEmAndamento.has(user.id)) {
+      return c.json({ error: "Sincronizacao Google Ads ja em andamento" }, 429);
+    }
+    googleSyncEmAndamento.add(user.id);
+
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ error: "Developer token do Google Ads nao configurado" }, 500);
+    }
+
+    const conn = await client.query(
+      `SELECT refresh_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows.length || !conn.rows[0].refresh_token) {
+      return c.json({ error: "Google Ads nao conectado" }, 400);
+    }
+
+    const dadosConta = conn.rows[0].dados_conta ?? {};
+    const customerId = dadosConta.customer_id;
+    if (!customerId) {
+      return c.json({ error: "Selecione a conta do Google Ads antes de sincronizar" }, 400);
+    }
+
+    const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
+
+    // 🔥 BUSCA CAMPANHAS
+    const campanhasResults = await googleAdsQuery(
+      customerId, accessToken,
+      "SELECT campaign.id, campaign.name, campaign.status FROM campaign"
+    );
+
+    for (const row of campanhasResults as any[]) {
+      const campanha = row.campaign;
+      const campaignId = String(campanha.id);
+
+      const existe = await client.query(
+        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+        [campaignId, user.id]
+      );
+
+      if (existe.rows.length > 0) {
+        await client.query(
+          `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
+           WHERE campaign_id = $3 AND usuario_id = $4`,
+          [campanha.name, campanha.status, campaignId, user.id]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
+           VALUES ($1, $2, $3, $4, $5, 'google', 'google', NOW())`,
+          [user.id, campaignId, String(customerId), campanha.name, campanha.status]
+        );
+      }
+    }
+
+    // 🔥 BUSCA LEADS (Lead Form Extensions, ultimos 30 dias)
+    const trintaDiasAtras = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const formatarDataHoraGoogle = (d: Date) => d.toISOString().slice(0, 19).replace("T", " ");
+    const inicio = formatarDataHoraGoogle(trintaDiasAtras);
+    const fim = formatarDataHoraGoogle(new Date());
+
+    const leadsResults = await googleAdsQuery(
+      customerId, accessToken,
+      `SELECT lead_form_submission_data.id, lead_form_submission_data.campaign_id,
+              lead_form_submission_data.submission_date_time,
+              lead_form_submission_data.lead_form_submission_fields
+       FROM lead_form_submission_data
+       WHERE lead_form_submission_data.submission_date_time BETWEEN '${inicio}' AND '${fim}'`
+    );
+
+    let totalLeads = 0;
+
+    for (const row of leadsResults as any[]) {
+      const dadosLead = row.leadFormSubmissionData;
+      const leadId = String(dadosLead.id);
+
+      const jaExiste = await client.query(
+        `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+        [leadId, user.id]
+      );
+      if (jaExiste.rows.length > 0) continue;
+
+      let nomeCampanha = "Campanha Google Ads";
+      let nichoId: number | null = null;
+      const campaignIdLead = dadosLead.campaignId ? String(dadosLead.campaignId) : "";
+      if (campaignIdLead) {
+        const campRow = await client.query(
+          `SELECT nome, nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 LIMIT 1`,
+          [campaignIdLead, user.id]
+        );
+        if (campRow.rows.length) {
+          nomeCampanha = campRow.rows[0].nome;
+          nichoId = campRow.rows[0].nicho_id ?? null;
+        }
+      }
+
+      let nome = "";
+      let email = "";
+      let telefone = "";
+      const respostasQualificacao: any[] = [];
+
+      for (const field of dadosLead.leadFormSubmissionFields ?? []) {
+        const tipo = String(field.fieldType ?? "").toUpperCase();
+        if (tipo === "FULL_NAME" || tipo === "FIRST_NAME") nome = field.fieldValue ?? "";
+        else if (tipo === "EMAIL") email = field.fieldValue ?? "";
+        else if (tipo === "PHONE_NUMBER") telefone = field.fieldValue ?? "";
+        else respostasQualificacao.push({ pergunta: field.fieldType, resposta: field.fieldValue ?? "" });
+      }
+
+      const criadoEm = dadosLead.submissionDateTime
+        ? new Date(String(dadosLead.submissionDateTime).replace(" ", "T") + "Z").toISOString()
+        : null;
+
+      await client.query(
+        `INSERT INTO leads
+           (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'google','google','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
+        [
+          user.id, leadId, nome || "Lead Google Ads", email, telefone,
+          nomeCampanha, String(customerId),
+          JSON.stringify(respostasQualificacao), nichoId, criadoEm
+        ]
+      );
+
+      await notificarNovoLeadWhatsApp(user.id, { nome, telefone, email, campanha: nomeCampanha });
+      totalLeads++;
+    }
+
+    await client.query(
+      `UPDATE plataforma_conexoes SET atualizado_em = NOW()
+       WHERE usuario_id = $1 AND plataforma = 'google'`,
+      [user.id]
+    );
+
+    return c.json({ sucesso: true, campanhas: campanhasResults.length, leads_novos: totalLeads });
+  } catch (err: any) {
+    console.error("ERRO GOOGLE SINCRONIZAR:", err);
+    return c.json({ error: err.message || "Erro ao sincronizar Google Ads" }, 500);
+  } finally {
+    googleSyncEmAndamento.delete(user.id);
+  }
+});
+
+/* =========================
    🎵 TIKTOK ADS
 ========================= */
 
