@@ -4433,13 +4433,16 @@ app.get("/auth/:plataforma/callback", async (c) => {
 /* =========================
    🔴 GOOGLE ADS
    ATENCAO: GOOGLE_ADS_API_VERSION precisa ser conferida periodicamente —
-   o Google descontinua versoes antigas da API cerca de 1 ano apos o
-   lancamento. Ver https://developers.google.com/google-ads/api/docs/release-notes
+   desde 2026 o Google lanca uma versao por mes (major.minor, ex: v24.1,
+   v24.2), mas releases menores nao trocam o segmento de versao da URL
+   REST — so o numero major (ex: "v24") importa aqui. O Google descontinua
+   versoes major antigas cerca de 1 ano apos o lancamento.
+   Ver https://developers.google.com/google-ads/api/docs/release-notes
 ========================= */
 
 const googleSyncEmAndamento = new Set<number>();
 
-const GOOGLE_ADS_API_VERSION = "v19";
+const GOOGLE_ADS_API_VERSION = "v24";
 const GOOGLE_ADS_API = `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}`;
 
 async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
