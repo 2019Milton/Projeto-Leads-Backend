@@ -4567,7 +4567,7 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const conn = await client.query(
-      `SELECT refresh_token, dados_conta, conectado_em FROM plataforma_conexoes
+      `SELECT refresh_token, dados_conta, conectado_em, atualizado_em FROM plataforma_conexoes
        WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
       [user.id]
     );
@@ -4595,6 +4595,7 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
       conectado: true,
       conta_selecionada: Boolean(customerId),
       customer_id: customerId ? String(customerId) : null,
+      ultimo_sync: conn.rows[0].atualizado_em ?? null,
       campanhas_ativas: Number(campanhasCount.rows[0]?.ativas ?? 0),
       campanhas_total: Number(campanhasCount.rows[0]?.total ?? 0),
       leads_hoje: Number(leadsHojeCount.rows[0]?.total ?? 0),
