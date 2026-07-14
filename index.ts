@@ -8215,6 +8215,115 @@ app.post("/meta/tos-aceitar", authMiddleware, async (c) => {
   }
 });
 
+// 🔥 Tenta vincular automaticamente a Página (com Instagram) ao Business Manager
+// dono da conta de anúncios em uso. Isso costuma liberar o Instagram para a
+// conta de anúncios sem exigir passo manual no Gerenciador de Negócios.
+// A Meta pode recusar (ex: Página já pertence a outro Business confirmado,
+// permissão insuficiente) — nesse caso, cai no fluxo manual existente.
+app.post("/meta/instagram/vincular-business", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id } = await c.req.json().catch(() => ({}));
+
+    const usuarioId =
+      resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const conn = await client.query(
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+
+    if (!conn.rows.length) {
+      return c.json({ error: "Meta não conectada" }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    const contaAds = await obterContaAnuncios(token, conn.rows[0].conta_anuncios_id);
+
+    if (!contaAds) {
+      return c.json({ error: "Nenhuma conta de anúncios encontrada" }, 400);
+    }
+
+    const businessId = contaAds.business?.id;
+
+    if (!businessId) {
+      return c.json({
+        error: "Essa conta de anúncios não pertence a um Business Manager, então não é possível vincular automaticamente. É preciso vincular manualmente pelo Gerenciador de Negócios.",
+        precisa_manual: true
+      }, 400);
+    }
+
+    const paginas = await listarPaginasComInstagram(token);
+    const instagram = await detectarInstagramMeta(token, paginas);
+
+    if (!instagram?.id) {
+      return c.json({
+        error: "Não encontramos nenhum Instagram vinculado a uma Página para adicionar ao Business Manager.",
+        precisa_manual: true
+      }, 400);
+    }
+
+    const paginaComInstagram =
+      paginas.find((p: any) => p.instagram?.id === instagram.id) ||
+      paginas[0];
+
+    if (!paginaComInstagram?.id) {
+      return c.json({
+        error: "Não encontramos a Página do Facebook vinculada a esse Instagram.",
+        precisa_manual: true
+      }, 400);
+    }
+
+    const resultado = await fetch(
+      `https://graph.facebook.com/v19.0/${businessId}/owned_pages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          page_id: paginaComInstagram.id,
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    if (resultado?.error) {
+      return c.json({
+        error: mensagemErroMeta(
+          resultado,
+          "A Meta recusou adicionar a Página automaticamente ao Business Manager."
+        ),
+        detalhe: resultado,
+        precisa_manual: true
+      }, 400);
+    }
+
+    const contasInstagramAnuncio =
+      await listarContasInstagramAnuncio(token, contaAds.id);
+
+    const instagramUtilizavelNaConta =
+      contasInstagramAnuncio.some(
+        (conta: any) => String(conta.id) === String(instagram.id)
+      );
+
+    return c.json({
+      sucesso: true,
+      instagram_utilizavel_na_conta: instagramUtilizavelNaConta,
+      resultado
+    });
+
+  } catch (err) {
+    console.error("ERRO VINCULAR INSTAGRAM BUSINESS:", err);
+    return c.json({
+      error: "Erro ao tentar vincular automaticamente. Use o passo manual."
+    }, 500);
+  }
+});
+
 app.post("/meta/direcionamento/interesses", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
