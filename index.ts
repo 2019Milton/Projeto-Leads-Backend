@@ -583,23 +583,32 @@ function erroMetaBidAmount(resposta: any) {
     ""
   ).toLowerCase();
 
+  // A Meta troca a redação dessa mensagem com frequencia (ja vimos "lance"
+  // em PT-BR e "licitação" em outra variante, por exemplo) e traduz pra
+  // varios idiomas. Em vez de depender de uma lista de frases exatas —
+  // que quebra a cada nova variacao de texto — combinamos duas partes:
+  // (1) a mensagem fala sobre lance/licitacao/bid, e
+  // (2) fala sobre exigir/faltar um valor ou restricao.
+  // Isso cobre variacoes de redacao e idioma sem precisar listar cada uma.
+  const falaDeControleDeCusto =
+    mensagem.includes("lance") ||
+    mensagem.includes("licitação") ||
+    mensagem.includes("licitacao") ||
+    mensagem.includes("bid");
+
+  const exigeValorOuRestricao =
+    mensagem.includes("obrigat") ||
+    mensagem.includes("restri") ||
+    mensagem.includes("valor") ||
+    mensagem.includes("value") ||
+    mensagem.includes("required") ||
+    mensagem.includes("necess");
+
   return (
     mensagem.includes("bid_amount") ||
-    mensagem.includes("valor do lance") ||
-    mensagem.includes("lance obrigatório") ||
-    mensagem.includes("lance obrigatórios") ||
-    mensagem.includes("restrições de lance") ||
-    // Meta às vezes usa "licitação" (PT-PT) em vez de "lance" (PT-BR) na mesma mensagem.
-    mensagem.includes("valor de licitação") ||
-    mensagem.includes("licitação obrigatório") ||
-    mensagem.includes("licitação obrigatórios") ||
-    mensagem.includes("restrições de licitação") ||
-    mensagem.includes("limite de licitação") ||
-    mensagem.includes("campo de licitação") ||
-    mensagem.includes("bid value") ||
-    mensagem.includes("bid restriction") ||
     mensagem.includes("lowest_cost_with_bid_cap") ||
-    mensagem.includes("target_cost")
+    mensagem.includes("target_cost") ||
+    (falaDeControleDeCusto && exigeValorOuRestricao)
   );
 }
 
@@ -8163,10 +8172,22 @@ app.get(
         ? saldoPrePago
         : saldoApi;
 
+    // IMPORTANTE: "zerado" so pode ser afirmado quando conseguimos LER o
+    // saldo pre-pago real da Meta (saldo_display_string) e ele veio <= 0.
+    // NUNCA usar `saldoApi` (campo `balance`, que reflete quanto ja foi
+    // gasto/devido, nao quanto esta disponivel) como substituto — se o
+    // texto da Meta mudar de formato de novo e o parser nao reconhecer,
+    // isso gerava falso alarme de "sem saldo" para contas com saldo real.
+    // Quando nao conseguimos confirmar, tratamos como desconhecido (nao
+    // como zerado), para nunca alarmar o usuario sem certeza.
     const saldoPrePagoZerado =
       pagamentoManual &&
-      saldoManual !== null &&
-      saldoManual <= 0;
+      saldoPrePago !== null &&
+      saldoPrePago <= 0;
+
+    const saldoPrePagoDesconhecido =
+      pagamentoManual &&
+      saldoPrePago === null;
 
     const pagamentoHabilitado =
       pagamentoAutomatico ||
@@ -8212,10 +8233,8 @@ app.get(
             ? "balance"
             : null,
         saldo_observacao:
-          pagamentoManual && saldoPrePago === null && saldoApi !== null
-            ? "A Meta nao informou o saldo pre-pago detalhado, entao exibimos o saldo retornado pela API."
-            : pagamentoManual && saldoManual === null
-            ? "A Meta nao confirmou o saldo pela API. Confira o saldo diretamente no Gerenciador de Anuncios."
+          saldoPrePagoDesconhecido
+            ? "Nao conseguimos confirmar o saldo pre-pago em um formato reconhecido. Isso NAO significa que o saldo esta zerado — confira o valor real no Gerenciador de Anuncios > Faturamento."
             : null,
         pre_pago: pagamentoManual,
         ativa: contaAtiva,
@@ -18201,7 +18220,7 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       String(c.req.query("ad_format") || "DESKTOP_FEED_STANDARD");
 
     const campRes = await client.query(
-      `SELECT c.id, c.usuario_id, c.ad_id, c.status, c.conta_anuncios_id
+      `SELECT c.id, c.usuario_id, c.ad_id, c.adset_id, c.campaign_id, c.status, c.conta_anuncios_id
        FROM campanhas c
        WHERE c.id = $1
          AND c.usuario_id = $2`,
@@ -18213,12 +18232,6 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
     }
 
     const campanha = campRes.rows[0];
-
-    if (!campanha.ad_id) {
-      return c.json({
-        error: "Esta campanha ainda não tem um anúncio publicado na Meta"
-      }, 400);
-    }
 
     const conn = await client.query(
       `SELECT access_token
@@ -18237,8 +18250,40 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       }, 400);
     }
 
+    let adId = campanha.ad_id;
+
+    // Campanhas sincronizadas direto da Meta (criadas fora da plataforma)
+    // podem nunca ter tido o ad_id gravado localmente. Antes de desistir,
+    // busca o anúncio direto na Meta usando o campaign_id.
+    if (!adId && campanha.campaign_id) {
+      try {
+        const adsRes: any = await fetch(
+          `https://graph.facebook.com/v19.0/${campanha.campaign_id}/ads?fields=id,adset_id&limit=1&access_token=${token}`
+        ).then(r => r.json());
+
+        const primeiroAd = adsRes?.data?.[0];
+
+        if (primeiroAd?.id) {
+          adId = primeiroAd.id;
+
+          await client.query(
+            `UPDATE campanhas SET ad_id = $1, adset_id = COALESCE(adset_id, $2) WHERE id = $3`,
+            [adId, primeiroAd.adset_id || null, campanha.id]
+          );
+        }
+      } catch (errBuscaAd) {
+        console.error("ERRO BUSCAR AD_ID POR CAMPAIGN_ID:", errBuscaAd);
+      }
+    }
+
+    if (!adId) {
+      return c.json({
+        error: "Esta campanha ainda não tem um anúncio publicado na Meta"
+      }, 400);
+    }
+
     const previewRes = await fetch(
-      `https://graph.facebook.com/v19.0/${campanha.ad_id}/previews?ad_format=${encodeURIComponent(adFormat)}&access_token=${token}`
+      `https://graph.facebook.com/v19.0/${adId}/previews?ad_format=${encodeURIComponent(adFormat)}&access_token=${token}`
     );
 
     const previewData: any = await previewRes.json();
@@ -18260,7 +18305,7 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
 
     try {
       const creativeRes = await fetch(
-        `https://graph.facebook.com/v19.0/${campanha.ad_id}?fields=creative{effective_object_story_id}&access_token=${token}`
+        `https://graph.facebook.com/v19.0/${adId}?fields=creative{effective_object_story_id}&access_token=${token}`
       );
       const creativeData: any = await creativeRes.json();
       const storyId = creativeData?.creative?.effective_object_story_id || null;
@@ -18275,7 +18320,7 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
     if (!linkAnuncio) {
       const actId = String(campanha.conta_anuncios_id || "").replace(/^act_/, "");
       linkAnuncio = actId
-        ? `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${encodeURIComponent(actId)}&selected_ad_ids=${encodeURIComponent(campanha.ad_id)}`
+        ? `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${encodeURIComponent(actId)}&selected_ad_ids=${encodeURIComponent(adId)}`
         : null;
     }
 
