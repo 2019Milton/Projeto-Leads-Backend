@@ -7684,6 +7684,83 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
 
       console.error("ERRO AD:", ad);
 
+      // Campanha, conjunto de anúncios e criativo já existem de verdade na Meta
+      // (só o Anúncio falhou). Quando a causa é falta de forma de pagamento na
+      // conta, isso não é um erro do usuário nem da plataforma — é só a conta
+      // Meta que não pode ativar anúncios ainda. Em vez de descartar tudo,
+      // persiste a configuração completa (igual ao caminho de sucesso) para
+      // que a campanha já possa ser encaminhada a um corretor, que publica na
+      // própria conta Meta dele (encaminhar nunca reaproveita ad_id/creative_id).
+      const semFormaPagamento =
+        ad?.error?.error_subcode === 1359188 ||
+        String(ad?.error?.error_user_title || "")
+          .toLowerCase()
+          .includes("forma de pagamento");
+
+      if (semFormaPagamento) {
+
+        const configuracoesPersistidas = {
+          ...(configuracoes_avancadas || {}),
+          texto,
+          cta,
+          page_id,
+          form_id,
+          imageHash: hashes[0] || imageHash || null,
+          imageHashes: hashes,
+          imagens_urls: Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [],
+          image_urls: Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [],
+          video_id: videoMetaId || null,
+          videoId: videoMetaId || null,
+          video_url: videoMetaUrl || null,
+          videoUrl: videoMetaUrl || null,
+          creative_id: creative.id,
+          adset_id,
+          image_hash: hashes[0] || imageHash || null,
+          image_hashes: hashes,
+          criativo: {
+            creative_id: creative.id,
+            image_hash: hashes[0] || imageHash || null,
+            image_hashes: hashes,
+            video_id: videoMetaId || null,
+            video_url: videoMetaUrl || null,
+            carrossel: isCarrossel,
+            tipo: videoMetaId ? "video" : isCarrossel ? "carrossel" : "imagem",
+            titulo: tituloAnuncio,
+            descricao: descricaoAnuncio,
+            link: linkDestino
+          }
+        };
+
+        await client.query(
+          `
+          UPDATE campanhas
+          SET
+            adset_id = $1,
+            form_id = $2,
+            page_id = $3,
+            daily_budget = $4,
+            configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $5::jsonb
+          WHERE CAST(campaign_id AS TEXT) = $6
+          AND usuario_id = $7
+          `,
+          [
+            adset_id,
+            form_id,
+            page_id,
+            numeroOpcional(daily_budget),
+            JSON.stringify(configuracoesPersistidas),
+            String(campaign_id),
+            usuarioId
+          ]
+        );
+
+        return c.json({
+          sem_forma_pagamento: true,
+          mensagem:
+            "Campanha, conjunto de anúncios e criativo foram criados na Meta, mas a conta não tem forma de pagamento cadastrada — por isso o anúncio final não foi ativado. Você já pode encaminhar esta campanha para um corretor publicar na conta Meta dele."
+        });
+      }
+
       return c.json({
         error: "Erro ao criar anúncio",
         detalhe: ad
