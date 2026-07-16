@@ -4836,6 +4836,469 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
 });
 
 /* =========================
+   🔴 GOOGLE ADS — PUBLICACAO (Display + Lead Form existente)
+   Segue o mesmo padrao de /tiktok/*: o Lead Form nao e criado pela API,
+   o usuario escolhe um ja existente no Google Ads Manager (GET /google/formularios).
+   Payloads conferidos contra a documentacao oficial da Google Ads API v24 em
+   16/07/2026 — ver plano de implementacao para as fontes.
+========================= */
+
+async function resolverConexaoGoogleAds(
+  usuarioId: number
+): Promise<{ erro: string } | { accessToken: string; customerId: string }> {
+  const conn = await client.query(
+    `SELECT refresh_token, dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+    [usuarioId]
+  );
+  if (!conn.rows.length || !conn.rows[0].refresh_token) {
+    return { erro: "Google Ads não conectado" };
+  }
+
+  const customerId = (conn.rows[0].dados_conta ?? {}).customer_id;
+  if (!customerId) {
+    return { erro: "Selecione a conta do Google Ads antes de publicar" };
+  }
+
+  const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
+  return { accessToken, customerId: String(customerId) };
+}
+
+async function googleAdsMutate(
+  customerId: string,
+  accessToken: string,
+  recurso: string,
+  operations: any[]
+) {
+  const res = await fetch(
+    `${GOOGLE_ADS_API}/customers/${customerId}/${recurso}:mutate`,
+    {
+      method: "POST",
+      headers: googleAdsHeaders(accessToken),
+      body: JSON.stringify({ operations }),
+    }
+  );
+  const data = await res.json() as any;
+  if (!res.ok) {
+    console.error(`ERRO GOOGLE ADS MUTATE (${recurso}):`, customerId, JSON.stringify(data));
+    throw new Error(data?.error?.message || `Erro ao gravar em ${recurso} no Google Ads`);
+  }
+  return data.results ?? [];
+}
+
+// Cria orcamento + campanha Display (PAUSED) + targeting geo/idioma (nao bloqueante).
+// Equivalente ao /meta/campanha e /tiktok/campanha.
+app.post("/google/campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, nome, orcamento, publicacao_grupo_id } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ error: "Developer token do Google Ads não configurado" }, 500);
+    }
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const orcamentoNumero = numeroOpcional(orcamento);
+    if (!orcamentoNumero || orcamentoNumero <= 0) {
+      return c.json({ error: "Orçamento diário é obrigatório para a campanha Google Ads" }, 400);
+    }
+
+    const nomeCampanha = textoOpcional(nome) || `Campanha Leads ${Date.now()}`;
+
+    const budgetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignBudgets", [
+      {
+        create: {
+          name: `Orcamento - ${nomeCampanha} - ${Date.now()}`,
+          amountMicros: String(Math.round(orcamentoNumero * 1_000_000)),
+          deliveryMethod: "STANDARD",
+          explicitlyShared: false,
+        },
+      },
+    ]);
+    const budgetResourceName = budgetResults[0]?.resourceName;
+    if (!budgetResourceName) {
+      return c.json({ error: "Erro ao criar orçamento no Google Ads" }, 502);
+    }
+
+    const campaignResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+      {
+        create: {
+          name: nomeCampanha,
+          advertisingChannelType: "DISPLAY",
+          status: "PAUSED",
+          campaignBudget: budgetResourceName,
+          manualCpc: {},
+        },
+      },
+    ]);
+    const campaignResourceName = campaignResults[0]?.resourceName;
+    if (!campaignResourceName) {
+      return c.json({ error: "Erro ao criar campanha no Google Ads" }, 502);
+    }
+    const campaignId = campaignResourceName.split("/").pop();
+
+    // ASSUMPTION: geoTargetConstants/2076 (Brasil) e languageConstants/1014 (portugues)
+    // fixos no MVP, sem UI de segmentacao — nao bloqueia a criacao da campanha se falhar.
+    try {
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignCriteria", [
+        { create: { campaign: campaignResourceName, location: { geoTargetConstant: "geoTargetConstants/2076" } } },
+        { create: { campaign: campaignResourceName, language: { languageConstant: "languageConstants/1014" } } },
+      ]);
+    } catch (err) {
+      console.warn("AVISO: falha ao aplicar targeting geo/idioma na campanha Google Ads (não bloqueante):", err);
+    }
+
+    await client.query(
+      `INSERT INTO campanhas (
+        usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
+        configuracoes_avancadas, plataforma, publicacao_grupo_id
+      )
+      VALUES ($1,$2,$3,$4,'PAUSED','plataforma',$5,'google',$6)`,
+      [
+        usuarioId,
+        campaignId,
+        conexao.customerId,
+        nomeCampanha,
+        JSON.stringify({ campaign_budget_resource_name: budgetResourceName }),
+        textoOpcional(publicacao_grupo_id) || null,
+      ]
+    );
+
+    return c.json({ id: campaignId, campaign_id: campaignId });
+  } catch (err: any) {
+    console.error("ERRO /google/campanha:", err);
+    return c.json({ error: err.message || "Erro ao criar campanha Google Ads" }, 500);
+  }
+});
+
+// Cria o Grupo de Anuncios Display (equivalente ao /meta/adset e /tiktok/adgroup)
+app.post("/google/adgroup", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, campaign_id, orcamento } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id não enviado" }, 400);
+    }
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
+    const cpcBidMicros = Math.max(
+      1_000_000,
+      Math.round((numeroOpcional(orcamento) || 10) * 1_000_000 * 0.1)
+    );
+
+    const adGroupResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroups", [
+      {
+        create: {
+          name: `AdGroup Leads ${Date.now()}`,
+          campaign: campaignResourceName,
+          type: "DISPLAY_STANDARD",
+          status: "ENABLED",
+          cpcBidMicros: String(cpcBidMicros),
+        },
+      },
+    ]);
+    const adGroupResourceName = adGroupResults[0]?.resourceName;
+    if (!adGroupResourceName) {
+      return c.json({ error: "Erro ao criar grupo de anúncios no Google Ads" }, 502);
+    }
+
+    return c.json({ id: adGroupResourceName.split("/").pop(), adgroup_id: adGroupResourceName.split("/").pop() });
+  } catch (err: any) {
+    console.error("ERRO /google/adgroup:", err);
+    return c.json({ error: err.message || "Erro ao criar grupo de anúncios Google Ads" }, 500);
+  }
+});
+
+// Lista os Lead Form assets ja existentes na conta conectada — o Google, assim como a
+// TikTok, nao cria o formulario via este fluxo (schema de Lead Form da API e mais
+// complexo que o da Meta); o usuario escolhe um ja criado no Google Ads Manager.
+app.get("/google/formularios", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await resolverConexaoGoogleAds(user.id);
+    if ("erro" in conexao) {
+      return c.json({ formularios: [], aviso: conexao.erro });
+    }
+
+    const results = await googleAdsQuery(
+      conexao.customerId, conexao.accessToken,
+      `SELECT asset.resource_name, asset.lead_form_asset.business_name, asset.lead_form_asset.headline
+       FROM asset WHERE asset.type = 'LEAD_FORM'`
+    );
+
+    const formularios = (results as any[]).map(r => {
+      const asset = r.asset ?? {};
+      const leadForm = asset.leadFormAsset ?? {};
+      return {
+        resource_name: asset.resourceName,
+        nome: leadForm.businessName || leadForm.headline || asset.resourceName,
+      };
+    });
+
+    if (!formularios.length) {
+      return c.json({
+        formularios: [],
+        aviso: "Nenhum Lead Form encontrado. Crie um no Google Ads Manager antes de publicar."
+      });
+    }
+
+    return c.json({ formularios });
+  } catch (err: any) {
+    console.error("ERRO /google/formularios:", err);
+    return c.json({
+      formularios: [],
+      aviso: "Não foi possível listar formulários existentes. Informe o resource name manualmente."
+    });
+  }
+});
+
+// Upload de imagem como Asset (equivalente ao /meta/upload-imagem e /tiktok/upload-imagem) —
+// cada imagem do Responsive Display Ad (paisagem 1.91:1 e quadrada 1:1) precisa de um
+// Asset proprio no Google Ads, referenciado depois em /google/anuncio.
+app.post("/google/upload-imagem", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+
+    const imagem = body.get("imagem") as File;
+    const usuario_id = body.get("usuario_id");
+    const tipo = String(body.get("tipo") || "paisagem");
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+    if (!imagem) return c.json({ error: "Imagem não enviada" }, 400);
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const bytes = await imagem.arrayBuffer();
+    const base64 = Buffer.from(bytes).toString("base64");
+    const mimeType = imagem.type === "image/png" ? "IMAGE_PNG" : "IMAGE_JPEG";
+
+    const assetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "assets", [
+      {
+        create: {
+          name: `Imagem ${tipo} - ${Date.now()}`,
+          type: "IMAGE",
+          imageAsset: { data: base64, mimeType },
+        },
+      },
+    ]);
+    const resourceName = assetResults[0]?.resourceName;
+    if (!resourceName) {
+      return c.json({ error: "Erro ao enviar imagem para o Google Ads" }, 502);
+    }
+
+    return c.json({ resource_name: resourceName });
+  } catch (err: any) {
+    console.error("ERRO /google/upload-imagem:", err);
+    return c.json({ error: err.message || "Erro ao enviar imagem para o Google Ads" }, 500);
+  }
+});
+
+// Cria o Responsive Display Ad e vincula o Lead Form escolhido a campanha
+// (equivalente ao /meta/anuncio e /tiktok/anuncio) — aqui a linha de campanhas
+// recebe adset_id/ad_id/form_id, mesmo padrao das outras plataformas.
+app.post("/google/anuncio", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id, campaign_id, adgroup_id, form_id,
+      titulos, titulo_longo, descricoes, nome_anunciante, url_destino,
+      imagem_paisagem_resource, imagem_quadrada_resource,
+      daily_budget, configuracoes_avancadas
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    if (!campaign_id) return c.json({ error: "campaign_id não enviado" }, 400);
+    if (!adgroup_id) return c.json({ error: "adgroup_id não enviado" }, 400);
+    if (!form_id) return c.json({ error: "Selecione um Lead Form antes de publicar" }, 400);
+    if (!imagem_paisagem_resource || !imagem_quadrada_resource) {
+      return c.json({ error: "Envie a imagem paisagem e a imagem quadrada antes de publicar" }, 400);
+    }
+
+    const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
+    const listaDescricoes = (Array.isArray(descricoes) ? descricoes : []).map(textoOpcional).filter(Boolean);
+    const tituloLongo = textoOpcional(titulo_longo);
+    const nomeAnunciante = textoOpcional(nome_anunciante);
+    const url = textoOpcional(url_destino) || "https://plataformadeleads.com.br";
+
+    if (!listaTitulos.length) return c.json({ error: "Informe ao menos um título para o anúncio Google" }, 400);
+    if (!tituloLongo) return c.json({ error: "Informe o título longo do anúncio Google" }, 400);
+    if (!listaDescricoes.length) return c.json({ error: "Informe ao menos uma descrição para o anúncio Google" }, 400);
+    if (!nomeAnunciante) return c.json({ error: "Informe o nome do anunciante para o anúncio Google" }, 400);
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
+    const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
+
+    const adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+      {
+        create: {
+          adGroup: adGroupResourceName,
+          status: "PAUSED",
+          ad: {
+            finalUrls: [url],
+            responsiveDisplayAd: {
+              headlines: listaTitulos.slice(0, 5).map(text => ({ text })),
+              longHeadline: { text: tituloLongo },
+              descriptions: listaDescricoes.slice(0, 5).map(text => ({ text })),
+              businessName: nomeAnunciante,
+              marketingImages: [{ asset: imagem_paisagem_resource }],
+              squareMarketingImages: [{ asset: imagem_quadrada_resource }],
+            },
+          },
+        },
+      },
+    ]);
+
+    const adResourceName = adResults[0]?.resourceName;
+    if (!adResourceName) {
+      return c.json({ error: "Erro ao criar anúncio no Google Ads" }, 502);
+    }
+    // adGroupAds usa chave composta "adGroupId~adId" no resourceName.
+    const adId = adResourceName.includes("~")
+      ? adResourceName.split("~")[1]
+      : adResourceName.split("/").pop();
+
+    // ASSUMPTION: vincular o Lead Form como CampaignAsset com fieldType LEAD_FORM
+    // (nao usa AssetSet/CampaignAssetSet) — conferido contra o sample oficial
+    // "Add lead form asset" da Google Ads API.
+    await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
+      {
+        create: {
+          campaign: campaignResourceName,
+          asset: form_id,
+          fieldType: "LEAD_FORM",
+        },
+      },
+    ]);
+
+    const configuracoesPersistidas = {
+      ...(configuracoes_avancadas || {}),
+      titulos: listaTitulos,
+      titulo_longo: tituloLongo,
+      descricoes: listaDescricoes,
+      nome_anunciante: nomeAnunciante,
+      url_destino: url,
+      imagem_paisagem_resource,
+      imagem_quadrada_resource,
+    };
+
+    await client.query(
+      `UPDATE campanhas
+       SET adset_id = $1,
+           ad_id = $2,
+           form_id = $3,
+           daily_budget = $4,
+           configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $5::jsonb,
+           atualizado_em = NOW()
+       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'google'`,
+      [
+        String(adgroup_id),
+        String(adId),
+        String(form_id),
+        numeroOpcional(daily_budget),
+        JSON.stringify(configuracoesPersistidas),
+        String(campaign_id),
+        usuarioId
+      ]
+    );
+
+    return c.json({ id: String(adId), ad_id: String(adId) });
+  } catch (err: any) {
+    console.error("ERRO /google/anuncio:", err);
+    return c.json({ error: err.message || "Erro ao criar anúncio Google Ads" }, 500);
+  }
+});
+
+// Exclui (soft-delete) uma campanha Google Ads criada pela plataforma — a Google Ads API
+// nao tem hard delete via mutate, so status=REMOVED (mesmo padrao do /tiktok/excluir-campanha).
+app.post("/google/excluir-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id } = await c.req.json();
+
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id obrigatorio" }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
+    }
+
+    const conexao = await resolverConexaoGoogleAds(user.id);
+
+    if (!("erro" in conexao)) {
+      const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
+      try {
+        await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+          {
+            update: { resourceName: campaignResourceName, status: "REMOVED" },
+            updateMask: "status",
+          },
+        ]);
+      } catch (err: any) {
+        // Tolera campanha ja removida/inexistente no Google Ads — mesmo espirito do Meta/TikTok:
+        // nao trava o usuario por causa de um objeto que ja sumiu do lado de la.
+        const msg = String(err?.message || "").toLowerCase();
+        const naoPertenceMaisGoogle =
+          msg.includes("not found") ||
+          msg.includes("does not exist") ||
+          msg.includes("invalid resource") ||
+          msg.includes("resource was not found");
+
+        if (!naoPertenceMaisGoogle) {
+          return c.json({ error: err.message || "Erro ao excluir no Google Ads" }, 400);
+        }
+        console.log("EXCLUIR GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campaign_id);
+      }
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = 'DELETED', atualizado_em = NOW() WHERE id = $1`,
+      [campanha.rows[0].id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /google/excluir-campanha:", err);
+    return c.json({ error: "Erro ao excluir campanha" }, 500);
+  }
+});
+
+/* =========================
    🎵 TIKTOK ADS
 ========================= */
 
