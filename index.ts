@@ -12851,6 +12851,14 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             "✅ LEAD SALVO:",
             lead.id
           );
+
+          // 📲 notificação WhatsApp para o dono da campanha
+          await notificarNovoLeadWhatsApp(user.id, {
+            nome: fields.full_name,
+            telefone: fields.phone_number,
+            email: fields.email,
+            campanha: nomeCampanha
+          });
         }
       }
     }
