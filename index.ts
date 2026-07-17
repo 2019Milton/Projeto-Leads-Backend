@@ -16367,6 +16367,13 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         .map((t: string) => t.trim().slice(0, 60))
         .slice(0, 9)
     : [];
+  const plataformas: string[] = Array.isArray(body.plataformas) && body.plataformas.length
+    ? body.plataformas.filter((p: unknown) => typeof p === "string")
+    : ["meta"];
+  const incluirGoogle = plataformas.includes("google");
+  const nomesPlataformas = plataformas
+    .map(p => ({ meta: "Meta Ads", tiktok: "TikTok Ads", google: "Google Ads" }[p]))
+    .filter(Boolean) as string[];
 
   const nichoConfig: Record<string, {
     topicoDefault: string;
@@ -16525,7 +16532,14 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_marca: "",
       nicho_publico_alvo: "",
       cbo: true,
-      attribution_spec: "7d_click_1d_view"
+      attribution_spec: "7d_click_1d_view",
+      google_titulo_1: "",
+      google_titulo_2: "",
+      google_titulo_3: "",
+      google_titulo_longo: "",
+      google_descricao_1: "",
+      google_descricao_2: "",
+      google_nome_anunciante: ""
     }));
 
   const norm = (v: any, ctaDefault: string) => {
@@ -16560,7 +16574,17 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_marca: v?.nicho_marca || v?.marca || "",
       nicho_publico_alvo: v?.nicho_publico_alvo || v?.publico_alvo || "",
       cbo: v?.cbo ?? true,
-      attribution_spec: v?.attribution_spec || "7d_click_1d_view"
+      attribution_spec: v?.attribution_spec || "7d_click_1d_view",
+      // Limites defensivos (30/90/90/25 chars) mesmo que a IA ignore o pedido no prompt —
+      // esses valores alimentam diretamente o Responsive Display Ad do Google Ads, que
+      // rejeita a criação do anúncio se algum desses campos estourar o limite.
+      google_titulo_1: String(v?.google_titulo_1 || "").slice(0, 30),
+      google_titulo_2: String(v?.google_titulo_2 || "").slice(0, 30),
+      google_titulo_3: String(v?.google_titulo_3 || "").slice(0, 30),
+      google_titulo_longo: String(v?.google_titulo_longo || "").slice(0, 90),
+      google_descricao_1: String(v?.google_descricao_1 || "").slice(0, 90),
+      google_descricao_2: String(v?.google_descricao_2 || "").slice(0, 90),
+      google_nome_anunciante: String(v?.google_nome_anunciante || "").slice(0, 25)
     };
   };
 
@@ -16598,7 +16622,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Produto/servico: "${topico}"\n` +
       `Nicho: ${cfg.especialidade}\n\n` +
       instrucaoContexto +
-      `Crie 3 anuncios Meta Ads com estilos COMPLETAMENTE DIFERENTES para captar leads desse produto.\n\n` +
+      `Crie 3 anuncios para ${nomesPlataformas.join(" e ") || "Meta Ads"} com estilos COMPLETAMENTE DIFERENTES para captar leads desse produto.\n\n` +
       `REGRAS OBRIGATORIAS:\n` +
       `1. O titulo NUNCA pode ser o nome do produto. Deve ser uma frase de impacto.\n` +
       `2. PROIBIDO usar: "Conheca X", "Atendimento rapido e personalizado", "com atendimento especializado".\n` +
@@ -16628,11 +16652,18 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Para imoveis: nicho_tipo_imovel (residencial|comercial|rural), nicho_finalidade (venda|locacao), nicho_valor_min, nicho_valor_max.\n` +
       `Para saude: nicho_operadora, nicho_tipo_plano (individual|familiar|empresarial), nicho_cobertura (basica|intermediaria|premium), nicho_acomodacao (enfermaria|apartamento).\n` +
       `Para suplementos: nicho_produto (whey|creatina|pre_workout|bcaa|multivitaminico|colageno|outro), nicho_objetivo (ganho_massa|emagrecimento|performance|saude), nicho_marca, nicho_publico_alvo (iniciantes|intermediario|avancado).\n\n` +
+      (incluirGoogle
+        ? `Campos extras OBRIGATORIOS por causa do Google Ads (anuncio Display, respeite os limites de caracteres a risca):\n` +
+          `google_titulo_1, google_titulo_2, google_titulo_3 (3 titulos curtos e DIFERENTES entre si, cada um com no maximo 30 caracteres),\n` +
+          `google_titulo_longo (versao mais completa do titulo, no maximo 90 caracteres),\n` +
+          `google_descricao_1, google_descricao_2 (2 descricoes curtas e DIFERENTES entre si, cada uma com no maximo 90 caracteres),\n` +
+          `google_nome_anunciante (nome curto do negocio/anunciante, no maximo 25 caracteres).\n\n`
+        : "") +
       `Retorne SOMENTE JSON valido sem texto antes ou depois:\n` +
       `{"v1":{...todos os campos...},"v2":{...},"v3":{...}}`;
 
     const systemMsg =
-      `Voce e um redator publicitario criativo especializado em Meta Ads para ${cfg.especialidade}. ` +
+      `Voce e um redator publicitario criativo especializado em ${nomesPlataformas.join(" e ") || "Meta Ads"} para ${cfg.especialidade}. ` +
       "Escreva copy persuasivo, especifico e distinto para cada variacao de anuncio. " +
       "NUNCA use frases genericas. Use os detalhes do produto para criar mensagens unicas. " +
       "Quando o usuario fornecer um contexto com detalhes especificos do plano/produto (operadora, cobertura, publico-alvo, condicoes, preco, regiao, etc.), esses detalhes sao prioridade absoluta: use TODOS eles nos anuncios e nos campos opcionais de nicho, e complemente com criatividade apenas o que faltar, sem contradizer o que foi informado. " +
