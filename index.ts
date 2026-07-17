@@ -4518,7 +4518,7 @@ async function googleAdsQuery(customerId: string, accessToken: string, gaql: str
   );
   const data = await res.json() as any;
   if (!res.ok) {
-    console.error("ERRO GOOGLE ADS QUERY:", customerId, data);
+    console.error("ERRO GOOGLE ADS QUERY:", customerId, JSON.stringify(data, null, 2));
     throw new Error(data?.error?.message || "Erro ao consultar Google Ads");
   }
   return data.results ?? [];
