@@ -5083,6 +5083,76 @@ app.get("/google/formularios", authMiddleware, async (c) => {
   }
 });
 
+// Cria um Lead Form asset novo (equivalente ao /meta/formulario) — diferente da Meta,
+// o schema do Google exige alguns campos fixos (política de privacidade, CTA, textos
+// pós-envio); usamos o mesmo padrão de placeholder já usado nas rotas Meta quando o
+// campo real não existe na UI (ex: privacidade_url cai em "https://google.com").
+app.post("/google/formulario", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id, nome_negocio, headline, descricao,
+      perguntas, obrigado_titulo, obrigado_texto, url_destino, privacidade_url
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const perguntasCustom = (Array.isArray(perguntas) ? perguntas : [])
+      .map(textoOpcional)
+      .filter(Boolean)
+      .slice(0, 5);
+
+    const leadFormAsset: any = {
+      businessName: textoOpcional(nome_negocio) || "Plataforma de Leads",
+      callToActionType: "GET_INFO",
+      callToActionDescription: "Fale com um especialista",
+      headline: textoOpcional(headline) || "Receba mais informações",
+      description: textoOpcional(descricao) || "Deixe seus dados e entraremos em contato.",
+      privacyPolicyUrl: urlOpcional(privacidade_url, "https://google.com"),
+      postSubmitHeadline: textoOpcional(obrigado_titulo) || "Obrigado!",
+      postSubmitDescription: textoOpcional(obrigado_texto) || "Recebemos seus dados. Em breve entraremos em contato.",
+      postSubmitCallToActionType: "VISIT_SITE",
+      fields: [
+        { inputType: "FULL_NAME" },
+        { inputType: "PHONE_NUMBER" },
+        { inputType: "EMAIL" },
+      ],
+    };
+
+    if (perguntasCustom.length) {
+      leadFormAsset.customQuestionFields = perguntasCustom.map(pergunta => ({
+        customQuestionText: pergunta,
+      }));
+    }
+
+    const assetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "assets", [
+      {
+        create: {
+          name: `Lead Form ${Date.now()}`,
+          finalUrls: [urlOpcional(url_destino, "https://plataformadeleads.com.br")],
+          leadFormAsset,
+        },
+      },
+    ]);
+
+    const resourceName = assetResults[0]?.resourceName;
+    if (!resourceName) {
+      return c.json({ error: "Erro ao criar formulário no Google Ads" }, 502);
+    }
+
+    return c.json({ resource_name: resourceName });
+  } catch (err: any) {
+    console.error("ERRO /google/formulario:", err);
+    return c.json({ error: err.message || "Erro ao criar formulário no Google Ads" }, 500);
+  }
+});
+
 // Upload de imagem como Asset (equivalente ao /meta/upload-imagem e /tiktok/upload-imagem) —
 // cada imagem do Responsive Display Ad (paisagem 1.91:1 e quadrada 1:1) precisa de um
 // Asset proprio no Google Ads, referenciado depois em /google/anuncio.
