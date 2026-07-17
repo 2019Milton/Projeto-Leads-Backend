@@ -907,8 +907,23 @@ async function enviarImagemMetaPorUrl(
   adAccountId: string,
   urlImagem: string
 ) {
+  // Não usamos o parâmetro "url" do /adimages (que manda a própria Meta buscar a
+  // imagem): para links do CDN da Meta (scontent-*.fbcdn.net) — que é o que fica salvo
+  // em configuracoes_avancadas depois de qualquer publicação — isso sempre falha com
+  // "(#3) Application does not have the capability to make this API call". Em vez
+  // disso baixamos os bytes aqui (como um navegador faria) e mandamos via "bytes".
+  const imagemRes = await fetch(urlImagem);
+  if (!imagemRes.ok) {
+    return {
+      hash: null,
+      resposta: { error: { message: `Falha ao baixar a imagem original (HTTP ${imagemRes.status})` } }
+    };
+  }
+
+  const bytesImagem = Buffer.from(await imagemRes.arrayBuffer()).toString("base64");
+
   const body = new URLSearchParams();
-  body.set("url", urlImagem);
+  body.set("bytes", bytesImagem);
   body.set("access_token", token);
 
   const upload = await fetch(
@@ -14026,20 +14041,24 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
       if (uploadImagem.hash) {
         hashes.push(uploadImagem.hash);
-      }
-    }
-
-    if (!hashes.length) {
-      if (Array.isArray(cfg.imageHashes)) {
-        hashes.push(...cfg.imageHashes.filter(Boolean));
-      } else if (cfg.imageHash) {
-        hashes.push(cfg.imageHash);
+      } else {
+        // Não existe fallback seguro para reaproveitar cfg.imageHash aqui: hashes de
+        // imagem na Meta são específicos por conta de anúncios, e o hash salvo em
+        // configuracoes_avancadas pertence à conta de quem encaminhou a campanha, não
+        // à de quem está publicando agora. Reaproveitá-lo cria um anúncio que a Meta
+        // aceita na criação mas rejeita na revisão ("Imagem não encontrada"). O link
+        // de imagem da Meta usado no reenvio por URL também expira com o tempo, então
+        // essa falha é esperada em campanhas encaminhadas há mais tempo.
+        console.error(
+          "PUBLICAR_RECEBIDA: falha ao reenviar imagem por URL (provável link expirado):",
+          urlImagem, JSON.stringify(uploadImagem.resposta)
+        );
       }
     }
 
     if (!hashes.length) {
       return await falhar(
-        "Imagem da campanha não encontrada. Edite a campanha e adicione uma imagem antes de publicar."
+        "Não foi possível reenviar a imagem original desta campanha para sua conta de anúncios (o link pode ter expirado). Peça para quem encaminhou reenviar a campanha novamente, ou edite esta campanha e adicione uma nova imagem antes de publicar."
       );
     }
 
