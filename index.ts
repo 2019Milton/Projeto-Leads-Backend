@@ -4652,42 +4652,61 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
     try {
       const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
 
-      const [contaResults, gastoResults] = await Promise.all([
-        googleAdsQuery(
+      // Cada consulta é isolada em seu próprio try/catch — antes rodavam num único
+      // Promise.all, e a conta/pagamento (que funcionam normalmente) ficavam null
+      // sempre que só UMA das consultas falhava. Isso acontece sempre que a conta
+      // selecionada é uma conta gerenciadora (MCC): a Google Ads API proíbe pedir
+      // métricas (gasto) diretamente numa conta gerenciadora
+      // (erro "REQUESTED_METRICS_FOR_MANAGER") — só contas de cliente têm gasto
+      // próprio. Isso não é uma falha de verdade, é esperado para esse tipo de conta.
+      let contaInfo: any = null;
+      try {
+        const contaResults = await googleAdsQuery(
           customerId, accessToken,
-          "SELECT customer.descriptive_name, customer.currency_code, customer.time_zone, customer.status FROM customer LIMIT 1"
-        ),
-        googleAdsQuery(
-          customerId, accessToken,
-          "SELECT metrics.cost_micros FROM campaign WHERE segments.date DURING TODAY"
-        ),
-      ]);
+          "SELECT customer.descriptive_name, customer.currency_code, customer.time_zone, customer.status, customer.manager FROM customer LIMIT 1"
+        );
+        contaInfo = (contaResults[0] as any)?.customer ?? null;
+      } catch (errConta: any) {
+        console.error("ERRO /google/status-completo (conta):", errConta.message);
+      }
 
-      const contaInfo = (contaResults[0] as any)?.customer ?? null;
-      const gastoMicros = (gastoResults as any[]).reduce(
-        (soma, row) => soma + Number(row.metrics?.costMicros ?? 0), 0
-      );
+      let gastoMicros: number | null = null;
+      if (!contaInfo?.manager) {
+        try {
+          const gastoResults = await googleAdsQuery(
+            customerId, accessToken,
+            "SELECT metrics.cost_micros FROM campaign WHERE segments.date DURING TODAY"
+          );
+          gastoMicros = (gastoResults as any[]).reduce(
+            (soma, row) => soma + Number(row.metrics?.costMicros ?? 0), 0
+          );
+        } catch (errGasto: any) {
+          console.warn("AVISO /google/status-completo (gasto indisponivel):", errGasto.message);
+        }
+      }
 
       // Status de pagamento: consulta best-effort — nem toda conta expoe billing_setup
       // (ex: contas gerenciadas so pelo billing do MCC), entao falha aqui nao quebra o resto.
       let pagamento: { status: string | null; texto: string } = {
         status: null,
-        texto: "Não identificado",
+        texto: contaInfo?.manager ? "Não se aplica (conta gerenciadora)" : "Não identificado",
       };
-      try {
-        const billingResults = await googleAdsQuery(
-          customerId, accessToken,
-          "SELECT billing_setup.status FROM billing_setup"
-        );
-        const statusBilling = (billingResults[0] as any)?.billingSetup?.status ?? null;
-        pagamento = {
-          status: statusBilling,
-          texto: statusBilling === "APPROVED" ? "Aprovado"
-            : statusBilling === "PENDING" ? "Pendente"
-            : statusBilling === "CANCELLED" ? "Cancelado"
-            : "Não identificado",
-        };
-      } catch (_) {}
+      if (!contaInfo?.manager) {
+        try {
+          const billingResults = await googleAdsQuery(
+            customerId, accessToken,
+            "SELECT billing_setup.status FROM billing_setup"
+          );
+          const statusBilling = (billingResults[0] as any)?.billingSetup?.status ?? null;
+          pagamento = {
+            status: statusBilling,
+            texto: statusBilling === "APPROVED" ? "Aprovado"
+              : statusBilling === "PENDING" ? "Pendente"
+              : statusBilling === "CANCELLED" ? "Cancelado"
+              : "Não identificado",
+          };
+        } catch (_) {}
+      }
 
       return c.json({
         ...base,
@@ -4696,8 +4715,9 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
           moeda: contaInfo.currencyCode || null,
           fuso_horario: contaInfo.timeZone || null,
           status: contaInfo.status || null,
+          gerenciadora: Boolean(contaInfo.manager),
         } : null,
-        gasto_hoje: gastoMicros / 1_000_000,
+        gasto_hoje: gastoMicros === null ? null : gastoMicros / 1_000_000,
         pagamento,
       });
     } catch (errApi: any) {
