@@ -4563,19 +4563,23 @@ app.get("/google/contas", authMiddleware, async (c) => {
     }
 
     const resourceNames: string[] = listData.resourceNames ?? [];
-    const contas: { customer_id: string; nome: string }[] = [];
+    const contas: { customer_id: string; nome: string; gerenciadora: boolean }[] = [];
 
     for (const resourceName of resourceNames) {
       const customerId = resourceName.split("/")[1];
       try {
         const results = await googleAdsQuery(
           customerId, accessToken,
-          "SELECT customer.id, customer.descriptive_name FROM customer LIMIT 1"
+          "SELECT customer.id, customer.descriptive_name, customer.manager FROM customer LIMIT 1"
         );
-        const nome = (results[0] as any)?.customer?.descriptiveName || customerId;
-        contas.push({ customer_id: customerId, nome });
+        const info = (results[0] as any)?.customer;
+        contas.push({
+          customer_id: customerId,
+          nome: info?.descriptiveName || customerId,
+          gerenciadora: Boolean(info?.manager),
+        });
       } catch (_) {
-        contas.push({ customer_id: customerId, nome: customerId });
+        contas.push({ customer_id: customerId, nome: customerId, gerenciadora: false });
       }
     }
 
@@ -4950,6 +4954,24 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       return c.json({ error: conexao.erro }, 400);
     }
 
+    // A Google Ads API não permite criar campanha diretamente numa conta gerenciadora
+    // (MCC) — só numa conta de cliente vinculada a ela. Sem essa checagem, a Google
+    // rejeita com um erro genérico ("Request contains an invalid argument" +
+    // OPERATION_NOT_PERMITTED_FOR_CONTEXT) que não explica o motivo real.
+    try {
+      const contaResults = await googleAdsQuery(
+        conexao.customerId, conexao.accessToken,
+        "SELECT customer.manager FROM customer LIMIT 1"
+      );
+      if ((contaResults[0] as any)?.customer?.manager) {
+        return c.json({
+          error: "A conta selecionada é uma conta gerenciadora (MCC) — o Google Ads não permite criar campanhas diretamente nela. Crie ou selecione uma conta de cliente (que efetivamente veicula anúncios) dentro dessa conta gerenciadora, no Google Ads Manager."
+        }, 400);
+      }
+    } catch (errCheck: any) {
+      console.warn("AVISO /google/campanha: falha ao checar se a conta é gerenciadora:", errCheck.message);
+    }
+
     const orcamentoNumero = numeroOpcional(orcamento);
     if (!orcamentoNumero || orcamentoNumero <= 0) {
       return c.json({ error: "Orçamento diário é obrigatório para a campanha Google Ads" }, 400);
@@ -4980,6 +5002,11 @@ app.post("/google/campanha", authMiddleware, async (c) => {
           status: "PAUSED",
           campaignBudget: budgetResourceName,
           manualCpc: {},
+          // Autodeclaração exigida pela Google Ads API em toda criação de campanha
+          // (EU Political Advertising Regulation) — sem isso a API rejeita com
+          // FieldError.REQUIRED. Plataforma é de leads no Brasil, sem qualquer
+          // publicidade política voltada à UE.
+          containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
         },
       },
     ]);
