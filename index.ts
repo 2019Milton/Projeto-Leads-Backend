@@ -9340,6 +9340,7 @@ const PLATAFORMAS_DISPONIVEIS = [
   "pinterest",
   "snapchat",
   "microsoft",
+  "whatsapp",
   "formulario",
 ] as const;
 
@@ -9433,6 +9434,133 @@ app.delete("/conexoes/:plataforma", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO DELETE /conexoes:", err);
     return c.json({ error: "Erro ao desconectar plataforma" }, 500);
+  }
+});
+
+/* =========================
+   💬 WHATSAPP OFICIAL (Cloud API) — conexão do corretor + bot config
+   Uma única conta Meta Business Manager (Tech Provider) da plataforma hospeda os
+   números de todos os corretores. Cada corretor conecta o PRÓPRIO número via
+   Embedded Signup (com coexistência), não via OAuth individual — por isso não há
+   access_token/refresh_token por linha em plataforma_conexoes aqui, só o
+   phone_number_id/waba_id em dados_conta. O envio usa o token de sistema único
+   (WHATSAPP_SYSTEM_USER_TOKEN, ver enviarMensagemWhatsAppOficial).
+========================= */
+
+// Dados públicos (não são segredos) que o frontend precisa pra chamar FB.init/FB.login
+// do Embedded Signup. Sem authMiddleware de propósito — usado antes do usuário logar
+// o popup do Facebook, mesmo padrão do SDK JS do Meta.
+app.get("/config/whatsapp-embedded-signup", async (c) => {
+  return c.json({
+    app_id: Bun.env.META_APP_ID || "",
+    config_id: Bun.env.META_EMBEDDED_SIGNUP_CONFIG_ID || "",
+  });
+});
+
+app.post("/whatsapp/conectar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const { waba_id, phone_number_id } = await c.req.json();
+    if (!waba_id || !phone_number_id) {
+      return c.json({ error: "waba_id e phone_number_id são obrigatórios" }, 400);
+    }
+
+    const token = Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
+    if (!token) {
+      return c.json({ error: "Integração de WhatsApp ainda não configurada no servidor" }, 500);
+    }
+
+    // Inscreve o app da plataforma pra receber os webhooks dessa WABA especifica
+    const subRes = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}/subscribed_apps`,
+      { method: "POST", headers: { Authorization: `Bearer ${token}` } }
+    );
+    const subData = await subRes.json() as any;
+    if (!subRes.ok) {
+      console.error("ERRO WHATSAPP subscribed_apps:", JSON.stringify(subData));
+      return c.json(
+        { error: "Erro ao inscrever webhook da conta do WhatsApp", detalhe: subData?.error?.message },
+        502
+      );
+    }
+
+    const infoRes = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${phone_number_id}?fields=display_phone_number,verified_name`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const infoData = await infoRes.json() as any;
+    if (!infoRes.ok) {
+      console.error("ERRO WHATSAPP phone info:", JSON.stringify(infoData));
+      return c.json(
+        { error: "Erro ao buscar dados do número conectado", detalhe: infoData?.error?.message },
+        502
+      );
+    }
+
+    const dadosConta = {
+      waba_id,
+      phone_number_id,
+      numero: infoData.display_phone_number || null,
+      display_name: infoData.verified_name || null,
+    };
+
+    await client.query(
+      `INSERT INTO plataforma_conexoes (usuario_id, plataforma, status, dados_conta, conectado_em, atualizado_em)
+       VALUES ($1, 'whatsapp', 'conectado', $2, NOW(), NOW())
+       ON CONFLICT (usuario_id, plataforma)
+       DO UPDATE SET status = 'conectado', dados_conta = $2, atualizado_em = NOW()`,
+      [user.id, JSON.stringify(dadosConta)]
+    );
+
+    return c.json({ ok: true, conta: dadosConta });
+  } catch (err: any) {
+    console.error("ERRO POST /whatsapp/conectar:", err);
+    return c.json({ error: "Erro ao conectar WhatsApp" }, 500);
+  }
+});
+
+app.get("/whatsapp/bot", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const row = await client.query(
+      `SELECT ativo, passos FROM whatsapp_bot_config WHERE usuario_id = $1`,
+      [user.id]
+    );
+    if (!row.rows.length) {
+      return c.json({ ativo: true, passos: [] });
+    }
+    return c.json({ ativo: row.rows[0].ativo, passos: row.rows[0].passos || [] });
+  } catch (err) {
+    console.error("ERRO GET /whatsapp/bot:", err);
+    return c.json({ error: "Erro ao carregar roteiro do bot" }, 500);
+  }
+});
+
+app.put("/whatsapp/bot", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const body = await c.req.json();
+    const ativo = body.ativo !== false;
+    const passos = Array.isArray(body.passos) ? body.passos : [];
+
+    for (const passo of passos) {
+      if (!passo || !["mensagem", "pergunta"].includes(passo.tipo) || !String(passo.texto || "").trim()) {
+        return c.json({ error: "Cada passo precisa de tipo ('mensagem' ou 'pergunta') e texto" }, 400);
+      }
+    }
+
+    await client.query(
+      `INSERT INTO whatsapp_bot_config (usuario_id, ativo, passos, atualizado_em)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (usuario_id)
+       DO UPDATE SET ativo = $2, passos = $3, atualizado_em = NOW()`,
+      [user.id, ativo, JSON.stringify(passos)]
+    );
+
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO PUT /whatsapp/bot:", err);
+    return c.json({ error: "Erro ao salvar roteiro do bot" }, 500);
   }
 });
 
@@ -9865,6 +9993,190 @@ app.post("/webhook/meta", async (c) => {
     return c.json({
       error: "Erro webhook"
     }, 500);
+  }
+});
+
+/* =========================
+   💬 WEBHOOK WHATSAPP OFICIAL — bot de primeiro atendimento
+   Rota irmã do /webhook/meta acima (não reaproveitada porque o formato do evento é
+   diferente: body.object === "whatsapp_business_account" e change.field === "messages",
+   contra "page"/"leadgen" do webhook de leads).
+========================= */
+
+app.get("/webhook/whatsapp", async (c) => {
+  const mode = c.req.query("hub.mode");
+  const token = c.req.query("hub.verify_token");
+  const challenge = c.req.query("hub.challenge");
+
+  const VERIFY_TOKEN = Bun.env.WHATSAPP_VERIFY_TOKEN;
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("WEBHOOK WHATSAPP VALIDADO");
+    return c.text(challenge);
+  }
+
+  return c.text("Erro verify", 403);
+});
+
+async function obterOuCriarConversaWhatsApp(usuarioId: number, telefoneCliente: string) {
+  const existente = await client.query(
+    `SELECT * FROM whatsapp_conversas WHERE usuario_id = $1 AND telefone_cliente = $2`,
+    [usuarioId, telefoneCliente]
+  );
+  const row = existente.rows[0];
+
+  if (!row || row.status === "encerrada") {
+    const criada = await client.query(
+      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, passo_atual, atualizado_em, ultima_mensagem_em)
+       VALUES ($1, $2, 'bot', 0, NOW(), NOW())
+       ON CONFLICT (usuario_id, telefone_cliente)
+       DO UPDATE SET status = 'bot', passo_atual = 0, atualizado_em = NOW(), ultima_mensagem_em = NOW()
+       RETURNING *`,
+      [usuarioId, telefoneCliente]
+    );
+    return criada.rows[0];
+  }
+
+  await client.query(`UPDATE whatsapp_conversas SET ultima_mensagem_em = NOW() WHERE id = $1`, [row.id]);
+  return row;
+}
+
+// Roda o roteiro configurado pelo corretor a partir do passo atual da conversa,
+// mandando mensagens em sequência até parar num passo tipo "pergunta" (espera
+// resposta do cliente) ou até um handoff (fim do roteiro ou passo marcado).
+async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
+  if (conversa.status === "humano" || conversa.status === "encerrada") return;
+
+  const configRes = await client.query(
+    `SELECT passos FROM whatsapp_bot_config WHERE usuario_id = $1 AND ativo = TRUE`,
+    [conversa.usuario_id]
+  );
+  const passos: any[] = configRes.rows[0]?.passos || [];
+  if (!passos.length) return;
+
+  // Se estava aguardando resposta, o cliente acabou de responder: avança pro próximo.
+  // Senão (conversa nova), passo_atual (0) já é o próximo a executar.
+  let indice = conversa.status === "aguardando_resposta" ? conversa.passo_atual + 1 : conversa.passo_atual;
+
+  while (indice < passos.length) {
+    const passo = passos[indice];
+    const wamid = await enviarMensagemWhatsAppOficial(phoneNumberId, conversa.telefone_cliente, passo.texto);
+    if (wamid) {
+      await client.query(
+        `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3)
+         ON CONFLICT (wamid) DO NOTHING`,
+        [conversa.id, wamid, passo.texto]
+      ).catch((e) => console.error("ERRO log saida whatsapp:", e));
+    }
+
+    const ultimoPasso = indice === passos.length - 1;
+
+    if (passo.tipo === "pergunta") {
+      await client.query(
+        `UPDATE whatsapp_conversas SET status = 'aguardando_resposta', passo_atual = $1, atualizado_em = NOW() WHERE id = $2`,
+        [indice, conversa.id]
+      );
+      return;
+    }
+    if (passo.handoff_apos || ultimoPasso) {
+      await client.query(
+        `UPDATE whatsapp_conversas SET status = 'humano', passo_atual = $1, atualizado_em = NOW() WHERE id = $2`,
+        [indice, conversa.id]
+      );
+      return;
+    }
+    indice += 1;
+  }
+}
+
+async function processarEventoWhatsApp(value: any) {
+  const phoneNumberId = value?.metadata?.phone_number_id;
+  if (!phoneNumberId) return;
+
+  const conexao = await client.query(
+    `SELECT usuario_id FROM plataforma_conexoes WHERE plataforma = 'whatsapp' AND dados_conta->>'phone_number_id' = $1 LIMIT 1`,
+    [phoneNumberId]
+  );
+  const usuarioId = conexao.rows[0]?.usuario_id;
+  if (!usuarioId) {
+    console.warn(`[whatsapp-webhook] nenhum corretor encontrado pro phone_number_id ${phoneNumberId}`);
+    return;
+  }
+
+  const numeroBusiness = String(value.metadata?.display_phone_number || "").replace(/\D/g, "");
+
+  for (const msg of value.messages || []) {
+    // ⚠️ Heurística provisória de detecção de eco (coexistência): assume que uma
+    // mensagem "de" o próprio número business é o corretor respondendo pelo app dele.
+    // VERIFICAR contra a doc atual da Meta o campo real que marca isso antes de ir
+    // pra produção — coexistência é feature nova e pode expor um flag dedicado.
+    const numeroOrigem = String(msg.from || "").replace(/\D/g, "");
+    const ehEco = numeroOrigem && numeroBusiness && numeroOrigem === numeroBusiness;
+
+    if (ehEco) {
+      const telefoneCliente = msg.to || null;
+      if (!telefoneCliente) continue;
+      await client.query(
+        `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, atualizado_em)
+         VALUES ($1, $2, 'humano', NOW())
+         ON CONFLICT (usuario_id, telefone_cliente)
+         DO UPDATE SET status = 'humano', atualizado_em = NOW()`,
+        [usuarioId, telefoneCliente]
+      );
+      continue;
+    }
+
+    const telefoneCliente = msg.from;
+    if (!telefoneCliente) continue;
+
+    const conversa = await obterOuCriarConversaWhatsApp(usuarioId, telefoneCliente);
+
+    // Dedupe por wamid: Meta reentrega webhook "pelo menos uma vez". Se o insert
+    // conflitar, essa mensagem já foi processada antes — não avança o roteiro de novo.
+    const logRes = await client.query(
+      `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo)
+       VALUES ($1, $2, 'entrada', $3)
+       ON CONFLICT (wamid) DO NOTHING
+       RETURNING id`,
+      [conversa.id, msg.id, msg.text?.body || null]
+    );
+    if (logRes.rows.length === 0) {
+      console.log(`[whatsapp-webhook] mensagem ${msg.id} já processada, ignorando`);
+      continue;
+    }
+
+    if (conversa.status === "humano" || conversa.status === "encerrada") continue;
+
+    await avancarBotWhatsApp(conversa, phoneNumberId);
+  }
+}
+
+app.post("/webhook/whatsapp", async (c) => {
+  try {
+    const corpoRaw = await c.req.text();
+    const assinatura = c.req.header("x-hub-signature-256") || c.req.header("X-Hub-Signature-256") || null;
+
+    if (!validarAssinaturaMetaWebhook(assinatura, corpoRaw)) {
+      return c.json({ error: "Assinatura Meta invalida" }, 401);
+    }
+
+    const body = JSON.parse(corpoRaw || "{}");
+
+    if (body.object === "whatsapp_business_account") {
+      for (const entry of body.entry || []) {
+        for (const change of entry.changes || []) {
+          if (change.field !== "messages") continue;
+          await processarEventoWhatsApp(change.value).catch((e: any) =>
+            console.error("ERRO processarEventoWhatsApp:", e)
+          );
+        }
+      }
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK WHATSAPP:", err);
+    return c.json({ error: "Erro webhook" }, 500);
   }
 });
 
@@ -10569,6 +10881,41 @@ await client.query(`
   );
   CREATE INDEX IF NOT EXISTS idx_plataforma_conexoes_usuario
     ON plataforma_conexoes(usuario_id);
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS whatsapp_bot_config (
+    id            SERIAL PRIMARY KEY,
+    usuario_id    INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    ativo         BOOLEAN NOT NULL DEFAULT TRUE,
+    passos        JSONB NOT NULL DEFAULT '[]',
+    criado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(usuario_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS whatsapp_conversas (
+    id                  SERIAL PRIMARY KEY,
+    usuario_id          INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    telefone_cliente    TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'bot'
+                           CHECK (status IN ('bot','aguardando_resposta','humano','encerrada')),
+    passo_atual         INTEGER NOT NULL DEFAULT 0,
+    iniciado_em         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ultima_mensagem_em  TIMESTAMP,
+    UNIQUE(usuario_id, telefone_cliente)
+  );
+  CREATE INDEX IF NOT EXISTS idx_whatsapp_conversas_usuario ON whatsapp_conversas(usuario_id, status);
+
+  CREATE TABLE IF NOT EXISTS whatsapp_mensagens_log (
+    id          SERIAL PRIMARY KEY,
+    conversa_id INTEGER NOT NULL REFERENCES whatsapp_conversas(id) ON DELETE CASCADE,
+    wamid       TEXT UNIQUE,
+    direcao     TEXT NOT NULL CHECK (direcao IN ('entrada','saida','echo')),
+    conteudo    TEXT,
+    criado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 await client.query(`
@@ -19197,6 +19544,60 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
     }
   } catch (e) {
     console.error("[z-api] ❌ exceção:", e);
+  }
+}
+
+const WHATSAPP_CLOUD_API_VERSION = "v24.0";
+
+// Envio pela API oficial do WhatsApp (Cloud API) — caminho separado do Z-API acima.
+// Usa o token de sistema único da plataforma (Bun.env.WHATSAPP_SYSTEM_USER_TOKEN),
+// já que todos os números dos corretores ficam sob a mesma conta Meta Business Manager.
+async function enviarMensagemWhatsAppOficial(
+  phoneNumberId: string,
+  telefoneDestino: string,
+  texto: string
+) {
+  const token = Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
+  if (!token) {
+    console.warn("⚠️ WhatsApp Oficial: WHATSAPP_SYSTEM_USER_TOKEN não configurado");
+    return;
+  }
+
+  const numero = String(telefoneDestino).replace(/\D/g, "");
+  if (!numero) {
+    console.warn("⚠️ WhatsApp Oficial: número vazio, envio cancelado");
+    return;
+  }
+  const to = numero.startsWith("55") ? numero : `55${numero}`;
+
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${phoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to,
+          type: "text",
+          text: { body: texto },
+        }),
+      }
+    );
+    const body = await res.json() as any;
+    if (res.ok) {
+      console.log(`[whatsapp-oficial] ✅ enviado para ${to}`);
+      return body?.messages?.[0]?.id ?? null;
+    } else {
+      console.error(`[whatsapp-oficial] ❌ erro ${res.status}:`, JSON.stringify(body));
+      return null;
+    }
+  } catch (e) {
+    console.error("[whatsapp-oficial] ❌ exceção:", e);
+    return null;
   }
 }
 
