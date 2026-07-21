@@ -16941,11 +16941,13 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       { titulo: v1tituloEx, texto: `${t}: ${cfg.v1texto}.`, cta: "SIGN_UP" },
       { titulo: v2tituloEx, texto: `${t}: ${cfg.v2texto}.`, cta: "LEARN_MORE" },
       { titulo: v3tituloEx, texto: `${t}: ${cfg.v3texto}.`, cta: "APPLY_NOW" }
-    ].map(({ titulo, texto, cta }) => ({
+    ].map(({ titulo, texto, cta }) => {
+      const descricao = `${t} com atendimento especializado.`;
+      return {
       titulo: titulo.slice(0, 40),
       nome_campanha: titulo.slice(0, 40),
       texto,
-      descricao: `${t} com atendimento especializado.`,
+      descricao,
       cta,
       perguntas: cfg.perguntas,
       interesses: cfg.interesses,
@@ -16970,24 +16972,36 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_publico_alvo: "",
       cbo: true,
       attribution_spec: "7d_click_1d_view",
-      google_titulo_1: "",
-      google_titulo_2: "",
-      google_titulo_3: "",
-      google_titulo_longo: "",
-      google_descricao_1: "",
-      google_descricao_2: "",
-      google_nome_anunciante: ""
-    }));
+      google_titulo_1: incluirGoogle ? titulo.slice(0, 30) : "",
+      google_titulo_2: incluirGoogle ? descricao.slice(0, 30) : "",
+      google_titulo_3: incluirGoogle ? cfg.especialidade.slice(0, 30) : "",
+      google_titulo_longo: incluirGoogle ? `${titulo} — ${descricao}`.slice(0, 90) : "",
+      google_descricao_1: incluirGoogle ? descricao.slice(0, 90) : "",
+      google_descricao_2: incluirGoogle ? texto.slice(0, 90) : "",
+      google_nome_anunciante: incluirGoogle ? cfg.especialidade.slice(0, 25) : ""
+      };
+    });
 
   const norm = (v: any, ctaDefault: string) => {
     const titulo =
       v?.titulo || v?.nome_campanha || topico.slice(0, 40);
+    const texto = v?.texto || "";
+    const descricao = v?.descricao || "";
+
+    // Rede de segurança: se o Google estiver selecionado e a IA não preencher algum
+    // campo do anúncio Google (ignorou a instrução, ou o modelo cortou a resposta),
+    // deriva um valor a partir do título/texto/descrição — que a IA SEMPRE preenche e
+    // que já carregam as informações de contexto do usuário — em vez de deixar vazio.
+    // Isso garante "a IA deve gerar; se o usuário não informar nada ela gera; se
+    // informar, usa" mesmo quando o modelo não obedece a instrução à risca.
+    const googleFallback = (valor: unknown, base: string, limite: number) =>
+      String(valor || "").trim().slice(0, limite) || base.slice(0, limite);
 
     return {
       nome_campanha: titulo,
       titulo,
-      texto: v?.texto || "",
-      descricao: v?.descricao || "",
+      texto,
+      descricao,
       cta: v?.cta || ctaDefault,
       perguntas: v?.perguntas || "",
       interesses: v?.interesses || "",
@@ -17014,14 +17028,17 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       attribution_spec: v?.attribution_spec || "7d_click_1d_view",
       // Limites defensivos (30/90/90/25 chars) mesmo que a IA ignore o pedido no prompt —
       // esses valores alimentam diretamente o Responsive Display Ad do Google Ads, que
-      // rejeita a criação do anúncio se algum desses campos estourar o limite.
-      google_titulo_1: String(v?.google_titulo_1 || "").slice(0, 30),
-      google_titulo_2: String(v?.google_titulo_2 || "").slice(0, 30),
-      google_titulo_3: String(v?.google_titulo_3 || "").slice(0, 30),
-      google_titulo_longo: String(v?.google_titulo_longo || "").slice(0, 90),
-      google_descricao_1: String(v?.google_descricao_1 || "").slice(0, 90),
-      google_descricao_2: String(v?.google_descricao_2 || "").slice(0, 90),
-      google_nome_anunciante: String(v?.google_nome_anunciante || "").slice(0, 25)
+      // rejeita a criação do anúncio se algum desses campos estourar o limite. Quando o
+      // Google está selecionado, cada campo cai pro fallback derivado do título/texto/
+      // descrição se a IA não mandar nada; quando não está selecionado, fica vazio como
+      // antes (a UI nem mostra esses campos nesse caso).
+      google_titulo_1: incluirGoogle ? googleFallback(v?.google_titulo_1, titulo, 30) : "",
+      google_titulo_2: incluirGoogle ? googleFallback(v?.google_titulo_2, descricao || texto, 30) : "",
+      google_titulo_3: incluirGoogle ? googleFallback(v?.google_titulo_3, cfg.especialidade, 30) : "",
+      google_titulo_longo: incluirGoogle ? googleFallback(v?.google_titulo_longo, `${titulo} — ${descricao}`, 90) : "",
+      google_descricao_1: incluirGoogle ? googleFallback(v?.google_descricao_1, descricao || texto, 90) : "",
+      google_descricao_2: incluirGoogle ? googleFallback(v?.google_descricao_2, texto || descricao, 90) : "",
+      google_nome_anunciante: incluirGoogle ? googleFallback(v?.google_nome_anunciante, cfg.especialidade, 25) : ""
     };
   };
 
