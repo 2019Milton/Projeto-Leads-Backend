@@ -9570,6 +9570,16 @@ app.put("/whatsapp/bot", authMiddleware, async (c) => {
       }
     }
 
+    if (ativo) {
+      const conexao = await client.query(
+        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
+        [user.id]
+      );
+      if (!conexao.rows.length) {
+        return c.json({ error: "Conecte seu WhatsApp antes de ativar o bot." }, 400);
+      }
+    }
+
     await client.query(
       `INSERT INTO whatsapp_bot_config (usuario_id, ativo, passos, atualizado_em)
        VALUES ($1, $2, $3, NOW())
@@ -16919,6 +16929,18 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     .map(p => ({ meta: "Meta Ads", tiktok: "TikTok Ads", google: "Google Ads" }[p]))
     .filter(Boolean) as string[];
 
+  // Corta no limite de caracteres sem partir uma palavra ao meio (ex: "vale a pena!"
+  // virando "vale a pen"), usado nos campos curtos do anúncio Google Ads. Só corta na
+  // última palavra inteira quando sobra pelo menos metade do limite — evita título
+  // minúsculo quando o primeiro espaço está bem no início do texto.
+  const truncarSemCortarPalavra = (texto: string, limite: number) => {
+    const t = String(texto || "").trim();
+    if (t.length <= limite) return t;
+    const cortado = t.slice(0, limite);
+    const ultimoEspaco = cortado.lastIndexOf(" ");
+    return ultimoEspaco >= limite * 0.5 ? cortado.slice(0, ultimoEspaco).trim() : cortado.trim();
+  };
+
   const nichoConfig: Record<string, {
     topicoDefault: string;
     especialidade: string;
@@ -17079,13 +17101,13 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_publico_alvo: "",
       cbo: true,
       attribution_spec: "7d_click_1d_view",
-      google_titulo_1: incluirGoogle ? titulo.slice(0, 30) : "",
-      google_titulo_2: incluirGoogle ? descricao.slice(0, 30) : "",
-      google_titulo_3: incluirGoogle ? cfg.especialidade.slice(0, 30) : "",
-      google_titulo_longo: incluirGoogle ? `${titulo} — ${descricao}`.slice(0, 90) : "",
-      google_descricao_1: incluirGoogle ? descricao.slice(0, 90) : "",
-      google_descricao_2: incluirGoogle ? texto.slice(0, 90) : "",
-      google_nome_anunciante: incluirGoogle ? cfg.especialidade.slice(0, 25) : ""
+      google_titulo_1: incluirGoogle ? truncarSemCortarPalavra(titulo, 30) : "",
+      google_titulo_2: incluirGoogle ? truncarSemCortarPalavra(descricao, 30) : "",
+      google_titulo_3: incluirGoogle ? truncarSemCortarPalavra(cfg.especialidade, 30) : "",
+      google_titulo_longo: incluirGoogle ? truncarSemCortarPalavra(`${titulo} — ${descricao}`, 90) : "",
+      google_descricao_1: incluirGoogle ? truncarSemCortarPalavra(descricao, 90) : "",
+      google_descricao_2: incluirGoogle ? truncarSemCortarPalavra(texto, 90) : "",
+      google_nome_anunciante: incluirGoogle ? truncarSemCortarPalavra(cfg.especialidade, 25) : ""
       };
     });
 
@@ -17102,7 +17124,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     // Isso garante "a IA deve gerar; se o usuário não informar nada ela gera; se
     // informar, usa" mesmo quando o modelo não obedece a instrução à risca.
     const googleFallback = (valor: unknown, base: string, limite: number) =>
-      String(valor || "").trim().slice(0, limite) || base.slice(0, limite);
+      truncarSemCortarPalavra(String(valor || ""), limite) || truncarSemCortarPalavra(base, limite);
 
     return {
       nome_campanha: titulo,
