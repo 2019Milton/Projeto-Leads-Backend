@@ -649,11 +649,18 @@ async function enviarPayloadMetaComFallbackBid(
       }
     ).then(r => r.json());
 
-  let resposta = await enviar(payload);
+  // IMPORTANTE: cada tentativa abaixo parte de `payloadAtual` (o payload da
+  // tentativa anterior), nunca do `payload` original — senão, quando uma
+  // requisição precisa de duas correções em sequência (ex: lance E depois
+  // idade/Advantage+), a segunda correção reconstroi do zero a partir do
+  // payload original e descarta a primeira correção já aplicada, fazendo o
+  // erro "resolvido" reaparecer na resposta final.
+  let payloadAtual = payload;
+  let resposta = await enviar(payloadAtual);
 
   if (erroMetaBidAmount(resposta)) {
-    const tinhaStrategy = !!payload.bid_strategy;
-    const retryPayload = { ...payload };
+    const tinhaStrategy = !!payloadAtual.bid_strategy;
+    const retryPayload = { ...payloadAtual };
     delete retryPayload.bid_strategy;
     delete retryPayload.bid_amount;
 
@@ -668,14 +675,15 @@ async function enviarPayloadMetaComFallbackBid(
       resposta?.error || resposta
     );
 
-    resposta = await enviar(retryPayload);
+    payloadAtual = retryPayload;
+    resposta = await enviar(payloadAtual);
   }
 
-  if (erroMetaIdade(resposta) && payload.targeting) {
+  if (erroMetaIdade(resposta) && payloadAtual.targeting) {
     const retryPayload = {
-      ...payload,
+      ...payloadAtual,
       targeting: {
-        ...payload.targeting
+        ...payloadAtual.targeting
       }
     };
 
@@ -690,7 +698,8 @@ async function enviarPayloadMetaComFallbackBid(
       resposta?.error || resposta
     );
 
-    resposta = await enviar(retryPayload);
+    payloadAtual = retryPayload;
+    resposta = await enviar(payloadAtual);
   }
 
   return resposta;
