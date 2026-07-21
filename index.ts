@@ -13898,7 +13898,8 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
       if (campanhaLanceRes.error) {
         return c.json({
-          error: campanhaLanceRes.error,
+          error: mensagemErroMeta(campanhaLanceRes, "Erro ao salvar o controle de custo no Meta"),
+          detalhe: campanhaLanceRes.error,
           targeting_enviado: targeting
         }, 400);
       }
@@ -13933,7 +13934,33 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       }
     }
 
-    const adsetRes = await enviarPayloadMetaComFallbackBid(
+    // Janela de atribuição — mesmo mapeamento usado na criação (POST /meta/adset),
+    // antes ausente aqui: o campo existia na tela de edição mas não tinha efeito
+    // nenhum, porque nunca chegava a ser incluído no payload enviado à Meta.
+    const atribuicaoEdicao =
+      textoOpcional(avancadas.attribution_spec);
+
+    if (atribuicaoEdicao) {
+      const janelasValidas: Record<string, object> = {
+        "1d_click": [{ event_type: "CLICK_THROUGH", window_days: 1 }],
+        "7d_click": [{ event_type: "CLICK_THROUGH", window_days: 7 }],
+        "28d_click": [{ event_type: "CLICK_THROUGH", window_days: 28 }],
+        "1d_click_1d_view": [
+          { event_type: "CLICK_THROUGH", window_days: 1 },
+          { event_type: "VIEW_THROUGH", window_days: 1 }
+        ],
+        "7d_click_1d_view": [
+          { event_type: "CLICK_THROUGH", window_days: 7 },
+          { event_type: "VIEW_THROUGH", window_days: 1 }
+        ]
+      };
+
+      if (janelasValidas[atribuicaoEdicao]) {
+        payloadAdset.attribution_spec = janelasValidas[atribuicaoEdicao];
+      }
+    }
+
+    let adsetRes = await enviarPayloadMetaComFallbackBid(
       `https://graph.facebook.com/v19.0/${adsetId}`,
       payloadAdset,
       "EDITAR_ADSET"
@@ -13946,9 +13973,35 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     console.log("EDITAR CAMPANHA RESPONSE:", adsetRes);
 
+    // Mesmo self-healing da criação: se a janela de atribuição for incompatível
+    // com o objetivo/otimização atual do conjunto, tenta de novo sem ela em vez
+    // de devolver o erro cru pro usuário.
+    if (adsetRes.error && payloadAdset.attribution_spec) {
+      const errMsgAtribuicao = String(
+        adsetRes.error?.error_user_msg ||
+        adsetRes.error?.message ||
+        ""
+      ).toLowerCase();
+
+      if (
+        errMsgAtribuicao.includes("attribution") ||
+        errMsgAtribuicao.includes("atribuição") ||
+        errMsgAtribuicao.includes("atribuicao")
+      ) {
+        console.log("EDITAR_ADSET: attribution_spec rejeitada pela Meta, tentando sem ela...");
+        delete payloadAdset.attribution_spec;
+        adsetRes = await enviarPayloadMetaComFallbackBid(
+          `https://graph.facebook.com/v19.0/${adsetId}`,
+          payloadAdset,
+          "EDITAR_ADSET_RETRY_ATTRIBUTION"
+        );
+      }
+    }
+
     if (adsetRes.error) {
       return c.json({
-        error: adsetRes.error,
+        error: mensagemErroMeta(adsetRes, "Erro ao salvar as alterações no Meta"),
+        detalhe: adsetRes.error,
         targeting_enviado: targeting
       }, 400);
     }
@@ -20096,6 +20149,24 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     const cfgFormulario = cfg.formulario || {};
     const cfgCriativo = cfg.criativo || {};
 
+    // Se qualquer etapa depois da criação da campanha falhar, remove a campanha
+    // já criada na Meta em vez de deixar um objeto órfão sem nenhum registro
+    // local (mesmo padrão de rollback usado em /campanhas/:id/publicar-recebida).
+    let campanhaMetaIdCriada: string | null = null;
+    const falharAtivacao = async (mensagem: string, detalhe: any = null, status = 400) => {
+      if (campanhaMetaIdCriada) {
+        await fetch(
+          `https://graph.facebook.com/v19.0/${campanhaMetaIdCriada}`,
+          {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ access_token: token })
+          }
+        ).catch(() => null);
+      }
+      return c.json({ error: mensagem, detalhe }, status);
+    };
+
     // 1. Cria campanha no Meta
     const categoriaEspecial = textoOpcional(cfgCampanha.categoria_especial);
     const payloadCampanha: any = {
@@ -20117,8 +20188,13 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     ).then(r => r.json());
 
     if (!campanhaMeta.id) {
-      return c.json({ error: "Erro ao criar campanha no Meta", detalhe: campanhaMeta }, 400);
+      return c.json({
+        error: mensagemErroMeta(campanhaMeta, "Erro ao criar campanha no Meta"),
+        detalhe: campanhaMeta
+      }, 400);
     }
+
+    campanhaMetaIdCriada = campanhaMeta.id;
 
     // 2. Busca page_id disponível do corretor
     let pageId = textoOpcional(cfgCriativo.page_id);
@@ -20134,10 +20210,10 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     }
 
     if (!pageId) {
-      return c.json({
-        error: "Nenhuma página do Facebook encontrada para o corretor. Configure uma página antes de ativar.",
-        campaign_id: campanhaMeta.id
-      }, 400);
+      return await falharAtivacao(
+        "Nenhuma página do Facebook encontrada para o corretor. Configure uma página antes de ativar.",
+        { campaign_id: campanhaMeta.id }
+      );
     }
 
     // 3. Cria adset
@@ -20194,7 +20270,10 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     );
 
     if (adsetMeta.error) {
-      return c.json({ error: "Erro ao criar adset no Meta", detalhe: adsetMeta, campaign_id: campanhaMeta.id }, 400);
+      return await falharAtivacao(
+        mensagemErroMeta(adsetMeta, "Erro ao criar conjunto de anúncios no Meta"),
+        adsetMeta
+      );
     }
 
     // 4. Cria formulário de lead
