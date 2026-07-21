@@ -1958,7 +1958,8 @@ type TipoUsoIA =
   | "reativacao_lote"
   | "criador_campanha"
   | "resumo_diario"
-  | "relatorio";
+  | "relatorio"
+  | "roteiro_whatsapp";
 
 const IA_CUSTO_ESTIMADO_PADRAO = 0.08;
 const OPENAI_RESPONSES_URL =
@@ -9581,6 +9582,112 @@ app.put("/whatsapp/bot", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO PUT /whatsapp/bot:", err);
     return c.json({ error: "Erro ao salvar roteiro do bot" }, 500);
+  }
+});
+
+// Passos genéricos usados quando a IA não está disponível/configurada ou falha —
+// mesmo roteiro que já aparecia como placeholder no textarea, nunca deixa o
+// corretor sem nada na tela.
+function passosRoteiroFallback() {
+  return [
+    { ordem: 1, tipo: "mensagem", texto: "Olá! Tudo bem? Obrigado por entrar em contato.", handoff_apos: false },
+    { ordem: 2, tipo: "pergunta", texto: "Pra te atender melhor, qual é o seu nome?", handoff_apos: false },
+    { ordem: 3, tipo: "mensagem", texto: "Perfeito! Já vou te conectar com um corretor pra continuar seu atendimento.", handoff_apos: true },
+  ];
+}
+
+function parsePassosRoteiroIA(texto: string) {
+  let raw = (texto || "").trim();
+  raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/, "").replace(/```\s*$/, "");
+  let json: any;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const passosBrutos = Array.isArray(json?.passos) ? json.passos : [];
+  const limpos = passosBrutos
+    .map((p: any, i: number) => ({
+      ordem: i + 1,
+      tipo: p?.tipo === "pergunta" ? "pergunta" : "mensagem",
+      texto: String(p?.texto || "").slice(0, 300).trim(),
+      handoff_apos: Boolean(p?.handoff_apos),
+    }))
+    .filter((p: any) => p.texto);
+  if (limpos.length && !limpos.some((p: any) => p.handoff_apos)) {
+    limpos[limpos.length - 1].handoff_apos = true;
+  }
+  return limpos;
+}
+
+app.post("/ia/whatsapp-bot/gerar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const bloqueio = await motivoBloqueioIA(user);
+    if (bloqueio) return c.json({ error: bloqueio }, 403);
+
+    const { contexto } = await c.req.json();
+    if (!String(contexto || "").trim()) {
+      return c.json({ error: "Descreva o negócio antes de gerar." }, 400);
+    }
+
+    const openaiKey = Bun.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return c.json({ passos: passosRoteiroFallback() });
+    }
+
+    const systemMsg =
+      "Você é um especialista em atendimento via WhatsApp para corretores de seguros e imóveis no Brasil. " +
+      "Crie roteiros curtos de bot de primeiro atendimento. Retorne SOMENTE JSON valido no formato " +
+      `{"passos":[{"tipo":"mensagem"|"pergunta","texto":"...","handoff_apos":boolean}]}, sem nenhum texto fora do JSON.`;
+    const prompt =
+      `Negócio/contexto informado pelo corretor: "${String(contexto).trim()}"\n\n` +
+      `Crie um roteiro de 3 a 6 passos. Passos "mensagem" só informam algo e seguem sozinhos; ` +
+      `passos "pergunta" perguntam algo e esperam a resposta do cliente antes de seguir. ` +
+      `O ultimo passo deve ter handoff_apos:true, indicando que a conversa deve ser transferida para o corretor humano.`;
+
+    const iaConf = await client.query("SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1");
+    const modelo =
+      textoOpcional(iaConf.rows[0]?.modelo) ||
+      textoOpcional(Bun.env.OPENAI_MODEL) ||
+      "gpt-5-mini";
+    const usarResponsesAPI =
+      modelo.startsWith("gpt-5") || modelo.startsWith("o1") || modelo.startsWith("o3") || modelo.startsWith("o4");
+
+    const respBody = usarResponsesAPI
+      ? { model: modelo, temperature: 1.0, instructions: systemMsg, input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }] }
+      : { model: modelo, temperature: 1.0, response_format: { type: "json_object" }, messages: [{ role: "system", content: systemMsg }, { role: "user", content: prompt }] };
+
+    const resp = await fetch(usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(respBody),
+    });
+    const data: any = await resp.json();
+    if (!resp.ok) {
+      console.error("WHATSAPP BOT IA ERROR:", data?.error?.message, "| model:", modelo);
+      return c.json({ passos: passosRoteiroFallback() });
+    }
+
+    const textoResposta: string = usarResponsesAPI
+      ? extrairTextoRespostaOpenAI(data)
+      : (data?.choices?.[0]?.message?.content || "");
+    const passos = parsePassosRoteiroIA(textoResposta);
+    if (!passos.length) {
+      return c.json({ passos: passosRoteiroFallback() });
+    }
+
+    const usageNorm = {
+      input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
+      output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0),
+    };
+    const custo = calcularCustoEstimadoOpenAI(usageNorm);
+    await registrarUsoIA(Number(user.id), "roteiro_whatsapp", "whatsapp_bot", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
+
+    return c.json({ passos });
+  } catch (err) {
+    console.error("ERRO /ia/whatsapp-bot/gerar:", err);
+    return c.json({ passos: passosRoteiroFallback() });
   }
 });
 
