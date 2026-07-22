@@ -9567,58 +9567,136 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
   }
 });
 
+function validarPassosRoteiro(passos: any[]) {
+  for (const passo of passos) {
+    if (!passo || !["mensagem", "pergunta"].includes(passo.tipo) || !String(passo.texto || "").trim()) {
+      return "Cada passo precisa de tipo ('mensagem' ou 'pergunta') e texto";
+    }
+  }
+  return null;
+}
+
 app.get("/whatsapp/bot", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
-    const row = await client.query(
-      `SELECT ativo, passos FROM whatsapp_bot_config WHERE usuario_id = $1`,
+    const rows = await client.query(
+      `SELECT id, nome, ativo, passos, atualizado_em FROM whatsapp_bot_config
+       WHERE usuario_id = $1 ORDER BY atualizado_em DESC`,
       [user.id]
     );
-    if (!row.rows.length) {
-      return c.json({ ativo: true, passos: [] });
-    }
-    return c.json({ ativo: row.rows[0].ativo, passos: row.rows[0].passos || [] });
+    return c.json({ roteiros: rows.rows });
   } catch (err) {
     console.error("ERRO GET /whatsapp/bot:", err);
-    return c.json({ error: "Erro ao carregar roteiro do bot" }, 500);
+    return c.json({ error: "Erro ao carregar roteiros do bot" }, 500);
   }
 });
 
-app.put("/whatsapp/bot", authMiddleware, async (c) => {
+app.post("/whatsapp/bot", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const body = await c.req.json();
-    const ativo = body.ativo !== false;
+    const nome = String(body.nome || "").trim() || "Roteiro sem nome";
     const passos = Array.isArray(body.passos) ? body.passos : [];
 
-    for (const passo of passos) {
-      if (!passo || !["mensagem", "pergunta"].includes(passo.tipo) || !String(passo.texto || "").trim()) {
-        return c.json({ error: "Cada passo precisa de tipo ('mensagem' ou 'pergunta') e texto" }, 400);
-      }
-    }
+    const erro = validarPassosRoteiro(passos);
+    if (erro) return c.json({ error: erro }, 400);
 
-    if (ativo) {
-      const conexao = await client.query(
-        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
-        [user.id]
-      );
-      if (!conexao.rows.length) {
-        return c.json({ error: "Conecte seu WhatsApp antes de ativar o bot." }, 400);
-      }
-    }
-
-    await client.query(
-      `INSERT INTO whatsapp_bot_config (usuario_id, ativo, passos, atualizado_em)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (usuario_id)
-       DO UPDATE SET ativo = $2, passos = $3, atualizado_em = NOW()`,
-      [user.id, ativo, JSON.stringify(passos)]
+    const row = await client.query(
+      `INSERT INTO whatsapp_bot_config (usuario_id, nome, ativo, passos, atualizado_em)
+       VALUES ($1, $2, false, $3, NOW())
+       RETURNING id, nome, ativo, passos, atualizado_em`,
+      [user.id, nome, JSON.stringify(passos)]
     );
+
+    return c.json({ roteiro: row.rows[0] });
+  } catch (err) {
+    console.error("ERRO POST /whatsapp/bot:", err);
+    return c.json({ error: "Erro ao criar roteiro do bot" }, 500);
+  }
+});
+
+app.put("/whatsapp/bot/:id", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const id = c.req.param("id");
+    const body = await c.req.json();
+    const nome = String(body.nome || "").trim() || "Roteiro sem nome";
+    const passos = Array.isArray(body.passos) ? body.passos : [];
+
+    const erro = validarPassosRoteiro(passos);
+    if (erro) return c.json({ error: erro }, 400);
+
+    const row = await client.query(
+      `UPDATE whatsapp_bot_config SET nome = $1, passos = $2, atualizado_em = NOW()
+       WHERE id = $3 AND usuario_id = $4
+       RETURNING id, nome, ativo, passos, atualizado_em`,
+      [nome, JSON.stringify(passos), id, user.id]
+    );
+    if (!row.rows.length) return c.json({ error: "Roteiro não encontrado" }, 404);
+
+    return c.json({ roteiro: row.rows[0] });
+  } catch (err) {
+    console.error("ERRO PUT /whatsapp/bot/:id:", err);
+    return c.json({ error: "Erro ao salvar roteiro do bot" }, 500);
+  }
+});
+
+app.post("/whatsapp/bot/:id/ativar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const id = c.req.param("id");
+
+    const conexao = await client.query(
+      `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
+      [user.id]
+    );
+    if (!conexao.rows.length) {
+      return c.json({ error: "Conecte seu WhatsApp antes de ativar o bot." }, 400);
+    }
+
+    await client.query(`UPDATE whatsapp_bot_config SET ativo = false WHERE usuario_id = $1`, [user.id]);
+    const row = await client.query(
+      `UPDATE whatsapp_bot_config SET ativo = true WHERE id = $1 AND usuario_id = $2 RETURNING id`,
+      [id, user.id]
+    );
+    if (!row.rows.length) return c.json({ error: "Roteiro não encontrado" }, 404);
 
     return c.json({ ok: true });
   } catch (err) {
-    console.error("ERRO PUT /whatsapp/bot:", err);
-    return c.json({ error: "Erro ao salvar roteiro do bot" }, 500);
+    console.error("ERRO POST /whatsapp/bot/:id/ativar:", err);
+    return c.json({ error: "Erro ao ativar roteiro do bot" }, 500);
+  }
+});
+
+app.post("/whatsapp/bot/:id/desativar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const id = c.req.param("id");
+    const row = await client.query(
+      `UPDATE whatsapp_bot_config SET ativo = false WHERE id = $1 AND usuario_id = $2 RETURNING id`,
+      [id, user.id]
+    );
+    if (!row.rows.length) return c.json({ error: "Roteiro não encontrado" }, 404);
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO POST /whatsapp/bot/:id/desativar:", err);
+    return c.json({ error: "Erro ao desativar roteiro do bot" }, 500);
+  }
+});
+
+app.delete("/whatsapp/bot/:id", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const id = c.req.param("id");
+    const row = await client.query(
+      `DELETE FROM whatsapp_bot_config WHERE id = $1 AND usuario_id = $2 RETURNING id`,
+      [id, user.id]
+    );
+    if (!row.rows.length) return c.json({ error: "Roteiro não encontrado" }, 404);
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO DELETE /whatsapp/bot/:id:", err);
+    return c.json({ error: "Erro ao excluir roteiro do bot" }, 500);
   }
 });
 
@@ -11054,9 +11132,16 @@ await client.query(`
     ativo         BOOLEAN NOT NULL DEFAULT TRUE,
     passos        JSONB NOT NULL DEFAULT '[]',
     criado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(usuario_id)
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+
+  -- Permite varios roteiros salvos por corretor (biblioteca de roteiros) — a
+  -- restricao antiga UNIQUE(usuario_id) so permitia um. O indice parcial abaixo
+  -- garante que, mesmo com varias linhas, no maximo uma fica ativa por vez.
+  ALTER TABLE whatsapp_bot_config DROP CONSTRAINT IF EXISTS whatsapp_bot_config_usuario_id_key;
+  ALTER TABLE whatsapp_bot_config ADD COLUMN IF NOT EXISTS nome TEXT NOT NULL DEFAULT 'Roteiro padrão';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bot_config_usuario_ativo
+    ON whatsapp_bot_config(usuario_id) WHERE ativo = true;
 
   CREATE TABLE IF NOT EXISTS whatsapp_conversas (
     id                  SERIAL PRIMARY KEY,
