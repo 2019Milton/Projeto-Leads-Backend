@@ -4489,6 +4489,7 @@ const googleSyncEmAndamento = new Set<number>();
 
 const GOOGLE_ADS_API_VERSION = "v24";
 const GOOGLE_ADS_API = `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}`;
+const googleLoginCustomerIdPorToken = new Map<string, string>();
 
 async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
   const res = await fetch("https://oauth2.googleapis.com/token", {
@@ -4509,20 +4510,22 @@ async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
   return data.access_token;
 }
 
-function googleAdsHeaders(accessToken: string) {
+function googleAdsHeaders(accessToken: string, loginCustomerId?: string | null) {
+  const loginId = loginCustomerId || googleLoginCustomerIdPorToken.get(accessToken) || null;
   return {
     Authorization: `Bearer ${accessToken}`,
     "developer-token": Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN || "",
+    ...(loginId ? { "login-customer-id": String(loginId).replace(/\D/g, "") } : {}),
     "Content-Type": "application/json",
   };
 }
 
-async function googleAdsQuery(customerId: string, accessToken: string, gaql: string) {
+async function googleAdsQuery(customerId: string, accessToken: string, gaql: string, loginCustomerId?: string | null) {
   const res = await fetch(
     `${GOOGLE_ADS_API}/customers/${customerId}/googleAds:search`,
     {
       method: "POST",
-      headers: googleAdsHeaders(accessToken),
+      headers: googleAdsHeaders(accessToken, loginCustomerId),
       body: JSON.stringify({ query: gaql }),
     }
   );
@@ -4532,6 +4535,67 @@ async function googleAdsQuery(customerId: string, accessToken: string, gaql: str
     throw new Error(data?.error?.message || "Erro ao consultar Google Ads");
   }
   return data.results ?? [];
+}
+
+type ContaGoogleAds = {
+  customer_id: string;
+  nome: string;
+  gerenciadora: boolean;
+  login_customer_id: string | null;
+};
+
+async function listarContasGoogleAds(accessToken: string): Promise<ContaGoogleAds[]> {
+  const listRes = await fetch(`${GOOGLE_ADS_API}/customers:listAccessibleCustomers`, {
+    headers: googleAdsHeaders(accessToken),
+  });
+  const listData = await listRes.json() as any;
+  if (!listRes.ok) {
+    throw new Error(listData?.error?.message || "Erro ao buscar contas do Google Ads");
+  }
+
+  const contas = new Map<string, ContaGoogleAds>();
+  for (const resourceName of (listData.resourceNames ?? []) as string[]) {
+    const customerId = resourceName.split("/")[1];
+    try {
+      const results = await googleAdsQuery(
+        customerId, accessToken,
+        "SELECT customer.id, customer.descriptive_name, customer.manager FROM customer LIMIT 1"
+      );
+      const info = (results[0] as any)?.customer;
+      const gerenciadora = Boolean(info?.manager);
+      contas.set(customerId, {
+        customer_id: customerId,
+        nome: info?.descriptiveName || customerId,
+        gerenciadora,
+        login_customer_id: null,
+      });
+
+      if (gerenciadora) {
+        const clientes = await googleAdsQuery(
+          customerId, accessToken,
+          "SELECT customer_client.id, customer_client.descriptive_name, customer_client.manager, customer_client.status, customer_client.level WHERE customer_client.level = 1",
+          customerId
+        );
+        for (const row of clientes as any[]) {
+          const cliente = row.customerClient;
+          if (!cliente?.id || cliente.status === "CANCELED") continue;
+          const clienteId = String(cliente.id);
+          contas.set(clienteId, {
+            customer_id: clienteId,
+            nome: cliente.descriptiveName || clienteId,
+            gerenciadora: Boolean(cliente.manager),
+            login_customer_id: customerId,
+          });
+        }
+      }
+    } catch (err: any) {
+      console.warn("AVISO GOOGLE ADS AO LISTAR CONTA:", customerId, err?.message || err);
+      if (!contas.has(customerId)) {
+        contas.set(customerId, { customer_id: customerId, nome: customerId, gerenciadora: false, login_customer_id: null });
+      }
+    }
+  }
+  return [...contas.values()];
 }
 
 // Lista as contas do Google Ads acessiveis pelo usuario conectado
@@ -4553,35 +4617,7 @@ app.get("/google/contas", authMiddleware, async (c) => {
 
     const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
 
-    const listRes = await fetch(`${GOOGLE_ADS_API}/customers:listAccessibleCustomers`, {
-      headers: googleAdsHeaders(accessToken),
-    });
-    const listData = await listRes.json() as any;
-    if (!listRes.ok) {
-      console.error("ERRO GOOGLE ADS CONTAS:", listData);
-      return c.json({ error: "Erro ao buscar contas do Google Ads", detalhe: listData?.error?.message }, 502);
-    }
-
-    const resourceNames: string[] = listData.resourceNames ?? [];
-    const contas: { customer_id: string; nome: string; gerenciadora: boolean }[] = [];
-
-    for (const resourceName of resourceNames) {
-      const customerId = resourceName.split("/")[1];
-      try {
-        const results = await googleAdsQuery(
-          customerId, accessToken,
-          "SELECT customer.id, customer.descriptive_name, customer.manager FROM customer LIMIT 1"
-        );
-        const info = (results[0] as any)?.customer;
-        contas.push({
-          customer_id: customerId,
-          nome: info?.descriptiveName || customerId,
-          gerenciadora: Boolean(info?.manager),
-        });
-      } catch (_) {
-        contas.push({ customer_id: customerId, nome: customerId, gerenciadora: false });
-      }
-    }
+    const contas = await listarContasGoogleAds(accessToken);
 
     return c.json({ contas });
   } catch (err: any) {
@@ -4597,12 +4633,28 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
     const { customer_id } = await c.req.json();
     if (!customer_id) return c.json({ error: "customer_id obrigatorio" }, 400);
 
+    const conn = await client.query(
+      `SELECT refresh_token FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows.length || !conn.rows[0].refresh_token) {
+      return c.json({ error: "Google Ads nao conectado" }, 400);
+    }
+    const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
+    const conta = (await listarContasGoogleAds(accessToken))
+      .find(item => item.customer_id === String(customer_id));
+    if (!conta) return c.json({ error: "Conta do Google Ads nao acessivel" }, 400);
+
     await client.query(
       `UPDATE plataforma_conexoes
-       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object('customer_id', $1::text),
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
+             'customer_id', $1::text,
+             'login_customer_id', $2::text
+           ),
            atualizado_em = NOW()
-       WHERE usuario_id = $2 AND plataforma = 'google'`,
-      [String(customer_id), user.id]
+       WHERE usuario_id = $3 AND plataforma = 'google'`,
+      [String(customer_id), conta.login_customer_id, user.id]
     );
     return c.json({ sucesso: true });
   } catch (err: any) {
@@ -4626,6 +4678,7 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
 
     const dadosConta = conn.rows[0].dados_conta ?? {};
     const customerId = dadosConta.customer_id;
+    const loginCustomerId = dadosConta.login_customer_id || null;
 
     const [campanhasCount, leadsHojeCount] = await Promise.all([
       client.query(
@@ -4668,7 +4721,8 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
       try {
         const contaResults = await googleAdsQuery(
           customerId, accessToken,
-          "SELECT customer.descriptive_name, customer.currency_code, customer.time_zone, customer.status, customer.manager FROM customer LIMIT 1"
+          "SELECT customer.descriptive_name, customer.currency_code, customer.time_zone, customer.status, customer.manager FROM customer LIMIT 1",
+          loginCustomerId
         );
         contaInfo = (contaResults[0] as any)?.customer ?? null;
       } catch (errConta: any) {
@@ -4680,7 +4734,8 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
         try {
           const gastoResults = await googleAdsQuery(
             customerId, accessToken,
-            "SELECT metrics.cost_micros FROM campaign WHERE segments.date DURING TODAY"
+            "SELECT metrics.cost_micros FROM campaign WHERE segments.date DURING TODAY",
+            loginCustomerId
           );
           gastoMicros = (gastoResults as any[]).reduce(
             (soma, row) => soma + Number(row.metrics?.costMicros ?? 0), 0
@@ -4700,7 +4755,8 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
         try {
           const billingResults = await googleAdsQuery(
             customerId, accessToken,
-            "SELECT billing_setup.status FROM billing_setup"
+            "SELECT billing_setup.status FROM billing_setup",
+            loginCustomerId
           );
           const statusBilling = (billingResults[0] as any)?.billingSetup?.status ?? null;
           pagamento = {
@@ -4759,6 +4815,7 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
 
     const dadosConta = conn.rows[0].dados_conta ?? {};
     const customerId = dadosConta.customer_id;
+    const loginCustomerId = dadosConta.login_customer_id || null;
     if (!customerId) {
       return c.json({ error: "Selecione a conta do Google Ads antes de sincronizar" }, 400);
     }
@@ -4768,7 +4825,8 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
     // 🔥 BUSCA CAMPANHAS
     const campanhasResults = await googleAdsQuery(
       customerId, accessToken,
-      "SELECT campaign.id, campaign.name, campaign.status FROM campaign"
+      "SELECT campaign.id, campaign.name, campaign.status FROM campaign",
+      loginCustomerId
     );
 
     for (const row of campanhasResults as any[]) {
@@ -4807,7 +4865,8 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
               lead_form_submission_data.submission_date_time,
               lead_form_submission_data.lead_form_submission_fields
        FROM lead_form_submission_data
-       WHERE lead_form_submission_data.submission_date_time BETWEEN '${inicio}' AND '${fim}'`
+       WHERE lead_form_submission_data.submission_date_time BETWEEN '${inicio}' AND '${fim}'`,
+      loginCustomerId
     );
 
     let totalLeads = 0;
@@ -4894,7 +4953,7 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
 
 async function resolverConexaoGoogleAds(
   usuarioId: number
-): Promise<{ erro: string } | { accessToken: string; customerId: string }> {
+): Promise<{ erro: string } | { accessToken: string; customerId: string; loginCustomerId: string | null }> {
   const conn = await client.query(
     `SELECT refresh_token, dados_conta FROM plataforma_conexoes
      WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
@@ -4905,25 +4964,31 @@ async function resolverConexaoGoogleAds(
   }
 
   const customerId = (conn.rows[0].dados_conta ?? {}).customer_id;
+  const loginCustomerId = (conn.rows[0].dados_conta ?? {}).login_customer_id || null;
   if (!customerId) {
     return { erro: "Selecione a conta do Google Ads antes de publicar" };
   }
 
   const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
-  return { accessToken, customerId: String(customerId) };
+  if (loginCustomerId) {
+    googleLoginCustomerIdPorToken.set(accessToken, String(loginCustomerId));
+    setTimeout(() => googleLoginCustomerIdPorToken.delete(accessToken), 60 * 60 * 1000);
+  }
+  return { accessToken, customerId: String(customerId), loginCustomerId: loginCustomerId ? String(loginCustomerId) : null };
 }
 
 async function googleAdsMutate(
   customerId: string,
   accessToken: string,
   recurso: string,
-  operations: any[]
+  operations: any[],
+  loginCustomerId?: string | null
 ) {
   const res = await fetch(
     `${GOOGLE_ADS_API}/customers/${customerId}/${recurso}:mutate`,
     {
       method: "POST",
-      headers: googleAdsHeaders(accessToken),
+      headers: googleAdsHeaders(accessToken, loginCustomerId),
       body: JSON.stringify({ operations }),
     }
   );
