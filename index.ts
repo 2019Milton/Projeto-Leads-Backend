@@ -4585,9 +4585,11 @@ async function listarContasGoogleAds(accessToken: string): Promise<{ contas: Con
             customerId
           );
           for (const row of clientes as any[]) {
-            const cliente = row.customerClient;
-            if (!cliente?.id || Number(cliente.level) === 0) continue;
-            const clienteId = String(cliente.id);
+            const cliente = row.customerClient || row.customer_client;
+            const clienteId = String(
+              cliente?.id || String(cliente?.clientCustomer || cliente?.client_customer || "").split("/")[1] || ""
+            );
+            if (!clienteId || Number(cliente.level) === 0) continue;
             contas.set(clienteId, {
               customer_id: clienteId,
               nome: cliente.descriptiveName || clienteId,
@@ -4644,7 +4646,8 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const { customer_id } = await c.req.json();
-    if (!customer_id) return c.json({ error: "customer_id obrigatorio" }, 400);
+    const customerId = String(customer_id || "").replace(/\D/g, "");
+    if (!customerId) return c.json({ error: "customer_id obrigatorio" }, 400);
 
     const conn = await client.query(
       `SELECT refresh_token FROM plataforma_conexoes
@@ -4655,9 +4658,36 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
       return c.json({ error: "Google Ads nao conectado" }, 400);
     }
     const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
-    const conta = (await listarContasGoogleAds(accessToken)).contas
-      .find(item => item.customer_id === String(customer_id));
-    if (!conta) return c.json({ error: "Conta do Google Ads nao acessivel" }, 400);
+    const contasAcessiveis = (await listarContasGoogleAds(accessToken)).contas;
+    let conta = contasAcessiveis.find(item => item.customer_id === customerId);
+
+    // Fallback para contas recém-criadas/vinculadas que ainda não aparecem na
+    // hierarquia customer_client. A conta só é aceita se uma MCC acessível
+    // conseguir consultá-la explicitamente pela API do Google Ads.
+    if (!conta) {
+      for (const mcc of contasAcessiveis.filter(item => item.gerenciadora)) {
+        try {
+          const results = await googleAdsQuery(
+            customerId, accessToken,
+            "SELECT customer.id, customer.descriptive_name, customer.manager FROM customer LIMIT 1",
+            mcc.customer_id
+          );
+          const info = (results[0] as any)?.customer;
+          if (info?.id) {
+            conta = {
+              customer_id: customerId,
+              nome: info.descriptiveName || customerId,
+              gerenciadora: Boolean(info.manager),
+              login_customer_id: mcc.customer_id,
+            };
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+    if (!conta) {
+      return c.json({ error: "A conta informada não está acessível por nenhuma MCC conectada" }, 400);
+    }
 
     await client.query(
       `UPDATE plataforma_conexoes
@@ -4667,7 +4697,7 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
            ),
            atualizado_em = NOW()
        WHERE usuario_id = $3 AND plataforma = 'google'`,
-      [String(customer_id), conta.login_customer_id, user.id]
+      [customerId, conta.login_customer_id, user.id]
     );
     return c.json({ sucesso: true });
   } catch (err: any) {
