@@ -4664,6 +4664,7 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
     // Fallback para contas recém-criadas/vinculadas que ainda não aparecem na
     // hierarquia customer_client. A conta só é aceita se uma MCC acessível
     // conseguir consultá-la explicitamente pela API do Google Ads.
+    const errosConsultaDireta: string[] = [];
     if (!conta) {
       for (const mcc of contasAcessiveis.filter(item => item.gerenciadora)) {
         try {
@@ -4682,11 +4683,16 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
             };
             break;
           }
-        } catch (_) {}
+        } catch (errDireto: any) {
+          errosConsultaDireta.push(`MCC ${mcc.customer_id}: ${errDireto?.message || "acesso negado"}`);
+        }
       }
     }
     if (!conta) {
-      return c.json({ error: "A conta informada não está acessível por nenhuma MCC conectada" }, 400);
+      return c.json({
+        error: "A conta informada não está acessível por nenhuma MCC conectada",
+        detalhe: errosConsultaDireta.join(" | ") || "O Google Ads não retornou a conta na hierarquia da MCC"
+      }, 400);
     }
 
     await client.query(
