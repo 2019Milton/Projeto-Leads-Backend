@@ -4544,7 +4544,7 @@ type ContaGoogleAds = {
   login_customer_id: string | null;
 };
 
-async function listarContasGoogleAds(accessToken: string): Promise<ContaGoogleAds[]> {
+async function listarContasGoogleAds(accessToken: string): Promise<{ contas: ContaGoogleAds[]; avisos: string[] }> {
   const listRes = await fetch(`${GOOGLE_ADS_API}/customers:listAccessibleCustomers`, {
     headers: googleAdsHeaders(accessToken),
   });
@@ -4554,6 +4554,7 @@ async function listarContasGoogleAds(accessToken: string): Promise<ContaGoogleAd
   }
 
   const contas = new Map<string, ContaGoogleAds>();
+  const avisos: string[] = [];
   for (const resourceName of (listData.resourceNames ?? []) as string[]) {
     const customerId = resourceName.split("/")[1];
     try {
@@ -4571,21 +4572,33 @@ async function listarContasGoogleAds(accessToken: string): Promise<ContaGoogleAd
       });
 
       if (gerenciadora) {
-        const clientes = await googleAdsQuery(
-          customerId, accessToken,
-          "SELECT customer_client.id, customer_client.descriptive_name, customer_client.manager, customer_client.status, customer_client.level WHERE customer_client.level = 1",
-          customerId
-        );
-        for (const row of clientes as any[]) {
-          const cliente = row.customerClient;
-          if (!cliente?.id || cliente.status === "CANCELED") continue;
-          const clienteId = String(cliente.id);
-          contas.set(clienteId, {
-            customer_id: clienteId,
-            nome: cliente.descriptiveName || clienteId,
-            gerenciadora: Boolean(cliente.manager),
-            login_customer_id: customerId,
-          });
+        try {
+          // Consulta recomendada pela documentação oficial para obter a hierarquia.
+          // O nível 0 é a própria MCC; nível 1 são seus clientes diretos.
+          const clientes = await googleAdsQuery(
+            customerId, accessToken,
+            `SELECT customer_client.client_customer, customer_client.id,
+                    customer_client.descriptive_name, customer_client.manager,
+                    customer_client.level
+             FROM customer_client
+             WHERE customer_client.level <= 1`,
+            customerId
+          );
+          for (const row of clientes as any[]) {
+            const cliente = row.customerClient;
+            if (!cliente?.id || Number(cliente.level) === 0) continue;
+            const clienteId = String(cliente.id);
+            contas.set(clienteId, {
+              customer_id: clienteId,
+              nome: cliente.descriptiveName || clienteId,
+              gerenciadora: Boolean(cliente.manager),
+              login_customer_id: customerId,
+            });
+          }
+        } catch (errClientes: any) {
+          const mensagem = errClientes?.message || "Não foi possível consultar as contas vinculadas";
+          avisos.push(`MCC ${customerId}: ${mensagem}`);
+          console.error("ERRO GOOGLE ADS AO EXPANDIR MCC:", customerId, mensagem);
         }
       }
     } catch (err: any) {
@@ -4595,7 +4608,7 @@ async function listarContasGoogleAds(accessToken: string): Promise<ContaGoogleAd
       }
     }
   }
-  return [...contas.values()];
+  return { contas: [...contas.values()], avisos };
 }
 
 // Lista as contas do Google Ads acessiveis pelo usuario conectado
@@ -4617,9 +4630,9 @@ app.get("/google/contas", authMiddleware, async (c) => {
 
     const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
 
-    const contas = await listarContasGoogleAds(accessToken);
+    const { contas, avisos } = await listarContasGoogleAds(accessToken);
 
-    return c.json({ contas });
+    return c.json({ contas, avisos });
   } catch (err: any) {
     console.error("ERRO /google/contas:", err);
     return c.json({ error: err.message || "Erro interno" }, 500);
@@ -4642,7 +4655,7 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
       return c.json({ error: "Google Ads nao conectado" }, 400);
     }
     const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
-    const conta = (await listarContasGoogleAds(accessToken))
+    const conta = (await listarContasGoogleAds(accessToken)).contas
       .find(item => item.customer_id === String(customer_id));
     if (!conta) return c.json({ error: "Conta do Google Ads nao acessivel" }, 400);
 
