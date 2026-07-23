@@ -67,21 +67,24 @@ const RECURSOS_POR_PLANO = {
     ia_leads: false,
     ia_assistente_comercial: false,
     ia_analise_campanhas: false,
-    ia_whatsapp: false
+    ia_whatsapp: false,
+    meta_conversion_leads: false
   },
   prata: {
     machine_learning_leads: true,
     ia_leads: false,
     ia_assistente_comercial: false,
     ia_analise_campanhas: false,
-    ia_whatsapp: false
+    ia_whatsapp: false,
+    meta_conversion_leads: false
   },
   ouro: {
     machine_learning_leads: true,
     ia_leads: true,
     ia_assistente_comercial: true,
     ia_analise_campanhas: true,
-    ia_whatsapp: true
+    ia_whatsapp: true,
+    meta_conversion_leads: true
   }
 } satisfies Record<PlanoPlataforma, Record<string, boolean>>;
 
@@ -872,6 +875,194 @@ function mensagemErroMeta(resposta: any, fallback: string) {
     resposta?.error ||
     fallback
   );
+}
+
+// ─── CONVERSION LEADS (Meta Conversions API) ────────────────────────────────
+// Manda de volta pra Meta os estagios de qualificacao do lead (score quente da
+// IA/ML, negocio fechado) casados pelo leadgen_id, pra Meta aprender a
+// priorizar entrega pra quem tende a virar lead bom, nao so quem preenche o
+// formulario. Doc: https://developers.facebook.com/documentation/ads-commerce/conversions-api/conversion-leads-integration
+
+async function obterOuCriarDatasetMetaUsuario(
+  usuarioId: number,
+  contaAnunciosId: string,
+  token: string
+) {
+  const conexao = await client.query(
+    `
+    SELECT id, dataset_id
+    FROM meta_conexoes
+    WHERE usuario_id = $1
+    ORDER BY id DESC
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+
+  const datasetExistente = conexao.rows[0]?.dataset_id;
+
+  if (datasetExistente) {
+    return datasetExistente;
+  }
+
+  const criado = await fetch(
+    `https://graph.facebook.com/v19.0/${contaAnunciosId}/adspixels`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "Plataforma de Leads",
+        access_token: token
+      })
+    }
+  ).then(r => r.json());
+
+  if (!criado?.id) {
+    throw new Error(
+      mensagemErroMeta(criado, "Erro ao criar dataset da Meta")
+    );
+  }
+
+  await client.query(
+    `UPDATE meta_conexoes SET dataset_id = $1 WHERE id = $2`,
+    [criado.id, conexao.rows[0]?.id]
+  );
+
+  return criado.id as string;
+}
+
+async function enviarEventoMetaConversionLeads(
+  usuarioId: number,
+  lead: any,
+  eventName: "Qualified Lead" | "Closed Won"
+): Promise<{ ok: boolean; erro?: string }> {
+
+  if (!lead?.lead_id) {
+    return { ok: false, erro: "Lead sem lead_id da Meta" };
+  }
+
+  const conexao = await client.query(
+    `
+    SELECT access_token, conta_anuncios_id, dataset_id
+    FROM meta_conexoes
+    WHERE usuario_id = $1
+    ORDER BY id DESC
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+
+  const token = conexao.rows[0]?.access_token;
+  const contaAnunciosId = conexao.rows[0]?.conta_anuncios_id;
+
+  if (!token || !contaAnunciosId) {
+    return { ok: false, erro: "Meta nao conectada" };
+  }
+
+  try {
+
+    const datasetId =
+      conexao.rows[0]?.dataset_id ||
+      (await obterOuCriarDatasetMetaUsuario(usuarioId, contaAnunciosId, token));
+
+    const resposta = await fetch(
+      `https://graph.facebook.com/v19.0/${datasetId}/events?access_token=${token}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          data: [{
+            event_name: eventName,
+            event_time: Math.floor(Date.now() / 1000),
+            action_source: "system_generated",
+            lead_id: String(lead.lead_id)
+          }]
+        })
+      }
+    ).then(r => r.json());
+
+    if (resposta?.error) {
+      const erro =
+        mensagemErroMeta(resposta, "Erro ao enviar evento para a Meta");
+      console.error(`CONVERSION LEADS (${eventName}) erro:`, erro);
+      return { ok: false, erro };
+    }
+
+    return { ok: true };
+
+  } catch (err: any) {
+    console.error(`CONVERSION LEADS (${eventName}) excecao:`, err);
+    return {
+      ok: false,
+      erro: err?.message || "Erro ao enviar evento para a Meta"
+    };
+  }
+}
+
+// Chamada nos pontos onde um lead e criado/atualizado. Best-effort: nunca deve
+// derrubar o fluxo principal (salvar o lead) por causa de uma falha na Meta.
+async function avaliarEEnviarQualificacaoMeta(
+  leadRow: any,
+  usuarioId: number
+) {
+  try {
+
+    if (!leadRow?.lead_id) {
+      return;
+    }
+
+    const usuario = await client.query(
+      `SELECT plano FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) {
+      return;
+    }
+
+    const scoreData = calcularScoreLead(leadRow);
+
+    if (
+      scoreData.score === "quente" &&
+      !leadRow.meta_evento_qualificado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoMetaConversionLeads(
+          usuarioId,
+          leadRow,
+          "Qualified Lead"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET meta_evento_qualificado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+    if (
+      leadRow.status === "fechado" &&
+      !leadRow.meta_evento_fechado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoMetaConversionLeads(
+          usuarioId,
+          leadRow,
+          "Closed Won"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET meta_evento_fechado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+  } catch (err) {
+    console.error("ERRO avaliarEEnviarQualificacaoMeta:", err);
+  }
 }
 
 async function registrarErroPublicacaoCampanha(
@@ -10288,7 +10479,7 @@ app.post("/webhook/meta", async (c) => {
             }
 
             // 💾 SALVA LEAD VINCULADO AO USUÁRIO CORRETO
-            await client.query(
+            const leadInserido = await client.query(
               `
               INSERT INTO leads (
                 usuario_id,
@@ -10306,6 +10497,7 @@ app.post("/webhook/meta", async (c) => {
                 criado_em
               )
               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13::timestamptz, NOW()))
+              RETURNING id
               `,
               [
                 usuarioId,
@@ -10333,6 +10525,17 @@ app.post("/webhook/meta", async (c) => {
 
             // 📲 notificação WhatsApp para o dono da campanha
             await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+
+            avaliarEEnviarQualificacaoMeta(
+              {
+                id: leadInserido.rows[0]?.id,
+                lead_id: leadgen_id,
+                status: "novo",
+                campanha: nomeCampanha,
+                respostas_qualificacao: respostasQualificacao
+              },
+              usuarioId
+            ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (webhook meta):", err));
           }
         }
       }
@@ -11291,6 +11494,19 @@ await client.query(`
   ALTER TABLE campanhas
     ADD COLUMN IF NOT EXISTS plataforma TEXT DEFAULT 'meta',
     ADD COLUMN IF NOT EXISTS publicacao_grupo_id TEXT;
+`);
+
+// Rastreio de envio dos eventos de Conversion Leads (Meta Conversions API) —
+// evita mandar o mesmo evento de novo se o lead oscilar de score depois.
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS meta_evento_qualificado_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS meta_evento_fechado_enviado_em TIMESTAMP;
+`);
+
+await client.query(`
+  ALTER TABLE meta_conexoes
+    ADD COLUMN IF NOT EXISTS dataset_id TEXT;
 `);
 
 /* =========================
@@ -13529,7 +13745,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
           console.log("FIELDS:", fields);
 
           // 🔥 salva lead
-          await client.query(
+          const leadSincronizado = await client.query(
             `
             INSERT INTO leads (
               usuario_id,
@@ -13549,6 +13765,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             VALUES (
               $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()
             )
+            RETURNING id
             `,
             [
               user.id,
@@ -13578,6 +13795,17 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             email: fields.email,
             campanha: nomeCampanha
           });
+
+          avaliarEEnviarQualificacaoMeta(
+            {
+              id: leadSincronizado.rows[0]?.id,
+              lead_id: lead.id,
+              status: "novo",
+              campanha: nomeCampanha,
+              respostas_qualificacao: respostasQualificacao
+            },
+            user.id
+          ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (sync meta):", err));
         }
       }
     }
@@ -15633,6 +15861,9 @@ app.put("/leads/:id", authMiddleware, async (c) => {
       scoreData.base;
     leadAtualizado.score_pontos =
       scoreData.pontos;
+
+    avaliarEEnviarQualificacaoMeta(leadAtualizado, user.id)
+      .catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (PUT /leads/:id):", err));
 
     return c.json({
       success: true,
