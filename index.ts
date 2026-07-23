@@ -15451,6 +15451,8 @@ app.get("/leads", authMiddleware, async (c) => {
         n.cor  AS nicho_cor,
         l.data_contato,
         l.observacao_agendamento,
+        l.meta_evento_qualificado_enviado_em,
+        l.meta_evento_fechado_enviado_em,
         COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
