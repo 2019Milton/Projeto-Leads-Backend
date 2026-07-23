@@ -1015,6 +1015,13 @@ async function avaliarEEnviarQualificacaoMeta(
       return;
     }
 
+    // TikTok e Google Ads também populam lead_id (com o id deles, não um
+    // leadgen_id da Meta) — sem esse filtro, PUT /leads/:id mandaria esses
+    // ids pra Conversions API da Meta como se fossem leadgen_id.
+    if ((leadRow.plataforma || leadRow.origem) !== "meta") {
+      return;
+    }
+
     const usuario = await client.query(
       `SELECT plano FROM usuarios WHERE id = $1`,
       [usuarioId]
@@ -10534,6 +10541,7 @@ app.post("/webhook/meta", async (c) => {
               {
                 id: leadInserido.rows[0]?.id,
                 lead_id: leadgen_id,
+                plataforma: "meta",
                 status: "novo",
                 campanha: nomeCampanha,
                 respostas_qualificacao: respostasQualificacao
@@ -13804,6 +13812,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             {
               id: leadSincronizado.rows[0]?.id,
               lead_id: lead.id,
+              plataforma: "meta",
               status: "novo",
               campanha: nomeCampanha,
               respostas_qualificacao: respostasQualificacao
@@ -15425,18 +15434,23 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
 
+    // Mesma regra de fallback de plataforma usada em GET /leads
+    // (COALESCE(plataforma, origem, 'formulario')), pra "Leads da Meta" bater
+    // com o resto do app em vez de usar um critério próprio.
     const resumo = await client.query(
       `
       SELECT
         COUNT(*) FILTER (
           WHERE lead_id IS NOT NULL
-          AND COALESCE(plataforma, origem) = 'meta'
+          AND COALESCE(plataforma, origem, 'formulario') = 'meta'
         )::int AS total_leads_meta,
         COUNT(*) FILTER (
           WHERE meta_evento_qualificado_enviado_em IS NOT NULL
+          AND COALESCE(plataforma, origem, 'formulario') = 'meta'
         )::int AS qualificados_enviados,
         COUNT(*) FILTER (
           WHERE meta_evento_fechado_enviado_em IS NOT NULL
+          AND COALESCE(plataforma, origem, 'formulario') = 'meta'
         )::int AS fechados_enviados
       FROM leads
       WHERE usuario_id = $1
@@ -16185,7 +16199,6 @@ app.get("/admin/ia", authMiddleware, async (c) => {
       LEFT JOIN ia_usos iu
         ON iu.usuario_id = u.id
         AND iu.criado_em >= date_trunc('month', CURRENT_DATE)
-      WHERE u.plano = 'ouro'
       GROUP BY
         u.id,
         u.email,
