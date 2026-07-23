@@ -61,22 +61,26 @@ const PARCEIRO_PERCENTUAL_COMISSAO = 0.35;
 type PlanoPlataforma =
   typeof PLANOS_PLATAFORMA[number];
 
+// Inteligência do Lead, ML e Conversion Leads (Meta) deixaram de ser
+// diferenciais por plano — valem para bronze/prata/ouro igualmente. As 3
+// flags abaixo ficam sempre true; os planos continuam existindo (billing e
+// possíveis gates futuros), só não recortam mais essas 3 capacidades.
 const RECURSOS_POR_PLANO = {
   bronze: {
-    machine_learning_leads: false,
-    ia_leads: false,
+    machine_learning_leads: true,
+    ia_leads: true,
     ia_assistente_comercial: false,
     ia_analise_campanhas: false,
     ia_whatsapp: false,
-    meta_conversion_leads: false
+    meta_conversion_leads: true
   },
   prata: {
     machine_learning_leads: true,
-    ia_leads: false,
+    ia_leads: true,
     ia_assistente_comercial: false,
     ia_analise_campanhas: false,
     ia_whatsapp: false,
-    meta_conversion_leads: false
+    meta_conversion_leads: true
   },
   ouro: {
     machine_learning_leads: true,
@@ -15412,6 +15416,83 @@ app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO stats plataformas:", err);
     return c.json({ error: "Erro ao carregar stats" }, 500);
+  }
+});
+
+// 🔹 dashboard "IA & Performance Meta" — o que já foi enviado pro Conversion
+// Leads da Meta (ver avaliarEEnviarQualificacaoMeta) e os últimos eventos.
+app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    const resumo = await client.query(
+      `
+      SELECT
+        COUNT(*) FILTER (
+          WHERE lead_id IS NOT NULL
+          AND COALESCE(plataforma, origem) = 'meta'
+        )::int AS total_leads_meta,
+        COUNT(*) FILTER (
+          WHERE meta_evento_qualificado_enviado_em IS NOT NULL
+        )::int AS qualificados_enviados,
+        COUNT(*) FILTER (
+          WHERE meta_evento_fechado_enviado_em IS NOT NULL
+        )::int AS fechados_enviados
+      FROM leads
+      WHERE usuario_id = $1
+      `,
+      [user.id]
+    );
+
+    const { total_leads_meta, qualificados_enviados, fechados_enviados } =
+      resumo.rows[0];
+
+    const ultimosEventos = await client.query(
+      `
+      SELECT
+        nome,
+        meta_evento_qualificado_enviado_em,
+        meta_evento_fechado_enviado_em
+      FROM leads
+      WHERE usuario_id = $1
+      AND (
+        meta_evento_qualificado_enviado_em IS NOT NULL
+        OR meta_evento_fechado_enviado_em IS NOT NULL
+      )
+      ORDER BY
+        COALESCE(
+          meta_evento_fechado_enviado_em,
+          meta_evento_qualificado_enviado_em
+        ) DESC
+      LIMIT 10
+      `,
+      [user.id]
+    );
+
+    return c.json({
+      total_leads_meta,
+      qualificados_enviados,
+      fechados_enviados,
+      taxa_qualificacao:
+        total_leads_meta > 0
+          ? (qualificados_enviados / total_leads_meta) * 100
+          : null,
+      taxa_fechamento:
+        total_leads_meta > 0
+          ? (fechados_enviados / total_leads_meta) * 100
+          : null,
+      ultimos_eventos: ultimosEventos.rows.map(row => ({
+        nome: row.nome,
+        tipo: row.meta_evento_fechado_enviado_em ? "fechado" : "qualificado",
+        enviado_em:
+          row.meta_evento_fechado_enviado_em ||
+          row.meta_evento_qualificado_enviado_em
+      }))
+    });
+
+  } catch (err) {
+    console.error("ERRO estatisticas meta-conversao:", err);
+    return c.json({ error: "Erro ao carregar estatisticas" }, 500);
   }
 });
 
