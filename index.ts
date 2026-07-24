@@ -1076,6 +1076,124 @@ async function avaliarEEnviarQualificacaoMeta(
   }
 }
 
+// Fase 2 do Conversion Leads: monta a config de Ad Set que faz a Meta
+// realmente otimizar entrega usando o evento "Qualified Lead" (em vez de só
+// receber o evento sem agir sobre ele). Retorna null quando o usuário não é
+// elegível (sem Meta conectada, sem plano, sem page_id) — quem chama deve
+// cair pro LEAD_GENERATION de sempre nesse caso.
+async function obterConfigQualityLead(
+  usuarioId: number,
+  pageId: string
+): Promise<{ optimization_goal: string; promoted_object: any } | null> {
+
+  try {
+
+    if (!pageId) {
+      return null;
+    }
+
+    const usuario = await client.query(
+      `SELECT plano FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) {
+      return null;
+    }
+
+    const conexao = await client.query(
+      `
+      SELECT access_token, conta_anuncios_id, dataset_id
+      FROM meta_conexoes
+      WHERE usuario_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [usuarioId]
+    );
+
+    const token = conexao.rows[0]?.access_token;
+    const contaAnunciosId = conexao.rows[0]?.conta_anuncios_id;
+
+    if (!token || !contaAnunciosId) {
+      return null;
+    }
+
+    const datasetId =
+      conexao.rows[0]?.dataset_id ||
+      (await obterOuCriarDatasetMetaUsuario(usuarioId, contaAnunciosId, token));
+
+    return {
+      optimization_goal: "QUALITY_LEAD",
+      promoted_object: {
+        page_id: pageId,
+        pixel_id: datasetId,
+        // custom_event_type "OTHER" + custom_event_str é obrigatório aqui:
+        // "Qualified Lead" é um nome de evento nosso, não um evento padrão da
+        // Meta — usar custom_event_type "LEAD" faria a Meta procurar pelo
+        // evento padrão "Lead" (que nunca mandamos) e a otimização pareceria
+        // configurada mas nunca teria dado nenhum.
+        custom_event_type: "OTHER",
+        custom_event_str: "Qualified Lead"
+      }
+    };
+
+  } catch (err) {
+    console.error("ERRO obterConfigQualityLead:", err);
+    return null;
+  }
+}
+
+// Cria um Ad Set tentando primeiro otimizar por Quality Lead (o nome técnico
+// do que a Meta chama comercialmente de "Conversion Leads"); se a Meta
+// rejeitar essa config, cai automaticamente pro LEAD_GENERATION de sempre em
+// vez de falhar a criação da campanha — mesmo padrão de fallback já usado por
+// enviarPayloadMetaComFallbackBid pra lance/idade. Só usar na CRIAÇÃO de um Ad
+// Set: a Meta não permite trocar optimization_goal de um que já está rodando.
+async function criarAdSetMetaComOtimizacaoInteligente(
+  url: string,
+  payloadBase: Record<string, any>,
+  contexto: string,
+  usuarioId: number
+) {
+
+  const pageId = payloadBase?.promoted_object?.page_id;
+
+  const configQuality =
+    await obterConfigQualityLead(usuarioId, pageId);
+
+  if (!configQuality) {
+    return enviarPayloadMetaComFallbackBid(url, payloadBase, contexto);
+  }
+
+  const payloadQuality = {
+    ...payloadBase,
+    optimization_goal: configQuality.optimization_goal,
+    promoted_object: configQuality.promoted_object
+  };
+
+  const resposta = await enviarPayloadMetaComFallbackBid(
+    url,
+    payloadQuality,
+    `${contexto}_QUALITY_LEAD`
+  );
+
+  if (!resposta.error) {
+    return resposta;
+  }
+
+  console.warn(
+    `${contexto}: Meta rejeitou otimizacao Quality Lead, usando LEAD_GENERATION`,
+    resposta.error
+  );
+
+  return enviarPayloadMetaComFallbackBid(
+    url,
+    payloadBase,
+    `${contexto}_FALLBACK_LEAD_GEN`
+  );
+}
+
 async function registrarErroPublicacaoCampanha(
   campanhaId: number,
   mensagem: string
@@ -7672,10 +7790,11 @@ app.post("/meta/adset", authMiddleware, async (c) => {
       }
     }
 
-    let adset = await enviarPayloadMetaComFallbackBid(
+    let adset = await criarAdSetMetaComOtimizacaoInteligente(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       payloadAdset,
-      "ADSET"
+      "ADSET",
+      usuarioId
     );
 
     console.log(
@@ -15157,10 +15276,11 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         new Date(fim).toISOString();
     }
 
-    const adsetMeta = await enviarPayloadMetaComFallbackBid(
+    const adsetMeta = await criarAdSetMetaComOtimizacaoInteligente(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       payloadAdset,
-      "PUBLICAR_RECEBIDA_ADSET"
+      "PUBLICAR_RECEBIDA_ADSET",
+      user.id
     );
 
     if (!adsetMeta.id) {
@@ -21034,10 +21154,11 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
         Math.round(controleCustoRascunho.bidAmount * 100);
     }
 
-    const adsetMeta = await enviarPayloadMetaComFallbackBid(
+    const adsetMeta = await criarAdSetMetaComOtimizacaoInteligente(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       payloadAdset,
-      "ATIVAR_RASCUNHO_ADSET"
+      "ATIVAR_RASCUNHO_ADSET",
+      user.id
     );
 
     if (adsetMeta.error) {
