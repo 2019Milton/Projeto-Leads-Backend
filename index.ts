@@ -1738,7 +1738,8 @@ function calcularScoreLead(
     [
       lead.campanha,
       lead.observacao,
-      respostasTexto
+      respostasTexto,
+      lead.whatsapp_transcricao
     ]
       .filter(Boolean)
       .join(" ")
@@ -1747,7 +1748,8 @@ function calcularScoreLead(
   const textoQualificacao =
     [
       lead.observacao,
-      respostasTexto
+      respostasTexto,
+      lead.whatsapp_transcricao
     ]
       .filter(Boolean)
       .join(" ")
@@ -2071,6 +2073,11 @@ function extrairFeaturesMLLead(lead: any) {
   adicionarTokensTextoMLLead(
     features,
     textoRespostasQualificacao(lead)
+  );
+
+  adicionarTokensTextoMLLead(
+    features,
+    lead?.whatsapp_transcricao
   );
 
   return [...features];
@@ -10886,6 +10893,78 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
   }
 }
 
+// Vincula a conversa a um lead JÁ EXISTENTE pelo telefone (não cria lead novo
+// a partir de WhatsApp — decisão do produto: mensagem de número sem lead
+// correspondente fica só registrada em whatsapp_mensagens_log). Roda uma vez
+// por conversa: assim que lead_id é preenchido, próximas mensagens pulam a busca.
+async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise<number | null> {
+  if (conversa.lead_id) {
+    return conversa.lead_id;
+  }
+
+  const telefoneConversa = normalizarTelefoneWhatsApp(conversa.telefone_cliente);
+  if (!telefoneConversa) {
+    return null;
+  }
+
+  const leadsUsuario = await client.query(
+    `SELECT id, telefone FROM leads WHERE usuario_id = $1 AND telefone IS NOT NULL`,
+    [usuarioId]
+  );
+
+  const leadEncontrado = leadsUsuario.rows.find((lead: any) =>
+    normalizarTelefoneWhatsApp(lead.telefone) === telefoneConversa
+  );
+
+  if (!leadEncontrado) {
+    return null;
+  }
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [leadEncontrado.id, conversa.id]
+  );
+
+  return leadEncontrado.id;
+}
+
+// Preenche nicho_slug/nicho_nome + o transcript de mensagens do WhatsApp (só
+// direcao='entrada', a fala do próprio cliente — o roteiro do bot é texto fixo
+// do script, não sinal) num lead já carregado. Usado onde não dá pra fazer um
+// SELECT com JOIN direto: PUT /leads/:id (só tem o RETURNING * cru do UPDATE)
+// e o webhook do WhatsApp (lead buscado avulso após vincularConversaAoLead).
+async function enriquecerLeadParaInteligencia(lead: any) {
+  if (!lead?.id) {
+    return lead;
+  }
+
+  const extra = await client.query(
+    `
+    SELECT
+      n.slug AS nicho_slug,
+      n.nome AS nicho_nome,
+      (
+        SELECT string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em)
+        FROM whatsapp_mensagens_log wml
+        JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+        WHERE wc.lead_id = l.id AND wml.direcao = 'entrada'
+      ) AS whatsapp_transcricao
+    FROM leads l
+    LEFT JOIN nichos n ON n.id = l.nicho_id
+    WHERE l.id = $1
+    `,
+    [lead.id]
+  );
+
+  const row = extra.rows[0];
+
+  lead.nicho_slug = row?.nicho_slug || null;
+  lead.nicho_nome = row?.nicho_nome || null;
+  lead.whatsapp_transcricao = row?.whatsapp_transcricao || null;
+
+  return lead;
+}
+
 async function processarEventoWhatsApp(value: any) {
   const phoneNumberId = value?.metadata?.phone_number_id;
   if (!phoneNumberId) return;
@@ -10940,6 +11019,36 @@ async function processarEventoWhatsApp(value: any) {
     if (logRes.rows.length === 0) {
       console.log(`[whatsapp-webhook] mensagem ${msg.id} já processada, ignorando`);
       continue;
+    }
+
+    // Guarda cru o referral (anúncio "clique para WhatsApp" que originou a
+    // conversa), se vier e ainda não tiver sido guardado — não usado pra
+    // vincular ainda, só arquivado pra atribuição por campanha no futuro.
+    if (msg.referral && !conversa.referral) {
+      await client.query(
+        `UPDATE whatsapp_conversas SET referral = $1 WHERE id = $2`,
+        [JSON.stringify(msg.referral), conversa.id]
+      ).catch(e => console.error("ERRO ao salvar referral whatsapp:", e));
+    }
+
+    // Vincula ao lead (se o telefone bater) e fecha o loop: recalcula o score
+    // já considerando a conversa e, se isso levar o lead a "quente"/fechado,
+    // dispara o evento de qualificação pra Meta na hora — não só na próxima
+    // vez que o lead for lido/salvo pela tela.
+    const leadIdVinculado = await vincularConversaAoLead(conversa, usuarioId)
+      .catch(e => { console.error("ERRO vincularConversaAoLead:", e); return null; });
+
+    if (leadIdVinculado) {
+      client.query(`SELECT * FROM leads WHERE id = $1`, [leadIdVinculado])
+        .then(async (leadRes) => {
+          const lead = leadRes.rows[0];
+          if (!lead) return;
+          await enriquecerLeadParaInteligencia(lead);
+          const scoreData = calcularScoreLead(lead);
+          lead.score = scoreData.score;
+          await avaliarEEnviarQualificacaoMeta(lead, usuarioId);
+        })
+        .catch(e => console.error("ERRO avaliarEEnviarQualificacaoMeta (whatsapp):", e));
     }
 
     if (conversa.status === "humano" || conversa.status === "encerrada") continue;
@@ -11720,6 +11829,20 @@ await client.query(`
     conteudo    TEXT,
     criado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+`);
+
+// Vincula a conversa do WhatsApp ao lead (por telefone, ver vincularConversaAoLead)
+// pra virar sinal de inteligência do lead (score/ML/IA) e alimentar o Conversion
+// Leads da Meta. `referral` guarda cru o que a Meta manda quando a conversa vem
+// de anúncio "clique para WhatsApp" — não usado pra vincular ainda, só arquivado.
+await client.query(`
+  ALTER TABLE whatsapp_conversas
+    ADD COLUMN IF NOT EXISTS lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS referral JSONB;
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_whatsapp_conversas_lead ON whatsapp_conversas(lead_id);
 `);
 
 await client.query(`
@@ -15832,9 +15955,17 @@ app.get("/leads", authMiddleware, async (c) => {
         l.observacao_agendamento,
         l.meta_evento_qualificado_enviado_em,
         l.meta_evento_fechado_enviado_em,
-        COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma
+        COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma,
+        wt.transcricao AS whatsapp_transcricao
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
+      LEFT JOIN (
+        SELECT wc.lead_id, string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em) AS transcricao
+        FROM whatsapp_mensagens_log wml
+        JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+        WHERE wc.lead_id IS NOT NULL AND wml.direcao = 'entrada'
+        GROUP BY wc.lead_id
+      ) wt ON wt.lead_id = l.id
       WHERE l.usuario_id = $1
       AND (
         COALESCE(l.origem, 'manual') <> 'meta'
@@ -15995,7 +16126,13 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
         l.respostas_qualificacao,
         l.criado_em,
         n.slug AS nicho_slug,
-        n.nome AS nicho_nome
+        n.nome AS nicho_nome,
+        (
+          SELECT string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em)
+          FROM whatsapp_mensagens_log wml
+          JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+          WHERE wc.lead_id = l.id AND wml.direcao = 'entrada'
+        ) AS whatsapp_transcricao
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
       WHERE l.id = $1
@@ -16028,9 +16165,17 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
         l.respostas_qualificacao,
         l.criado_em,
         n.slug AS nicho_slug,
-        n.nome AS nicho_nome
+        n.nome AS nicho_nome,
+        wt.transcricao AS whatsapp_transcricao
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
+      LEFT JOIN (
+        SELECT wc.lead_id, string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em) AS transcricao
+        FROM whatsapp_mensagens_log wml
+        JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+        WHERE wc.lead_id IS NOT NULL AND wml.direcao = 'entrada'
+        GROUP BY wc.lead_id
+      ) wt ON wt.lead_id = l.id
       WHERE l.usuario_id = $1
       `,
       [user.id]
@@ -16240,17 +16385,10 @@ app.put("/leads/:id", authMiddleware, async (c) => {
     const leadAtualizado =
       result.rows[0];
 
-    // RETURNING * só traz nicho_id (a FK crua) — sem isso a pontuação/ML por
-    // nicho nunca dispara ao editar um lead direto, só na listagem (GET /leads).
-    if (leadAtualizado.nicho_id) {
-      const nichoRow = await client.query(
-        `SELECT slug, nome FROM nichos WHERE id = $1`,
-        [leadAtualizado.nicho_id]
-      );
-
-      leadAtualizado.nicho_slug = nichoRow.rows[0]?.slug || null;
-      leadAtualizado.nicho_nome = nichoRow.rows[0]?.nome || null;
-    }
+    // RETURNING * só traz dados crus (nicho_id como FK, nada de WhatsApp) —
+    // sem isso a pontuação/ML por nicho/conversa nunca dispara ao editar um
+    // lead direto, só na listagem (GET /leads, que já faz os JOINs).
+    await enriquecerLeadParaInteligencia(leadAtualizado);
 
     const scoreData =
       calcularScoreLead(leadAtualizado);
@@ -16347,6 +16485,35 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
   } catch (err: any) {
     console.error("ERRO DATA CONTATO:", err);
     return c.json({ error: "Erro ao salvar data de contato", detail: String(err?.message || err) }, 500);
+  }
+});
+
+// Transcript da conversa de WhatsApp vinculada a este lead (ver
+// vincularConversaAoLead), pro drawer de detalhes do lead mostrar de verdade
+// as mensagens trocadas, não só usar como sinal internamente.
+app.get("/leads/:id/whatsapp", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const leadId = Number(c.req.param("id"));
+
+    const mensagens = await client.query(
+      `
+      SELECT wml.conteudo, wml.direcao, wml.criado_em
+      FROM whatsapp_mensagens_log wml
+      JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+      JOIN leads l ON l.id = wc.lead_id
+      WHERE wc.lead_id = $1
+      AND l.usuario_id = $2
+      ORDER BY wml.criado_em ASC
+      `,
+      [leadId, user.id]
+    );
+
+    return c.json({ mensagens: mensagens.rows });
+
+  } catch (err) {
+    console.error("ERRO /leads/:id/whatsapp:", err);
+    return c.json({ error: "Erro ao carregar conversa do WhatsApp" }, 500);
   }
 });
 
@@ -20584,6 +20751,14 @@ async function notificarNovoLeadWhatsApp(
   }
 }
 
+// Formato de telefone que o WhatsApp (Z-API e Cloud API oficial) espera: só
+// dígitos, sempre com o prefixo 55. Mesma normalização usada pra vincular uma
+// conversa a um lead pelo telefone (ver vincularConversaAoLead).
+function normalizarTelefoneWhatsApp(valor: unknown): string {
+  const numero = String(valor || "").replace(/\D/g, "");
+  return numero ? (numero.startsWith("55") ? numero : `55${numero}`) : "";
+}
+
 async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
   const instanceId = Bun.env.ZAPI_INSTANCE_ID;
   const token      = Bun.env.ZAPI_TOKEN;
@@ -20593,13 +20768,12 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
     return;
   }
 
-  const numero = String(telefone).replace(/\D/g, "");
-  if (!numero) {
+  const phone = normalizarTelefoneWhatsApp(telefone);
+  if (!phone) {
     console.warn("⚠️ Z-API: número vazio, envio cancelado");
     return;
   }
 
-  const phone = numero.startsWith("55") ? numero : `55${numero}`;
   const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
 
   try {
@@ -20638,12 +20812,11 @@ async function enviarMensagemWhatsAppOficial(
     return;
   }
 
-  const numero = String(telefoneDestino).replace(/\D/g, "");
-  if (!numero) {
+  const to = normalizarTelefoneWhatsApp(telefoneDestino);
+  if (!to) {
     console.warn("⚠️ WhatsApp Oficial: número vazio, envio cancelado");
     return;
   }
-  const to = numero.startsWith("55") ? numero : `55${numero}`;
 
   try {
     const res = await fetch(
