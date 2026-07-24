@@ -506,6 +506,19 @@ function textoOpcional(value: unknown) {
   return String(value ?? "").trim();
 }
 
+// Corta no limite de caracteres sem partir uma palavra ao meio (ex: "vale a pena!"
+// virando "vale a pen"), usado nos campos curtos de anúncio/formulário Google Ads
+// que rejeitam texto acima do limite (TOO_LONG). Só corta na última palavra inteira
+// quando sobra pelo menos metade do limite — evita texto minúsculo quando o primeiro
+// espaço está bem no início.
+function truncarSemCortarPalavra(texto: unknown, limite: number) {
+  const t = String(texto ?? "").trim();
+  if (t.length <= limite) return t;
+  const cortado = t.slice(0, limite);
+  const ultimoEspaco = cortado.lastIndexOf(" ");
+  return ultimoEspaco >= limite * 0.5 ? cortado.slice(0, ultimoEspaco).trim() : cortado.trim();
+}
+
 function escaparHtmlEmail(value: unknown) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -5683,15 +5696,20 @@ app.post("/google/formulario", authMiddleware, async (c) => {
       .filter(Boolean)
       .slice(0, 5);
 
+    // Limites de caracteres do Google Ads para LeadFormAsset (confirmado via
+    // documentacao oficial: nome do negocio 25, titulo 30, descricao 200 —
+    // postSubmitHeadline/Description seguem o mesmo padrao dos campos irmaos
+    // headline/description). Sem truncar, texto vindo da IA ou do usuario que
+    // passe do limite derruba a criacao inteira com erro TOO_LONG.
     const leadFormAsset: any = {
-      businessName: textoOpcional(nome_negocio) || "Plataforma de Leads",
+      businessName: truncarSemCortarPalavra(textoOpcional(nome_negocio) || "Plataforma de Leads", 25),
       callToActionType: "GET_INFO",
       callToActionDescription: "Fale com um especialista",
-      headline: textoOpcional(headline) || "Receba mais informações",
-      description: textoOpcional(descricao) || "Deixe seus dados e entraremos em contato.",
+      headline: truncarSemCortarPalavra(textoOpcional(headline) || "Receba mais informações", 30),
+      description: truncarSemCortarPalavra(textoOpcional(descricao) || "Deixe seus dados e entraremos em contato.", 200),
       privacyPolicyUrl: urlOpcional(privacidade_url, "https://google.com"),
-      postSubmitHeadline: textoOpcional(obrigado_titulo) || "Obrigado!",
-      postSubmitDescription: textoOpcional(obrigado_texto) || "Recebemos seus dados. Em breve entraremos em contato.",
+      postSubmitHeadline: truncarSemCortarPalavra(textoOpcional(obrigado_titulo) || "Obrigado!", 30),
+      postSubmitDescription: truncarSemCortarPalavra(textoOpcional(obrigado_texto) || "Recebemos seus dados. Em breve entraremos em contato.", 200),
       postSubmitCallToActionType: "VISIT_SITE",
       fields: [
         { inputType: "FULL_NAME" },
@@ -5928,8 +5946,10 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
   }
 });
 
-// Exclui (soft-delete) uma campanha Google Ads criada pela plataforma — a Google Ads API
-// nao tem hard delete via mutate, so status=REMOVED (mesmo padrao do /tiktok/excluir-campanha).
+// Exclui (soft-delete) uma campanha Google Ads criada pela plataforma via operacao
+// "remove" no mutate — a Google Ads API resulta no mesmo status=REMOVED internamente,
+// mas nao aceita mais chegar la via update de status (mesma ideia do /tiktok/excluir-campanha,
+// so que a forma de acionar difere entre as duas APIs).
 app.post("/google/excluir-campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -5955,11 +5975,12 @@ app.post("/google/excluir-campanha", authMiddleware, async (c) => {
     if (!("erro" in conexao)) {
       const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
       try {
+        // A API do Google Ads nao aceita mais setar status:"REMOVED" via update
+        // ("Enum value 'REMOVED' cannot be used", confirmado em producao) — o jeito
+        // correto de excluir um recurso via mutate e a operacao "remove", que leva
+        // so o resourceName (sem updateMask).
         await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
-          {
-            update: { resourceName: campaignResourceName, status: "REMOVED" },
-            updateMask: "status",
-          },
+          { remove: campaignResourceName },
         ]);
       } catch (err: any) {
         // Tolera campanha ja removida/inexistente no Google Ads — mesmo espirito do Meta/TikTok:
@@ -17953,18 +17974,6 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   const nomesPlataformas = plataformas
     .map(p => ({ meta: "Meta Ads", tiktok: "TikTok Ads", google: "Google Ads" }[p]))
     .filter(Boolean) as string[];
-
-  // Corta no limite de caracteres sem partir uma palavra ao meio (ex: "vale a pena!"
-  // virando "vale a pen"), usado nos campos curtos do anúncio Google Ads. Só corta na
-  // última palavra inteira quando sobra pelo menos metade do limite — evita título
-  // minúsculo quando o primeiro espaço está bem no início do texto.
-  const truncarSemCortarPalavra = (texto: string, limite: number) => {
-    const t = String(texto || "").trim();
-    if (t.length <= limite) return t;
-    const cortado = t.slice(0, limite);
-    const ultimoEspaco = cortado.lastIndexOf(" ");
-    return ultimoEspaco >= limite * 0.5 ? cortado.slice(0, ultimoEspaco).trim() : cortado.trim();
-  };
 
   const nichoConfig: Record<string, {
     topicoDefault: string;
