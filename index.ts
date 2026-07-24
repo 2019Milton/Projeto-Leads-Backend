@@ -1850,6 +1850,20 @@ function calcularScoreLead(
     base.push("+20 Lead retornou novamente");
   }
 
+  // 🎯 Sinal específico do nicho do lead (imóveis, saúde, suplementos...) —
+  // além das regras genéricas acima, cada nicho tem seu próprio vocabulário
+  // de intenção forte (ver VOCABULARIO_NICHO).
+  const chaveNicho = detectarChaveNicho(lead);
+
+  if (chaveNicho) {
+    const vocabularioNicho = VOCABULARIO_NICHO[chaveNicho];
+
+    if (vocabularioNicho.some(palavra => textoComercial.includes(palavra))) {
+      pontos += 20;
+      base.push(`+20 Sinal específico do nicho (${contextoNicho(lead).nicho})`);
+    }
+  }
+
   // 🔥 Classificação final
   let score = "frio";
 
@@ -2019,6 +2033,12 @@ function extrairFeaturesMLLead(lead: any) {
     idadeLeadEmDias(lead);
 
   features.add(`origem:${origem}`);
+
+  const chaveNicho = detectarChaveNicho(lead);
+
+  if (chaveNicho) {
+    features.add(`nicho:${chaveNicho}`);
+  }
 
   if (textoOpcional(lead?.email)) {
     features.add("contato:email");
@@ -2362,17 +2382,52 @@ function detectarSinaisIA(lead: any, ml: any) {
   return { sinais, riscos };
 }
 
-function contextoNicho(lead: any) {
+// Chave curta de nicho usada tanto pelo contexto da IA (contextoNicho) quanto
+// pela pontuação por regras e pelas features do ML (calcularScoreLead,
+// extrairFeaturesMLLead) — único lugar que decide "qual nicho é esse lead".
+type ChaveNicho =
+  | "imoveis" | "saude" | "suplementos" | "saas"
+  | "educacao" | "auto" | "consorcio";
+
+function detectarChaveNicho(lead: any): ChaveNicho | null {
   const slug = String(lead?.nicho_slug || "").toLowerCase();
   const nome = String(lead?.nicho_nome || "").toLowerCase();
 
-  const isImoveis    = slug.includes("imovel") || slug.includes("imóvel") || nome.includes("imóv") || nome.includes("imovel");
-  const isSaude      = slug.includes("saude")  || slug.includes("saúde")  || nome.includes("saúde") || nome.includes("saude");
-  const isSuplemento = slug.includes("suplement") || nome.includes("suplement");
-  const isSaas       = slug.includes("saas") || slug.includes("plataforma") || nome.includes("saas") || nome.includes("plataforma");
-  const isEducacao   = slug.includes("educa") || nome.includes("educa") || nome.includes("curso") || nome.includes("ensino");
-  const isAuto       = slug.includes("auto") || nome.includes("auto") || nome.includes("veículo") || nome.includes("veiculo") || nome.includes("carro");
-  const isConsorcio  = slug.includes("consorcio") || slug.includes("consórcio") || nome.includes("consórcio") || nome.includes("consorcio");
+  if (slug.includes("imovel") || slug.includes("imóvel") || nome.includes("imóv") || nome.includes("imovel")) return "imoveis";
+  if (slug.includes("saude")  || slug.includes("saúde")  || nome.includes("saúde") || nome.includes("saude")) return "saude";
+  if (slug.includes("suplement") || nome.includes("suplement")) return "suplementos";
+  if (slug.includes("saas") || slug.includes("plataforma") || nome.includes("saas") || nome.includes("plataforma")) return "saas";
+  if (slug.includes("educa") || nome.includes("educa") || nome.includes("curso") || nome.includes("ensino")) return "educacao";
+  if (slug.includes("auto") || nome.includes("auto") || nome.includes("veículo") || nome.includes("veiculo") || nome.includes("carro")) return "auto";
+  if (slug.includes("consorcio") || slug.includes("consórcio") || nome.includes("consórcio") || nome.includes("consorcio")) return "consorcio";
+
+  return null;
+}
+
+// Palavras-chave reais por nicho, usadas pela pontuação por regras
+// (calcularScoreLead) — derivadas dos "qualificadores" que contextoNicho já
+// usa nos prompts de IA, só que aqui viram termos que batem contra o texto
+// do lead (campanha/observação/respostas), não tópicos pra pergunta.
+const VOCABULARIO_NICHO: Record<ChaveNicho, string[]> = {
+  imoveis: ["financiamento", "entrada", "visita", "aluguel", "condominio", "condomínio", "escritura", "metragem", "iptu", "chaves"],
+  saude: ["cobertura", "sinistro", "carencia", "carência", "reembolso", "internacao", "internação", "operadora", "mensalidade", "dependente"],
+  suplementos: ["assinatura", "recorrencia", "recorrência", "whey", "creatina", "treino", "academia", "hipertrofia", "emagrecimento", "dose"],
+  saas: ["implantacao", "implantação", "licenca", "licença", "usuarios", "usuários", "integracao", "integração", "trial", "onboarding"],
+  educacao: ["matricula", "matrícula", "turma", "bolsa", "certificado", "presencial", "carga horaria", "carga horária", "professor", "aula"],
+  auto: ["seminovo", "revisao", "revisão", "test drive", "quilometragem", "troca", "financiamento", "entrada", "placa", "laudo"],
+  consorcio: ["carta de credito", "carta de crédito", "contemplacao", "contemplação", "lance", "grupo", "cota", "assembleia"]
+};
+
+function contextoNicho(lead: any) {
+  const chave = detectarChaveNicho(lead);
+
+  const isImoveis    = chave === "imoveis";
+  const isSaude      = chave === "saude";
+  const isSuplemento = chave === "suplementos";
+  const isSaas       = chave === "saas";
+  const isEducacao   = chave === "educacao";
+  const isAuto       = chave === "auto";
+  const isConsorcio  = chave === "consorcio";
 
   if (isImoveis) return {
     nicho: "Imóveis",
@@ -15892,22 +15947,25 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
     const leadResult = await client.query(
       `
       SELECT
-        id,
-        nome,
-        telefone,
-        email,
-        status,
-        origem,
-        campanha,
-        observacao,
-        score,
-        score_manual,
-        motivo_perda,
-        respostas_qualificacao,
-        criado_em
-      FROM leads
-      WHERE id = $1
-      AND usuario_id = $2
+        l.id,
+        l.nome,
+        l.telefone,
+        l.email,
+        l.status,
+        l.origem,
+        l.campanha,
+        l.observacao,
+        l.score,
+        l.score_manual,
+        l.motivo_perda,
+        l.respostas_qualificacao,
+        l.criado_em,
+        n.slug AS nicho_slug,
+        n.nome AS nicho_nome
+      FROM leads l
+      LEFT JOIN nichos n ON n.id = l.nicho_id
+      WHERE l.id = $1
+      AND l.usuario_id = $2
       LIMIT 1
       `,
       [id, user.id]
@@ -15922,21 +15980,24 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
     const todosLeads = await client.query(
       `
       SELECT
-        id,
-        nome,
-        telefone,
-        email,
-        status,
-        origem,
-        campanha,
-        observacao,
-        score,
-        score_manual,
-        motivo_perda,
-        respostas_qualificacao,
-        criado_em
-      FROM leads
-      WHERE usuario_id = $1
+        l.id,
+        l.nome,
+        l.telefone,
+        l.email,
+        l.status,
+        l.origem,
+        l.campanha,
+        l.observacao,
+        l.score,
+        l.score_manual,
+        l.motivo_perda,
+        l.respostas_qualificacao,
+        l.criado_em,
+        n.slug AS nicho_slug,
+        n.nome AS nicho_nome
+      FROM leads l
+      LEFT JOIN nichos n ON n.id = l.nicho_id
+      WHERE l.usuario_id = $1
       `,
       [user.id]
     );
@@ -16144,6 +16205,19 @@ app.put("/leads/:id", authMiddleware, async (c) => {
 
     const leadAtualizado =
       result.rows[0];
+
+    // RETURNING * só traz nicho_id (a FK crua) — sem isso a pontuação/ML por
+    // nicho nunca dispara ao editar um lead direto, só na listagem (GET /leads).
+    if (leadAtualizado.nicho_id) {
+      const nichoRow = await client.query(
+        `SELECT slug, nome FROM nichos WHERE id = $1`,
+        [leadAtualizado.nicho_id]
+      );
+
+      leadAtualizado.nicho_slug = nichoRow.rows[0]?.slug || null;
+      leadAtualizado.nicho_nome = nichoRow.rows[0]?.nome || null;
+    }
+
     const scoreData =
       calcularScoreLead(leadAtualizado);
 
