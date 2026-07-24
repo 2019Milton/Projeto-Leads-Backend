@@ -14531,7 +14531,9 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       campaign_id,
       daily_budget,
       configuracoes_avancadas,
-      nome
+      nome,
+      imageHash: imageHashNovo,
+      imageHashes: imageHashesNovo
     } = await c.req.json();
 
     const usuarioId =
@@ -14544,6 +14546,13 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     // Campanha ainda não publicada na Meta (duplicada ou rascunho): salva só localmente
     if (!campaign_id && campanha_local_id) {
       const avancadas = configuracoes_avancadas || {};
+      if (Array.isArray(imageHashesNovo) && imageHashesNovo.length) {
+        avancadas.imageHashes = imageHashesNovo;
+        avancadas.imageHash = imageHashesNovo[0] || null;
+      } else if (textoOpcional(imageHashNovo)) {
+        avancadas.imageHash = imageHashNovo;
+        avancadas.imageHashes = [imageHashNovo];
+      }
       const dailyBudget = numeroOpcional(daily_budget);
       const nomeLocal = textoOpcional(nome);
       await client.query(
@@ -14826,18 +14835,29 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         textoOpcional(cfgBanco.cta) || "LEARN_MORE";
 
       const imageHash =
+        textoOpcional(imageHashNovo) ||
         textoOpcional(avancadas.imageHash) ||
         textoOpcional(avancadas.image_hash) ||
         textoOpcional(cfgBanco.imageHash) ||
         textoOpcional(cfgBanco.image_hash) || "";
 
       const imageHashes: string[] =
-        (Array.isArray(avancadas.imageHashes) && avancadas.imageHashes.length
+        (Array.isArray(imageHashesNovo) && imageHashesNovo.length
+          ? imageHashesNovo
+          : Array.isArray(avancadas.imageHashes) && avancadas.imageHashes.length
           ? avancadas.imageHashes
           : Array.isArray(cfgBanco.imageHashes) && cfgBanco.imageHashes.length
           ? cfgBanco.imageHashes
           : imageHash ? [imageHash] : []
         ).filter(Boolean);
+
+      // Reflete a imagem nova recem-enviada em `avancadas` antes de persistir no
+      // banco — sem isso o criativo na Meta ficava certo mas o registro salvo
+      // (e portanto a tela de detalhes) continuava com o hash antigo.
+      if (imageHashes.length) {
+        avancadas.imageHashes = imageHashes;
+        avancadas.imageHash = imageHashes[0];
+      }
 
       const videoId =
         textoOpcional(avancadas.video_id) ||
