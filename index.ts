@@ -5866,25 +5866,46 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
     const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
 
-    const adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
-      {
-        create: {
-          adGroup: adGroupResourceName,
-          status: "PAUSED",
-          ad: {
-            finalUrls: [url],
-            responsiveDisplayAd: {
-              headlines: listaTitulos.slice(0, 5).map(text => ({ text })),
-              longHeadline: { text: tituloLongo },
-              descriptions: listaDescricoes.slice(0, 5).map(text => ({ text })),
-              businessName: nomeAnunciante,
-              marketingImages: [{ asset: imagem_paisagem_resource }],
-              squareMarketingImages: [{ asset: imagem_quadrada_resource }],
+    let adResults;
+    try {
+      adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+        {
+          create: {
+            adGroup: adGroupResourceName,
+            status: "PAUSED",
+            ad: {
+              finalUrls: [url],
+              responsiveDisplayAd: {
+                headlines: listaTitulos.slice(0, 5).map(text => ({ text })),
+                longHeadline: { text: tituloLongo },
+                descriptions: listaDescricoes.slice(0, 5).map(text => ({ text })),
+                businessName: nomeAnunciante,
+                marketingImages: [{ asset: imagem_paisagem_resource }],
+                squareMarketingImages: [{ asset: imagem_quadrada_resource }],
+              },
             },
           },
         },
-      },
-    ]);
+      ]);
+    } catch (err: any) {
+      // O Google Ads Display exige duas imagens com proporcoes bem diferentes: paisagem
+      // (1.91:1, ex: 1200x628) e quadrada (1:1, ex: 1200x1200) — quando a campanha so tem
+      // uma imagem, o frontend reaproveita ela nos dois formatos (ver publicarCampanhaGoogle),
+      // o que sempre falha em um dos dois lados, ja que uma imagem so nao serve pras duas
+      // proporcoes ao mesmo tempo. Mensagem clara em vez do erro cru da API.
+      if (
+        googleAdsTemErroCode(err, "DIMENSIONS_NOT_ALLOWED") ||
+        googleAdsTemErroCode(err, "ASPECT_RATIO_NOT_ALLOWED")
+      ) {
+        return c.json({
+          error: "As imagens da campanha não estão no formato exigido pelo Google Ads Display. " +
+            "São necessárias duas imagens com proporções diferentes: uma paisagem (proporção 1.91:1, " +
+            "ex: 1200×628px) e uma quadrada (proporção 1:1, ex: 1200×1200px) — a mesma imagem não " +
+            "serve para os dois formatos. Adicione uma segunda imagem (quadrada) na campanha e tente novamente."
+        }, 400);
+      }
+      throw err;
+    }
 
     const adResourceName = adResults[0]?.resourceName;
     if (!adResourceName) {
