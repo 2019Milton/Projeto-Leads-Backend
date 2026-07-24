@@ -5246,9 +5246,29 @@ async function googleAdsMutate(
   const data = await res.json() as any;
   if (!res.ok) {
     console.error(`ERRO GOOGLE ADS MUTATE (${recurso}):`, customerId, JSON.stringify(data));
-    throw new Error(data?.error?.message || `Erro ao gravar em ${recurso} no Google Ads`);
+    const err: any = new Error(data?.error?.message || `Erro ao gravar em ${recurso} no Google Ads`);
+    // Anexa o corpo bruto do erro (com os sub-erros em error.details[].errors[]) —
+    // a mensagem top-level da Google e sempre generica ("Request contains an
+    // invalid argument"), quem importa esta nos sub-erros aninhados.
+    err.googleAdsError = data;
+    throw err;
   }
   return data.results ?? [];
+}
+
+// Varre error.details[].errors[] (formato padrao de erro da Google Ads API) procurando
+// um errorCode especifico (ex: "LEAD_FORM_MISSING_AGREEMENT", "INVALID_VALUE") em
+// qualquer uma das categorias de erro (assetError, fieldError, etc — o nome da
+// categoria varia conforme o tipo do erro, so o valor e fixo).
+function googleAdsTemErroCode(err: any, codigo: string): boolean {
+  const detalhes = err?.googleAdsError?.error?.details;
+  if (!Array.isArray(detalhes)) return false;
+  for (const detalhe of detalhes) {
+    for (const erroItem of detalhe?.errors ?? []) {
+      if (Object.values(erroItem?.errorCode ?? {}).includes(codigo)) return true;
+    }
+  }
+  return false;
 }
 
 // Cria orcamento + campanha Display (PAUSED) + targeting geo/idioma (nao bloqueante).
@@ -5504,15 +5524,47 @@ app.post("/google/formulario", authMiddleware, async (c) => {
       }));
     }
 
-    const assetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "assets", [
-      {
-        create: {
-          name: `Lead Form ${Date.now()}`,
-          finalUrls: [urlOpcional(url_destino, "https://plataformadeleads.com.br")],
-          leadFormAsset,
+    const criarAsset = () =>
+      googleAdsMutate(conexao.customerId, conexao.accessToken, "assets", [
+        {
+          create: {
+            name: `Lead Form ${Date.now()}`,
+            finalUrls: [urlOpcional(url_destino, "https://plataformadeleads.com.br")],
+            leadFormAsset,
+          },
         },
-      },
-    ]);
+      ]);
+
+    const mensagemFaltaTermos =
+      "A conta do Google Ads ainda não aceitou os Termos de Serviço de Lead Forms — isso só pode ser feito uma vez, manualmente, na interface do Google Ads (não tem como aceitar pela API). No Google Ads, vá em Campanhas → Ativos → clique em \"+\" → \"Formulário de lead\", preencha um formulário de exemplo e aceite os Termos de Serviço na última etapa antes de salvar. Depois disso, tente publicar a campanha novamente.";
+
+    let assetResults;
+    try {
+      assetResults = await criarAsset();
+    } catch (err: any) {
+      if (googleAdsTemErroCode(err, "LEAD_FORM_MISSING_AGREEMENT")) {
+        return c.json({ error: mensagemFaltaTermos }, 400);
+      }
+
+      // Perguntas customizadas via API são um recurso instável na Google Ads API (a
+      // própria Google já confirmou casos de INVALID_VALUE sem causa determinística).
+      // Em vez de bloquear o formulário inteiro por causa delas, tenta de novo só com
+      // os campos fixos (nome/telefone/email), que não passam por aprovação nenhuma.
+      if (leadFormAsset.customQuestionFields && googleAdsTemErroCode(err, "INVALID_VALUE")) {
+        console.warn("GOOGLE FORMULARIO: perguntas customizadas rejeitadas, tentando sem elas...");
+        delete leadFormAsset.customQuestionFields;
+        try {
+          assetResults = await criarAsset();
+        } catch (err2: any) {
+          if (googleAdsTemErroCode(err2, "LEAD_FORM_MISSING_AGREEMENT")) {
+            return c.json({ error: mensagemFaltaTermos }, 400);
+          }
+          throw err2;
+        }
+      } else {
+        throw err;
+      }
+    }
 
     const resourceName = assetResults[0]?.resourceName;
     if (!resourceName) {
