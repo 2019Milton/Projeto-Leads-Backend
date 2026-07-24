@@ -14827,8 +14827,11 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         textoOpcional(cfgBanco.descricao) || "";
 
       const linkDestino =
-        textoOpcional(avancadas.link) ||
-        textoOpcional(cfgBanco.link) || "";
+        urlOpcional(
+          textoOpcional(avancadas.link) ||
+          textoOpcional(cfgBanco.link),
+          "https://google.com"
+        );
 
       const ctaType =
         textoOpcional(avancadas.cta) ||
