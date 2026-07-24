@@ -14588,8 +14588,29 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       configuracoes_avancadas,
       nome,
       imageHash: imageHashNovo,
-      imageHashes: imageHashesNovo
+      imageHashes: imageHashesNovo,
+      imageUrls: imageUrlsNovo
     } = await c.req.json();
+
+    // Um mesmo hash/URL de imagem é lido em varios formatos espalhados pelo
+    // codigo (camelCase, snake_case, e uma copia dentro de `criativo`) — sem
+    // sincronizar todos, telas diferentes (detalhes, edicao) podem mostrar
+    // imagens diferentes para a mesma campanha apos uma troca.
+    function sincronizarCamposImagem(avancadas: any, hashes: string[], urls: string[]) {
+      if (!hashes.length) return;
+      avancadas.imageHashes = hashes;
+      avancadas.imageHash = hashes[0];
+      avancadas.image_hashes = hashes;
+      avancadas.image_hash = hashes[0];
+      if (urls.length) {
+        avancadas.imagens_urls = urls;
+        avancadas.image_urls = urls;
+      }
+      if (avancadas.criativo) {
+        avancadas.criativo.image_hashes = hashes;
+        avancadas.criativo.image_hash = hashes[0];
+      }
+    }
 
     const usuarioId =
       resolverUsuarioIdOperacao(user, usuario_id);
@@ -14601,13 +14622,17 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     // Campanha ainda não publicada na Meta (duplicada ou rascunho): salva só localmente
     if (!campaign_id && campanha_local_id) {
       const avancadas = configuracoes_avancadas || {};
-      if (Array.isArray(imageHashesNovo) && imageHashesNovo.length) {
-        avancadas.imageHashes = imageHashesNovo;
-        avancadas.imageHash = imageHashesNovo[0] || null;
-      } else if (textoOpcional(imageHashNovo)) {
-        avancadas.imageHash = imageHashNovo;
-        avancadas.imageHashes = [imageHashNovo];
-      }
+      const hashesRascunho =
+        Array.isArray(imageHashesNovo) && imageHashesNovo.length
+          ? imageHashesNovo
+          : textoOpcional(imageHashNovo)
+          ? [imageHashNovo]
+          : [];
+      sincronizarCamposImagem(
+        avancadas,
+        hashesRascunho,
+        Array.isArray(imageUrlsNovo) ? imageUrlsNovo.filter(Boolean) : []
+      );
       const dailyBudget = numeroOpcional(daily_budget);
       const nomeLocal = textoOpcional(nome);
       await client.query(
@@ -14909,13 +14934,22 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           : imageHash ? [imageHash] : []
         ).filter(Boolean);
 
+      const imageUrls: string[] =
+        (Array.isArray(imageUrlsNovo) && imageUrlsNovo.length
+          ? imageUrlsNovo
+          : Array.isArray(avancadas.imagens_urls) && avancadas.imagens_urls.length
+          ? avancadas.imagens_urls
+          : Array.isArray(cfgBanco.imagens_urls) && cfgBanco.imagens_urls.length
+          ? cfgBanco.imagens_urls
+          : []
+        ).filter(Boolean);
+
       // Reflete a imagem nova recem-enviada em `avancadas` antes de persistir no
       // banco — sem isso o criativo na Meta ficava certo mas o registro salvo
-      // (e portanto a tela de detalhes) continuava com o hash antigo.
-      if (imageHashes.length) {
-        avancadas.imageHashes = imageHashes;
-        avancadas.imageHash = imageHashes[0];
-      }
+      // (e portanto a tela de detalhes) continuava com o hash antigo, e as URLs
+      // e os campos duplicados em snake_case/criativo ficavam desatualizados
+      // mesmo quando o hash em si estava certo.
+      sincronizarCamposImagem(avancadas, imageHashes, imageUrls);
 
       const videoId =
         textoOpcional(avancadas.video_id) ||
