@@ -2322,6 +2322,7 @@ function textoLeadIA(lead: any) {
     lead?.origem,
     lead?.campanha,
     lead?.observacao,
+    lead?.whatsapp_transcricao,
     ...(Array.isArray(lead?.respostas_qualificacao)
       ? lead.respostas_qualificacao.map((item: any) =>
           `${item?.pergunta || ""} ${item?.resposta || ""}`
@@ -2932,6 +2933,7 @@ async function gerarAnaliseIAOpenAI(
     origem: lead?.origem || null,
     campanha: lead?.campanha || null,
     observacao: lead?.observacao || null,
+    conversa_whatsapp: lead?.whatsapp_transcricao || null,
     score: lead?.score || null,
     score_pontos: lead?.score_pontos || 0,
     score_base: lead?.score_base || [],
