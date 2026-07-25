@@ -12606,6 +12606,22 @@ app.get("/campanhas", authMiddleware, async (c) => {
         user.id
       );
 
+    // A checagem de "pertence a conta de anuncios selecionada" abaixo so comparava
+    // contra a conta Meta — campanhas Google (e futuramente TikTok) tem
+    // conta_anuncios_id num espaco de IDs completamente diferente (customer_id do
+    // Google, advertiser_id do TikTok), entao nunca batiam e a linha inteira
+    // desaparecia da listagem mesmo com a campanha criada com sucesso. Resolve a
+    // conta selecionada de cada plataforma pra comparar cada uma com a sua propria.
+    const contaAnunciosIdGoogle = await client.query(
+      `SELECT dados_conta->>'customer_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
+    const contaAnunciosIdTikTok = await client.query(
+      `SELECT dados_conta->>'advertiser_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
     const nichoSlug =
       textoOpcional(c.req.query("nicho"));
 
@@ -12678,11 +12694,16 @@ app.get("/campanhas", authMiddleware, async (c) => {
       ) nd ON true
       WHERE
         c.usuario_id = $1
-        AND (c.origem = 'manual' OR c.conta_anuncios_id = $2)
+        AND (
+          c.origem = 'manual'
+          OR (COALESCE(c.plataforma, 'meta') = 'meta' AND c.conta_anuncios_id = $2)
+          OR (c.plataforma = 'google' AND c.conta_anuncios_id = $4)
+          OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $5)
+        )
         AND ($3::text IS NULL OR COALESCE(n.slug, nd.slug) = $3)
       ORDER BY c.id DESC
       `,
-      [user.id, contaAnunciosId ?? null, nichoSlug ?? null]
+      [user.id, contaAnunciosId ?? null, nichoSlug ?? null, contaAnunciosIdGoogle, contaAnunciosIdTikTok]
     );
 
     console.log("CAMPANHAS:", campanhas.rows);
