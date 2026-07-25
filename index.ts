@@ -3491,6 +3491,346 @@ async function gerarSugestaoComercialOpenAI(
   };
 }
 
+// ─── Análise de campanha por um especialista sênior de tráfego pago ─────────
+// Diferente de gerarSugestaoComercialOpenAI (persona comercial genérica,
+// usada em vários pontos do produto): aqui a persona e o contexto enviado
+// são inteiramente dedicados a mídia paga (Meta Ads/leads), e as duas APIs
+// de IA configuradas (OpenAI + Anthropic) são consultadas EM PARALELO,
+// não uma como fallback da outra — a ideia é dar duas leituras
+// independentes da mesma campanha, como dois gestores de tráfego revisando
+// o mesmo painel, para reduzir o risco de uma recomendação de um único
+// modelo passar sem crítica.
+function construirContextoCampanhaIA(campanha: any) {
+  const cfg = campanha?.configuracoes_avancadas || {};
+
+  const gasto = Number(campanha?.gasto || 0);
+  const leads = Number(campanha?.leads || 0);
+  const impressoes = Number(campanha?.impressoes || 0);
+  const alcance = Number(campanha?.alcance || 0);
+  const cliques = Number(campanha?.cliques || 0);
+  const ctr = Number(campanha?.ctr || 0);
+  const cpc = Number(campanha?.cpc || 0);
+  const orcamentoDiario =
+    campanha?.daily_budget ? Number(campanha.daily_budget) / 100 : null;
+
+  const criadoEm = campanha?.criado_em ? new Date(campanha.criado_em) : null;
+  const diasAtiva =
+    criadoEm && !Number.isNaN(criadoEm.getTime())
+      ? Math.max(1, Math.round((Date.now() - criadoEm.getTime()) / 86_400_000))
+      : null;
+
+  const cpl = leads > 0 ? Number((gasto / leads).toFixed(2)) : null;
+  const frequencia =
+    alcance > 0 ? Number((impressoes / alcance).toFixed(2)) : null;
+  const orcamentoProjetado =
+    orcamentoDiario !== null && diasAtiva !== null
+      ? Number((orcamentoDiario * diasAtiva).toFixed(2))
+      : null;
+  const pacingPercentual =
+    orcamentoProjetado && orcamentoProjetado > 0
+      ? Number(((gasto / orcamentoProjetado) * 100).toFixed(1))
+      : null;
+
+  const localidades = (() => {
+    if (Array.isArray(cfg.localidades) && cfg.localidades.length) {
+      return cfg.localidades.map((l: any) => l?.nome || l?.key).filter(Boolean);
+    }
+    return cfg.localidade_nome ? [cfg.localidade_nome] : [];
+  })();
+
+  return {
+    identificacao: {
+      nome: campanha?.nome || null,
+      nicho: campanha?.nicho || cfg.nicho || null,
+      objetivo: campanha?.objetivo || "Leads",
+      status: campanha?.status || null,
+      plataforma: campanha?.origem || "meta"
+    },
+    desempenho_periodo_30d: {
+      gasto_total: gasto,
+      gasto_hoje: Number(campanha?.gasto_hoje || 0),
+      orcamento_diario: orcamentoDiario,
+      leads,
+      cpl_atual: cpl,
+      impressoes,
+      alcance,
+      cliques,
+      ctr_percentual: ctr,
+      cpc,
+      frequencia,
+      dias_ativa: diasAtiva,
+      pacing_orcamento_percentual: pacingPercentual
+    },
+    segmentacao: {
+      pais: cfg.pais || "BR",
+      localidades,
+      idade_min: cfg.idade_min || null,
+      idade_max: cfg.idade_max || null,
+      genero: cfg.genero === "1" ? "homens" : cfg.genero === "2" ? "mulheres" : "todos",
+      interesses_detalhados: Array.isArray(cfg.interesses_detalhados)
+        ? cfg.interesses_detalhados.map((i: any) => i?.nome || i?.name || String(i))
+        : cfg.interesses_detalhados || null,
+      publicos_personalizados: Array.isArray(cfg.custom_audiences)
+        ? cfg.custom_audiences.length
+        : 0,
+      publico_advantage_meta: cfg.advantage_audience ?? true
+    },
+    posicionamento: {
+      plataformas: cfg.plataformas || null,
+      posicoes_facebook: cfg.facebook_positions || null,
+      posicoes_instagram: cfg.instagram_positions || null,
+      dispositivos: cfg.dispositivos || null
+    },
+    criativo: {
+      tipo:
+        cfg.criativo_tipo ||
+        (cfg.video_id || cfg.videoId
+          ? "video"
+          : (cfg.imageHashes?.length > 1 || cfg.image_hashes?.length > 1)
+            ? "carrossel"
+            : "imagem"),
+      titulo: cfg.titulo || null,
+      texto: cfg.texto || null,
+      descricao: cfg.descricao || null,
+      cta: cfg.cta || null,
+      link_destino: cfg.link || null
+    },
+    lance_orcamento: {
+      controle_custo: cfg.bid_strategy || "automatico_meta",
+      valor_controle: cfg.bid_amount || null,
+      cbo_ativo: cfg.cbo ?? true,
+      janela_atribuicao: cfg.attribution_spec || "padrao_meta",
+      categoria_especial: cfg.categoria_especial || null
+    },
+    formulario_leads: {
+      formulario_qualidade_ativo: Boolean(cfg.formulario_qualidade),
+      quantidade_perguntas_qualificadoras: Array.isArray(cfg.perguntas)
+        ? cfg.perguntas.length
+        : 0
+    },
+    cronograma: {
+      inicio: cfg.inicio || null,
+      fim: cfg.fim || null
+    }
+  };
+}
+
+async function gerarAnaliseTrafegoPagoIA(campanha: any) {
+  const contexto = construirContextoCampanhaIA(campanha);
+
+  const fallback = sugestaoIAFallback(
+    "Analise de campanha IA",
+    "Analise baseada em gasto, leads, CPL, CTR e status da campanha.",
+    "Acompanhar CPL e ajustar criativo, publico ou orcamento se a campanha estiver cara.",
+    [],
+    [],
+    [],
+    [
+      "Se gerou leads com CPL aceitavel, mantenha ou aumente aos poucos.",
+      "Se teve gasto sem leads, revise publico e criativo.",
+      "Se CTR estiver baixo, teste outro texto ou imagem."
+    ]
+  );
+
+  const systemMsg =
+    "Voce e um gestor de trafego pago senior, especialista em Meta Ads (Facebook/Instagram) para geracao de leads no mercado brasileiro, com anos de experiencia otimizando campanhas para corretores (seguros, imoveis, planos de saude, suplementos, SaaS). " +
+    "Analise a campanha como faria uma auditoria profissional real: avalie CPL, CTR, CPC e frequencia contra o que e tipico para Meta Ads de geracao de leads no Brasil (sem inventar numeros de terceiros, apenas usando seu conhecimento geral de mercado como referencia qualitativa); avalie o pacing do orcamento (gasto real vs. orcamento projetado para os dias ativos); avalie se a segmentacao (idade, genero, interesses, localidades, publicos customizados, Advantage+) esta ampla ou estreita demais para o volume de dados que ja existe; avalie o criativo (tipo, copy, CTA) e sinais de possivel fadiga (frequencia alta com CTR caindo); avalie a estrategia de lance/CBO e a janela de atribuicao; avalie a fricção do formulario de leads (quantidade de perguntas, formulario de qualidade). " +
+    "Considere tambem quantos dias a campanha esta ativa e quantos leads/impressoes ja existem: com poucos dias ou poucos dados, deixe claro que e cedo para conclusoes fortes e recomende continuar coletando dados antes de mudancas bruscas, em vez de sugerir uma acao agressiva baseada em amostra pequena. " +
+    "De recomendacoes concretas e priorizadas (o que fazer primeiro, o que testar, o que NAO mexer ainda) pensando sempre em gerar mais leads pelo menor custo possivel, considerando tanto as configuracoes atuais quanto os ajustes que poderiam ser feitos e ainda nao foram (ex: reduzir perguntas do formulario, ativar/desativar CBO, testar novo criativo, ampliar ou restringir publico, ajustar orcamento). Use somente os dados reais recebidos, nunca invente metricas, nomes ou configuracoes que nao foram informadas. " +
+    "Responda somente no JSON solicitado, em portugues do Brasil, com linguagem direta e profissional, sem emojis.";
+
+  const schemaProperties = {
+    titulo: { type: "string" },
+    resumo: { type: "string" },
+    acao_principal: { type: "string" },
+    mensagens: { type: "array", items: { type: "string" } },
+    motivos: { type: "array", items: { type: "string" } },
+    campos: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["chave", "valor"],
+        properties: { chave: { type: "string" }, valor: { type: "string" } }
+      }
+    },
+    recomendacoes: { type: "array", items: { type: "string" } },
+    diagnostico: { type: "array", items: { type: "string" } }
+  };
+  const schemaRequired = [
+    "titulo", "resumo", "acao_principal", "mensagens",
+    "motivos", "campos", "recomendacoes", "diagnostico"
+  ];
+  const schemaDescricao =
+    `Retorne SOMENTE JSON valido com esta estrutura exata (sem texto antes ou depois):
+{"titulo":"string","resumo":"string","diagnostico":["achados tecnicos objetivos: CPL/CTR/CPC/frequencia/pacing de orcamento comparados ao esperado, fadiga de criativo, segmentacao ampla/estreita demais, etc"],"acao_principal":"string","mensagens":["sugestoes de copy/criativo para testar"],"motivos":["por que a acao_principal foi escolhida"],"campos":[{"chave":"string","valor":"string"}],"recomendacoes":["lista priorizada de proximos passos concretos"]}`;
+
+  const userText = JSON.stringify({
+    objetivo:
+      "Fazer uma auditoria completa desta campanha de trafego pago (Meta Ads, geracao de leads) como um especialista senior faria, cobrindo desempenho, segmentacao, criativo, lance/orcamento e formulario, e recomendar os ajustes que realmente aumentam leads pelo menor custo.",
+    campanha: contexto
+  });
+
+  const iaConf = await buscarConfigIA();
+
+  const parseSugestao = (texto: string, provider: string) => {
+    const limpo = texto.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    return {
+      ...fallback,
+      ...JSON.parse(limpo),
+      disponivel: true,
+      origem: provider
+    };
+  };
+
+  const chamarOpenAI = async () => {
+    const openaiKey = Bun.env.OPENAI_API_KEY;
+    if (!openaiKey) return null;
+
+    try {
+      const modelo =
+        textoOpcional(iaConf?.modelo) ||
+        textoOpcional(Bun.env.OPENAI_MODEL) ||
+        "gpt-5-mini";
+      const usarResponsesAPI =
+        modelo.startsWith("gpt-5") || modelo.startsWith("o1") ||
+        modelo.startsWith("o3") || modelo.startsWith("o4");
+
+      const respBody = usarResponsesAPI
+        ? {
+            model: modelo,
+            instructions: systemMsg,
+            input: [{ role: "user", content: [{ type: "input_text", text: userText }] }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "analise_trafego_pago_ia",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: schemaRequired,
+                  properties: schemaProperties
+                }
+              }
+            }
+          }
+        : {
+            model: modelo,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: systemMsg + "\n\n" + schemaDescricao },
+              { role: "user", content: userText }
+            ]
+          };
+
+      const response = await fetch(
+        usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
+        {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify(respBody)
+        }
+      );
+      const data: any = await response.json();
+
+      if (!response.ok) {
+        console.error("ANALISE TRAFEGO OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+        return null;
+      }
+
+      const texto = usarResponsesAPI
+        ? extrairTextoRespostaOpenAI(data)
+        : (data?.choices?.[0]?.message?.content || "");
+      if (!texto) return null;
+
+      return {
+        sugestao: parseSugestao(texto, "openai"),
+        usage: data?.usage || null,
+        custo_estimado: calcularCustoEstimadoOpenAI(data?.usage),
+        provider: "openai"
+      };
+    } catch (err) {
+      console.error("ANALISE TRAFEGO OPENAI EXCEPTION:", err);
+      return null;
+    }
+  };
+
+  const chamarAnthropic = async () => {
+    const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
+    if (!anthropicKey) return null;
+
+    try {
+      const anthropicModelo =
+        textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: anthropicModelo,
+          max_tokens: 1600,
+          system: systemMsg + "\n\n" + schemaDescricao,
+          messages: [{ role: "user", content: userText }]
+        })
+      });
+      const data: any = await resp.json();
+
+      if (!resp.ok) {
+        console.error("ANALISE TRAFEGO ANTHROPIC ERROR:", data?.error?.message);
+        return null;
+      }
+
+      const texto = data?.content?.[0]?.text || "";
+      if (!texto) return null;
+
+      const inTok = Number(data?.usage?.input_tokens || 0);
+      const outTok = Number(data?.usage?.output_tokens || 0);
+      return {
+        sugestao: parseSugestao(texto, "anthropic"),
+        usage: { input_tokens: inTok, output_tokens: outTok },
+        custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }),
+        provider: "anthropic"
+      };
+    } catch (err) {
+      console.error("ANALISE TRAFEGO ANTHROPIC EXCEPTION:", err);
+      return null;
+    }
+  };
+
+  // Consulta as duas IAs em paralelo — nao e fallback, e uma segunda opiniao real.
+  const [openaiResultado, anthropicResultado] = await Promise.all([
+    chamarOpenAI(),
+    chamarAnthropic()
+  ]);
+
+  const resultados = [openaiResultado, anthropicResultado].filter(Boolean) as Array<{
+    sugestao: any; usage: any; custo_estimado: number; provider: string;
+  }>;
+
+  if (!resultados.length) {
+    return {
+      sugestao: { ...fallback, disponivel: false, origem: "fallback" },
+      segunda_opiniao: null,
+      resultados: []
+    };
+  }
+
+  const primario =
+    resultados.find(r => r.provider === "openai") || resultados[0];
+  const secundario =
+    resultados.find(r => r !== primario) || null;
+
+  return {
+    sugestao: primario.sugestao,
+    segunda_opiniao: secundario?.sugestao || null,
+    resultados
+  };
+}
+
 
 app.use("/*", cors({
   origin: resolverOrigemCors,
@@ -18771,40 +19111,26 @@ app.post("/ia/campanhas/analise", authMiddleware, async (c) => {
     const campanha =
       body.campanha || {};
 
-    const fallback =
-      sugestaoIAFallback(
-        "Analise de campanha IA",
-        "Analise baseada em gasto, leads, CPL, CTR e status da campanha.",
-        "Acompanhar CPL e ajustar criativo, publico ou orcamento se a campanha estiver cara.",
-        [],
-        [],
-        [],
-        [
-          "Se gerou leads com CPL aceitavel, mantenha ou aumente aos poucos.",
-          "Se teve gasto sem leads, revise publico e criativo.",
-          "Se CTR estiver baixo, teste outro texto ou imagem."
-        ]
-      );
-
     const usoIA =
-      await gerarSugestaoComercialOpenAI(
-        "Analisar campanha e recomendar aumentar orcamento, pausar, trocar criativo, mudar publico ou ajustar chamada.",
-        { campanha },
-        fallback
+      await gerarAnaliseTrafegoPagoIA(campanha);
+
+    for (const resultado of usoIA.resultados) {
+      await registrarUsoIA(
+        Number(user.id),
+        "analise_campanha",
+        "campanha",
+        campanha.id || campanha.campaign_id || null,
+        resultado.custo_estimado,
+        Number(resultado.usage?.input_tokens || 0),
+        Number(resultado.usage?.output_tokens || 0),
+        resultado.provider
       );
+    }
 
-    await registrarUsoIA(
-      Number(user.id),
-      "analise_campanha",
-      "campanha",
-      campanha.id || campanha.campaign_id || null,
-      usoIA.custo_estimado,
-      Number(usoIA.usage?.input_tokens || 0),
-      Number(usoIA.usage?.output_tokens || 0),
-      usoIA.provider || "openai"
-    );
-
-    return c.json({ sugestao: usoIA.sugestao });
+    return c.json({
+      sugestao: usoIA.sugestao,
+      segunda_opiniao: usoIA.segunda_opiniao
+    });
   } catch (err) {
     console.error("ERRO IA ANALISE CAMPANHA:", err);
     return c.json({ error: "Erro ao analisar campanha com IA" }, 500);
