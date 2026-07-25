@@ -13778,6 +13778,13 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         0
       );
 
+    const totalLeadsPlataforma =
+      diasPerformance.reduce(
+        (total: number, dia: any) =>
+          total + (dia.leads_plataforma || 0),
+        0
+      );
+
     const hoje =
       diasPerformance[diasPerformance.length - 1] || null;
 
@@ -13869,6 +13876,7 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
       resumo: {
         gasto_total: totalGasto,
         leads_total: totalLeads,
+        leads_total_plataforma: totalLeadsPlataforma,
         custo_por_lead_medio:
           totalLeads > 0
             ? totalGasto / totalLeads
