@@ -14779,7 +14779,7 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
 
     const campanha = await client.query(
       `
-      SELECT id, campaign_id, status
+      SELECT id, campaign_id, status, plataforma
       FROM campanhas
       WHERE id = $1
       AND usuario_id = $2
@@ -14800,47 +14800,106 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
     const statusAtual =
       String(campanhaLocal.status || "").toUpperCase();
 
+    const plataformaLocal =
+      campanhaLocal.plataforma || "meta";
+
+    // Antes so tentava excluir via Meta, ignorando a plataforma real da campanha —
+    // pra uma campanha Google/TikTok isso chamava a API errada com um campaign_id
+    // que nao existe la, e o botao "excluir definitivamente" nunca funcionava.
     if (
       campanhaLocal.campaign_id &&
       statusAtual !== "DELETED"
     ) {
-      const conn = await client.query(
-        `
-        SELECT access_token
-        FROM meta_conexoes
-        WHERE usuario_id = $1
-        ORDER BY id DESC
-        LIMIT 1
-        `,
-        [user.id]
-      );
+      if (plataformaLocal === "google") {
+        const conexao = await resolverConexaoGoogleAds(user.id);
 
-      const token =
-        conn.rows[0]?.access_token || null;
+        if (!("erro" in conexao)) {
+          try {
+            await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+              { remove: `customers/${conexao.customerId}/campaigns/${campanhaLocal.campaign_id}` },
+            ]);
+          } catch (err: any) {
+            const msg = String(err?.message || "").toLowerCase();
+            const naoPertenceMaisGoogle =
+              msg.includes("not found") ||
+              msg.includes("does not exist") ||
+              msg.includes("invalid resource") ||
+              msg.includes("resource was not found");
 
-      if (token) {
-        const metaRes = await fetch(
-          `https://graph.facebook.com/v19.0/${campanhaLocal.campaign_id}`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              status: "DELETED",
-              access_token: token
-            })
+            if (!naoPertenceMaisGoogle) {
+              return c.json({
+                error: err?.message || "O Google Ads não permitiu excluir a campanha"
+              }, 400);
+            }
+            console.log("EXCLUIR DEFINITIVO GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campanhaLocal.campaign_id);
           }
-        ).then(r => r.json());
+        }
+      } else if (plataformaLocal === "tiktok") {
+        const conexao = await obterConexaoTikTok(user.id);
 
-        console.log("DELETE DEFINITIVO META:", metaRes);
+        if (conexao?.advertiserId) {
+          const del = await tiktokFetch("/campaign/update/status/", conexao.token, {
+            method: "POST",
+            body: {
+              advertiser_id: conexao.advertiserId,
+              campaign_ids: [String(campanhaLocal.campaign_id)],
+              operation_status: "DELETE"
+            }
+          });
 
-        if (metaRes.error) {
-          return c.json({
-            error:
-              metaRes.error.message ||
-              "A Meta não permitiu excluir a campanha"
-          }, 400);
+          if (!del.ok) {
+            const msg = (del.error || "").toLowerCase();
+            const naoPertenceMaisTikTok =
+              msg.includes("not exist") ||
+              msg.includes("not found") ||
+              msg.includes("invalid campaign") ||
+              msg.includes("does not exist");
+
+            if (!naoPertenceMaisTikTok) {
+              return c.json({ error: del.error || "O TikTok não permitiu excluir a campanha" }, 400);
+            }
+            console.log("EXCLUIR DEFINITIVO TIKTOK: campanha não encontrada na TikTok, removendo localmente:", campanhaLocal.campaign_id);
+          }
+        }
+      } else {
+        const conn = await client.query(
+          `
+          SELECT access_token
+          FROM meta_conexoes
+          WHERE usuario_id = $1
+          ORDER BY id DESC
+          LIMIT 1
+          `,
+          [user.id]
+        );
+
+        const token =
+          conn.rows[0]?.access_token || null;
+
+        if (token) {
+          const metaRes = await fetch(
+            `https://graph.facebook.com/v19.0/${campanhaLocal.campaign_id}`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                status: "DELETED",
+                access_token: token
+              })
+            }
+          ).then(r => r.json());
+
+          console.log("DELETE DEFINITIVO META:", metaRes);
+
+          if (metaRes.error) {
+            return c.json({
+              error:
+                metaRes.error.message ||
+                "A Meta não permitiu excluir a campanha"
+            }, 400);
+          }
         }
       }
     }
