@@ -2,6 +2,7 @@
 import { cors } from "hono/cors";
 import { Pool } from "pg";
 import bcrypt from "bcryptjs";
+import sharp from "sharp";
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
@@ -5780,7 +5781,29 @@ app.post("/google/formulario", authMiddleware, async (c) => {
 
 // Upload de imagem como Asset (equivalente ao /meta/upload-imagem e /tiktok/upload-imagem) —
 // cada imagem do Responsive Display Ad (paisagem 1.91:1 e quadrada 1:1) precisa de um
-// Asset proprio no Google Ads, referenciado depois em /google/anuncio.
+// Asset proprio no Google Ads, referenciado depois em /google/anuncio. Pedir pro usuario
+// subir imagens ja exatamente nessas proporcoes nao e realista, entao cortamos server-side
+// pra sempre gerar o formato certo, seja qual for a imagem/proporcao original. position:
+// "attention" usa deteccao de saliencia do sharp (bordas/contraste/rostos) pra centralizar
+// o corte na parte mais relevante da imagem em vez de cortar no meio cego.
+const DIMENSOES_GOOGLE_DISPLAY = {
+  paisagem: { width: 1200, height: 628 },
+  quadrada: { width: 1200, height: 1200 },
+} as const;
+
+async function cortarImagemGoogleDisplay(bytes: ArrayBuffer, tipo: string) {
+  const dimensoes =
+    DIMENSOES_GOOGLE_DISPLAY[tipo as keyof typeof DIMENSOES_GOOGLE_DISPLAY] ||
+    DIMENSOES_GOOGLE_DISPLAY.paisagem;
+
+  const buffer = await sharp(Buffer.from(bytes))
+    .resize(dimensoes.width, dimensoes.height, { fit: "cover", position: "attention" })
+    .jpeg({ quality: 88 })
+    .toBuffer();
+
+  return buffer;
+}
+
 app.post("/google/upload-imagem", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -5799,9 +5822,10 @@ app.post("/google/upload-imagem", authMiddleware, async (c) => {
       return c.json({ error: conexao.erro }, 400);
     }
 
-    const bytes = await imagem.arrayBuffer();
-    const base64 = Buffer.from(bytes).toString("base64");
-    const mimeType = imagem.type === "image/png" ? "IMAGE_PNG" : "IMAGE_JPEG";
+    const bytesOriginais = await imagem.arrayBuffer();
+    const bytesCortados = await cortarImagemGoogleDisplay(bytesOriginais, tipo);
+    const base64 = bytesCortados.toString("base64");
+    const mimeType = "IMAGE_JPEG";
 
     const assetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "assets", [
       {
