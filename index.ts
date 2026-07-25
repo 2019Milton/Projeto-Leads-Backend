@@ -520,6 +520,18 @@ function truncarSemCortarPalavra(texto: unknown, limite: number) {
   return ultimoEspaco >= limite * 0.5 ? cortado.slice(0, ultimoEspaco).trim() : cortado.trim();
 }
 
+// Remove simbolos que a Google Ads rejeita em texto de palavra-chave (erro
+// KEYWORD_HAS_INVALID_CHARS) — titulos de anuncio (usados como keyword, ver
+// /google/anuncio) costumam ter pontuacao de chamada tipo "!" ou "?" que e valida
+// num anuncio mas invalida numa keyword. Lista de simbolos confirmada via
+// documentacao/relatos oficiais da Google Ads API.
+function sanitizarPalavraChaveGoogle(texto: unknown) {
+  return String(texto ?? "")
+    .replace(/[!@%^()={};~`<>?\\|―·,*[\]{}"']/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function escaparHtmlEmail(value: unknown) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -5952,14 +5964,19 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     // Campanha de Pesquisa exige palavras-chave pra veicular (sem elas o anuncio nunca
     // aparece) — reaproveita os proprios titulos do anuncio como palavras-chave em
     // correspondencia ampla, ja que sao textos curtos e relevantes ao nicho gerados
-    // pela IA/usuario, sem precisar de um campo novo so pra isso.
-    const keywordOps: any[] = listaTitulos.slice(0, 10).map(texto => ({
-      create: {
-        adGroup: adGroupResourceName,
-        status: "ENABLED",
-        keyword: { text: texto, matchType: "BROAD" },
-      },
-    }));
+    // pela IA/usuario, sem precisar de um campo novo so pra isso. Sanitiza pontuacao
+    // de chamada (!, ?, etc — valida num titulo de anuncio, invalida numa keyword).
+    const keywordOps: any[] = listaTitulos
+      .map(sanitizarPalavraChaveGoogle)
+      .filter(Boolean)
+      .slice(0, 10)
+      .map(texto => ({
+        create: {
+          adGroup: adGroupResourceName,
+          status: "ENABLED",
+          keyword: { text: texto, matchType: "BROAD" },
+        },
+      }));
 
     try {
       await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria", keywordOps);
