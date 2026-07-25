@@ -5467,6 +5467,34 @@ function googleAdsTemErroCode(err: any, codigo: string): boolean {
   return false;
 }
 
+// Varre error.details[].errors[] procurando violacoes de politica marcadas como
+// "isExemptible" (ex: HEALTH_IN_PERSONALIZED_ADS — comum em nichos como planos de
+// saude, ja que o texto do titulo/palavra-chave pode soar como segmentacao por
+// informacao de saude sensivel mesmo sem essa intencao). Cada violacao exemptivel
+// pode ser "perdoada" numa nova tentativa anexando a mesma policyViolationKey
+// (policyName + violatingText) na operacao correspondente, via campo
+// exemptPolicyViolationKeys — padrao oficial documentado pela Google Ads API.
+function googleAdsExtrairExencoesPolitica(
+  err: any
+): { operationIndex: number; key: { policyName: string; violatingText: string } }[] {
+  const detalhes = err?.googleAdsError?.error?.details;
+  if (!Array.isArray(detalhes)) return [];
+  const exencoes: { operationIndex: number; key: { policyName: string; violatingText: string } }[] = [];
+  for (const detalhe of detalhes) {
+    for (const erroItem of detalhe?.errors ?? []) {
+      const violacao = erroItem?.details?.policyViolationDetails;
+      if (!violacao?.isExemptible || !violacao?.key) continue;
+      const operationEl = (erroItem?.location?.fieldPathElements ?? []).find(
+        (el: any) => el?.fieldName === "operations"
+      );
+      if (typeof operationEl?.index === "number") {
+        exencoes.push({ operationIndex: operationEl.index, key: violacao.key });
+      }
+    }
+  }
+  return exencoes;
+}
+
 // Cria orcamento + campanha de Pesquisa (PAUSED) + targeting geo/idioma (nao bloqueante).
 // Equivalente ao /meta/campanha e /tiktok/campanha.
 app.post("/google/campanha", authMiddleware, async (c) => {
@@ -5925,15 +5953,35 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     // aparece) — reaproveita os proprios titulos do anuncio como palavras-chave em
     // correspondencia ampla, ja que sao textos curtos e relevantes ao nicho gerados
     // pela IA/usuario, sem precisar de um campo novo so pra isso.
-    await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria",
-      listaTitulos.slice(0, 10).map(texto => ({
-        create: {
-          adGroup: adGroupResourceName,
-          status: "ENABLED",
-          keyword: { text: texto, matchType: "BROAD" },
-        },
-      }))
-    );
+    const keywordOps: any[] = listaTitulos.slice(0, 10).map(texto => ({
+      create: {
+        adGroup: adGroupResourceName,
+        status: "ENABLED",
+        keyword: { text: texto, matchType: "BROAD" },
+      },
+    }));
+
+    try {
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria", keywordOps);
+    } catch (err: any) {
+      // Nichos sensiveis (saude, financas etc.) fazem o texto do titulo/palavra-chave
+      // esbarrar em politicas de "publicidade personalizada" mesmo sem intencao de
+      // segmentar por essa categoria — quando a Google marca a violacao como
+      // "isExemptible", da pra pedir isencao reenviando a mesma policyViolationKey.
+      const exencoes = googleAdsExtrairExencoesPolitica(err);
+      if (!exencoes.length) throw err;
+
+      for (const { operationIndex, key } of exencoes) {
+        const operacao = keywordOps[operationIndex];
+        if (!operacao) continue;
+        operacao.exemptPolicyViolationKeys = [
+          ...(operacao.exemptPolicyViolationKeys || []),
+          key,
+        ];
+      }
+
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria", keywordOps);
+    }
 
     // ASSUMPTION: vincular o Lead Form como CampaignAsset com fieldType LEAD_FORM
     // (nao usa AssetSet/CampaignAssetSet) — conferido contra o sample oficial
