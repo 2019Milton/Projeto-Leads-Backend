@@ -13487,6 +13487,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         nome: campanha.nome,
         status: campanha.status,
         origem: campanha.origem,
+        plataforma: campanha.plataforma || "meta",
         campaign_id: campanha.campaign_id,
         criada_por_usuario_id: campanha.usuario_id,
         criada_por_email: campanha.criado_por_email,
