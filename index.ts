@@ -4135,8 +4135,8 @@ async function sincronizarCampanhasUsuario(
       );
     } else {
       await client.query(
-        `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, atualizado_em)
-         VALUES ($1,$2,$3,$4,$5,'meta',NOW())`,
+        `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
+         VALUES ($1,$2,$3,$4,$5,'meta','meta',NOW())`,
         [usuarioId, campanha.id, contaAnunciosId, campanha.name, statusFinal]
       );
     }
