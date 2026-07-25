@@ -5550,6 +5550,12 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     }
 
     const nomeCampanha = textoOpcional(nome) || `Campanha Leads ${Date.now()}`;
+    // A Google Ads API rejeita criar uma campanha ATIVA/PAUSADA com o mesmo nome de
+    // outra ja existente na conta (DUPLICATE_CAMPAIGN_NAME) — confirmado em producao
+    // quando o nome da campanha (vindo do campo compartilhado "Nome da campanha") se
+    // repetiu entre tentativas. O nome exibido na nossa plataforma (banco) continua
+    // limpo; so o nome enviado pra Google ganha um sufixo unico.
+    const nomeCampanhaGoogle = `${nomeCampanha} - ${Date.now()}`;
 
     const budgetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignBudgets", [
       {
@@ -5569,7 +5575,7 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     const campaignResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
       {
         create: {
-          name: nomeCampanha,
+          name: nomeCampanhaGoogle,
           // Campanhas Display com Lead Form exigem a conta ja ter gasto historico
           // (>US$1.000, confirmado via CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE em
           // producao e na documentacao oficial do Google) — bloqueia toda conta nova.
