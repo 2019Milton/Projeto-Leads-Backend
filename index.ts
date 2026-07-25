@@ -5467,7 +5467,7 @@ function googleAdsTemErroCode(err: any, codigo: string): boolean {
   return false;
 }
 
-// Cria orcamento + campanha Display (PAUSED) + targeting geo/idioma (nao bloqueante).
+// Cria orcamento + campanha de Pesquisa (PAUSED) + targeting geo/idioma (nao bloqueante).
 // Equivalente ao /meta/campanha e /tiktok/campanha.
 app.post("/google/campanha", authMiddleware, async (c) => {
   try {
@@ -5530,10 +5530,21 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       {
         create: {
           name: nomeCampanha,
-          advertisingChannelType: "DISPLAY",
+          // Campanhas Display com Lead Form exigem a conta ja ter gasto historico
+          // (>US$1.000, confirmado via CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE em
+          // producao e na documentacao oficial do Google) — bloqueia toda conta nova.
+          // Pesquisa nao tem essa exigencia e e o tipo recomendado pela propria Google
+          // pra Lead Forms, entao a plataforma usa Pesquisa em vez de Display.
+          advertisingChannelType: "SEARCH",
           status: "PAUSED",
           campaignBudget: budgetResourceName,
           manualCpc: {},
+          networkSettings: {
+            targetGoogleSearch: true,
+            targetSearchNetwork: true,
+            targetContentNetwork: false,
+            targetPartnerSearchNetwork: false,
+          },
           // Autodeclaração exigida pela Google Ads API em toda criação de campanha
           // (EU Political Advertising Regulation) — sem isso a API rejeita com
           // FieldError.REQUIRED. Plataforma é de leads no Brasil, sem qualquer
@@ -5582,7 +5593,7 @@ app.post("/google/campanha", authMiddleware, async (c) => {
   }
 });
 
-// Cria o Grupo de Anuncios Display (equivalente ao /meta/adset e /tiktok/adgroup)
+// Cria o Grupo de Anuncios de Pesquisa (equivalente ao /meta/adset e /tiktok/adgroup)
 app.post("/google/adgroup", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -5611,7 +5622,7 @@ app.post("/google/adgroup", authMiddleware, async (c) => {
         create: {
           name: `AdGroup Leads ${Date.now()}`,
           campaign: campaignResourceName,
-          type: "DISPLAY_STANDARD",
+          type: "SEARCH_STANDARD",
           status: "ENABLED",
           cpcBidMicros: String(cpcBidMicros),
         },
@@ -5848,16 +5859,15 @@ app.post("/google/upload-imagem", authMiddleware, async (c) => {
   }
 });
 
-// Cria o Responsive Display Ad e vincula o Lead Form escolhido a campanha
-// (equivalente ao /meta/anuncio e /tiktok/anuncio) — aqui a linha de campanhas
-// recebe adset_id/ad_id/form_id, mesmo padrao das outras plataformas.
+// Cria o Responsive Search Ad (texto, sem imagem) + palavras-chave e vincula o Lead
+// Form escolhido a campanha (equivalente ao /meta/anuncio e /tiktok/anuncio) — aqui a
+// linha de campanhas recebe adset_id/ad_id/form_id, mesmo padrao das outras plataformas.
 app.post("/google/anuncio", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const {
       usuario_id, campaign_id, adgroup_id, form_id,
-      titulos, titulo_longo, descricoes, nome_anunciante, url_destino,
-      imagem_paisagem_resource, imagem_quadrada_resource,
+      titulos, descricoes, nome_anunciante, url_destino,
       daily_budget, configuracoes_avancadas
     } = await c.req.json();
 
@@ -5867,20 +5877,16 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     if (!campaign_id) return c.json({ error: "campaign_id não enviado" }, 400);
     if (!adgroup_id) return c.json({ error: "adgroup_id não enviado" }, 400);
     if (!form_id) return c.json({ error: "Selecione um Lead Form antes de publicar" }, 400);
-    if (!imagem_paisagem_resource || !imagem_quadrada_resource) {
-      return c.json({ error: "Envie a imagem paisagem e a imagem quadrada antes de publicar" }, 400);
-    }
 
     const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
     const listaDescricoes = (Array.isArray(descricoes) ? descricoes : []).map(textoOpcional).filter(Boolean);
-    const tituloLongo = textoOpcional(titulo_longo);
     const nomeAnunciante = textoOpcional(nome_anunciante);
     const url = textoOpcional(url_destino) || "https://plataformadeleads.com.br";
 
-    if (!listaTitulos.length) return c.json({ error: "Informe ao menos um título para o anúncio Google" }, 400);
-    if (!tituloLongo) return c.json({ error: "Informe o título longo do anúncio Google" }, 400);
-    if (!listaDescricoes.length) return c.json({ error: "Informe ao menos uma descrição para o anúncio Google" }, 400);
-    if (!nomeAnunciante) return c.json({ error: "Informe o nome do anunciante para o anúncio Google" }, 400);
+    // O Responsive Search Ad exige no minimo 3 titulos e 2 descricoes (regra fixa da
+    // Google Ads API) — sem esse minimo a criacao do anuncio e rejeitada.
+    if (listaTitulos.length < 3) return c.json({ error: "Informe ao menos 3 títulos para o anúncio Google" }, 400);
+    if (listaDescricoes.length < 2) return c.json({ error: "Informe ao menos 2 descrições para o anúncio Google" }, 400);
 
     const conexao = await resolverConexaoGoogleAds(usuarioId);
     if ("erro" in conexao) {
@@ -5890,46 +5896,21 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
     const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
 
-    let adResults;
-    try {
-      adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
-        {
-          create: {
-            adGroup: adGroupResourceName,
-            status: "PAUSED",
-            ad: {
-              finalUrls: [url],
-              responsiveDisplayAd: {
-                headlines: listaTitulos.slice(0, 5).map(text => ({ text })),
-                longHeadline: { text: tituloLongo },
-                descriptions: listaDescricoes.slice(0, 5).map(text => ({ text })),
-                businessName: nomeAnunciante,
-                marketingImages: [{ asset: imagem_paisagem_resource }],
-                squareMarketingImages: [{ asset: imagem_quadrada_resource }],
-              },
+    const adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+      {
+        create: {
+          adGroup: adGroupResourceName,
+          status: "PAUSED",
+          ad: {
+            finalUrls: [url],
+            responsiveSearchAd: {
+              headlines: listaTitulos.slice(0, 15).map(text => ({ text })),
+              descriptions: listaDescricoes.slice(0, 4).map(text => ({ text })),
             },
           },
         },
-      ]);
-    } catch (err: any) {
-      // O Google Ads Display exige duas imagens com proporcoes bem diferentes: paisagem
-      // (1.91:1, ex: 1200x628) e quadrada (1:1, ex: 1200x1200) — quando a campanha so tem
-      // uma imagem, o frontend reaproveita ela nos dois formatos (ver publicarCampanhaGoogle),
-      // o que sempre falha em um dos dois lados, ja que uma imagem so nao serve pras duas
-      // proporcoes ao mesmo tempo. Mensagem clara em vez do erro cru da API.
-      if (
-        googleAdsTemErroCode(err, "DIMENSIONS_NOT_ALLOWED") ||
-        googleAdsTemErroCode(err, "ASPECT_RATIO_NOT_ALLOWED")
-      ) {
-        return c.json({
-          error: "As imagens da campanha não estão no formato exigido pelo Google Ads Display. " +
-            "São necessárias duas imagens com proporções diferentes: uma paisagem (proporção 1.91:1, " +
-            "ex: 1200×628px) e uma quadrada (proporção 1:1, ex: 1200×1200px) — a mesma imagem não " +
-            "serve para os dois formatos. Adicione uma segunda imagem (quadrada) na campanha e tente novamente."
-        }, 400);
-      }
-      throw err;
-    }
+      },
+    ]);
 
     const adResourceName = adResults[0]?.resourceName;
     if (!adResourceName) {
@@ -5939,6 +5920,20 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const adId = adResourceName.includes("~")
       ? adResourceName.split("~")[1]
       : adResourceName.split("/").pop();
+
+    // Campanha de Pesquisa exige palavras-chave pra veicular (sem elas o anuncio nunca
+    // aparece) — reaproveita os proprios titulos do anuncio como palavras-chave em
+    // correspondencia ampla, ja que sao textos curtos e relevantes ao nicho gerados
+    // pela IA/usuario, sem precisar de um campo novo so pra isso.
+    await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria",
+      listaTitulos.slice(0, 10).map(texto => ({
+        create: {
+          adGroup: adGroupResourceName,
+          status: "ENABLED",
+          keyword: { text: texto, matchType: "BROAD" },
+        },
+      }))
+    );
 
     // ASSUMPTION: vincular o Lead Form como CampaignAsset com fieldType LEAD_FORM
     // (nao usa AssetSet/CampaignAssetSet) — conferido contra o sample oficial
@@ -5956,12 +5951,9 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
       titulos: listaTitulos,
-      titulo_longo: tituloLongo,
       descricoes: listaDescricoes,
       nome_anunciante: nomeAnunciante,
       url_destino: url,
-      imagem_paisagem_resource,
-      imagem_quadrada_resource,
     };
 
     await client.query(
