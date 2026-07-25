@@ -13066,6 +13066,20 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
     const contaAnunciosId =
       conn.rows[0]?.conta_anuncios_id || null;
 
+    // Apesar do nome, essa rota e a fonte real de "Minhas Campanhas" pro frontend
+    // (carregarCampanhas() chama so ela) — o WHERE abaixo so comparava contra a conta
+    // Meta, entao toda campanha Google/TikTok sumia da lista mesmo criada com sucesso
+    // (mesmo bug ja corrigido em GET /campanhas, que na pratica nao e usada pela tela).
+    const contaAnunciosIdGoogle = await client.query(
+      `SELECT dados_conta->>'customer_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
+    const contaAnunciosIdTikTok = await client.query(
+      `SELECT dados_conta->>'advertiser_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
     const campanhas = await client.query(
       `
       SELECT
@@ -13135,10 +13149,15 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         ON cp.campanha_id = c.id
       WHERE
         c.usuario_id = $1
-        AND (c.origem = 'manual' OR $2::text IS NULL OR c.conta_anuncios_id = $2)
+        AND (
+          c.origem = 'manual'
+          OR (COALESCE(c.plataforma, 'meta') = 'meta' AND ($2::text IS NULL OR c.conta_anuncios_id = $2))
+          OR (c.plataforma = 'google' AND c.conta_anuncios_id = $3)
+          OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $4)
+        )
       ORDER BY c.id DESC
       `,
-      [user.id, contaAnunciosId]
+      [user.id, contaAnunciosId, contaAnunciosIdGoogle, contaAnunciosIdTikTok]
     );
 
     // 🔥 STATUS DA CONTA (account_status indica problema de pagamento/cobranca)
@@ -13316,6 +13335,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       if (
         token &&
         campanha.campaign_id &&
+        (campanha.plataforma || "meta") === "meta" &&
         String(campanha.status || "").toUpperCase() !== "DELETED"
       ) {
         try {
