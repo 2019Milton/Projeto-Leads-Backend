@@ -4493,6 +4493,126 @@ async function sincronizarCampanhasUsuario(
   );
 }
 
+// Reconciliação de leads Meta: varre páginas → formulários → leads e importa
+// pro banco o que ainda não existe (deduplicado por lead_id). É o mesmo
+// mecanismo que o botão manual "Sincronizar" sempre usou — extraído aqui pra
+// também rodar dentro do auto sync de 4h (webhook /webhook/meta continua
+// sendo a via principal em tempo real; isto é o backup que cobre falha de
+// webhook, atraso ou app parado).
+async function sincronizarLeadsMetaUsuario(
+  usuarioId: number,
+  token: string,
+  adAccountId: string
+) {
+  const paginas = await fetch(
+    `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+  ).then(r => r.json());
+
+  for (const pagina of paginas.data || []) {
+    const pageToken = pagina.access_token;
+
+    const forms = await fetch(
+      `https://graph.facebook.com/v19.0/${pagina.id}/leadgen_forms?access_token=${pageToken}`
+    ).then(r => r.json());
+
+    for (const form of forms.data || []) {
+      const campanhaBanco = await client.query(
+        `
+        SELECT nome, nicho_id
+        FROM campanhas
+        WHERE form_id = $1
+        AND conta_anuncios_id = $2
+        AND usuario_id = $3
+        LIMIT 1
+        `,
+        [form.id, adAccountId, usuarioId]
+      );
+
+      if (!campanhaBanco.rows.length) continue;
+
+      const nomeCampanha =
+        campanhaBanco.rows[0]?.nome || "Campanha sem vínculo";
+      const nichoIdSync: number | null =
+        campanhaBanco.rows[0]?.nicho_id ?? null;
+
+      const leadsMeta = await fetch(
+        `https://graph.facebook.com/v19.0/${form.id}/leads?access_token=${pageToken}`
+      ).then(r => r.json());
+
+      for (const lead of leadsMeta.data || []) {
+        const fields: any = {};
+        const respostasQualificacao: any[] = [];
+
+        for (const field of lead.field_data || []) {
+          fields[field.name] = field.values?.[0] || "";
+
+          if (!["full_name", "email", "phone_number"].includes(field.name)) {
+            respostasQualificacao.push({
+              pergunta: field.name,
+              resposta: field.values?.[0] || ""
+            });
+          }
+        }
+
+        const leadExiste = await client.query(
+          `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+          [lead.id, usuarioId]
+        );
+
+        if (leadExiste.rows.length > 0) {
+          await client.query(
+            `
+            UPDATE leads
+            SET campanha = $1, respostas_qualificacao = $2, conta_anuncios_id = $3
+            WHERE lead_id = $4 AND usuario_id = $5
+            `,
+            [nomeCampanha, JSON.stringify(respostasQualificacao), adAccountId, lead.id, usuarioId]
+          );
+          continue;
+        }
+
+        const leadSincronizado = await client.query(
+          `
+          INSERT INTO leads (
+            usuario_id, lead_id, nome, email, telefone, campanha,
+            conta_anuncios_id, origem, plataforma, status,
+            respostas_qualificacao, nicho_id, criado_em
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+          RETURNING id
+          `,
+          [
+            usuarioId, lead.id, fields.full_name || "", fields.email || "",
+            fields.phone_number || "", nomeCampanha, adAccountId, "meta", "meta",
+            "novo", JSON.stringify(respostasQualificacao), nichoIdSync
+          ]
+        );
+
+        console.log("✅ LEAD RECONCILIADO (sync):", lead.id);
+
+        await notificarNovoLeadWhatsApp(usuarioId, {
+          nome: fields.full_name,
+          telefone: fields.phone_number,
+          email: fields.email,
+          campanha: nomeCampanha
+        });
+
+        avaliarEEnviarQualificacaoMeta(
+          {
+            id: leadSincronizado.rows[0]?.id,
+            lead_id: lead.id,
+            plataforma: "meta",
+            status: "novo",
+            campanha: nomeCampanha,
+            respostas_qualificacao: respostasQualificacao
+          },
+          usuarioId
+        ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (auto sync meta):", err));
+      }
+    }
+  }
+}
+
 async function sincronizarTodasCampanhas() {
 
   try {
@@ -4513,6 +4633,11 @@ async function sincronizarTodasCampanhas() {
 
       try {
         await sincronizarCampanhasUsuario(
+          user.usuario_id,
+          user.access_token,
+          user.conta_anuncios_id
+        );
+        await sincronizarLeadsMetaUsuario(
           user.usuario_id,
           user.access_token,
           user.conta_anuncios_id
@@ -14489,210 +14614,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
     // =====================================================
     // 🔥 SINCRONIZA LEADS
     // =====================================================
-
-    // 🔥 BUSCA PÁGINAS
-    const paginas = await fetch(
-      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
-    ).then(r => r.json());
-
-    console.log(
-      "PAGINAS META:",
-      JSON.stringify(paginas, null, 2)
-    );
-
-    for (const pagina of paginas.data || []) {
-
-      console.log("PAGINA:", pagina.name);
-
-      // 🔥 BUSCA FORMULÁRIOS
-      const pageToken =
-        pagina.access_token;
-      
-      const forms = await fetch(
-        `https://graph.facebook.com/v19.0/${pagina.id}/leadgen_forms?access_token=${pageToken}`
-      ).then(r => r.json());
-
-      console.log(
-        "FORMS META:",
-        Array.isArray(forms.data) ? forms.data.length : 0
-      );
-
-      for (const form of forms.data || []) {
-
-        // 🔥 BUSCA CAMPANHA PELO FORM
-        const campanhaBanco = await client.query(
-          `
-          SELECT nome, nicho_id
-          FROM campanhas
-          WHERE form_id = $1
-          AND conta_anuncios_id = $2
-          AND usuario_id = $3
-          LIMIT 1
-          `,
-          [form.id, adAccountId, user.id]
-        );
-
-        if (!campanhaBanco.rows.length) {
-          console.log(
-            "FORMULARIO SEM CAMPANHA DA CONTA SELECIONADA:",
-            form.id
-          );
-          continue;
-        }
-
-        const nomeCampanha =
-          campanhaBanco.rows[0]?.nome ||
-          "Campanha sem vínculo";
-
-        const nichoIdSync: number | null =
-          campanhaBanco.rows[0]?.nicho_id ?? null;
-        
-        console.log("FORM:", form.name);
-
-        // 🔥 BUSCA LEADS
-        const leadsMeta = await fetch(
-          `https://graph.facebook.com/v19.0/${form.id}/leads?access_token=${pageToken}`
-        ).then(r => r.json());
-
-        console.log(
-          "LEADS META:",
-          Array.isArray(leadsMeta.data) ? leadsMeta.data.length : 0
-        );
-
-        for (const lead of leadsMeta.data || []) {
-
-          // 🔥 transforma fields
-          const fields: any = {};
-          const respostasQualificacao: any[] = [];
-
-          for (const field of lead.field_data || []) {
-
-            fields[field.name] =
-              field.values?.[0] || "";
-
-            if (
-              ![
-                "full_name",
-                "email",
-                "phone_number"
-              ].includes(field.name)
-            ) {
-              respostasQualificacao.push({
-                pergunta: field.name,
-                resposta: field.values?.[0] || ""
-              });
-            }
-          }
-
-          // 🔥 evita duplicar lead
-          const leadExiste = await client.query(
-            `
-            SELECT id
-            FROM leads
-            WHERE lead_id = $1
-            AND usuario_id = $2
-            `,
-            [lead.id, user.id]
-          );
-
-          if (leadExiste.rows.length > 0) {
-
-            await client.query(
-              `
-              UPDATE leads
-              SET
-                campanha = $1,
-                respostas_qualificacao = $2,
-                conta_anuncios_id = $3
-              WHERE lead_id = $4
-              AND usuario_id = $5
-              `,
-              [
-                nomeCampanha,
-                JSON.stringify(respostasQualificacao),
-                adAccountId,
-                lead.id,
-                user.id
-              ]
-            );
-          
-            console.log(
-              "♻️ Lead atualizado:",
-              lead.id,
-              nomeCampanha
-            );
-          
-            continue;
-          }
-
-          console.log("FIELDS:", fields);
-
-          // 🔥 salva lead
-          const leadSincronizado = await client.query(
-            `
-            INSERT INTO leads (
-              usuario_id,
-              lead_id,
-              nome,
-              email,
-              telefone,
-              campanha,
-              conta_anuncios_id,
-              origem,
-              plataforma,
-              status,
-              respostas_qualificacao,
-              nicho_id,
-              criado_em
-            )
-            VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()
-            )
-            RETURNING id
-            `,
-            [
-              user.id,
-              lead.id,
-              fields.full_name || "",
-              fields.email || "",
-              fields.phone_number || "",
-              nomeCampanha,
-              adAccountId,
-              "meta",
-              "meta",
-              "novo",
-              JSON.stringify(respostasQualificacao),
-              nichoIdSync
-            ]
-          );
-
-          console.log(
-            "✅ LEAD SALVO:",
-            lead.id
-          );
-
-          // 📲 notificação WhatsApp para o dono da campanha
-          await notificarNovoLeadWhatsApp(user.id, {
-            nome: fields.full_name,
-            telefone: fields.phone_number,
-            email: fields.email,
-            campanha: nomeCampanha
-          });
-
-          avaliarEEnviarQualificacaoMeta(
-            {
-              id: leadSincronizado.rows[0]?.id,
-              lead_id: lead.id,
-              plataforma: "meta",
-              status: "novo",
-              campanha: nomeCampanha,
-              respostas_qualificacao: respostasQualificacao
-            },
-            user.id
-          ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (sync meta):", err));
-        }
-      }
-    }
+    await sincronizarLeadsMetaUsuario(user.id, token, adAccountId);
 
     // 🔥 UPDATE ÚLTIMO SYNC
     await client.query(
@@ -19960,7 +19882,8 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
 
 
 
-// 🔄 AUTO SYNC A CADA 4 HORAS (com delay de 2s entre usuários para não sobrecarregar a Meta API)
+// 🔄 AUTO SYNC A CADA 4 HORAS — campanhas (nome/status) + reconciliação de leads
+// (com delay de 2s entre usuários para não sobrecarregar a Meta API)
 setInterval(() => {
   sincronizarTodasCampanhas();
 }, 1000 * 60 * 60 * 4);
