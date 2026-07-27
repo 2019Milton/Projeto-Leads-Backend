@@ -4632,7 +4632,16 @@ async function sincronizarLeadsMetaUsuario(
   }
 }
 
+let autoSyncEmAndamento = false;
+
 async function sincronizarTodasCampanhas() {
+
+  if (autoSyncEmAndamento) {
+    console.log("⏭️ AUTO SYNC pulado — ciclo anterior ainda em andamento");
+    return;
+  }
+
+  autoSyncEmAndamento = true;
 
   try {
 
@@ -4673,6 +4682,8 @@ async function sincronizarTodasCampanhas() {
 
   } catch (err) {
     console.error("ERRO AUTO SYNC:", err);
+  } finally {
+    autoSyncEmAndamento = false;
   }
 }
 
@@ -14466,6 +14477,28 @@ app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: an
   }
 });
 
+// Consulta leve (só banco, sem chamar a API da Meta) pro indicador de
+// "última sincronização" na sidebar — não usar /meta/status-completo aqui,
+// que é pesada e faz várias chamadas à Meta.
+app.get("/meta/ultimo-sync", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    const conn = await client.query(
+      `SELECT ultimo_sync FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+      [user.id]
+    );
+
+    return c.json({
+      conectado: conn.rows.length > 0,
+      ultimo_sync: conn.rows[0]?.ultimo_sync || null
+    });
+  } catch (err) {
+    console.error("ERRO ULTIMO SYNC:", err);
+    return c.json({ error: "Erro ao buscar última sincronização" }, 500);
+  }
+});
+
 app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
   const user: any = c.get("user");
@@ -19904,11 +19937,13 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
 
 
 
-// 🔄 AUTO SYNC A CADA 4 HORAS — campanhas (nome/status) + reconciliação de leads
-// (com delay de 2s entre usuários para não sobrecarregar a Meta API)
+// 🔄 AUTO SYNC A CADA 30 MINUTOS — campanhas (nome/status) + reconciliação de leads
+// (delay de 2s entre usuários pra não sobrecarregar a Meta API; autoSyncEmAndamento
+// evita ciclos sobrepostos caso a base de usuários cresça e um ciclo demore mais
+// que o intervalo)
 setInterval(() => {
   sincronizarTodasCampanhas();
-}, 1000 * 60 * 60 * 4);
+}, 1000 * 60 * 30);
 
 
 /* =========================
