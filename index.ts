@@ -4493,6 +4493,23 @@ async function sincronizarCampanhasUsuario(
   );
 }
 
+// A Meta devolve o campo customizado da pergunta qualificadora com a KEY
+// interna (ex: "qualificacao_1"), não com o texto da pergunta — a key é a
+// mesma que a própria plataforma atribui ao criar o formulário na Meta
+// (key: `qualificacao_${index+1}`, na mesma ordem de cfg.perguntas). Por
+// isso dá pra remapear de volta pro texto real da pergunta configurada na
+// campanha, em vez de mostrar "qualificacao_1" pro usuário final.
+function mapearPerguntaQualificacaoMeta(fieldName: string, perguntas: any): string {
+  const match = /^qualificacao_(\d+)$/.exec(String(fieldName || ""));
+  if (!match) return fieldName;
+
+  const indice = Number(match[1]) - 1;
+  const lista = Array.isArray(perguntas) ? perguntas : [];
+  const textoReal = textoOpcional(lista[indice]);
+
+  return textoReal || fieldName;
+}
+
 // Reconciliação de leads Meta: varre páginas → formulários → leads e importa
 // pro banco o que ainda não existe (deduplicado por lead_id). É o mesmo
 // mecanismo que o botão manual "Sincronizar" sempre usou — extraído aqui pra
@@ -4518,7 +4535,7 @@ async function sincronizarLeadsMetaUsuario(
     for (const form of forms.data || []) {
       const campanhaBanco = await client.query(
         `
-        SELECT nome, nicho_id
+        SELECT nome, nicho_id, configuracoes_avancadas
         FROM campanhas
         WHERE form_id = $1
         AND conta_anuncios_id = $2
@@ -4534,6 +4551,8 @@ async function sincronizarLeadsMetaUsuario(
         campanhaBanco.rows[0]?.nome || "Campanha sem vínculo";
       const nichoIdSync: number | null =
         campanhaBanco.rows[0]?.nicho_id ?? null;
+      const perguntasCampanha =
+        campanhaBanco.rows[0]?.configuracoes_avancadas?.perguntas;
 
       const leadsMeta = await fetch(
         `https://graph.facebook.com/v19.0/${form.id}/leads?access_token=${pageToken}`
@@ -4548,7 +4567,7 @@ async function sincronizarLeadsMetaUsuario(
 
           if (!["full_name", "email", "phone_number"].includes(field.name)) {
             respostasQualificacao.push({
-              pergunta: field.name,
+              pergunta: mapearPerguntaQualificacaoMeta(field.name, perguntasCampanha),
               resposta: field.values?.[0] || ""
             });
           }
@@ -11200,11 +11219,12 @@ app.post("/webhook/meta", async (c) => {
             let nomeCampanha = "Campanha Meta";
             let contaAnunciosId: string | null = null;
             let nichoIdLead: number | null = null;
+            let perguntasCampanhaLead: any = null;
 
             if (form_id) {
               const campanhaByForm = await client.query(
                 `
-                SELECT usuario_id, nome, conta_anuncios_id, nicho_id
+                SELECT usuario_id, nome, conta_anuncios_id, nicho_id, configuracoes_avancadas
                 FROM campanhas
                 WHERE form_id = $1
                 LIMIT 1
@@ -11217,13 +11237,14 @@ app.post("/webhook/meta", async (c) => {
                 nomeCampanha = campanhaByForm.rows[0].nome;
                 contaAnunciosId = campanhaByForm.rows[0].conta_anuncios_id;
                 nichoIdLead = campanhaByForm.rows[0].nicho_id ?? null;
+                perguntasCampanhaLead = campanhaByForm.rows[0].configuracoes_avancadas?.perguntas ?? null;
               }
             }
 
             if (!usuarioId && page_id) {
               const campanhaByPage = await client.query(
                 `
-                SELECT usuario_id, nome, conta_anuncios_id, nicho_id
+                SELECT usuario_id, nome, conta_anuncios_id, nicho_id, configuracoes_avancadas
                 FROM campanhas
                 WHERE page_id = $1
                 ORDER BY id DESC
@@ -11237,6 +11258,7 @@ app.post("/webhook/meta", async (c) => {
                 nomeCampanha = campanhaByPage.rows[0].nome;
                 contaAnunciosId = campanhaByPage.rows[0].conta_anuncios_id;
                 nichoIdLead = campanhaByPage.rows[0].nicho_id ?? null;
+                perguntasCampanhaLead = campanhaByPage.rows[0].configuracoes_avancadas?.perguntas ?? null;
               }
             }
 
@@ -11313,7 +11335,7 @@ app.post("/webhook/meta", async (c) => {
                 telefone = field.values?.[0];
               } else {
                 respostasQualificacao.push({
-                  pergunta: field.name,
+                  pergunta: mapearPerguntaQualificacaoMeta(field.name, perguntasCampanhaLead),
                   resposta: field.values?.[0] || ""
                 });
               }
