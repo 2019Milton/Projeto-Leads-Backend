@@ -13453,8 +13453,8 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
           const novaCopia = await conn.query(
             `
             INSERT INTO campanhas
-              (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, origem_campanha_id, criado_em)
-            VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, NOW())
+              (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, origem_campanha_id, plataforma, criado_em)
+            VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, $7, NOW())
             RETURNING id
             `,
             [
@@ -13463,7 +13463,8 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
               orig.nicho_id ?? null,
               orig.daily_budget ?? null,
               orig.configuracoes_avancadas ?? null,
-              campanhaId
+              campanhaId,
+              orig.plataforma || "meta"
             ]
           );
 
