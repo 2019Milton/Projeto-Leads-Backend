@@ -13980,10 +13980,19 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           String(campanha.status || "").toUpperCase()
         );
 
+      // erroPagamentoConta/issuesPorCampanha vem inteiramente da conta de anuncios
+      // Meta (contaAnunciosId) — sem este filtro, uma campanha Google/TikTok ativa
+      // herdava o aviso de faturamento da conta Meta do usuario, mesmo sem nenhuma
+      // relacao com ela.
+      const campanhaEhMeta =
+        (campanha.plataforma || "meta") === "meta";
+
       const mensagemErroPagamento =
-        (issuePagamento &&
-          (issuePagamento.error_summary || issuePagamento.error_message)) ||
-        (campanhaAtiva ? erroPagamentoConta : null);
+        campanhaEhMeta
+          ? (issuePagamento &&
+              (issuePagamento.error_summary || issuePagamento.error_message)) ||
+            (campanhaAtiva ? erroPagamentoConta : null)
+          : null;
 
       // 🔥 VEICULAÇÃO (status detalhado igual ao Gerenciador de Anúncios)
       const veiculacaoStatus =
@@ -14011,7 +14020,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         diagnosticarVeiculacaoMeta(
           veiculacaoStatus,
           issuesCampanha,
-          mensagemErroPagamento || erroPagamentoConta,
+          mensagemErroPagamento || (campanhaEhMeta ? erroPagamentoConta : null),
           campanha.status
         );
 
