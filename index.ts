@@ -6615,6 +6615,75 @@ app.post("/google/excluir-campanha", authMiddleware, async (c) => {
   }
 });
 
+// Ativa/pausa uma campanha Google Ads (equivalente ao /meta/toggle-campanha e
+// /tiktok/toggle-campanha) — campanhas de Pesquisa sao sempre criadas PAUSED pela
+// API (nao ha como criar ja ENABLED), entao esta e a unica forma de comecar a
+// veicular depois da criacao. A Google Ads API usa o enum ENABLED (nao ACTIVE
+// como Meta/TikTok) e exige updateMask explicito em toda operacao "update".
+app.post("/google/toggle-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id, status } = await c.req.json();
+
+    if (!campaign_id || !["ACTIVE", "PAUSED"].includes(status)) {
+      return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
+    }
+
+    const campanhaBanco = await client.query(
+      `SELECT id, adset_id, ad_id
+       FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+    }
+
+    const { adset_id, ad_id } = campanhaBanco.rows[0];
+
+    const conexao = await resolverConexaoGoogleAds(user.id);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const googleStatus = status === "ACTIVE" ? "ENABLED" : "PAUSED";
+    const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
+
+    await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+      { update: { resourceName: campaignResourceName, status: googleStatus }, updateMask: "status" },
+    ]);
+
+    // Adgroup/anuncio sao best-effort (mesmo espirito do toggle da Meta): a
+    // campanha ja mudou de status no Google, nao vale travar o usuario por uma
+    // falha secundaria aqui — só loga.
+    if (adset_id) {
+      const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adset_id}`;
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroups", [
+        { update: { resourceName: adGroupResourceName, status: googleStatus }, updateMask: "status" },
+      ]).catch((err: any) => console.warn("AVISO /google/toggle-campanha (adgroup):", err.message));
+    }
+
+    if (ad_id && adset_id) {
+      const adGroupAdResourceName = `customers/${conexao.customerId}/adGroupAds/${adset_id}~${ad_id}`;
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+        { update: { resourceName: adGroupAdResourceName, status: googleStatus }, updateMask: "status" },
+      ]).catch((err: any) => console.warn("AVISO /google/toggle-campanha (ad):", err.message));
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = $1, atualizado_em = NOW() WHERE id = $2`,
+      [status, campanhaBanco.rows[0].id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /google/toggle-campanha:", err);
+    return c.json({ error: err.message || "Erro ao alterar campanha Google Ads" }, 500);
+  }
+});
+
 /* =========================
    🎵 TIKTOK ADS
 ========================= */
