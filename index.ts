@@ -10753,14 +10753,35 @@ app.get("/config/whatsapp-embedded-signup", async (c) => {
 app.post("/whatsapp/conectar", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
-    const { waba_id, phone_number_id } = await c.req.json();
-    if (!waba_id || !phone_number_id) {
-      return c.json({ error: "waba_id e phone_number_id são obrigatórios" }, 400);
+    const body = await c.req.json();
+    const waba_id = body.waba_id;
+    let phone_number_id = body.phone_number_id;
+    if (!waba_id) {
+      return c.json({ error: "waba_id é obrigatório" }, 400);
     }
 
     const token = Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
     if (!token) {
       return c.json({ error: "Integração de WhatsApp ainda não configurada no servidor" }, 500);
+    }
+
+    // Fluxo de Coexistência (número já ativo no app do WhatsApp Business) só devolve o
+    // waba_id no evento de conclusão do Embedded Signup — busca o número vinculado a essa
+    // WABA diretamente na Graph API quando o frontend não mandou o phone_number_id.
+    if (!phone_number_id) {
+      const numerosRes = await fetch(
+        `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}/phone_numbers`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const numerosData = await numerosRes.json() as any;
+      if (!numerosRes.ok || !numerosData?.data?.length) {
+        console.error("ERRO WHATSAPP phone_numbers:", JSON.stringify(numerosData));
+        return c.json(
+          { error: "Não foi possível encontrar o número vinculado a essa conta do WhatsApp", detalhe: numerosData?.error?.message },
+          502
+        );
+      }
+      phone_number_id = numerosData.data[0].id;
     }
 
     // Inscreve o app da plataforma pra receber os webhooks dessa WABA especifica
