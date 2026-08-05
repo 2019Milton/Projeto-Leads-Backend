@@ -11781,8 +11781,10 @@ app.post("/webhook/whatsapp", async (c) => {
   try {
     const corpoRaw = await c.req.text();
     const assinatura = c.req.header("x-hub-signature-256") || c.req.header("X-Hub-Signature-256") || null;
+    console.log("WEBHOOK WHATSAPP RECEBIDO:", corpoRaw.slice(0, 500));
 
     if (!validarAssinaturaMetaWebhook(assinatura, corpoRaw)) {
+      console.error("WEBHOOK WHATSAPP: assinatura invalida", { assinatura });
       return c.json({ error: "Assinatura Meta invalida" }, 401);
     }
 
