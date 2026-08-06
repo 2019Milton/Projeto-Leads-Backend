@@ -11826,6 +11826,50 @@ async function processarEventoWhatsApp(value: any) {
   }
 }
 
+// Coexistência: mensagem que o corretor manda pelo próprio app do WhatsApp (não
+// pela plataforma) chega nesse campo separado, não em "messages". Serve pra
+// marcar a conversa como 'humano' (o corretor já assumiu, o bot para de responder)
+// e logar o que foi dito — sem isso o handoff bot→corretor não é confiável em
+// Coexistência real (a heurística antiga em processarEventoWhatsApp era só um
+// palpite provisório, não o campo oficial da Meta pra isso).
+async function processarEcoWhatsApp(value: any) {
+  const phoneNumberId = value?.metadata?.phone_number_id;
+  if (!phoneNumberId) return;
+
+  const conexao = await client.query(
+    `SELECT usuario_id FROM plataforma_conexoes WHERE plataforma = 'whatsapp' AND dados_conta->>'phone_number_id' = $1 LIMIT 1`,
+    [phoneNumberId]
+  );
+  const usuarioId = conexao.rows[0]?.usuario_id;
+  if (!usuarioId) {
+    console.warn(`[whatsapp-echo] nenhum corretor encontrado pro phone_number_id ${phoneNumberId}`);
+    return;
+  }
+
+  for (const msg of value.message_echoes || []) {
+    const telefoneCliente = msg.to;
+    if (!telefoneCliente) continue;
+
+    const conversaRes = await client.query(
+      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, atualizado_em)
+       VALUES ($1, $2, 'humano', NOW())
+       ON CONFLICT (usuario_id, telefone_cliente)
+       DO UPDATE SET status = 'humano', atualizado_em = NOW()
+       RETURNING id`,
+      [usuarioId, telefoneCliente]
+    );
+    const conversaId = conversaRes.rows[0]?.id;
+    if (!conversaId) continue;
+
+    const conteudo = msg.text?.body || (msg.type ? `[${msg.type}]` : null);
+    await client.query(
+      `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'echo', $3)
+       ON CONFLICT (wamid) DO NOTHING`,
+      [conversaId, msg.id, conteudo]
+    ).catch((e) => console.error("ERRO log eco whatsapp:", e));
+  }
+}
+
 app.post("/webhook/whatsapp", async (c) => {
   try {
     const corpoRaw = await c.req.text();
@@ -11842,10 +11886,15 @@ app.post("/webhook/whatsapp", async (c) => {
     if (body.object === "whatsapp_business_account") {
       for (const entry of body.entry || []) {
         for (const change of entry.changes || []) {
-          if (change.field !== "messages") continue;
-          await processarEventoWhatsApp(change.value).catch((e: any) =>
-            console.error("ERRO processarEventoWhatsApp:", e)
-          );
+          if (change.field === "messages") {
+            await processarEventoWhatsApp(change.value).catch((e: any) =>
+              console.error("ERRO processarEventoWhatsApp:", e)
+            );
+          } else if (change.field === "smb_message_echoes") {
+            await processarEcoWhatsApp(change.value).catch((e: any) =>
+              console.error("ERRO processarEcoWhatsApp:", e)
+            );
+          }
         }
       }
     }
