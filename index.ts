@@ -10833,6 +10833,55 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
   }
 });
 
+// Checagem ao vivo (via Graph API) do que da pra saber sobre a prontidao da conta
+// pra mandar/receber mensagem. Forma de pagamento e verificacao de empresa nao
+// aparecem aqui de proposito — vivem no nivel do Business Manager, que exige a
+// permissao business_management (nao temos), entao continuam so como aviso no guia.
+app.get("/whatsapp/diagnostico", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexaoRes = await client.query(
+      `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
+      [user.id]
+    );
+    const dadosConta = conexaoRes.rows[0]?.dados_conta;
+    if (!dadosConta?.waba_id || !dadosConta?.phone_number_id) {
+      return c.json({ conectado: false });
+    }
+
+    const token = Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
+    if (!token) {
+      return c.json({ error: "Integração de WhatsApp ainda não configurada no servidor" }, 500);
+    }
+
+    const [wabaRes, numerosRes] = await Promise.all([
+      fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}?fields=account_review_status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}/phone_numbers?fields=code_verification_status,quality_rating,messaging_limit_tier,status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+    ]);
+    const wabaData = await wabaRes.json() as any;
+    const numerosData = await numerosRes.json() as any;
+    const numero = numerosData?.data?.find((n: any) => n.id === dadosConta.phone_number_id) || numerosData?.data?.[0] || {};
+
+    return c.json({
+      conectado: true,
+      conta_aprovada: wabaData?.account_review_status === "APPROVED",
+      account_review_status: wabaData?.account_review_status || null,
+      numero_status: numero.status || null,
+      numero_verificado: numero.code_verification_status === "VERIFIED",
+      code_verification_status: numero.code_verification_status || null,
+      quality_rating: numero.quality_rating || null,
+      messaging_limit_tier: numero.messaging_limit_tier || null,
+    });
+  } catch (err: any) {
+    console.error("ERRO GET /whatsapp/diagnostico:", err);
+    return c.json({ error: "Erro ao consultar diagnóstico do WhatsApp" }, 500);
+  }
+});
+
 function validarPassosRoteiro(passos: any[]) {
   for (const passo of passos) {
     if (!passo || !["mensagem", "pergunta"].includes(passo.tipo) || !String(passo.texto || "").trim()) {
