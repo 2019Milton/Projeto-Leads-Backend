@@ -21364,11 +21364,11 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
 
     const novaRes = await client.query(
       `INSERT INTO campanhas
-         (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, conta_anuncios_id)
-       VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6)
+         (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, conta_anuncios_id, plataforma)
+       VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, $7)
        RETURNING id`,
       [user.id, novoNome, orig.nicho_id ?? null, orig.daily_budget ?? null,
-       orig.configuracoes_avancadas ?? null, orig.conta_anuncios_id ?? null]
+       orig.configuracoes_avancadas ?? null, orig.conta_anuncios_id ?? null, orig.plataforma || "meta"]
     );
     const novaId = novaRes.rows[0].id;
 
