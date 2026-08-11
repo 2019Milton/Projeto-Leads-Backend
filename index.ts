@@ -967,7 +967,9 @@ async function enviarEventoMetaConversionLeads(
   eventName: "Qualified Lead" | "Closed Won"
 ): Promise<{ ok: boolean; erro?: string }> {
 
-  if (!lead?.lead_id) {
+  const isCtwa = Boolean(lead?.ctwa_clid);
+
+  if (!isCtwa && !lead?.lead_id) {
     return { ok: false, erro: "Lead sem lead_id da Meta" };
   }
 
@@ -989,25 +991,56 @@ async function enviarEventoMetaConversionLeads(
     return { ok: false, erro: "Meta nao conectada" };
   }
 
+  // CTWA (lead criado a partir de conversa de WhatsApp de anúncio) usa
+  // whatsapp_business_account_id no lugar do lead_id — busca o waba_id da
+  // conexão de WhatsApp desse corretor (mesma tabela usada pra achar o
+  // usuario_id ao processar mensagens, plataforma_conexoes).
+  let wabaId: string | null = null;
+  if (isCtwa) {
+    const conexaoWhatsapp = await client.query(
+      `SELECT dados_conta->>'waba_id' AS waba_id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' LIMIT 1`,
+      [usuarioId]
+    );
+    wabaId = conexaoWhatsapp.rows[0]?.waba_id || null;
+    if (!wabaId) {
+      return { ok: false, erro: "WhatsApp nao conectado (sem waba_id)" };
+    }
+  }
+
   try {
 
     const datasetId =
       conexao.rows[0]?.dataset_id ||
       (await obterOuCriarDatasetMetaUsuario(usuarioId, contaAnunciosId, token));
 
+    // ⚠️ Formato business_messaging/user_data.ctwa_clid segue a documentação
+    // pública da Meta pra Click-to-WhatsApp — ainda não confirmado contra
+    // tráfego real. ctwa_clid vai cru (não hasheado), diferente dos campos de
+    // PII do resto da integração.
+    const evento = isCtwa
+      ? {
+          event_name: eventName,
+          event_time: Math.floor(Date.now() / 1000),
+          action_source: "business_messaging",
+          messaging_channel: "whatsapp",
+          user_data: {
+            ctwa_clid: lead.ctwa_clid,
+            whatsapp_business_account_id: wabaId
+          }
+        }
+      : {
+          event_name: eventName,
+          event_time: Math.floor(Date.now() / 1000),
+          action_source: "system_generated",
+          lead_id: String(lead.lead_id)
+        };
+
     const resposta = await fetch(
       `https://graph.facebook.com/v19.0/${datasetId}/events?access_token=${token}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          data: [{
-            event_name: eventName,
-            event_time: Math.floor(Date.now() / 1000),
-            action_source: "system_generated",
-            lead_id: String(lead.lead_id)
-          }]
-        })
+        body: JSON.stringify({ data: [evento] })
       }
     ).then(r => r.json());
 
@@ -1037,14 +1070,19 @@ async function avaliarEEnviarQualificacaoMeta(
 ) {
   try {
 
-    if (!leadRow?.lead_id) {
+    if (!leadRow?.lead_id && !leadRow?.ctwa_clid) {
       return;
     }
 
     // TikTok e Google Ads também populam lead_id (com o id deles, não um
     // leadgen_id da Meta) — sem esse filtro, PUT /leads/:id mandaria esses
-    // ids pra Conversions API da Meta como se fossem leadgen_id.
-    if ((leadRow.plataforma || leadRow.origem) !== "meta") {
+    // ids pra Conversions API da Meta como se fossem leadgen_id. Leads criados
+    // a partir de conversa de WhatsApp de anúncio (ver criarLeadDeConversaCTWA)
+    // usam plataforma:'whatsapp' + ctwa_clid em vez de lead_id — aceitos aqui
+    // à parte, sem isso nunca disparariam evento nenhum pra Meta.
+    const ehMeta = (leadRow.plataforma || leadRow.origem) === "meta";
+    const ehWhatsappCtwa = leadRow.plataforma === "whatsapp" && Boolean(leadRow.ctwa_clid);
+    if (!ehMeta && !ehWhatsappCtwa) {
       return;
     }
 
@@ -1218,6 +1256,81 @@ async function criarAdSetMetaComOtimizacaoInteligente(
     payloadBase,
     `${contexto}_FALLBACK_LEAD_GEN`
   );
+}
+
+/* =========================
+   💬 CLICK-TO-WHATSAPP (CTWA) — campanha com destino direto pro WhatsApp
+   em vez de formulário de Lead Ads. Objective/optimization_goal/promoted_object
+   e o formato do call_to_action do criativo são diferentes dos de Lead Ads e a
+   Meta não permite misturar (nem trocar depois que o Ad Set já está rodando).
+   ⚠️ optimization_goal "CONVERSATIONS" e promoted_object.whatsapp_phone_number
+   seguem a documentação pública da Meta pra Click-to-WhatsApp — ainda não
+   confirmados contra tráfego real, verificar na primeira publicação de teste.
+========================= */
+
+type DestinoCampanhaMeta = "lead_ads" | "whatsapp";
+
+function resolverDestinoCampanha(valor: unknown): DestinoCampanhaMeta {
+  return valor === "whatsapp" ? "whatsapp" : "lead_ads";
+}
+
+// Objetivo da campanha: Lead Ads otimiza pra formulário preenchido, CTWA
+// otimiza pra conversa iniciada no WhatsApp — objetivos incompatíveis na
+// Meta, não dá pra trocar depois de criada.
+function montarObjetivoCampanhaMeta(destino: DestinoCampanhaMeta, objetivoInformado?: string) {
+  return destino === "whatsapp"
+    ? "OUTCOME_ENGAGEMENT"
+    : (objetivoInformado || "OUTCOME_LEADS");
+}
+
+// destination_type/optimization_goal/promoted_object do Ad Set variam com o
+// destino — só usar na CRIAÇÃO (mesma ressalva de criarAdSetMetaComOtimizacaoInteligente).
+function montarDestinoAdsetMeta(
+  destino: DestinoCampanhaMeta,
+  pageId: string,
+  whatsappPhoneNumber?: string | null
+) {
+  if (destino === "whatsapp") {
+    return {
+      destination_type: "WHATSAPP",
+      optimization_goal: "CONVERSATIONS",
+      promoted_object: {
+        page_id: pageId,
+        ...(whatsappPhoneNumber ? { whatsapp_phone_number: whatsappPhoneNumber } : {})
+      }
+    };
+  }
+  return {
+    destination_type: "ON_AD",
+    optimization_goal: "LEAD_GENERATION",
+    promoted_object: { page_id: pageId }
+  };
+}
+
+// Cria o Ad Set pro destino pedido. Pra Lead Ads mantém o caminho existente
+// (Quality Lead com fallback). Pra WhatsApp NÃO tenta Quality Lead — a Meta
+// não aceita optimization_goal QUALITY_LEAD/promoted_object com pixel_id num
+// Ad Set destination_type=WHATSAPP (formatos incompatíveis).
+async function criarAdSetMetaParaDestino(
+  url: string,
+  payloadBase: Record<string, any>,
+  contexto: string,
+  usuarioId: number,
+  destino: DestinoCampanhaMeta
+) {
+  if (destino === "whatsapp") {
+    return enviarPayloadMetaComFallbackBid(url, payloadBase, `${contexto}_WHATSAPP`);
+  }
+  return criarAdSetMetaComOtimizacaoInteligente(url, payloadBase, contexto, usuarioId);
+}
+
+// call_to_action do criativo: Lead Ads abre o Instant Form, CTWA abre uma
+// conversa de WhatsApp. Mesmo shape usado no anúncio único, no carrossel e no
+// video_data.
+function montarCallToActionMeta(destino: DestinoCampanhaMeta, ctaType: string, formId: string | null) {
+  return destino === "whatsapp"
+    ? { type: "WHATSAPP_MESSAGE", value: { app_destination: "WHATSAPP" } }
+    : { type: ctaType, value: { lead_gen_form_id: formId } };
 }
 
 async function registrarErroPublicacaoCampanha(
@@ -8296,10 +8409,22 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
       categoriaEspecial
         ? [categoriaEspecial]
         : [];
-    
+
+    const destino = resolverDestinoCampanha(configuracoes_avancadas?.destino);
+
+    if (destino === "whatsapp") {
+      const conexaoWhatsapp = await client.query(
+        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
+        [usuarioId]
+      );
+      if (!conexaoWhatsapp.rows.length) {
+        return c.json({ error: "Conecte o WhatsApp da plataforma antes de publicar uma campanha com destino WhatsApp." }, 400);
+      }
+    }
+
     const payloadCampanha: any = {
       name: nome || "Campanha Leads Plataforma",
-      objective: objetivo || "OUTCOME_LEADS",
+      objective: montarObjetivoCampanhaMeta(destino, objetivo),
       status: "PAUSED",
       special_ad_categories: specialAdCategories,
       is_adset_budget_sharing_enabled: false,
@@ -8370,7 +8495,8 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
         "plataforma",
         JSON.stringify({
           ...(configuracoes_avancadas || {}),
-          cbo: Boolean(cbo)
+          cbo: Boolean(cbo),
+          destino
         }),
         nicho_id ?? null
       ]
@@ -8477,6 +8603,8 @@ app.post("/meta/adset", authMiddleware, async (c) => {
         avancadas.bid_amount
       );
 
+    const destino = resolverDestinoCampanha(avancadas.destino);
+
     const payloadAdset: any = {
       name: `AdSet Leads ${Date.now()}`,
 
@@ -8484,19 +8612,13 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
       billing_event: "IMPRESSIONS",
 
-      optimization_goal: "LEAD_GENERATION",
-
-      destination_type: "ON_AD",
+      ...montarDestinoAdsetMeta(destino, page_id, avancadas.whatsapp_phone_number),
 
       start_time: inicio
         ? new Date(inicio).toISOString()
         : new Date(Date.now() + 60000).toISOString(),
 
       targeting,
-
-      promoted_object: {
-        page_id
-      },
 
       status: "PAUSED",
 
@@ -8549,11 +8671,12 @@ app.post("/meta/adset", authMiddleware, async (c) => {
       }
     }
 
-    let adset = await criarAdSetMetaComOtimizacaoInteligente(
+    let adset = await criarAdSetMetaParaDestino(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       payloadAdset,
       "ADSET",
-      usuarioId
+      usuarioId,
+      destino
     );
 
     console.log(
@@ -9274,7 +9397,9 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
 
     console.log("CAMPAIGN ID:", campaign_id);
 
-    if (!form_id) {
+    const destino = resolverDestinoCampanha(configuracoes_avancadas?.destino);
+
+    if (!form_id && destino !== "whatsapp") {
 
       return c.json({
         error: "form_id não enviado"
@@ -9322,10 +9447,12 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       configuracoes_avancadas || {};
 
     const linkDestino =
-      urlOpcional(
-        avancadas.link,
-        "https://google.com"
-      );
+      destino === "whatsapp"
+        ? "https://api.whatsapp.com/send"
+        : urlOpcional(
+            avancadas.link,
+            "https://google.com"
+          );
 
     const tituloAnuncio =
       textoOpcional(avancadas.titulo) ||
@@ -9376,10 +9503,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         image_hash: hash,
         name: i === 0 ? tituloAnuncio : `Slide ${i + 1}`,
         description: descricaoAnuncio,
-        call_to_action: {
-          type: ctaType,
-          value: { lead_gen_form_id: form_id }
-        }
+        call_to_action: montarCallToActionMeta(destino, ctaType, form_id)
       }));
       linkDataBase.multi_share_end_card = false;
     } else {
@@ -9387,10 +9511,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       linkDataBase.image_hash = hashes[0] || imageHash;
       linkDataBase.name = tituloAnuncio;
       linkDataBase.description = descricaoAnuncio;
-      linkDataBase.call_to_action = {
-        type: ctaType,
-        value: { lead_gen_form_id: form_id }
-      };
+      linkDataBase.call_to_action = montarCallToActionMeta(destino, ctaType, form_id);
     }
 
     // 🔥 INSTAGRAM ACTOR (necessario para o anuncio veicular no Instagram)
@@ -9419,10 +9540,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       video_id: videoMetaId,
       title: tituloAnuncio,
       message: texto || "Quer mais clientes? 🚀",
-      call_to_action: {
-        type: ctaType,
-        value: { lead_gen_form_id: form_id }
-      }
+      call_to_action: montarCallToActionMeta(destino, ctaType, form_id)
     };
 
     // Meta exige image_hash ou image_url no video_data
@@ -11831,10 +11949,14 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
   }
 }
 
-// Vincula a conversa a um lead JÁ EXISTENTE pelo telefone (não cria lead novo
-// a partir de WhatsApp — decisão do produto: mensagem de número sem lead
-// correspondente fica só registrada em whatsapp_mensagens_log). Roda uma vez
-// por conversa: assim que lead_id é preenchido, próximas mensagens pulam a busca.
+// Vincula a conversa a um lead JÁ EXISTENTE pelo telefone — nunca cria lead
+// novo aqui (decisão original do produto, ainda válida pro caso geral: mensagem
+// de número sem lead correspondente fica só registrada em whatsapp_mensagens_log).
+// A única exceção mora em criarLeadDeConversaCTWA logo abaixo, chamada à parte
+// quando essa função retorna null — escopo restrito a conversa vinda de um
+// anúncio Click-to-WhatsApp de verdade (confirmado por ctwa_clid no referral),
+// nunca pra qualquer mensagem de estranho. Roda uma vez por conversa: assim que
+// lead_id é preenchido, próximas mensagens pulam a busca.
 async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise<number | null> {
   if (conversa.lead_id) {
     return conversa.lead_id;
@@ -11864,6 +11986,74 @@ async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise
   );
 
   return leadEncontrado.id;
+}
+
+// Cria um lead novo a partir de uma conversa de WhatsApp sem lead correspondente
+// — só quando a conversa carrega um referral genuíno de anúncio Click-to-WhatsApp
+// (ctwa_clid presente). Sem isso, retorna null e o comportamento de sempre
+// (mensagem só registrada, sem virar lead) continua intacto.
+async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number): Promise<number | null> {
+  const ctwaClid = conversa?.referral?.ctwa_clid;
+  if (!ctwaClid) {
+    return null;
+  }
+
+  // Evita corrida: se outra chamada concorrente já vinculou entre o momento em
+  // que vincularConversaAoLead rodou e agora, não duplica o lead.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const sourceId = conversa.referral?.source_id ? String(conversa.referral.source_id) : null;
+
+  let nichoId: number | null = null;
+  let nomeCampanha = "Campanha WhatsApp";
+  let campanhaId: number | null = null;
+
+  if (sourceId) {
+    const campRow = await client.query(
+      `SELECT id, nome, nicho_id FROM campanhas WHERE ad_id = $1 AND usuario_id = $2 LIMIT 1`,
+      [sourceId, usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+
+    if (campRow.rows.length) {
+      campanhaId = campRow.rows[0].id;
+      nomeCampanha = campRow.rows[0].nome || nomeCampanha;
+      nichoId = campRow.rows[0].nicho_id ?? null;
+    }
+  }
+
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, ctwa_clid, nome, email, telefone,
+      origem, plataforma, status, campanha, campanha_id, nicho_id, criado_em
+    )
+    VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', 'novo', $5, $6, $7, NOW())
+    RETURNING id
+    `,
+    [usuarioId, ctwaClid, "Lead WhatsApp (anúncio)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: "Lead WhatsApp (anúncio)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (CTWA):", e));
+
+  return novoLeadId;
 }
 
 // Preenche nicho_slug/nicho_nome + o transcript de mensagens do WhatsApp
@@ -11961,21 +12151,31 @@ async function processarEventoWhatsApp(value: any) {
     }
 
     // Guarda cru o referral (anúncio "clique para WhatsApp" que originou a
-    // conversa), se vier e ainda não tiver sido guardado — não usado pra
-    // vincular ainda, só arquivado pra atribuição por campanha no futuro.
+    // conversa), se vier e ainda não tiver sido guardado — usado por
+    // criarLeadDeConversaCTWA logo abaixo pra decidir se cria lead novo.
+    // Atualiza também o objeto em memória (não só o banco): essa é a MESMA
+    // mensagem que carrega o referral (só vem no primeiro contato), então sem
+    // isso conversa.referral ficaria desatualizado até a próxima mensagem —
+    // tarde demais, o ctwa_clid só aparece uma vez.
     if (msg.referral && !conversa.referral) {
       await client.query(
         `UPDATE whatsapp_conversas SET referral = $1 WHERE id = $2`,
         [JSON.stringify(msg.referral), conversa.id]
       ).catch(e => console.error("ERRO ao salvar referral whatsapp:", e));
+      conversa.referral = msg.referral;
     }
 
     // Vincula ao lead (se o telefone bater) e fecha o loop: recalcula o score
     // já considerando a conversa e, se isso levar o lead a "quente"/fechado,
     // dispara o evento de qualificação pra Meta na hora — não só na próxima
     // vez que o lead for lido/salvo pela tela.
-    const leadIdVinculado = await vincularConversaAoLead(conversa, usuarioId)
+    let leadIdVinculado = await vincularConversaAoLead(conversa, usuarioId)
       .catch(e => { console.error("ERRO vincularConversaAoLead:", e); return null; });
+
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaCTWA(conversa, usuarioId)
+        .catch(e => { console.error("ERRO criarLeadDeConversaCTWA:", e); return null; });
+    }
 
     if (leadIdVinculado) {
       client.query(`SELECT * FROM leads WHERE id = $1`, [leadIdVinculado])
@@ -12885,6 +13085,15 @@ await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS meta_evento_qualificado_enviado_em TIMESTAMP,
     ADD COLUMN IF NOT EXISTS meta_evento_fechado_enviado_em TIMESTAMP;
+`);
+
+// Preenchido só em leads criados automaticamente a partir de uma conversa de
+// WhatsApp originada de anúncio Click-to-WhatsApp (ver criarLeadDeConversaCTWA)
+// — não tem leadgen_id (lead_id fica NULL), então esse é o identificador usado
+// pra mandar o evento de qualificação pra Meta nesse caso (ver
+// enviarEventoMetaConversionLeads).
+await client.query(`
+  ALTER TABLE leads ADD COLUMN IF NOT EXISTS ctwa_clid TEXT;
 `);
 
 await client.query(`
@@ -16234,6 +16443,19 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     const campanha = campanhaRes.rows[0];
     const cfg = campanha.configuracoes_avancadas || {};
+    const destino = resolverDestinoCampanha(cfg.destino);
+
+    if (destino === "whatsapp") {
+      const conexaoWhatsapp = await client.query(
+        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
+        [user.id]
+      );
+      if (!conexaoWhatsapp.rows.length) {
+        return await falhar(
+          "Conecte o WhatsApp da plataforma antes de publicar uma campanha com destino WhatsApp."
+        );
+      }
+    }
 
     const conn = await client.query(
       `
@@ -16306,7 +16528,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     const payloadCampanha: any = {
       name: campanha.nome || cfg.nome || "Campanha Leads Plataforma",
-      objective: "OUTCOME_LEADS",
+      objective: montarObjetivoCampanhaMeta(destino, cfg.objetivo),
       status: "ACTIVE",
       special_ad_categories: categoriaEspecial ? [categoriaEspecial] : [],
       is_adset_budget_sharing_enabled: false,
@@ -16350,64 +16572,68 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
           ? cfg.perguntas_qualificacao
           : [];
 
-    const payloadFormulario: any = {
-      name: `Form ${campanha.nome || "Leads"} ${Date.now()}`,
-      locale: "pt_BR",
-      questions: [
-        { type: "FULL_NAME" },
-        { type: "EMAIL" },
-        { type: "PHONE" },
-        ...perguntasExtras.slice(0, 4).map((pergunta: string, index: number) => ({
-          type: "CUSTOM",
-          key: `qualificacao_${index + 1}`,
-          label: pergunta
-        }))
-      ],
-      privacy_policy: {
-        url: urlOpcional(cfg.privacidade_url || cfg.url_privacidade, "https://google.com"),
-        link_text:
-          textoOpcional(cfg.privacidade_texto) ||
-          "Política de Privacidade"
-      },
-      thank_you_page: {
-        title:
-          textoOpcional(cfg.obrigado_titulo) ||
-          textoOpcional(cfg.mensagem_agradecimento_titulo) ||
-          "Obrigado!",
-        body:
-          textoOpcional(cfg.obrigado_texto) ||
-          textoOpcional(cfg.mensagem_agradecimento) ||
-          "Recebemos seus dados 🚀",
-        button_type: "VIEW_WEBSITE",
-        button_text:
-          textoOpcional(cfg.obrigado_botao) ||
-          "Ver mais",
-        website_url: urlOpcional(
-          cfg.obrigado_url || cfg.url_privacidade || cfg.privacidade_url,
-          "https://google.com"
-        )
-      },
-      access_token: pageToken
-    };
+    let formMeta: { id: string | null } = { id: null };
 
-    if (cfg.formulario_qualidade) {
-      payloadFormulario.is_optimized_for_quality = true;
-    }
+    if (destino !== "whatsapp") {
+      const payloadFormulario: any = {
+        name: `Form ${campanha.nome || "Leads"} ${Date.now()}`,
+        locale: "pt_BR",
+        questions: [
+          { type: "FULL_NAME" },
+          { type: "EMAIL" },
+          { type: "PHONE" },
+          ...perguntasExtras.slice(0, 4).map((pergunta: string, index: number) => ({
+            type: "CUSTOM",
+            key: `qualificacao_${index + 1}`,
+            label: pergunta
+          }))
+        ],
+        privacy_policy: {
+          url: urlOpcional(cfg.privacidade_url || cfg.url_privacidade, "https://google.com"),
+          link_text:
+            textoOpcional(cfg.privacidade_texto) ||
+            "Política de Privacidade"
+        },
+        thank_you_page: {
+          title:
+            textoOpcional(cfg.obrigado_titulo) ||
+            textoOpcional(cfg.mensagem_agradecimento_titulo) ||
+            "Obrigado!",
+          body:
+            textoOpcional(cfg.obrigado_texto) ||
+            textoOpcional(cfg.mensagem_agradecimento) ||
+            "Recebemos seus dados 🚀",
+          button_type: "VIEW_WEBSITE",
+          button_text:
+            textoOpcional(cfg.obrigado_botao) ||
+            "Ver mais",
+          website_url: urlOpcional(
+            cfg.obrigado_url || cfg.url_privacidade || cfg.privacidade_url,
+            "https://google.com"
+          )
+        },
+        access_token: pageToken
+      };
 
-    const formMeta = await fetch(
-      `https://graph.facebook.com/v19.0/${pageId}/leadgen_forms`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payloadFormulario)
+      if (cfg.formulario_qualidade) {
+        payloadFormulario.is_optimized_for_quality = true;
       }
-    ).then(r => r.json());
 
-    if (!formMeta.id) {
-      return await falhar(
-        mensagemErroMeta(formMeta, "Erro ao criar formulário de leads na Meta"),
-        formMeta
-      );
+      formMeta = await fetch(
+        `https://graph.facebook.com/v19.0/${pageId}/leadgen_forms`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payloadFormulario)
+        }
+      ).then(r => r.json());
+
+      if (!formMeta.id) {
+        return await falhar(
+          mensagemErroMeta(formMeta, "Erro ao criar formulário de leads na Meta"),
+          formMeta
+        );
+      }
     }
 
     const targeting =
@@ -16435,13 +16661,9 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       name: `AdSet ${campanha.nome || "Leads"} ${Date.now()}`,
       campaign_id: campanhaMeta.id,
       billing_event: "IMPRESSIONS",
-      optimization_goal: "LEAD_GENERATION",
-      destination_type: "ON_AD",
+      ...montarDestinoAdsetMeta(destino, pageId, cfg.whatsapp_phone_number),
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
-      promoted_object: {
-        page_id: pageId
-      },
       status: "ACTIVE",
       access_token: token
     };
@@ -16471,11 +16693,12 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         new Date(fim).toISOString();
     }
 
-    const adsetMeta = await criarAdSetMetaComOtimizacaoInteligente(
+    const adsetMeta = await criarAdSetMetaParaDestino(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       payloadAdset,
       "PUBLICAR_RECEBIDA_ADSET",
-      user.id
+      user.id,
+      destino
     );
 
     if (!adsetMeta.id) {
@@ -16521,7 +16744,9 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     }
 
     const linkDestino =
-      urlOpcional(cfg.link, "https://google.com");
+      destino === "whatsapp"
+        ? "https://api.whatsapp.com/send"
+        : urlOpcional(cfg.link, "https://google.com");
 
     const tituloAnuncio =
       textoOpcional(cfg.titulo) ||
@@ -16552,10 +16777,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         image_hash: hash,
         name: index === 0 ? tituloAnuncio : `Slide ${index + 1}`,
         description: descricaoAnuncio,
-        call_to_action: {
-          type: ctaType,
-          value: { lead_gen_form_id: formMeta.id }
-        }
+        call_to_action: montarCallToActionMeta(destino, ctaType, formMeta.id)
       }));
       linkDataBase.multi_share_end_card = false;
     } else {
@@ -16563,10 +16785,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       linkDataBase.image_hash = hashes[0];
       linkDataBase.name = tituloAnuncio;
       linkDataBase.description = descricaoAnuncio;
-      linkDataBase.call_to_action = {
-        type: ctaType,
-        value: { lead_gen_form_id: formMeta.id }
-      };
+      linkDataBase.call_to_action = montarCallToActionMeta(destino, ctaType, formMeta.id);
     }
 
     const objectStorySpec: Record<string, any> = {
@@ -16631,6 +16850,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     const configuracoesPublicadas = {
       ...cfg,
+      destino,
       page_id: pageId,
       form_id: formMeta.id,
       creative_id: creativeMeta.id,
@@ -21362,13 +21582,25 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
     const orig = origRes.rows[0];
     const novoNome = body.nome?.trim() || `Cópia de ${orig.nome}`;
 
+    // Destino (Lead Ads vs WhatsApp) pode ser trocado no duplicar — é o único
+    // jeito de "converter" uma campanha já rodando, já que a Meta não deixa
+    // editar destination_type de um Ad Set em atividade. Sem escolha explícita,
+    // mantém o destino original.
+    const destinoEscolhido = body.destino !== undefined
+      ? resolverDestinoCampanha(body.destino)
+      : resolverDestinoCampanha((orig.configuracoes_avancadas || {}).destino);
+    const configuracoesNovas = {
+      ...(orig.configuracoes_avancadas || {}),
+      destino: destinoEscolhido
+    };
+
     const novaRes = await client.query(
       `INSERT INTO campanhas
          (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, conta_anuncios_id, plataforma)
        VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, $7)
        RETURNING id`,
       [user.id, novoNome, orig.nicho_id ?? null, orig.daily_budget ?? null,
-       orig.configuracoes_avancadas ?? null, orig.conta_anuncios_id ?? null, orig.plataforma || "meta"]
+       JSON.stringify(configuracoesNovas), orig.conta_anuncios_id ?? null, orig.plataforma || "meta"]
     );
     const novaId = novaRes.rows[0].id;
 
@@ -22307,6 +22539,17 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     const cfgPublico = cfg.publico || {};
     const cfgFormulario = cfg.formulario || {};
     const cfgCriativo = cfg.criativo || {};
+    const destino = resolverDestinoCampanha(cfgCampanha.destino);
+
+    if (destino === "whatsapp") {
+      const conexaoWhatsapp = await client.query(
+        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
+        [rascunho.corretor_id]
+      );
+      if (!conexaoWhatsapp.rows.length) {
+        return c.json({ error: "O corretor precisa conectar o WhatsApp da plataforma antes de ativar uma campanha com destino WhatsApp." }, 400);
+      }
+    }
 
     // Se qualquer etapa depois da criação da campanha falhar, remove a campanha
     // já criada na Meta em vez de deixar um objeto órfão sem nenhum registro
@@ -22330,7 +22573,7 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     const categoriaEspecial = textoOpcional(cfgCampanha.categoria_especial);
     const payloadCampanha: any = {
       name: rascunho.nome,
-      objective: cfgCampanha.objetivo || "OUTCOME_LEADS",
+      objective: montarObjetivoCampanhaMeta(destino, cfgCampanha.objetivo),
       status: "PAUSED",
       special_ad_categories: categoriaEspecial ? [categoriaEspecial] : [],
       is_adset_budget_sharing_enabled: false,
@@ -22399,12 +22642,10 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
       name: `AdSet ${rascunho.nome} ${Date.now()}`,
       campaign_id: campanhaMeta.id,
       billing_event: "IMPRESSIONS",
-      optimization_goal: "LEAD_GENERATION",
-      destination_type: "ON_AD",
+      ...montarDestinoAdsetMeta(destino, pageId, cfgCriativo.whatsapp_phone_number),
       daily_budget: cfgPublico.orcamento_diario_centavos || cfgCampanha.orcamento_diario_centavos || 2000,
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
-      promoted_object: { page_id: pageId },
       status: "PAUSED",
       access_token: token
     };
@@ -22422,11 +22663,12 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
         Math.round(controleCustoRascunho.bidAmount * 100);
     }
 
-    const adsetMeta = await criarAdSetMetaComOtimizacaoInteligente(
+    const adsetMeta = await criarAdSetMetaParaDestino(
       `https://graph.facebook.com/v19.0/${adAccountId}/adsets`,
       payloadAdset,
       "ATIVAR_RASCUNHO_ADSET",
-      user.id
+      user.id,
+      destino
     );
 
     if (adsetMeta.error) {
@@ -22444,7 +22686,7 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     const pagina = pagesDetalhes.data?.find((p: any) => p.id === pageId);
     let formId: string | null = null;
 
-    if (pagina?.access_token) {
+    if (pagina?.access_token && destino !== "whatsapp") {
       const perguntasExtras = Array.isArray(cfgFormulario.perguntas_customizadas)
         ? cfgFormulario.perguntas_customizadas.slice(0, 4).map((q: string, i: number) => ({
             type: "CUSTOM", key: `qualificacao_${i + 1}`, label: q
@@ -22497,7 +22739,7 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
         pageId,
         adAccountId,
         rascunho.nome,
-        JSON.stringify({ origem_rascunho_id: rascunho.id }),
+        JSON.stringify({ origem_rascunho_id: rascunho.id, destino }),
         cfg.nicho_id || null
       ]
     );
