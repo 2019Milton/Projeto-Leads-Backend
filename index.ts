@@ -1281,6 +1281,21 @@ function resolverDestinoCampanha(valor: unknown): DestinoCampanhaMeta {
   return valor === "whatsapp" ? "whatsapp" : "lead_ads";
 }
 
+async function obterNumeroWhatsappConectadoUsuario(usuarioId: number) {
+  const conexao = await client.query(
+    `SELECT dados_conta->>'numero' AS numero
+     FROM plataforma_conexoes
+     WHERE usuario_id = $1
+       AND plataforma = 'whatsapp'
+       AND status = 'conectado'
+     ORDER BY atualizado_em DESC, id DESC
+     LIMIT 1`,
+    [usuarioId]
+  );
+
+  return normalizarTelefoneWhatsApp(conexao.rows[0]?.numero);
+}
+
 // Objetivo da campanha: Lead Ads otimiza pra formulário preenchido, CTWA
 // otimiza pra conversa iniciada no WhatsApp — objetivos incompatíveis na
 // Meta, não dá pra trocar depois de criada.
@@ -8420,12 +8435,11 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
     const destino = resolverDestinoCampanha(configuracoes_avancadas?.destino);
 
     if (destino === "whatsapp") {
-      const conexaoWhatsapp = await client.query(
-        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
-        [usuarioId]
-      );
-      if (!conexaoWhatsapp.rows.length) {
-        return c.json({ error: "Conecte o WhatsApp da plataforma antes de publicar uma campanha com destino WhatsApp." }, 400);
+      const whatsappPhoneNumber =
+        await obterNumeroWhatsappConectadoUsuario(usuarioId);
+
+      if (!whatsappPhoneNumber) {
+        return c.json({ error: "Reconecte o WhatsApp da plataforma para confirmar o número que receberá as conversas desta campanha." }, 400);
       }
     }
 
@@ -8612,6 +8626,17 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
     const destino = resolverDestinoCampanha(avancadas.destino);
 
+    const whatsappPhoneNumber =
+      destino === "whatsapp"
+        ? await obterNumeroWhatsappConectadoUsuario(usuarioId)
+        : null;
+
+    if (destino === "whatsapp" && !whatsappPhoneNumber) {
+      return c.json({
+        error: "O WhatsApp conectado não possui um número válido. Reconecte o WhatsApp da plataforma antes de publicar."
+      }, 400);
+    }
+
     const payloadAdset: any = {
       name: `AdSet Leads ${Date.now()}`,
 
@@ -8619,7 +8644,7 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
       billing_event: "IMPRESSIONS",
 
-      ...montarDestinoAdsetMeta(destino, page_id, avancadas.whatsapp_phone_number),
+      ...montarDestinoAdsetMeta(destino, page_id, whatsappPhoneNumber),
 
       start_time: inicio
         ? new Date(inicio).toISOString()
@@ -11681,8 +11706,93 @@ app.post("/webhook/tiktok", async (c) => {
   }
 });
 
+type StatusLeadKanban =
+  | "novo"
+  | "primeiro_contato"
+  | "em_conversa"
+  | "fechado"
+  | "perdido";
+
+const OPCOES_STATUS_LEAD_WHATSAPP: Array<{
+  id: string;
+  status: StatusLeadKanban;
+  title: string;
+  description: string;
+}> = [
+  {
+    id: "lead_status_novo",
+    status: "novo",
+    title: "Novo",
+    description: "Ainda não iniciei o contato",
+  },
+  {
+    id: "lead_status_primeiro_contato",
+    status: "primeiro_contato",
+    title: "Primeiro contato",
+    description: "Primeiro contato realizado",
+  },
+  {
+    id: "lead_status_em_conversa",
+    status: "em_conversa",
+    title: "Em conversa",
+    description: "Negociação em andamento",
+  },
+  {
+    id: "lead_status_fechado",
+    status: "fechado",
+    title: "Fechado",
+    description: "Negócio concluído",
+  },
+  {
+    id: "lead_status_perdido",
+    status: "perdido",
+    title: "Perdido",
+    description: "Lead sem continuidade",
+  },
+];
+
+function normalizarRespostaStatusLead(valor: unknown): string {
+  return String(valor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+// Respostas de lista/botão são determinísticas e não precisam de IA. Também
+// aceita o número/nome digitado pelo corretor como alternativa ao toque.
+function statusLeadPorRespostaWhatsapp(body: any, texto: string): StatusLeadKanban | null {
+  const idSelecionado = String(
+    body?.listResponseMessage?.selectedRowId ||
+    body?.buttonsResponseMessage?.buttonId ||
+    ""
+  ).trim();
+
+  const opcaoPorId = OPCOES_STATUS_LEAD_WHATSAPP.find(
+    (opcao) => opcao.id === idSelecionado
+  );
+  if (opcaoPorId) return opcaoPorId.status;
+
+  const resposta = normalizarRespostaStatusLead(texto);
+  const mapa: Record<string, StatusLeadKanban> = {
+    "1": "novo",
+    "novo": "novo",
+    "2": "primeiro_contato",
+    "primeiro contato": "primeiro_contato",
+    "3": "em_conversa",
+    "em conversa": "em_conversa",
+    "4": "fechado",
+    "fechado": "fechado",
+    "5": "perdido",
+    "perdido": "perdido",
+  };
+  return mapa[resposta] || null;
+}
+
 // Classifica a resposta livre do corretor (WhatsApp pessoal, Z-API) sobre o
-// andamento de um lead num dos 3 status relevantes do Kanban — nunca
+// andamento de um lead num dos 5 status do Kanban — nunca
 // adivinha: só aplica se a IA reportar confiança "alta"; qualquer falha de
 // parse/HTTP/confiança baixa ou IA pausada pelo admin vira status:null
 // (inconclusiva), e quem chama não deve tocar no status do lead nesse caso.
@@ -11691,7 +11801,7 @@ app.post("/webhook/tiktok", async (c) => {
 async function classificarRespostaStatusLead(
   usuarioId: number,
   texto: string
-): Promise<{ status: "em_conversa" | "fechado" | "perdido" | null }> {
+): Promise<{ status: StatusLeadKanban | null }> {
   const configIA = await buscarConfigIA();
   if (configIA?.status !== "contratado") {
     return { status: null };
@@ -11704,8 +11814,9 @@ async function classificarRespostaStatusLead(
 
   const systemMsg =
     "Você classifica respostas informais em português de corretores brasileiros sobre o andamento de uma negociação com um cliente. " +
-    `Responda SOMENTE JSON no formato {"status":"em_conversa"|"fechado"|"perdido"|null,"confianca":"alta"|"baixa"}, sem nenhum texto fora do JSON. ` +
-    `"fechado" = negócio fechado/vendido; "perdido" = cliente desistiu/não tem mais interesse; "em_conversa" = ainda em negociação, sem decisão; ` +
+    `Responda SOMENTE JSON no formato {"status":"novo"|"primeiro_contato"|"em_conversa"|"fechado"|"perdido"|null,"confianca":"alta"|"baixa"}, sem nenhum texto fora do JSON. ` +
+    `"novo" = contato ainda não iniciado; "primeiro_contato" = primeiro contato já realizado; "em_conversa" = negociação em andamento; ` +
+    `"fechado" = negócio fechado/vendido; "perdido" = cliente desistiu/não tem mais interesse; ` +
     `use status:null e confianca:"baixa" se não conseguir identificar com clareza.`;
   const prompt = `Resposta do corretor: "${texto}"`;
 
@@ -11751,7 +11862,13 @@ async function classificarRespostaStatusLead(
       return { status: null };
     }
 
-    const statusValidos = ["em_conversa", "fechado", "perdido"];
+    const statusValidos: StatusLeadKanban[] = [
+      "novo",
+      "primeiro_contato",
+      "em_conversa",
+      "fechado",
+      "perdido",
+    ];
     if (parsed?.confianca === "alta" && statusValidos.includes(parsed?.status)) {
       return { status: parsed.status };
     }
@@ -11765,10 +11882,22 @@ async function classificarRespostaStatusLead(
 // Trata a resposta do corretor no WhatsApp pessoal (Z-API) a uma pergunta de
 // status pendente (ver processarPerguntasStatusLead). Formato do payload
 // confirmado contra a doc oficial da Z-API (developer.z-api.io): type
-// "ReceivedCallback", phone, fromMe, text.message.
+// "ReceivedCallback", phone, fromMe, text.message, buttonsResponseMessage e
+// listResponseMessage.selectedRowId.
 async function processarRespostaCorretorZapi(body: any) {
-  const telefoneOrigem = body?.phone;
-  const textoResposta = String(body?.text?.message || "").trim();
+  const telefoneOrigem = body?.phone || body?.from;
+  const idSelecionado = String(
+    body?.listResponseMessage?.selectedRowId ||
+    body?.buttonsResponseMessage?.buttonId ||
+    ""
+  ).trim();
+  const textoResposta = String(
+    body?.text?.message ||
+    body?.buttonsResponseMessage?.message ||
+    body?.listResponseMessage?.title ||
+    body?.listResponseMessage?.message ||
+    idSelecionado
+  ).trim();
   if (!telefoneOrigem || !textoResposta) return;
 
   const telefoneNormalizado = normalizarTelefoneWhatsApp(telefoneOrigem);
@@ -11792,7 +11921,10 @@ async function processarRespostaCorretorZapi(body: any) {
   const perguntaRow = pergunta.rows[0];
   if (!perguntaRow) return; // mensagem solta, sem pergunta pendente relacionada
 
-  const classificacao = await classificarRespostaStatusLead(corretor.id, textoResposta);
+  const statusSelecionado = statusLeadPorRespostaWhatsapp(body, textoResposta);
+  const classificacao = statusSelecionado
+    ? { status: statusSelecionado }
+    : await classificarRespostaStatusLead(corretor.id, textoResposta);
 
   if (classificacao.status) {
     const leadAtual = await client.query(
@@ -16810,15 +16942,15 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     const campanha = campanhaRes.rows[0];
     const cfg = campanha.configuracoes_avancadas || {};
     const destino = resolverDestinoCampanha(cfg.destino);
+    let whatsappPhoneNumber: string | null = null;
 
     if (destino === "whatsapp") {
-      const conexaoWhatsapp = await client.query(
-        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
-        [user.id]
-      );
-      if (!conexaoWhatsapp.rows.length) {
+      whatsappPhoneNumber =
+        await obterNumeroWhatsappConectadoUsuario(user.id);
+
+      if (!whatsappPhoneNumber) {
         return await falhar(
-          "Conecte o WhatsApp da plataforma antes de publicar uma campanha com destino WhatsApp."
+          "Conecte novamente o WhatsApp da plataforma para confirmar o número que receberá as conversas desta campanha."
         );
       }
     }
@@ -17027,7 +17159,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       name: `AdSet ${campanha.nome || "Leads"} ${Date.now()}`,
       campaign_id: campanhaMeta.id,
       billing_event: "IMPRESSIONS",
-      ...montarDestinoAdsetMeta(destino, pageId, cfg.whatsapp_phone_number),
+      ...montarDestinoAdsetMeta(destino, pageId, whatsappPhoneNumber),
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
       status: "ACTIVE",
@@ -22321,6 +22453,65 @@ function normalizarTelefoneWhatsApp(valor: unknown): string {
   return numero ? (numero.startsWith("55") ? numero : `55${numero}`) : "";
 }
 
+// Envia uma lista nativa do WhatsApp com os cinco estágios do Kanban. Se a
+// instância/endpoint estiver indisponível, quem chama usa a pergunta em texto
+// como compatibilidade, sem deixar de contactar o corretor.
+async function enviarPerguntaStatusLeadWhatsApp(
+  telefone: string,
+  mensagem: string
+): Promise<boolean> {
+  const instanceId = Bun.env.ZAPI_INSTANCE_ID;
+  const token = Bun.env.ZAPI_TOKEN;
+
+  if (!instanceId || !token) {
+    console.warn("⚠️ Z-API: ZAPI_INSTANCE_ID ou ZAPI_TOKEN não configurados");
+    return false;
+  }
+
+  const phone = normalizarTelefoneWhatsApp(telefone);
+  if (!phone) {
+    console.warn("⚠️ Z-API: número vazio, envio da lista cancelado");
+    return false;
+  }
+
+  const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
+
+  try {
+    const res = await fetch(
+      `https://api.z-api.io/instances/${instanceId}/token/${token}/send-option-list`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(clientToken ? { "Client-Token": clientToken } : {}),
+        },
+        body: JSON.stringify({
+          phone,
+          message: mensagem,
+          optionList: {
+            title: "Status do lead",
+            buttonLabel: "Escolher status",
+            options: OPCOES_STATUS_LEAD_WHATSAPP.map(
+              ({ id, title, description }) => ({ id, title, description })
+            ),
+          },
+        }),
+      }
+    );
+    const resposta = await res.text();
+    if (res.ok) {
+      console.log(`[z-api] ✅ lista de status enviada para ${phone}`);
+      return true;
+    }
+
+    console.error(`[z-api] ❌ erro ao enviar lista ${res.status}:`, resposta);
+    return false;
+  } catch (e) {
+    console.error("[z-api] ❌ exceção ao enviar lista de status:", e);
+    return false;
+  }
+}
+
 async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
   const instanceId = Bun.env.ZAPI_INSTANCE_ID;
   const token      = Bun.env.ZAPI_TOKEN;
@@ -22905,14 +23096,14 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     const cfgFormulario = cfg.formulario || {};
     const cfgCriativo = cfg.criativo || {};
     const destino = resolverDestinoCampanha(cfgCampanha.destino);
+    let whatsappPhoneNumber: string | null = null;
 
     if (destino === "whatsapp") {
-      const conexaoWhatsapp = await client.query(
-        `SELECT 1 FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
-        [rascunho.corretor_id]
-      );
-      if (!conexaoWhatsapp.rows.length) {
-        return c.json({ error: "O corretor precisa conectar o WhatsApp da plataforma antes de ativar uma campanha com destino WhatsApp." }, 400);
+      whatsappPhoneNumber =
+        await obterNumeroWhatsappConectadoUsuario(rascunho.corretor_id);
+
+      if (!whatsappPhoneNumber) {
+        return c.json({ error: "O corretor precisa reconectar o WhatsApp da plataforma para confirmar o número desta campanha." }, 400);
       }
     }
 
@@ -23007,7 +23198,7 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
       name: `AdSet ${rascunho.nome} ${Date.now()}`,
       campaign_id: campanhaMeta.id,
       billing_event: "IMPRESSIONS",
-      ...montarDestinoAdsetMeta(destino, pageId, cfgCriativo.whatsapp_phone_number),
+      ...montarDestinoAdsetMeta(destino, pageId, whatsappPhoneNumber),
       daily_budget: cfgPublico.orcamento_diario_centavos || cfgCampanha.orcamento_diario_centavos || 2000,
       start_time: new Date(Date.now() + 60000).toISOString(),
       targeting,
@@ -23165,8 +23356,8 @@ agendarLembretes();
    Quando uma conversa em atendimento humano esfria (24h sem mensagem do
    cliente nem do corretor), pergunta pro corretor no WhatsApp PESSOAL dele
    (Z-API, canal separado do número oficial) o que aconteceu, e usa a
-   resposta livre (classificada por IA, ver classificarRespostaStatusLead)
-   pra mover o lead sozinho no Kanban — ver processarRespostaCorretorZapi.
+   uma lista com os 5 estágios do Kanban. A opção tocada move o lead sem
+   depender de IA; texto livre continua aceito como compatibilidade.
 ========================= */
 
 async function processarPerguntasStatusLead() {
@@ -23225,8 +23416,8 @@ async function processarPerguntasStatusLead() {
 
       const perguntaTexto =
         tentativa === 1
-          ? `Oi ${cand.corretor_nome}! Como ficou a conversa com o lead *${cand.lead_nome}*? Responda algo como "fechou", "ainda em conversa" ou "perdeu o interesse" que eu já atualizo o funil pra você. 📋`
-          : `Oi ${cand.corretor_nome}! Só confirmando: como ficou o lead *${cand.lead_nome}*? Fechou, ainda tá em conversa, ou perdeu o interesse?`;
+          ? `Oi ${cand.corretor_nome}! Como está o lead *${cand.lead_nome}*? Escolha o status abaixo que eu atualizo o Kanban pra você. 📋`
+          : `Oi ${cand.corretor_nome}! Só confirmando: qual é o status atual do lead *${cand.lead_nome}*? Escolha uma opção abaixo.`;
 
       // Índice único parcial (1 pendente por corretor) como trava final contra
       // corrida entre execuções sobrepostas do cron.
@@ -23239,7 +23430,16 @@ async function processarPerguntasStatusLead() {
       );
       if (!inserted.rows.length) continue;
 
-      await enviarLembreteWhatsApp(cand.corretor_whatsapp, perguntaTexto);
+      const enviadoComOpcoes = await enviarPerguntaStatusLeadWhatsApp(
+        cand.corretor_whatsapp,
+        perguntaTexto
+      );
+      if (!enviadoComOpcoes) {
+        await enviarLembreteWhatsApp(
+          cand.corretor_whatsapp,
+          `${perguntaTexto}\n\nResponda com:\n1 - Novo\n2 - Primeiro contato\n3 - Em conversa\n4 - Fechado\n5 - Perdido`
+        );
+      }
 
       await client.query(
         `INSERT INTO notificacoes (usuario_id, lead_id, tipo, titulo, mensagem)
