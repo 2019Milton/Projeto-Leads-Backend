@@ -8,6 +8,13 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 
 const app = new Hono();
 
+const WHATSAPP_CLOUD_API_VERSION =
+  Bun.env.WHATSAPP_CLOUD_API_VERSION || "v24.0";
+const WHATSAPP_PERMISSOES_OBRIGATORIAS = [
+  "whatsapp_business_management",
+  "whatsapp_business_messaging",
+];
+
 const DEFAULT_TOKEN_SECRET = "troque-esta-chave-em-producao";
 
 const syncEmAndamento = new Set<number>();
@@ -10851,13 +10858,125 @@ app.delete("/conexoes/:plataforma", authMiddleware, async (c) => {
 
 /* =========================
    💬 WHATSAPP OFICIAL (Cloud API) — conexão do corretor + bot config
-   Uma única conta Meta Business Manager (Tech Provider) da plataforma hospeda os
-   números de todos os corretores. Cada corretor conecta o PRÓPRIO número via
-   Embedded Signup (com coexistência), não via OAuth individual — por isso não há
-   access_token/refresh_token por linha em plataforma_conexoes aqui, só o
-   phone_number_id/waba_id em dados_conta. O envio usa o token de sistema único
-   (WHATSAPP_SYSTEM_USER_TOKEN, ver enviarMensagemWhatsAppOficial).
+   Cada corretor conecta o próprio número via Embedded Signup (com coexistência).
+   O código de autorização retornado pelo Facebook Login for Business é trocado no
+   backend por um token limitado à WABA autorizada. O token geral de sistema fica
+   apenas como compatibilidade para conexões antigas que pertencem ao mesmo Business.
 ========================= */
+
+function normalizarIdMeta(valor: unknown) {
+  const id = String(valor || "").trim();
+  return /^\d+$/.test(id) ? id : "";
+}
+
+async function lerRespostaMeta(resposta: Response) {
+  const texto = await resposta.text();
+  if (!texto) return {};
+  try {
+    return JSON.parse(texto);
+  } catch {
+    return { error: { message: texto.slice(0, 500) } };
+  }
+}
+
+function detalhesErroMeta(payload: any) {
+  const erro = payload?.error || {};
+  return {
+    message: erro.message || null,
+    type: erro.type || null,
+    code: erro.code ?? null,
+    error_subcode: erro.error_subcode ?? null,
+    fbtrace_id: erro.fbtrace_id || null,
+  };
+}
+
+function statusHttpErroMeta(payload: any) {
+  if (payload?.data?.is_valid === false) return 401;
+  const codigo = Number(payload?.error?.code || 0);
+  if (codigo === 190) return 401;
+  if (codigo === 10 || codigo === 200) return 403;
+  if (codigo === 100) return 400;
+  return 502;
+}
+
+function responderErroMeta(
+  c: any,
+  error: string,
+  code: string,
+  payload: any,
+  contexto: Record<string, any> = {}
+) {
+  const meta = detalhesErroMeta(payload);
+  const erroPermissao = meta.code === 10 || meta.code === 200;
+  console.error(`[whatsapp-meta] ${code}:`, JSON.stringify({ ...meta, ...contexto }));
+
+  return c.json({
+    error,
+    code,
+    detalhe: meta.message,
+    meta: { ...meta, ...contexto },
+    ...(erroPermissao ? {
+      instrucoes: [
+        "Confirme que o app tem acesso avançado a whatsapp_business_management e whatsapp_business_messaging.",
+        "No Meta Business, atribua esta WABA ao usuário do sistema com a tarefa Gerenciar (MANAGE).",
+        "Depois de corrigir as permissões, refaça o Embedded Signup para gerar um novo código/token.",
+      ],
+    } : {}),
+  }, statusHttpErroMeta(payload) as any);
+}
+
+async function trocarCodigoEmbeddedSignup(codigo: string) {
+  const params = new URLSearchParams({
+    client_id: Bun.env.META_APP_ID || "",
+    client_secret: Bun.env.META_APP_SECRET || "",
+    code: codigo,
+  });
+  const resposta = await fetch(
+    `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/oauth/access_token?${params.toString()}`,
+    { headers: { Accept: "application/json" } }
+  );
+  return { resposta, payload: await lerRespostaMeta(resposta) };
+}
+
+async function depurarTokenWhatsapp(token: string) {
+  const appToken = `${Bun.env.META_APP_ID || ""}|${Bun.env.META_APP_SECRET || ""}`;
+  const resposta = await fetch(
+    `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/debug_token?input_token=${encodeURIComponent(token)}`,
+    { headers: { Authorization: `Bearer ${appToken}` } }
+  );
+  return { resposta, payload: await lerRespostaMeta(resposta) };
+}
+
+function diagnosticarPermissoesToken(debugData: any, wabaId: string) {
+  const scopes = Array.isArray(debugData?.scopes) ? debugData.scopes.map(String) : [];
+  const faltantes = WHATSAPP_PERMISSOES_OBRIGATORIAS.filter(
+    permissao => !scopes.includes(permissao)
+  );
+  const granular = Array.isArray(debugData?.granular_scopes)
+    ? debugData.granular_scopes
+    : [];
+  const escopoGestao = granular.find(
+    (item: any) => item?.scope === "whatsapp_business_management"
+  );
+  const targetIds = Array.isArray(escopoGestao?.target_ids)
+    ? escopoGestao.target_ids.map(String)
+    : [];
+
+  return {
+    scopes,
+    faltantes,
+    waba_autorizada: targetIds.length ? targetIds.includes(wabaId) : null,
+  };
+}
+
+async function obterTokenWhatsappUsuario(usuarioId: number) {
+  const resultado = await client.query(
+    `SELECT access_token FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'whatsapp' LIMIT 1`,
+    [usuarioId]
+  );
+  return resultado.rows[0]?.access_token || Bun.env.WHATSAPP_SYSTEM_USER_TOKEN || "";
+}
 
 // Dados públicos (não são segredos) que o frontend precisa pra chamar FB.init/FB.login
 // do Embedded Signup. Sem authMiddleware de propósito — usado antes do usuário logar
@@ -10866,6 +10985,7 @@ app.get("/config/whatsapp-embedded-signup", async (c) => {
   return c.json({
     app_id: Bun.env.META_APP_ID || "",
     config_id: Bun.env.META_EMBEDDED_SIGNUP_CONFIG_ID || "",
+    graph_api_version: WHATSAPP_CLOUD_API_VERSION,
   });
 });
 
@@ -10873,82 +10993,237 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const body = await c.req.json();
-    const waba_id = body.waba_id;
-    let phone_number_id = body.phone_number_id;
+    const waba_id = normalizarIdMeta(body.waba_id);
+    const phoneNumberInformado = normalizarIdMeta(body.phone_number_id);
+    const codigo = String(body.code || "").trim();
     if (!waba_id) {
-      return c.json({ error: "waba_id é obrigatório" }, 400);
+      return c.json({ error: "waba_id inválido", code: "INVALID_WABA_ID" }, 400);
     }
 
-    const token = Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
-    if (!token) {
-      return c.json({ error: "Integração de WhatsApp ainda não configurada no servidor" }, 500);
+    if (!Bun.env.META_APP_ID || !Bun.env.META_APP_SECRET) {
+      return c.json({
+        error: "Integração de WhatsApp incompleta no servidor",
+        code: "META_APP_CONFIG_MISSING",
+        detalhe: "META_APP_ID e META_APP_SECRET precisam estar configurados.",
+      }, 500);
     }
 
-    // Fluxo de Coexistência (número já ativo no app do WhatsApp Business) só devolve o
-    // waba_id no evento de conclusão do Embedded Signup — busca o número vinculado a essa
-    // WABA diretamente na Graph API quando o frontend não mandou o phone_number_id.
-    if (!phone_number_id) {
-      const numerosRes = await fetch(
-        `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}/phone_numbers`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      const numerosData = await numerosRes.json() as any;
-      if (!numerosRes.ok || !numerosData?.data?.length) {
-        console.error("ERRO WHATSAPP phone_numbers:", JSON.stringify(numerosData));
-        return c.json(
-          { error: "Não foi possível encontrar o número vinculado a essa conta do WhatsApp", detalhe: numerosData?.error?.message },
-          502
+    let token = "";
+    let tokenExpiraEm: Date | null = null;
+
+    if (codigo) {
+      const troca = await trocarCodigoEmbeddedSignup(codigo);
+      if (!troca.resposta.ok || !troca.payload?.access_token) {
+        return responderErroMeta(
+          c,
+          "A Meta recusou o código de autorização do WhatsApp",
+          "META_CODE_EXCHANGE_FAILED",
+          troca.payload,
+          { http_status: troca.resposta.status }
         );
       }
-      phone_number_id = numerosData.data[0].id;
+      token = troca.payload.access_token;
+      if (Number(troca.payload.expires_in) > 0) {
+        tokenExpiraEm = new Date(Date.now() + Number(troca.payload.expires_in) * 1000);
+      }
+    } else {
+      token = await obterTokenWhatsappUsuario(user.id);
     }
 
-    // Inscreve o app da plataforma pra receber os webhooks dessa WABA especifica
-    const subRes = await fetch(
-      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}/subscribed_apps`,
-      { method: "POST", headers: { Authorization: `Bearer ${token}` } }
-    );
-    const subData = await subRes.json() as any;
-    if (!subRes.ok) {
-      console.error("ERRO WHATSAPP subscribed_apps:", JSON.stringify(subData));
-      return c.json(
-        { error: "Erro ao inscrever webhook da conta do WhatsApp", detalhe: subData?.error?.message },
-        502
+    if (!token) {
+      return c.json({
+        error: "O Embedded Signup não devolveu o código de autorização",
+        code: "META_AUTH_CODE_REQUIRED",
+        detalhe: "Feche a janela da Meta e clique novamente em Conectar meu WhatsApp.",
+      }, 400);
+    }
+
+    const debug = await depurarTokenWhatsapp(token);
+    if (!debug.resposta.ok || debug.payload?.data?.is_valid !== true) {
+      return responderErroMeta(
+        c,
+        "O token devolvido pela Meta é inválido ou expirou",
+        "META_TOKEN_INVALID",
+        debug.payload,
+        { http_status: debug.resposta.status }
       );
     }
 
-    const infoRes = await fetch(
-      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${phone_number_id}?fields=display_phone_number,verified_name`,
+    const tokenData = debug.payload.data;
+    if (String(tokenData.app_id || "") !== String(Bun.env.META_APP_ID)) {
+      return c.json({
+        error: "O token do WhatsApp pertence a outro aplicativo Meta",
+        code: "META_TOKEN_APP_MISMATCH",
+      }, 403);
+    }
+
+    const permissoes = diagnosticarPermissoesToken(tokenData, waba_id);
+    if (permissoes.faltantes.length || permissoes.waba_autorizada === false) {
+      return c.json({
+        error: "O token da Meta não tem permissão para gerenciar esta conta do WhatsApp",
+        code: "META_TOKEN_PERMISSIONS",
+        detalhe: permissoes.faltantes.length
+          ? `Permissões ausentes: ${permissoes.faltantes.join(", ")}`
+          : "A WABA não aparece entre os ativos autorizados para whatsapp_business_management.",
+        meta: {
+          missing_permissions: permissoes.faltantes,
+          waba_authorized: permissoes.waba_autorizada,
+        },
+        instrucoes: [
+          "Conceda acesso avançado ao app para whatsapp_business_management e whatsapp_business_messaging.",
+          "Atribua a WABA ao usuário do sistema com a tarefa Gerenciar (MANAGE).",
+          "Refaça o Embedded Signup para emitir um token com acesso a esta WABA.",
+        ],
+      }, 403);
+    }
+
+    const wabaRes = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}?fields=id,name,account_review_status`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-    const infoData = await infoRes.json() as any;
-    if (!infoRes.ok) {
-      console.error("ERRO WHATSAPP phone info:", JSON.stringify(infoData));
-      return c.json(
-        { error: "Erro ao buscar dados do número conectado", detalhe: infoData?.error?.message },
-        502
+    const wabaData = await lerRespostaMeta(wabaRes) as any;
+    if (!wabaRes.ok || normalizarIdMeta(wabaData?.id) !== waba_id) {
+      return responderErroMeta(
+        c,
+        "Não foi possível acessar a conta do WhatsApp selecionada",
+        "WABA_ACCESS_FAILED",
+        wabaData,
+        { http_status: wabaRes.status, waba_id }
       );
+    }
+
+    const numerosRes = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}/phone_numbers?fields=id,display_phone_number,verified_name,code_verification_status,quality_rating,messaging_limit_tier,status`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const numerosData = await lerRespostaMeta(numerosRes) as any;
+    if (!numerosRes.ok) {
+      return responderErroMeta(
+        c,
+        "Não foi possível listar os números desta conta do WhatsApp",
+        "WABA_PHONE_NUMBERS_FAILED",
+        numerosData,
+        { http_status: numerosRes.status, waba_id }
+      );
+    }
+
+    const numeros = Array.isArray(numerosData?.data) ? numerosData.data : [];
+    if (!numeros.length) {
+      return c.json({
+        error: "Nenhum número foi encontrado na conta do WhatsApp selecionada",
+        code: "WABA_WITHOUT_PHONE_NUMBER",
+      }, 409);
+    }
+
+    let numero = phoneNumberInformado
+      ? numeros.find((item: any) => normalizarIdMeta(item?.id) === phoneNumberInformado)
+      : null;
+    if (phoneNumberInformado && !numero) {
+      return c.json({
+        error: "O número selecionado não pertence à conta do WhatsApp informada",
+        code: "PHONE_NUMBER_WABA_MISMATCH",
+      }, 400);
+    }
+    if (!numero && numeros.length > 1) {
+      return c.json({
+        error: "Esta conta possui mais de um número; selecione o número novamente no Embedded Signup",
+        code: "MULTIPLE_PHONE_NUMBERS",
+        numeros: numeros.map((item: any) => ({
+          id: normalizarIdMeta(item?.id),
+          numero: item?.display_phone_number || null,
+        })),
+      }, 409);
+    }
+    numero = numero || numeros[0];
+    const phone_number_id = normalizarIdMeta(numero.id);
+
+    const subscriptionsRes = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}/subscribed_apps`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const subscriptionsData = await lerRespostaMeta(subscriptionsRes) as any;
+    if (!subscriptionsRes.ok) {
+      return responderErroMeta(
+        c,
+        "A Meta não permitiu consultar a inscrição do webhook desta conta",
+        "WABA_SUBSCRIPTIONS_READ_FAILED",
+        subscriptionsData,
+        { http_status: subscriptionsRes.status, waba_id }
+      );
+    }
+
+    const appId = String(Bun.env.META_APP_ID);
+    let webhookInscrito = (subscriptionsData?.data || []).some((item: any) =>
+      String(item?.whatsapp_business_api_data?.id || item?.id || "") === appId
+    );
+
+    if (!webhookInscrito) {
+      const subRes = await fetch(
+        `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${waba_id}/subscribed_apps`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      const subData = await lerRespostaMeta(subRes) as any;
+      if (!subRes.ok || subData?.success !== true) {
+        return responderErroMeta(
+          c,
+          "A Meta não permitiu inscrever o webhook desta conta do WhatsApp",
+          "WABA_SUBSCRIPTION_FAILED",
+          subData,
+          { http_status: subRes.status, waba_id }
+        );
+      }
+      webhookInscrito = true;
     }
 
     const dadosConta = {
       waba_id,
       phone_number_id,
-      numero: infoData.display_phone_number || null,
-      display_name: infoData.verified_name || null,
+      waba_name: wabaData.name || null,
+      numero: numero.display_phone_number || null,
+      display_name: numero.verified_name || null,
+      account_review_status: wabaData.account_review_status || null,
+      phone_number_status: numero.status || null,
+      webhook_subscribed: webhookInscrito,
     };
 
     await client.query(
-      `INSERT INTO plataforma_conexoes (usuario_id, plataforma, status, dados_conta, conectado_em, atualizado_em)
-       VALUES ($1, 'whatsapp', 'conectado', $2, NOW(), NOW())
+      `INSERT INTO plataforma_conexoes
+         (usuario_id, plataforma, status, access_token, token_expira_em, dados_conta, conectado_em, atualizado_em)
+       VALUES ($1, 'whatsapp', 'conectado', $2, $3, $4, NOW(), NOW())
        ON CONFLICT (usuario_id, plataforma)
-       DO UPDATE SET status = 'conectado', dados_conta = $2, atualizado_em = NOW()`,
-      [user.id, JSON.stringify(dadosConta)]
+       DO UPDATE SET
+         status = 'conectado',
+         access_token = $2,
+         token_expira_em = COALESCE($3, plataforma_conexoes.token_expira_em),
+         dados_conta = $4,
+         atualizado_em = NOW()`,
+      [user.id, token, tokenExpiraEm, JSON.stringify(dadosConta)]
     );
 
-    return c.json({ ok: true, conta: dadosConta });
+    return c.json({
+      ok: true,
+      conta: dadosConta,
+      diagnostico: {
+        webhook_inscrito: webhookInscrito,
+        conta_aprovada: wabaData.account_review_status === "APPROVED",
+        permissoes_ausentes: permissoes.faltantes,
+      },
+      ...(wabaData.account_review_status !== "APPROVED" ? {
+        aviso: `A conexão foi salva, mas a análise da conta na Meta ainda está ${wabaData.account_review_status || "pendente"}.`,
+      } : {}),
+    });
   } catch (err: any) {
     console.error("ERRO POST /whatsapp/conectar:", err);
-    return c.json({ error: "Erro ao conectar WhatsApp" }, 500);
+    return c.json({
+      error: "Erro interno ao concluir a conexão do WhatsApp",
+      code: "WHATSAPP_CONNECTION_INTERNAL_ERROR",
+    }, 500);
   }
 });
 
@@ -10960,7 +11235,8 @@ app.get("/whatsapp/diagnostico", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const conexaoRes = await client.query(
-      `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
+      `SELECT access_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'`,
       [user.id]
     );
     const dadosConta = conexaoRes.rows[0]?.dados_conta;
@@ -10968,32 +11244,65 @@ app.get("/whatsapp/diagnostico", authMiddleware, async (c) => {
       return c.json({ conectado: false });
     }
 
-    const token = Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
+    const token = conexaoRes.rows[0]?.access_token || Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
     if (!token) {
       return c.json({ error: "Integração de WhatsApp ainda não configurada no servidor" }, 500);
     }
 
-    const [wabaRes, numerosRes] = await Promise.all([
+    const [debug, wabaRes, numerosRes, subscriptionsRes] = await Promise.all([
+      depurarTokenWhatsapp(token),
       fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}?fields=account_review_status`, {
         headers: { Authorization: `Bearer ${token}` },
       }),
-      fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}/phone_numbers?fields=code_verification_status,quality_rating,messaging_limit_tier,status`, {
+      fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}/phone_numbers?fields=id,code_verification_status,quality_rating,messaging_limit_tier,status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}/subscribed_apps`, {
         headers: { Authorization: `Bearer ${token}` },
       }),
     ]);
-    const wabaData = await wabaRes.json() as any;
-    const numerosData = await numerosRes.json() as any;
-    const numero = numerosData?.data?.find((n: any) => n.id === dadosConta.phone_number_id) || numerosData?.data?.[0] || {};
+    const [wabaData, numerosData, subscriptionsData] = await Promise.all([
+      lerRespostaMeta(wabaRes),
+      lerRespostaMeta(numerosRes),
+      lerRespostaMeta(subscriptionsRes),
+    ]) as any[];
+
+    if (!debug.resposta.ok || debug.payload?.data?.is_valid !== true) {
+      return responderErroMeta(c, "O token do WhatsApp é inválido ou expirou", "META_TOKEN_INVALID", debug.payload);
+    }
+    if (!wabaRes.ok) {
+      return responderErroMeta(c, "Não foi possível consultar a conta do WhatsApp", "WABA_STATUS_FAILED", wabaData);
+    }
+    if (!numerosRes.ok) {
+      return responderErroMeta(c, "Não foi possível consultar o número do WhatsApp", "WABA_PHONE_STATUS_FAILED", numerosData);
+    }
+    if (!subscriptionsRes.ok) {
+      return responderErroMeta(c, "Não foi possível consultar a inscrição do webhook", "WABA_SUBSCRIPTIONS_READ_FAILED", subscriptionsData);
+    }
+
+    const permissoes = diagnosticarPermissoesToken(debug.payload.data, String(dadosConta.waba_id));
+    const numero = numerosData?.data?.find(
+      (n: any) => String(n.id) === String(dadosConta.phone_number_id)
+    ) || numerosData?.data?.[0] || {};
+    const webhookInscrito = (subscriptionsData?.data || []).some((item: any) =>
+      String(item?.whatsapp_business_api_data?.id || item?.id || "") === String(Bun.env.META_APP_ID || "")
+    );
+    const contaAprovada = wabaData?.account_review_status === "APPROVED";
+    const numeroConectado = numero.status === "CONNECTED";
 
     return c.json({
       conectado: true,
-      conta_aprovada: wabaData?.account_review_status === "APPROVED",
+      pronto_para_mensagens: contaAprovada && numeroConectado && webhookInscrito && !permissoes.faltantes.length,
+      conta_aprovada: contaAprovada,
       account_review_status: wabaData?.account_review_status || null,
       numero_status: numero.status || null,
       numero_verificado: numero.code_verification_status === "VERIFIED",
       code_verification_status: numero.code_verification_status || null,
       quality_rating: numero.quality_rating || null,
       messaging_limit_tier: numero.messaging_limit_tier || null,
+      webhook_inscrito: webhookInscrito,
+      permissoes_ausentes: permissoes.faltantes,
+      waba_autorizada: permissoes.waba_autorizada,
     });
   } catch (err: any) {
     console.error("ERRO GET /whatsapp/diagnostico:", err);
@@ -11920,7 +12229,12 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
 
   while (indice < passos.length) {
     const passo = passos[indice];
-    const wamid = await enviarMensagemWhatsAppOficial(phoneNumberId, conversa.telefone_cliente, passo.texto);
+    const wamid = await enviarMensagemWhatsAppOficial(
+      conversa.usuario_id,
+      phoneNumberId,
+      conversa.telefone_cliente,
+      passo.texto
+    );
     if (wamid) {
       await client.query(
         `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3)
@@ -21992,19 +22306,18 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
   }
 }
 
-const WHATSAPP_CLOUD_API_VERSION = "v24.0";
-
 // Envio pela API oficial do WhatsApp (Cloud API) — caminho separado do Z-API acima.
-// Usa o token de sistema único da plataforma (Bun.env.WHATSAPP_SYSTEM_USER_TOKEN),
-// já que todos os números dos corretores ficam sob a mesma conta Meta Business Manager.
+// Prefere o token limitado à WABA salvo no Embedded Signup. O token geral de sistema
+// só é usado como compatibilidade para conexões antigas do mesmo Business Manager.
 async function enviarMensagemWhatsAppOficial(
+  usuarioId: number,
   phoneNumberId: string,
   telefoneDestino: string,
   texto: string
 ) {
-  const token = Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
+  const token = await obterTokenWhatsappUsuario(usuarioId);
   if (!token) {
-    console.warn("⚠️ WhatsApp Oficial: WHATSAPP_SYSTEM_USER_TOKEN não configurado");
+    console.warn(`⚠️ WhatsApp Oficial: token não configurado para o usuário ${usuarioId}`);
     return;
   }
 
