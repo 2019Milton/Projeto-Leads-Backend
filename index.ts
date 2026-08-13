@@ -16279,6 +16279,22 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       }, 404);
     }
 
+    const configuracoesBanco =
+      campanhaBanco.rows[0]?.configuracoes_avancadas || {};
+    const destinoOriginal =
+      resolverDestinoCampanha(configuracoesBanco.destino);
+    const destinoSolicitado =
+      resolverDestinoCampanha(configuracoes_avancadas?.destino);
+
+    // A Meta não permite converter o destination_type de um Ad Set existente
+    // entre formulário e WhatsApp. Sem esta proteção, o banco passava a mostrar
+    // WhatsApp enquanto o anúncio remoto continuava sendo Lead Ads.
+    if (destinoSolicitado !== destinoOriginal) {
+      return c.json({
+        error: "O destino de uma campanha já publicada não pode ser alterado. Duplique a campanha e escolha o novo destino na cópia."
+      }, 409);
+    }
+
     const adsetId =
       campanhaBanco.rows[0]?.adset_id;
 
@@ -16493,7 +16509,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     try {
       const adId = campanhaBanco.rows[0]?.ad_id;
       const formId = campanhaBanco.rows[0]?.form_id;
-      const cfgBanco = campanhaBanco.rows[0]?.configuracoes_avancadas || {};
+      const cfgBanco = configuracoesBanco;
 
       const pageId =
         textoOpcional(avancadas.page_id) ||
