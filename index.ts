@@ -14913,6 +14913,11 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         origem: campanha.origem,
         plataforma: campanha.plataforma || "meta",
         campaign_id: campanha.campaign_id,
+        adset_id: campanha.adset_id,
+        ad_id: campanha.ad_id,
+        form_id: campanha.form_id,
+        destino_editavel:
+          !campanha.adset_id && !campanha.ad_id,
         criada_por_usuario_id: campanha.usuario_id,
         criada_por_email: campanha.criado_por_email,
         criada_por_nome:
@@ -14942,6 +14947,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           Boolean(campanha.origem_campanha_id),
         rascunho_local:
           String(campanha.origem || "").toLowerCase() === "manual" ||
+          (!campanha.adset_id && !campanha.ad_id) ||
           (!campanha.campaign_id && !metaDisponivel),
         configuracoes_avancadas:
           configuracoesCampanha,
@@ -16233,7 +16239,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     // isso não usamos apenas o valor enviado pela tela para decidir se é rascunho.
     const campanhaLocalRes = campanha_local_id
       ? await client.query(
-          `SELECT id, campaign_id, origem, origem_campanha_id
+          `SELECT id, campaign_id, adset_id, ad_id, origem, origem_campanha_id
            FROM campanhas
            WHERE id = $1 AND usuario_id = $2
            LIMIT 1`,
@@ -16244,6 +16250,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     const ehRascunhoLocal = Boolean(
       campanhaLocal && (
         !campanhaLocal.campaign_id ||
+        (!campanhaLocal.adset_id && !campanhaLocal.ad_id) ||
         String(campanhaLocal.origem || "").toLowerCase() === "manual"
       )
     );
