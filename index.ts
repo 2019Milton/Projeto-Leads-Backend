@@ -4814,6 +4814,42 @@ async function sincronizarTodasCampanhas() {
       await new Promise(r => setTimeout(r, 2000));
     }
 
+    const conexoesOutrasPlataformas = await client.query(`
+      SELECT usuario_id, plataforma
+      FROM plataforma_conexoes
+      WHERE plataforma IN ('google', 'tiktok')
+        AND status = 'conectado'
+      ORDER BY usuario_id, plataforma
+    `);
+
+    for (const conexao of conexoesOutrasPlataformas.rows) {
+      const usuarioId = Number(conexao.usuario_id);
+      const plataforma = String(conexao.plataforma);
+      const trava = plataforma === "google"
+        ? googleSyncEmAndamento
+        : tiktokSyncEmAndamento;
+
+      if (trava.has(usuarioId)) {
+        console.log(`⏭️ AUTO SYNC ${plataforma} pulado para usuário ${usuarioId} — sincronização manual em andamento`);
+        continue;
+      }
+
+      trava.add(usuarioId);
+      try {
+        if (plataforma === "google") {
+          await sincronizarGoogleAdsUsuario(usuarioId);
+        } else {
+          await sincronizarTikTokAdsUsuario(usuarioId);
+        }
+      } catch (err) {
+        console.error(`ERRO AUTO SYNC ${plataforma} USUÁRIO ${usuarioId}:`, err);
+      } finally {
+        trava.delete(usuarioId);
+      }
+
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
     console.log("🚀 AUTO SYNC FINALIZADO");
 
   } catch (err) {
@@ -5882,33 +5918,27 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
   }
 });
 
-// Sincroniza campanhas e leads (Lead Form Extensions) do Google Ads
-app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
-  const user: any = c.get("user");
-  try {
-    if (googleSyncEmAndamento.has(user.id)) {
-      return c.json({ error: "Sincronizacao Google Ads ja em andamento" }, 429);
-    }
-    googleSyncEmAndamento.add(user.id);
-
+// Sincroniza campanhas e leads (Lead Form Extensions) do Google Ads. A mesma
+// função é usada pelo botão manual e pelo ciclo automático.
+async function sincronizarGoogleAdsUsuario(usuarioId: number) {
     if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
-      return c.json({ error: "Developer token do Google Ads nao configurado" }, 500);
+      throw new Error("Developer token do Google Ads nao configurado");
     }
 
     const conn = await client.query(
       `SELECT refresh_token, dados_conta FROM plataforma_conexoes
        WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
-      [user.id]
+      [usuarioId]
     );
     if (!conn.rows.length || !conn.rows[0].refresh_token) {
-      return c.json({ error: "Google Ads nao conectado" }, 400);
+      throw new Error("Google Ads nao conectado");
     }
 
     const dadosConta = conn.rows[0].dados_conta ?? {};
     const customerId = dadosConta.customer_id;
     const loginCustomerId = dadosConta.login_customer_id || null;
     if (!customerId) {
-      return c.json({ error: "Selecione a conta do Google Ads antes de sincronizar" }, 400);
+      throw new Error("Selecione a conta do Google Ads antes de sincronizar");
     }
 
     const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
@@ -5926,20 +5956,20 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
 
       const existe = await client.query(
         `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
-        [campaignId, user.id]
+        [campaignId, usuarioId]
       );
 
       if (existe.rows.length > 0) {
         await client.query(
           `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
            WHERE campaign_id = $3 AND usuario_id = $4`,
-          [campanha.name, campanha.status, campaignId, user.id]
+          [campanha.name, campanha.status, campaignId, usuarioId]
         );
       } else {
         await client.query(
           `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
            VALUES ($1, $2, $3, $4, $5, 'google', 'google', NOW())`,
-          [user.id, campaignId, String(customerId), campanha.name, campanha.status]
+          [usuarioId, campaignId, String(customerId), campanha.name, campanha.status]
         );
       }
     }
@@ -5968,7 +5998,7 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
 
       const jaExiste = await client.query(
         `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
-        [leadId, user.id]
+        [leadId, usuarioId]
       );
       if (jaExiste.rows.length > 0) continue;
 
@@ -5978,7 +6008,7 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
       if (campaignIdLead) {
         const campRow = await client.query(
           `SELECT nome, nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 LIMIT 1`,
-          [campaignIdLead, user.id]
+          [campaignIdLead, usuarioId]
         );
         if (campRow.rows.length) {
           nomeCampanha = campRow.rows[0].nome;
@@ -6009,23 +6039,35 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
             origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
          VALUES ($1,$2,$3,$4,$5,$6,$7,'google','google','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
         [
-          user.id, leadId, nome || "Lead Google Ads", email, telefone,
+          usuarioId, leadId, nome || "Lead Google Ads", email, telefone,
           nomeCampanha, String(customerId),
           JSON.stringify(respostasQualificacao), nichoId, criadoEm
         ]
       );
 
-      await notificarNovoLeadWhatsApp(user.id, { nome, telefone, email, campanha: nomeCampanha });
+      await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
       totalLeads++;
     }
 
     await client.query(
       `UPDATE plataforma_conexoes SET atualizado_em = NOW()
        WHERE usuario_id = $1 AND plataforma = 'google'`,
-      [user.id]
+      [usuarioId]
     );
 
-    return c.json({ sucesso: true, campanhas: campanhasResults.length, leads_novos: totalLeads });
+    return { sucesso: true, campanhas: campanhasResults.length, leads_novos: totalLeads };
+}
+
+app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+
+  if (googleSyncEmAndamento.has(user.id)) {
+    return c.json({ error: "Sincronizacao Google Ads ja em andamento" }, 429);
+  }
+  googleSyncEmAndamento.add(user.id);
+
+  try {
+    return c.json(await sincronizarGoogleAdsUsuario(user.id));
   } catch (err: any) {
     console.error("ERRO GOOGLE SINCRONIZAR:", err);
     return c.json({ error: err.message || "Erro ao sincronizar Google Ads" }, 500);
@@ -6942,28 +6984,22 @@ app.post("/tiktok/selecionar-anunciante", authMiddleware, async (c) => {
   }
 });
 
-// Sincroniza campanhas e leads do TikTok Ads
-app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
-  const user: any = c.get("user");
-  try {
-    if (tiktokSyncEmAndamento.has(user.id)) {
-      return c.json({ error: "Sincronizacao TikTok ja em andamento" }, 429);
-    }
-    tiktokSyncEmAndamento.add(user.id);
-
+// Sincroniza campanhas e leads do TikTok Ads. Compartilhada entre o botão
+// manual e o ciclo automático.
+async function sincronizarTikTokAdsUsuario(usuarioId: number) {
     const conn = await client.query(
       `SELECT access_token, dados_conta FROM plataforma_conexoes
        WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
-      [user.id]
+      [usuarioId]
     );
-    if (!conn.rows.length) return c.json({ error: "TikTok nao conectado" }, 400);
+    if (!conn.rows.length) throw new Error("TikTok nao conectado");
 
     const token = conn.rows[0].access_token;
     const dadosConta = conn.rows[0].dados_conta ?? {};
     const advertiserId = dadosConta.advertiser_id;
 
     if (!advertiserId) {
-      return c.json({ error: "Selecione a conta de anunciante TikTok antes de sincronizar" }, 400);
+      throw new Error("Selecione a conta de anunciante TikTok antes de sincronizar");
     }
 
     // 🔥 BUSCA CAMPANHAS
@@ -6975,7 +7011,7 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
 
     if (campanhasData.code !== 0) {
       console.error("ERRO CAMPANHAS TIKTOK:", campanhasData);
-      return c.json({ error: "Erro ao buscar campanhas TikTok", detalhe: campanhasData.message }, 502);
+      throw new Error(campanhasData.message || "Erro ao buscar campanhas TikTok");
     }
 
     const campanhas = campanhasData.data?.list ?? [];
@@ -6984,20 +7020,20 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
     for (const campanha of campanhas) {
       const existe = await client.query(
         `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
-        [String(campanha.campaign_id), user.id]
+        [String(campanha.campaign_id), usuarioId]
       );
 
       if (existe.rows.length > 0) {
         await client.query(
           `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
            WHERE campaign_id = $3 AND usuario_id = $4`,
-          [campanha.campaign_name, campanha.status, String(campanha.campaign_id), user.id]
+          [campanha.campaign_name, campanha.status, String(campanha.campaign_id), usuarioId]
         );
       } else {
         await client.query(
           `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
            VALUES ($1, $2, $3, $4, $5, 'tiktok', 'tiktok', NOW())`,
-          [user.id, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.status]
+          [usuarioId, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.status]
         );
       }
     }
@@ -7033,7 +7069,7 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
 
         const jaExiste = await client.query(
           `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
-          [leadId, user.id]
+          [leadId, usuarioId]
         );
         if (jaExiste.rows.length > 0) continue;
 
@@ -7043,7 +7079,7 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
         if (formId) {
           const campRow = await client.query(
             `SELECT nome, nicho_id FROM campanhas WHERE form_id = $1 AND usuario_id = $2 LIMIT 1`,
-            [formId, user.id]
+            [formId, usuarioId]
           );
           if (campRow.rows.length) {
             nomeCampanha = campRow.rows[0].nome;
@@ -7074,13 +7110,13 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
               origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
            VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
           [
-            user.id, leadId, nome || "Lead TikTok", email, telefone,
+            usuarioId, leadId, nome || "Lead TikTok", email, telefone,
             nomeCampanha, String(advertiserId),
             JSON.stringify(respostasQualificacao), nichoId, criadoEm
           ]
         );
 
-        await notificarNovoLeadWhatsApp(user.id, { nome, telefone, email, campanha: nomeCampanha });
+        await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
         totalLeads++;
       }
     }
@@ -7088,13 +7124,25 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
     await client.query(
       `UPDATE plataforma_conexoes SET atualizado_em = NOW()
        WHERE usuario_id = $1 AND plataforma = 'tiktok'`,
-      [user.id]
+      [usuarioId]
     );
 
-    return c.json({ sucesso: true, campanhas: campanhas.length, leads_novos: totalLeads });
+    return { sucesso: true, campanhas: campanhas.length, leads_novos: totalLeads };
+}
+
+app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+
+  if (tiktokSyncEmAndamento.has(user.id)) {
+    return c.json({ error: "Sincronizacao TikTok ja em andamento" }, 429);
+  }
+  tiktokSyncEmAndamento.add(user.id);
+
+  try {
+    return c.json(await sincronizarTikTokAdsUsuario(user.id));
   } catch (err: any) {
     console.error("ERRO TIKTOK SINCRONIZAR:", err);
-    return c.json({ error: "Erro ao sincronizar TikTok" }, 500);
+    return c.json({ error: err?.message || "Erro ao sincronizar TikTok" }, 500);
   } finally {
     tiktokSyncEmAndamento.delete(user.id);
   }
@@ -14589,6 +14637,286 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
   }
 });
 
+type MetricasCampanhaExterna = {
+  impressoes: number;
+  cliques: number;
+  alcance: number;
+  gasto: number;
+  gasto_hoje: number;
+  cpc: number;
+  ctr: number;
+  grafico: Array<{
+    data: string;
+    clicks: number;
+    ctr: number;
+    gasto: number;
+    impressoes: number;
+  }>;
+};
+
+function dataCalendarioBrasil(data: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(data);
+}
+
+// Intervalo explícito evita a diferença entre os presets das plataformas.
+// Por exemplo, LAST_30_DAYS no Google exclui hoje. Aqui são 30 dias de
+// calendário contando a data atual, iguais para Meta, Google e TikTok.
+function intervaloMetricasCampanhas(dias = 30) {
+  const agora = new Date();
+  const inicio = new Date(agora);
+  inicio.setUTCDate(inicio.getUTCDate() - Math.max(0, dias - 1));
+
+  return {
+    inicio: dataCalendarioBrasil(inicio),
+    fim: dataCalendarioBrasil(agora),
+    hoje: dataCalendarioBrasil(agora),
+  };
+}
+
+function metricasCampanhaVazias(): MetricasCampanhaExterna {
+  return {
+    impressoes: 0,
+    cliques: 0,
+    alcance: 0,
+    gasto: 0,
+    gasto_hoje: 0,
+    cpc: 0,
+    ctr: 0,
+    grafico: [],
+  };
+}
+
+function finalizarMetricasCampanha(
+  metricas: MetricasCampanhaExterna
+): MetricasCampanhaExterna {
+  metricas.cpc = metricas.cliques > 0
+    ? metricas.gasto / metricas.cliques
+    : 0;
+  metricas.ctr = metricas.impressoes > 0
+    ? (metricas.cliques / metricas.impressoes) * 100
+    : 0;
+  return metricas;
+}
+
+async function carregarMetricasGoogleCampanhas(
+  usuarioId: number,
+  inicio: string,
+  fim: string,
+  hoje: string
+): Promise<{
+  disponivel: boolean;
+  erro: string | null;
+  metricas: Map<string, MetricasCampanhaExterna>;
+}> {
+  const metricas = new Map<string, MetricasCampanhaExterna>();
+
+  try {
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return { disponivel: false, erro: "Developer token do Google Ads não configurado", metricas };
+    }
+
+    const conexao = await client.query(
+      `SELECT refresh_token, dados_conta
+       FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' AND status = 'conectado'
+       LIMIT 1`,
+      [usuarioId]
+    );
+    const row = conexao.rows[0];
+    const customerId = row?.dados_conta?.customer_id;
+    const loginCustomerId = row?.dados_conta?.login_customer_id || null;
+
+    if (!row?.refresh_token || !customerId) {
+      return { disponivel: false, erro: null, metricas };
+    }
+
+    const accessToken = await obterAccessTokenGoogle(row.refresh_token);
+    const resultados = await googleAdsQuery(
+      String(customerId),
+      accessToken,
+      `SELECT campaign.id, segments.date, metrics.impressions, metrics.clicks, metrics.cost_micros
+       FROM campaign
+       WHERE segments.date BETWEEN '${inicio}' AND '${fim}'`,
+      loginCustomerId
+    );
+
+    for (const item of resultados as any[]) {
+      const campaignId = String(item.campaign?.id || "");
+      if (!campaignId) continue;
+
+      const atual = metricas.get(campaignId) || metricasCampanhaVazias();
+      const impressoes = Number(item.metrics?.impressions || 0);
+      const cliques = Number(item.metrics?.clicks || 0);
+      const gasto = Number(item.metrics?.costMicros || 0) / 1_000_000;
+      const data = String(item.segments?.date || "");
+
+      atual.impressoes += impressoes;
+      atual.cliques += cliques;
+      atual.gasto += gasto;
+      if (data === hoje) atual.gasto_hoje += gasto;
+      atual.grafico.push({
+        data,
+        clicks: cliques,
+        ctr: impressoes > 0 ? (cliques / impressoes) * 100 : 0,
+        gasto,
+        impressoes,
+      });
+      metricas.set(campaignId, atual);
+    }
+
+    // Alcance no Google se chama unique_users e só está disponível em alguns
+    // tipos (Display, Vídeo, Discovery e App). Consulta separada para não somar
+    // pessoas repetidas de dias diferentes. Se a conta não aceitar a métrica,
+    // as demais continuam válidas.
+    try {
+      const alcanceResultados = await googleAdsQuery(
+        String(customerId),
+        accessToken,
+        `SELECT campaign.id, metrics.unique_users
+         FROM campaign
+         WHERE segments.date BETWEEN '${inicio}' AND '${fim}'`,
+        loginCustomerId
+      );
+      for (const item of alcanceResultados as any[]) {
+        const campaignId = String(item.campaign?.id || "");
+        if (!campaignId) continue;
+        const atual = metricas.get(campaignId) || metricasCampanhaVazias();
+        atual.alcance = Number(item.metrics?.uniqueUsers || 0);
+        metricas.set(campaignId, atual);
+      }
+    } catch (err: any) {
+      console.warn("AVISO MÉTRICA ALCANCE GOOGLE:", err?.message || err);
+    }
+
+    for (const valor of metricas.values()) finalizarMetricasCampanha(valor);
+    return { disponivel: true, erro: null, metricas };
+  } catch (err: any) {
+    console.error("ERRO MÉTRICAS GOOGLE CAMPANHAS:", err);
+    return {
+      disponivel: false,
+      erro: err?.message || "Métricas indisponíveis no Google Ads",
+      metricas,
+    };
+  }
+}
+
+async function relatorioTikTokCampanhas(
+  token: string,
+  advertiserId: string,
+  inicio: string,
+  fim: string,
+  dimensoes: string[]
+): Promise<any[]> {
+  const registros: any[] = [];
+  let pagina = 1;
+  let totalPaginas = 1;
+
+  do {
+    const params = new URLSearchParams({
+      advertiser_id: advertiserId,
+      report_type: "BASIC",
+      data_level: "AUCTION_CAMPAIGN",
+      dimensions: JSON.stringify(dimensoes),
+      metrics: JSON.stringify(["spend", "impressions", "clicks", "reach", "ctr", "cpc"]),
+      start_date: inicio,
+      end_date: fim,
+      page: String(pagina),
+      page_size: "1000",
+    });
+    const res = await fetch(`${TIKTOK_API}/report/integrated/get/?${params}`, {
+      headers: tiktokHeaders(token),
+    });
+    const data = await res.json() as any;
+    if (!res.ok || data.code !== 0) {
+      throw new Error(data?.message || "Erro ao consultar relatório do TikTok Ads");
+    }
+
+    registros.push(...(data.data?.list || []));
+    const info = data.data?.page_info || {};
+    totalPaginas = Number(info.total_page || Math.ceil(Number(info.total_number || 0) / 1000) || 1);
+    pagina += 1;
+  } while (pagina <= totalPaginas);
+
+  return registros;
+}
+
+async function carregarMetricasTikTokCampanhas(
+  usuarioId: number,
+  inicio: string,
+  fim: string,
+  hoje: string
+): Promise<{
+  disponivel: boolean;
+  erro: string | null;
+  metricas: Map<string, MetricasCampanhaExterna>;
+}> {
+  const metricas = new Map<string, MetricasCampanhaExterna>();
+
+  try {
+    const conexao = await client.query(
+      `SELECT access_token, dados_conta
+       FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' AND status = 'conectado'
+       LIMIT 1`,
+      [usuarioId]
+    );
+    const row = conexao.rows[0];
+    const advertiserId = row?.dados_conta?.advertiser_id;
+    if (!row?.access_token || !advertiserId) {
+      return { disponivel: false, erro: null, metricas };
+    }
+
+    const [totais, diarios] = await Promise.all([
+      relatorioTikTokCampanhas(row.access_token, String(advertiserId), inicio, fim, ["campaign_id"]),
+      relatorioTikTokCampanhas(row.access_token, String(advertiserId), inicio, fim, ["campaign_id", "stat_time_day"]),
+    ]);
+
+    for (const item of totais) {
+      const campaignId = String(item.dimensions?.campaign_id || "");
+      if (!campaignId) continue;
+      const valor = metricasCampanhaVazias();
+      valor.impressoes = Number(item.metrics?.impressions || 0);
+      valor.cliques = Number(item.metrics?.clicks || 0);
+      valor.alcance = Number(item.metrics?.reach || 0);
+      valor.gasto = Number(item.metrics?.spend || 0);
+      metricas.set(campaignId, finalizarMetricasCampanha(valor));
+    }
+
+    for (const item of diarios) {
+      const campaignId = String(item.dimensions?.campaign_id || "");
+      if (!campaignId) continue;
+      const atual = metricas.get(campaignId) || metricasCampanhaVazias();
+      const impressoes = Number(item.metrics?.impressions || 0);
+      const cliques = Number(item.metrics?.clicks || 0);
+      const gasto = Number(item.metrics?.spend || 0);
+      const data = String(item.dimensions?.stat_time_day || "").slice(0, 10);
+      if (data === hoje) atual.gasto_hoje += gasto;
+      atual.grafico.push({
+        data,
+        clicks: cliques,
+        ctr: impressoes > 0 ? (cliques / impressoes) * 100 : 0,
+        gasto,
+        impressoes,
+      });
+      metricas.set(campaignId, finalizarMetricasCampanha(atual));
+    }
+
+    return { disponivel: true, erro: null, metricas };
+  } catch (err: any) {
+    console.error("ERRO MÉTRICAS TIKTOK CAMPANHAS:", err);
+    return {
+      disponivel: false,
+      erro: err?.message || "Métricas indisponíveis no TikTok Ads",
+      metricas,
+    };
+  }
+}
+
 // 📊 métricas reais das campanhas
 app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
@@ -14706,6 +15034,27 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       `,
       [user.id, contaAnunciosId, contaAnunciosIdGoogle, contaAnunciosIdTikTok]
     );
+
+    const periodoMetricas = intervaloMetricasCampanhas(30);
+    const [metricasGoogle, metricasTikTok] = await Promise.all([
+      carregarMetricasGoogleCampanhas(
+        user.id,
+        periodoMetricas.inicio,
+        periodoMetricas.fim,
+        periodoMetricas.hoje
+      ),
+      carregarMetricasTikTokCampanhas(
+        user.id,
+        periodoMetricas.inicio,
+        periodoMetricas.fim,
+        periodoMetricas.hoje
+      ),
+    ]);
+
+    const timeRangeMeta = encodeURIComponent(JSON.stringify({
+      since: periodoMetricas.inicio,
+      until: periodoMetricas.fim,
+    }));
 
     // 🔥 STATUS DA CONTA (account_status indica problema de pagamento/cobranca)
     let erroPagamentoConta: string | null = null;
@@ -14879,19 +15228,21 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       let metaDisponivel = false;
       let erroMeta: string | null = null;
 
+      const plataformaCampanha = String(campanha.plataforma || "meta").toLowerCase();
+
       if (
         token &&
         campanha.campaign_id &&
-        (campanha.plataforma || "meta") === "meta" &&
+        plataformaCampanha === "meta" &&
         String(campanha.status || "").toUpperCase() !== "DELETED"
       ) {
         try {
           const [insightsTotais, insightsGrafico, insightsHoje] = await Promise.all([
             fetch(
-              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&date_preset=last_30d&access_token=${token}`
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&time_range=${timeRangeMeta}&access_token=${token}`
             ).then(r => r.json()),
             fetch(
-              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,ctr&time_increment=1&date_preset=last_30d&access_token=${token}`
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,ctr&time_increment=1&time_range=${timeRangeMeta}&access_token=${token}`
             ).then(r => r.json()),
             fetch(
               `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=spend&date_preset=today&access_token=${token}`
@@ -14921,6 +15272,44 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           }
         } catch {
           erroMeta = "Métricas indisponíveis na Meta";
+        }
+      } else if (campanha.campaign_id && plataformaCampanha === "google") {
+        if (metricasGoogle.disponivel) {
+          const metrica =
+            metricasGoogle.metricas.get(String(campanha.campaign_id)) ||
+            metricasCampanhaVazias();
+          dados = {
+            impressions: metrica.impressoes,
+            clicks: metrica.cliques,
+            reach: metrica.alcance,
+            spend: metrica.gasto,
+            cpc: metrica.cpc,
+            ctr: metrica.ctr,
+          };
+          grafico = metrica.grafico;
+          gastoHojeCampanha = metrica.gasto_hoje;
+          metaDisponivel = true;
+        } else {
+          erroMeta = metricasGoogle.erro;
+        }
+      } else if (campanha.campaign_id && plataformaCampanha === "tiktok") {
+        if (metricasTikTok.disponivel) {
+          const metrica =
+            metricasTikTok.metricas.get(String(campanha.campaign_id)) ||
+            metricasCampanhaVazias();
+          dados = {
+            impressions: metrica.impressoes,
+            clicks: metrica.cliques,
+            reach: metrica.alcance,
+            spend: metrica.gasto,
+            cpc: metrica.cpc,
+            ctr: metrica.ctr,
+          };
+          grafico = metrica.grafico;
+          gastoHojeCampanha = metrica.gasto_hoje;
+          metaDisponivel = true;
+        } else {
+          erroMeta = metricasTikTok.erro;
         }
       }
 
@@ -15099,7 +15488,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
         grafico,
         criado_em: campanha.criado_em,
-        metricas_origem: metaDisponivel ? "meta" : "local",
+        metricas_origem: metaDisponivel ? plataformaCampanha : "local",
         meta_disponivel: metaDisponivel,
         erro_meta: erroMeta,
         erro_publicacao:
