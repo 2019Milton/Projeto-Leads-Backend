@@ -14940,6 +14940,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           })),
         recebida_por_encaminhamento:
           Boolean(campanha.origem_campanha_id),
+        rascunho_local:
+          String(campanha.origem || "").toLowerCase() === "manual" ||
+          (!campanha.campaign_id && !metaDisponivel),
         configuracoes_avancadas:
           configuracoesCampanha,
         daily_budget:
@@ -16225,8 +16228,30 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       return negarAcessoConta(c);
     }
 
-    // Campanha ainda não publicada na Meta (duplicada ou rascunho): salva só localmente
-    if (!campaign_id && campanha_local_id) {
+    // O estado do banco é a fonte de verdade. Algumas cópias antigas podem
+    // chegar do frontend com um campaign_id herdado da campanha de origem; por
+    // isso não usamos apenas o valor enviado pela tela para decidir se é rascunho.
+    const campanhaLocalRes = campanha_local_id
+      ? await client.query(
+          `SELECT id, campaign_id, origem, origem_campanha_id
+           FROM campanhas
+           WHERE id = $1 AND usuario_id = $2
+           LIMIT 1`,
+          [campanha_local_id, usuarioId]
+        )
+      : { rows: [] as any[] };
+    const campanhaLocal = campanhaLocalRes.rows[0] || null;
+    const ehRascunhoLocal = Boolean(
+      campanhaLocal && (
+        !campanhaLocal.campaign_id ||
+        String(campanhaLocal.origem || "").toLowerCase() === "manual"
+      )
+    );
+
+    // Campanha ainda não publicada na Meta (duplicada ou rascunho): salva só localmente.
+    // Limpa IDs remotos eventualmente herdados para que a primeira publicação
+    // crie campanha, conjunto e anúncio novos em vez de alterar a campanha original.
+    if (ehRascunhoLocal) {
       const avancadas = configuracoes_avancadas || {};
       const hashesRascunho =
         Array.isArray(imageHashesNovo) && imageHashesNovo.length
@@ -16246,6 +16271,10 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
          SET configuracoes_avancadas = $1,
              daily_budget = COALESCE($2, daily_budget),
              nome = COALESCE($3, nome),
+             campaign_id = NULL,
+             adset_id = NULL,
+             ad_id = NULL,
+             form_id = NULL,
              atualizado_em = NOW()
          WHERE id = $4 AND usuario_id = $5`,
         [JSON.stringify(avancadas), dailyBudget, nomeLocal, campanha_local_id, usuarioId]
