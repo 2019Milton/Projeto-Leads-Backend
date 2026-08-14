@@ -18508,6 +18508,10 @@ app.get("/leads", authMiddleware, async (c) => {
         l.observacao_agendamento,
         l.meta_evento_qualificado_enviado_em,
         l.meta_evento_fechado_enviado_em,
+        l.google_evento_qualificado_enviado_em,
+        l.google_evento_fechado_enviado_em,
+        l.tiktok_evento_qualificado_enviado_em,
+        l.tiktok_evento_fechado_enviado_em,
         COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma,
         wt.transcricao AS whatsapp_transcricao
       FROM leads l
