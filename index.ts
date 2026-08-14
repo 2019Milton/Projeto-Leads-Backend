@@ -16709,6 +16709,472 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
   }
 });
 
+// Carrega a configuração real usada no editor. Campanhas antigas, importadas
+// ou criadas antes de todos os campos serem persistidos podem ter apenas os IDs
+// locais. Nesse caso completamos os dados a partir da campanha/adset/criativo
+// publicados na Meta, sem modificar o anúncio remoto.
+app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+
+    if (!Number.isFinite(campanhaId) || campanhaId <= 0) {
+      return c.json({ error: "Campanha inválida" }, 400);
+    }
+
+    const campanhaRes = await client.query(
+      `SELECT * FROM campanhas WHERE id = $1 AND usuario_id = $2 LIMIT 1`,
+      [campanhaId, user.id]
+    );
+
+    if (!campanhaRes.rows.length) {
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const campanha = campanhaRes.rows[0];
+
+    const objetoConfiguracao = (valor: any): Record<string, any> => {
+      if (!valor) return {};
+      if (typeof valor === "string") {
+        try {
+          const parsed = JSON.parse(valor);
+          return parsed && typeof parsed === "object" ? parsed : {};
+        } catch {
+          return {};
+        }
+      }
+      return typeof valor === "object" ? { ...valor } : {};
+    };
+
+    const configuracoes = objetoConfiguracao(campanha.configuracoes_avancadas);
+    const respostaLocal = (aviso: string | null = null) => ({
+      id: campanha.id,
+      nome: campanha.nome,
+      status: campanha.status,
+      campaign_id: campanha.campaign_id,
+      adset_id: campanha.adset_id,
+      ad_id: campanha.ad_id,
+      form_id: campanha.form_id,
+      page_id: campanha.page_id,
+      daily_budget: campanha.daily_budget,
+      configuracoes_avancadas: configuracoes,
+      meta_carregada: false,
+      aviso
+    });
+
+    const plataforma = String(campanha.plataforma || "meta").toLowerCase();
+    if (plataforma !== "meta" || !campanha.campaign_id) {
+      return c.json(respostaLocal());
+    }
+
+    const conn = await client.query(
+      `SELECT access_token, conta_anuncios_id
+       FROM meta_conexoes
+       WHERE usuario_id = $1
+       ORDER BY id DESC
+       LIMIT 1`,
+      [user.id]
+    );
+
+    const token = conn.rows[0]?.access_token;
+    if (!token) {
+      return c.json(respostaLocal("Meta não conectada; exibindo os dados salvos na plataforma."));
+    }
+
+    const consultarObjetoMeta = async (id: string, fields: string) => {
+      const params = new URLSearchParams({ fields, access_token: token });
+      const res = await fetch(
+        `https://graph.facebook.com/v19.0/${id}?${params}`
+      );
+      const data = await res.json() as any;
+      if (!res.ok || data?.error) {
+        throw new Error(
+          data?.error?.error_user_msg ||
+          data?.error?.message ||
+          `Não foi possível consultar ${id} na Meta`
+        );
+      }
+      return data;
+    };
+
+    const consultarPrimeiroEdgeMeta = async (
+      id: string,
+      edge: string,
+      fields: string
+    ) => {
+      const params = new URLSearchParams({
+        fields,
+        limit: "1",
+        access_token: token
+      });
+      const res = await fetch(
+        `https://graph.facebook.com/v19.0/${id}/${edge}?${params}`
+      );
+      const data = await res.json() as any;
+      if (!res.ok || data?.error) return null;
+      return data?.data?.[0] || null;
+    };
+
+    try {
+      const campanhaMeta = await consultarObjetoMeta(
+        String(campanha.campaign_id),
+        "id,name,status,objective,daily_budget,special_ad_categories"
+      );
+
+      let adsetId = textoOpcional(campanha.adset_id);
+      let adId = textoOpcional(campanha.ad_id);
+
+      const adsetLista = !adsetId
+        ? await consultarPrimeiroEdgeMeta(
+            String(campanha.campaign_id),
+            "adsets",
+            "id"
+          )
+        : null;
+      adsetId = adsetId || textoOpcional(adsetLista?.id);
+
+      const adLista = !adId
+        ? await consultarPrimeiroEdgeMeta(
+            String(campanha.campaign_id),
+            "ads",
+            "id,adset_id,creative"
+          )
+        : null;
+      adId = adId || textoOpcional(adLista?.id);
+      adsetId = adsetId || textoOpcional(adLista?.adset_id);
+
+      const [adsetMeta, adMetaConsultado] = await Promise.all([
+        adsetId
+          ? consultarObjetoMeta(
+              adsetId,
+              "id,daily_budget,bid_strategy,bid_amount,start_time,end_time,targeting,attribution_spec,destination_type,promoted_object"
+            ).catch(() => null)
+          : Promise.resolve(null),
+        adId
+          ? consultarObjetoMeta(adId, "id,adset_id,creative").catch(() => null)
+          : Promise.resolve(adLista)
+      ]);
+
+      // Se o acesso direto ao anúncio falhar pontualmente, ainda aproveita o
+      // objeto que veio da listagem da campanha para localizar o criativo.
+      const adMeta = adMetaConsultado || adLista;
+
+      const creativeRef = adMeta?.creative ?? adLista?.creative;
+      const creativeId =
+        textoOpcional(creativeRef?.id) ||
+        (typeof creativeRef === "string" ? textoOpcional(creativeRef) : "");
+
+      let creativeMeta: any = null;
+      if (creativeId) {
+        creativeMeta = await consultarObjetoMeta(
+          creativeId,
+          "id,object_story_spec,thumbnail_url,image_url,image_hash,asset_feed_spec"
+        ).catch(() => null);
+
+        // Alguns tipos antigos de criativo não expõem asset_feed_spec. Uma
+        // segunda consulta menor evita perder texto e imagem por causa apenas
+        // desse campo opcional.
+        if (!creativeMeta) {
+          creativeMeta = await consultarObjetoMeta(
+            creativeId,
+            "id,object_story_spec,thumbnail_url,image_url,image_hash"
+          ).catch(() => null);
+        }
+      }
+
+      const story = creativeMeta?.object_story_spec || {};
+      const linkData = story.link_data || {};
+      const videoData = story.video_data || {};
+      const anexos = Array.isArray(linkData.child_attachments)
+        ? linkData.child_attachments
+        : [];
+      const targeting = adsetMeta?.targeting || {};
+      const geo = targeting.geo_locations || {};
+
+      const definir = (chave: string, valor: any) => {
+        const vazio =
+          valor === null ||
+          valor === undefined ||
+          valor === "" ||
+          (Array.isArray(valor) && !valor.length);
+        if (!vazio) configuracoes[chave] = valor;
+      };
+
+      // Dados básicos/criativo publicados.
+      definir("page_id", story.page_id || campanha.page_id);
+      definir("texto", linkData.message || videoData.message);
+      definir("titulo", linkData.name || videoData.title);
+      definir("descricao", linkData.description || videoData.description);
+      definir("link", linkData.link);
+      if (!configuracoes.cta) {
+        definir(
+          "cta",
+          linkData.call_to_action?.type || videoData.call_to_action?.type
+        );
+      }
+      definir("creative_id", creativeId);
+      definir("adset_id", adsetId);
+      definir("ad_id", adId);
+      definir("objetivo", campanhaMeta?.objective);
+      definir("categoria_especial", campanhaMeta?.special_ad_categories?.[0]);
+
+      if (campanhaMeta?.daily_budget !== undefined) {
+        configuracoes.cbo = true;
+      } else if (configuracoes.cbo === undefined && adsetMeta?.daily_budget !== undefined) {
+        configuracoes.cbo = false;
+      }
+
+      const formIdMeta =
+        linkData.call_to_action?.value?.lead_gen_form_id ||
+        videoData.call_to_action?.value?.lead_gen_form_id ||
+        adsetMeta?.promoted_object?.lead_gen_form_id ||
+        campanha.form_id;
+      definir("form_id", formIdMeta);
+
+      const destinationType = String(adsetMeta?.destination_type || "").toUpperCase();
+      if (destinationType.includes("WHATSAPP")) {
+        configuracoes.destino = "whatsapp";
+      } else if (!configuracoes.destino) {
+        configuracoes.destino = "lead_ads";
+      }
+
+      // Público, posicionamentos e orçamento reais do Ad Set.
+      definir("idade_min", targeting.age_min);
+      definir("idade_max", targeting.age_max);
+      definir("genero", targeting.genders?.[0]);
+      definir("pais", geo.countries?.[0]);
+      definir("plataformas", targeting.publisher_platforms);
+      definir("facebook_positions", targeting.facebook_positions);
+      definir("instagram_positions", targeting.instagram_positions);
+      definir("dispositivos", targeting.device_platforms);
+      definir(
+        "interesses_detalhados",
+        (targeting.flexible_spec || [])
+          .flatMap((grupo: any) => grupo?.interests || [])
+          .map((item: any) => ({
+            id: textoOpcional(item?.id),
+            nome: textoOpcional(item?.name)
+          }))
+          .filter((item: any) => item.id && item.nome)
+      );
+      definir(
+        "custom_audiences",
+        (targeting.custom_audiences || [])
+          .map((item: any) => textoOpcional(item?.id || item))
+          .filter(Boolean)
+      );
+
+      if (targeting.targeting_automation?.advantage_audience !== undefined) {
+        configuracoes.advantage_audience =
+          Number(targeting.targeting_automation.advantage_audience) !== 0;
+      }
+
+      const localidades: any[] = [];
+      const adicionarLocalidades = (lista: any, tipo: string) => {
+        for (const local of Array.isArray(lista) ? lista : []) {
+          const key = textoOpcional(local?.key || local?.id);
+          if (!key) continue;
+          localidades.push({
+            key,
+            tipo,
+            nome: textoOpcional(local?.name) || key,
+            raio: numeroOpcional(local?.radius)
+          });
+        }
+      };
+      adicionarLocalidades(geo.regions, "region");
+      adicionarLocalidades(geo.cities, "city");
+      adicionarLocalidades(geo.neighborhoods, "neighborhood");
+      adicionarLocalidades(geo.zips, "zip");
+      adicionarLocalidades(geo.geo_markets, "geo_market");
+      adicionarLocalidades(geo.electoral_districts, "electoral_district");
+      definir("localidades", localidades);
+
+      definir("bid_strategy", adsetMeta?.bid_strategy);
+      if (numeroOpcional(adsetMeta?.bid_amount) !== null) {
+        configuracoes.bid_amount = Number(adsetMeta.bid_amount) / 100;
+      }
+
+      const atrib = Array.isArray(adsetMeta?.attribution_spec)
+        ? adsetMeta.attribution_spec
+        : [];
+      const clickDays = atrib.find((item: any) => item.event_type === "CLICK_THROUGH")?.window_days;
+      const viewDays = atrib.find((item: any) => item.event_type === "VIEW_THROUGH")?.window_days;
+      if (clickDays === 1 && viewDays === 1) configuracoes.attribution_spec = "1d_click_1d_view";
+      else if (clickDays === 7 && viewDays === 1) configuracoes.attribution_spec = "7d_click_1d_view";
+      else if (clickDays === 1) configuracoes.attribution_spec = "1d_click";
+      else if (clickDays === 7) configuracoes.attribution_spec = "7d_click";
+      else if (clickDays === 28) configuracoes.attribution_spec = "28d_click";
+
+      const dataHoraBrasil = (valor: any) => {
+        if (!valor) return "";
+        const data = new Date(valor);
+        if (Number.isNaN(data.getTime())) return "";
+        const partes = new Intl.DateTimeFormat("en-CA", {
+          timeZone: "America/Sao_Paulo",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          hourCycle: "h23"
+        }).formatToParts(data);
+        const obter = (tipo: string) => partes.find(p => p.type === tipo)?.value || "";
+        return `${obter("year")}-${obter("month")}-${obter("day")}T${obter("hour")}:${obter("minute")}`;
+      };
+      if (!configuracoes.inicio) definir("inicio", dataHoraBrasil(adsetMeta?.start_time));
+      if (!configuracoes.fim) definir("fim", dataHoraBrasil(adsetMeta?.end_time));
+
+      const hashesRemotos = Array.from(new Set([
+        ...anexos.map((item: any) => item?.image_hash),
+        linkData.image_hash,
+        creativeMeta?.image_hash,
+        ...(creativeMeta?.asset_feed_spec?.images || []).map((item: any) => item?.hash)
+      ].filter(Boolean).map(String)));
+
+      const hashesLocais = [
+        ...(Array.isArray(configuracoes.imageHashes) ? configuracoes.imageHashes : []),
+        ...(Array.isArray(configuracoes.image_hashes) ? configuracoes.image_hashes : []),
+        configuracoes.imageHash,
+        configuracoes.image_hash
+      ].filter(Boolean).map(String);
+
+      const hashes = hashesRemotos.length
+        ? hashesRemotos
+        : Array.from(new Set(hashesLocais));
+
+      const urlPorHash = new Map<string, string>();
+      if (hashes.length) {
+        const contaAnunciosId =
+          textoOpcional(campanha.conta_anuncios_id) ||
+          textoOpcional(conn.rows[0]?.conta_anuncios_id);
+
+        if (contaAnunciosId) {
+          const params = new URLSearchParams({
+            fields: "hash,url,url_128",
+            hashes: JSON.stringify(hashes),
+            access_token: token
+          });
+          const imagensMeta = await fetch(
+            `https://graph.facebook.com/v19.0/${contaAnunciosId}/adimages?${params}`
+          ).then(r => r.json()).catch(() => null) as any;
+          const listaImagens = Array.isArray(imagensMeta?.data)
+            ? imagensMeta.data
+            : Object.values(imagensMeta?.data || {});
+          for (const imagem of listaImagens as any[]) {
+            const hash = textoOpcional(imagem?.hash);
+            const url = textoOpcional(imagem?.url || imagem?.url_128);
+            if (hash && url) urlPorHash.set(hash, url);
+          }
+        }
+      }
+
+      const urlsPorOrdem = hashes
+        .map(hash => urlPorHash.get(hash))
+        .filter(Boolean) as string[];
+      const urlsCriativo = [
+        ...anexos.map((item: any) => item?.picture || item?.image_url),
+        ...(creativeMeta?.asset_feed_spec?.images || []).map((item: any) => item?.url),
+        creativeMeta?.image_url,
+        creativeMeta?.thumbnail_url
+      ].filter(Boolean).map(String);
+      const urlsLocais = [
+        ...(Array.isArray(configuracoes.imagens_urls) ? configuracoes.imagens_urls : []),
+        ...(Array.isArray(configuracoes.image_urls) ? configuracoes.image_urls : []),
+        configuracoes.imagem_url,
+        configuracoes.image_url
+      ].filter(Boolean).map(String);
+      const urls = Array.from(new Set([
+        ...urlsPorOrdem,
+        ...urlsCriativo,
+        ...urlsLocais
+      ]));
+
+      if (hashes.length) {
+        configuracoes.imageHashes = hashes;
+        configuracoes.image_hashes = hashes;
+        configuracoes.imageHash = hashes[0];
+        configuracoes.image_hash = hashes[0];
+      }
+      if (urls.length) {
+        configuracoes.imagens_urls = urls;
+        configuracoes.image_urls = urls;
+      }
+      configuracoes.criativo = {
+        ...(configuracoes.criativo || {}),
+        creative_id: creativeId || configuracoes.criativo?.creative_id || null,
+        image_hash: hashes[0] || configuracoes.criativo?.image_hash || null,
+        image_hashes: hashes,
+        tipo: videoData.video_id
+          ? "video"
+          : hashes.length > 1
+          ? "carrossel"
+          : "imagem"
+      };
+
+      const dailyBudgetMeta =
+        numeroOpcional(adsetMeta?.daily_budget) ??
+        numeroOpcional(campanhaMeta?.daily_budget) ??
+        numeroOpcional(campanha.daily_budget);
+
+      // Faz um reparo local dos registros antigos para que as próximas
+      // aberturas continuem completas mesmo se a Meta estiver temporariamente
+      // indisponível. Nenhum dado do anúncio remoto é alterado aqui.
+      await client.query(
+        `UPDATE campanhas
+         SET adset_id = COALESCE($1, adset_id),
+             ad_id = COALESCE($2, ad_id),
+             form_id = COALESCE($3, form_id),
+             page_id = COALESCE($4, page_id),
+             daily_budget = COALESCE($5, daily_budget),
+             configuracoes_avancadas = $6,
+             atualizado_em = NOW()
+         WHERE id = $7 AND usuario_id = $8`,
+        [
+          adsetId || null,
+          adId || null,
+          formIdMeta || null,
+          story.page_id || null,
+          dailyBudgetMeta,
+          JSON.stringify(configuracoes),
+          campanha.id,
+          user.id
+        ]
+      ).catch((errPersistencia: any) =>
+        console.warn(
+          "CONFIGURAÇÃO EDIÇÃO META: não foi possível persistir o reparo:",
+          errPersistencia?.message || errPersistencia
+        )
+      );
+
+      return c.json({
+        id: campanha.id,
+        nome: campanhaMeta?.name || campanha.nome,
+        status: campanhaMeta?.status || campanha.status,
+        campaign_id: campanha.campaign_id,
+        adset_id: adsetId || campanha.adset_id,
+        ad_id: adId || campanha.ad_id,
+        form_id: formIdMeta || campanha.form_id,
+        page_id: story.page_id || campanha.page_id,
+        daily_budget: dailyBudgetMeta,
+        configuracoes_avancadas: configuracoes,
+        meta_carregada: true,
+        aviso: null
+      });
+    } catch (errMeta: any) {
+      console.warn("CONFIGURAÇÃO EDIÇÃO META: usando dados locais:", errMeta?.message || errMeta);
+      return c.json(
+        respostaLocal(
+          "Não foi possível completar os dados ao vivo da Meta; exibindo o que está salvo na plataforma."
+        )
+      );
+    }
+  } catch (err) {
+    console.error("ERRO CONFIGURAÇÃO EDIÇÃO CAMPANHA:", err);
+    return c.json({ error: "Erro ao carregar configuração da campanha" }, 500);
+  }
+});
+
 // 🔹 editar segmentação, orçamento, datas e lance de uma campanha existente
 app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
@@ -17086,11 +17552,13 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         textoOpcional(cfgBanco.descricao) || "";
 
       const linkDestino =
-        urlOpcional(
-          textoOpcional(avancadas.link) ||
-          textoOpcional(cfgBanco.link),
-          "https://google.com"
-        );
+        destinoOriginal === "whatsapp"
+          ? "https://api.whatsapp.com/send"
+          : urlOpcional(
+              textoOpcional(avancadas.link) ||
+              textoOpcional(cfgBanco.link),
+              "https://google.com"
+            );
 
       const ctaType =
         textoOpcional(avancadas.cta) ||
@@ -17136,13 +17604,18 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         textoOpcional(cfgBanco.video_id) ||
         textoOpcional(cfgBanco.videoId) || "";
 
-      if (adId && pageId && formId) {
+      if (
+        adId &&
+        pageId &&
+        (destinoOriginal === "whatsapp" || formId)
+      ) {
         const isCarrossel = imageHashes.length > 1;
 
-        const ctaPayload: any = {
-          type: ctaType,
-          value: { lead_gen_form_id: formId }
-        };
+        const ctaPayload = montarCallToActionMeta(
+          destinoOriginal,
+          ctaType,
+          formId || null
+        );
 
         let objectStorySpec: Record<string, any>;
 
