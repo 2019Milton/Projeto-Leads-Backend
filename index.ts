@@ -5294,7 +5294,13 @@ app.get("/auth/meta/login", async (c) => {
     "leads_retrieval",
     "pages_show_list",
     "pages_read_engagement",
-    "pages_manage_ads"
+    "pages_manage_ads",
+    // Sem estes dois, a Meta aceita destination_type=WHATSAPP no Ad Set mas
+    // ignora silenciosamente promoted_object.whatsapp_phone_number (nao da
+    // erro nenhum) - confirmado via /me/permissions retornando "declined"
+    // pra ambos numa conexao real, mesmo com o numero certo sendo enviado.
+    "whatsapp_business_management",
+    "whatsapp_business_messaging"
 
   ].join(",");
 
