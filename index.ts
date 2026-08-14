@@ -18396,7 +18396,9 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
 
     // Mesma regra de fallback de plataforma usada em GET /leads
     // (COALESCE(plataforma, origem, 'formulario')), pra "Leads da Meta" bater
-    // com o resto do app em vez de usar um critério próprio.
+    // com o resto do app em vez de usar um critério próprio. Google e TikTok
+    // seguem o mesmo padrão de 3 números (total/qualificados/fechados) que a
+    // Meta já tinha, só trocando as colunas de rastreio.
     const resumo = await client.query(
       `
       SELECT
@@ -18411,32 +18413,71 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
         COUNT(*) FILTER (
           WHERE meta_evento_fechado_enviado_em IS NOT NULL
           AND COALESCE(plataforma, origem, 'formulario') = 'meta'
-        )::int AS fechados_enviados
+        )::int AS fechados_enviados,
+
+        COUNT(*) FILTER (
+          WHERE COALESCE(plataforma, origem, 'formulario') = 'google'
+        )::int AS total_leads_google,
+        COUNT(*) FILTER (
+          WHERE google_evento_qualificado_enviado_em IS NOT NULL
+          AND COALESCE(plataforma, origem, 'formulario') = 'google'
+        )::int AS qualificados_enviados_google,
+        COUNT(*) FILTER (
+          WHERE google_evento_fechado_enviado_em IS NOT NULL
+          AND COALESCE(plataforma, origem, 'formulario') = 'google'
+        )::int AS fechados_enviados_google,
+
+        COUNT(*) FILTER (
+          WHERE COALESCE(plataforma, origem, 'formulario') = 'tiktok'
+        )::int AS total_leads_tiktok,
+        COUNT(*) FILTER (
+          WHERE tiktok_evento_qualificado_enviado_em IS NOT NULL
+          AND COALESCE(plataforma, origem, 'formulario') = 'tiktok'
+        )::int AS qualificados_enviados_tiktok,
+        COUNT(*) FILTER (
+          WHERE tiktok_evento_fechado_enviado_em IS NOT NULL
+          AND COALESCE(plataforma, origem, 'formulario') = 'tiktok'
+        )::int AS fechados_enviados_tiktok
       FROM leads
       WHERE usuario_id = $1
       `,
       [user.id]
     );
 
-    const { total_leads_meta, qualificados_enviados, fechados_enviados } =
-      resumo.rows[0];
+    const {
+      total_leads_meta, qualificados_enviados, fechados_enviados,
+      total_leads_google, qualificados_enviados_google, fechados_enviados_google,
+      total_leads_tiktok, qualificados_enviados_tiktok, fechados_enviados_tiktok
+    } = resumo.rows[0];
+
+    const taxa = (num: number, den: number) => den > 0 ? (num / den) * 100 : null;
 
     const ultimosEventos = await client.query(
       `
       SELECT
         nome,
+        COALESCE(plataforma, origem, 'formulario') AS plataforma,
         meta_evento_qualificado_enviado_em,
-        meta_evento_fechado_enviado_em
+        meta_evento_fechado_enviado_em,
+        google_evento_qualificado_enviado_em,
+        google_evento_fechado_enviado_em,
+        tiktok_evento_qualificado_enviado_em,
+        tiktok_evento_fechado_enviado_em
       FROM leads
       WHERE usuario_id = $1
       AND (
         meta_evento_qualificado_enviado_em IS NOT NULL
         OR meta_evento_fechado_enviado_em IS NOT NULL
+        OR google_evento_qualificado_enviado_em IS NOT NULL
+        OR google_evento_fechado_enviado_em IS NOT NULL
+        OR tiktok_evento_qualificado_enviado_em IS NOT NULL
+        OR tiktok_evento_fechado_enviado_em IS NOT NULL
       )
       ORDER BY
         COALESCE(
-          meta_evento_fechado_enviado_em,
-          meta_evento_qualificado_enviado_em
+          meta_evento_fechado_enviado_em, meta_evento_qualificado_enviado_em,
+          google_evento_fechado_enviado_em, google_evento_qualificado_enviado_em,
+          tiktok_evento_fechado_enviado_em, tiktok_evento_qualificado_enviado_em
         ) DESC
       LIMIT 10
       `,
@@ -18447,21 +18488,37 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       total_leads_meta,
       qualificados_enviados,
       fechados_enviados,
-      taxa_qualificacao:
-        total_leads_meta > 0
-          ? (qualificados_enviados / total_leads_meta) * 100
-          : null,
-      taxa_fechamento:
-        total_leads_meta > 0
-          ? (fechados_enviados / total_leads_meta) * 100
-          : null,
-      ultimos_eventos: ultimosEventos.rows.map(row => ({
-        nome: row.nome,
-        tipo: row.meta_evento_fechado_enviado_em ? "fechado" : "qualificado",
-        enviado_em:
+      taxa_qualificacao: taxa(qualificados_enviados, total_leads_meta),
+      taxa_fechamento: taxa(fechados_enviados, total_leads_meta),
+
+      total_leads_google,
+      qualificados_enviados_google,
+      fechados_enviados_google,
+      taxa_qualificacao_google: taxa(qualificados_enviados_google, total_leads_google),
+      taxa_fechamento_google: taxa(fechados_enviados_google, total_leads_google),
+
+      total_leads_tiktok,
+      qualificados_enviados_tiktok,
+      fechados_enviados_tiktok,
+      taxa_qualificacao_tiktok: taxa(qualificados_enviados_tiktok, total_leads_tiktok),
+      taxa_fechamento_tiktok: taxa(fechados_enviados_tiktok, total_leads_tiktok),
+
+      ultimos_eventos: ultimosEventos.rows.map(row => {
+        const fechadoEm =
           row.meta_evento_fechado_enviado_em ||
-          row.meta_evento_qualificado_enviado_em
-      }))
+          row.google_evento_fechado_enviado_em ||
+          row.tiktok_evento_fechado_enviado_em;
+        return {
+          nome: row.nome,
+          plataforma: row.plataforma,
+          tipo: fechadoEm ? "fechado" : "qualificado",
+          enviado_em:
+            fechadoEm ||
+            row.meta_evento_qualificado_enviado_em ||
+            row.google_evento_qualificado_enviado_em ||
+            row.tiktok_evento_qualificado_enviado_em
+        };
+      })
     });
 
   } catch (err) {
