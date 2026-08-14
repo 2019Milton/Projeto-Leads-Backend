@@ -1147,6 +1147,163 @@ async function avaliarEEnviarQualificacaoMeta(
   }
 }
 
+// Dispatcher multi-plataforma: decide se o lead é Meta/WhatsApp-CTWA (fluxo
+// acima, inalterado — chamado direto), Google Ads ou TikTok, e manda pro
+// avaliador certo. Todos os pontos que criam/atualizam um lead devem chamar
+// este dispatcher (não avaliarEEnviarQualificacaoMeta direto), pra novos
+// leads Google/TikTok também disparem o evento quando o corretor mudar o
+// status deles depois — não só no momento da sincronização.
+async function avaliarEEnviarQualificacaoLead(
+  leadRow: any,
+  usuarioId: number
+) {
+  const plataforma = leadRow?.plataforma || leadRow?.origem;
+
+  if (plataforma === "google") {
+    return avaliarEEnviarQualificacaoGoogle(leadRow, usuarioId);
+  }
+
+  if (plataforma === "tiktok") {
+    return avaliarEEnviarQualificacaoTikTok(leadRow, usuarioId);
+  }
+
+  return avaliarEEnviarQualificacaoMeta(leadRow, usuarioId);
+}
+
+// Equivalente Google Ads de avaliarEEnviarQualificacaoMeta — mesmo par de
+// eventos (Qualified Lead / Closed Won), mesmo gate de plano, casando pelo
+// gclid em vez do lead_id nativo da Meta (ver enviarEventoGoogleAdsConversionLeads).
+async function avaliarEEnviarQualificacaoGoogle(
+  leadRow: any,
+  usuarioId: number
+) {
+  try {
+
+    if (!leadRow?.gclid) {
+      return;
+    }
+
+    const usuario = await client.query(
+      `SELECT plano FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) {
+      return;
+    }
+
+    const scoreData = calcularScoreLead(leadRow);
+
+    if (
+      scoreData.score === "quente" &&
+      !leadRow.google_evento_qualificado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoGoogleAdsConversionLeads(
+          usuarioId,
+          leadRow,
+          "Qualified Lead"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET google_evento_qualificado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+    if (
+      leadRow.status === "fechado" &&
+      !leadRow.google_evento_fechado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoGoogleAdsConversionLeads(
+          usuarioId,
+          leadRow,
+          "Closed Won"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET google_evento_fechado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+  } catch (err) {
+    console.error("ERRO avaliarEEnviarQualificacaoGoogle:", err);
+  }
+}
+
+// Equivalente TikTok de avaliarEEnviarQualificacaoMeta — casa por
+// email/telefone hasheados em vez de um click id nativo (ver
+// enviarEventoTikTokConversionLeads).
+async function avaliarEEnviarQualificacaoTikTok(
+  leadRow: any,
+  usuarioId: number
+) {
+  try {
+
+    if (!leadRow?.email && !leadRow?.telefone) {
+      return;
+    }
+
+    const usuario = await client.query(
+      `SELECT plano FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) {
+      return;
+    }
+
+    const scoreData = calcularScoreLead(leadRow);
+
+    if (
+      scoreData.score === "quente" &&
+      !leadRow.tiktok_evento_qualificado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoTikTokConversionLeads(
+          usuarioId,
+          leadRow,
+          "Qualified Lead"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET tiktok_evento_qualificado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+    if (
+      leadRow.status === "fechado" &&
+      !leadRow.tiktok_evento_fechado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoTikTokConversionLeads(
+          usuarioId,
+          leadRow,
+          "Closed Won"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET tiktok_evento_fechado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+  } catch (err) {
+    console.error("ERRO avaliarEEnviarQualificacaoTikTok:", err);
+  }
+}
+
 // Fase 2 do Conversion Leads: monta a config de Ad Set que faz a Meta
 // realmente otimizar entrega usando o evento "Qualified Lead" (em vez de só
 // receber o evento sem agir sobre ele). Retorna null quando o usuário não é
@@ -4752,7 +4909,7 @@ async function sincronizarLeadsMetaUsuario(
           campanha: nomeCampanha
         });
 
-        avaliarEEnviarQualificacaoMeta(
+        avaliarEEnviarQualificacaoLead(
           {
             id: leadSincronizado.rows[0]?.id,
             lead_id: lead.id,
@@ -4762,7 +4919,7 @@ async function sincronizarLeadsMetaUsuario(
             respostas_qualificacao: respostasQualificacao
           },
           usuarioId
-        ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (auto sync meta):", err));
+        ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (auto sync meta):", err));
       }
     }
   }
@@ -5984,7 +6141,8 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       customerId, accessToken,
       `SELECT lead_form_submission_data.id, lead_form_submission_data.campaign_id,
               lead_form_submission_data.submission_date_time,
-              lead_form_submission_data.lead_form_submission_fields
+              lead_form_submission_data.lead_form_submission_fields,
+              lead_form_submission_data.gclid
        FROM lead_form_submission_data
        WHERE lead_form_submission_data.submission_date_time BETWEEN '${inicio}' AND '${fim}'`,
       loginCustomerId
@@ -6033,19 +6191,33 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
         ? new Date(String(dadosLead.submissionDateTime).replace(" ", "T") + "Z").toISOString()
         : null;
 
-      await client.query(
+      const leadInseridoGoogle = await client.query(
         `INSERT INTO leads
            (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
-            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'google','google','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
+            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em, gclid)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'google','google','novo',$8,$9,COALESCE($10::timestamptz, NOW()),$11)
+         RETURNING id`,
         [
           usuarioId, leadId, nome || "Lead Google Ads", email, telefone,
           nomeCampanha, String(customerId),
-          JSON.stringify(respostasQualificacao), nichoId, criadoEm
+          JSON.stringify(respostasQualificacao), nichoId, criadoEm,
+          textoOpcional(dadosLead.gclid)
         ]
       );
 
       await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+
+      avaliarEEnviarQualificacaoLead(
+        {
+          id: leadInseridoGoogle.rows[0]?.id,
+          lead_id: leadId,
+          plataforma: "google",
+          status: "novo",
+          gclid: textoOpcional(dadosLead.gclid),
+          respostas_qualificacao: respostasQualificacao
+        },
+        usuarioId
+      ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync google):", err));
       totalLeads++;
     }
 
@@ -6108,6 +6280,157 @@ async function resolverConexaoGoogleAds(
     setTimeout(() => googleLoginCustomerIdPorToken.delete(accessToken), 60 * 60 * 1000);
   }
   return { accessToken, customerId: String(customerId), loginCustomerId: loginCustomerId ? String(loginCustomerId) : null };
+}
+
+// Cria (ou reaproveita) a Conversion Action do Google Ads usada como alvo do
+// uploadClickConversions — equivalente ao dataset/pixel da Meta
+// (obterOuCriarDatasetMetaUsuario), mas o Google exige uma Conversion Action
+// dedicada por TIPO de evento, nao um nome de evento livre por chamada. O
+// resource name criado fica salvo em plataforma_conexoes.dados_conta (chave
+// "conversion_action_qualified_id"/"conversion_action_closed_id") pra nao
+// recriar a cada envio.
+async function obterOuCriarConversionActionGoogle(
+  usuarioId: number,
+  customerId: string,
+  accessToken: string,
+  loginCustomerId: string | null,
+  chave: "qualified" | "closed",
+  nomeEvento: string
+): Promise<string | null> {
+  const campoJson =
+    chave === "qualified"
+      ? "conversion_action_qualified_id"
+      : "conversion_action_closed_id";
+
+  try {
+    const conexao = await client.query(
+      `SELECT id, dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [usuarioId]
+    );
+
+    if (!conexao.rows.length) return null;
+
+    const dadosConta = conexao.rows[0].dados_conta ?? {};
+    const existente = dadosConta[campoJson];
+
+    if (existente) {
+      return existente;
+    }
+
+    const resultados = await googleAdsMutate(
+      customerId, accessToken, "conversionActions",
+      [
+        {
+          create: {
+            name: `Plataforma de Leads - ${nomeEvento}`,
+            type: "UPLOAD_CLICKS",
+            category: "LEAD",
+            status: "ENABLED",
+          },
+        },
+      ],
+      loginCustomerId
+    );
+
+    const resourceName = resultados[0]?.resourceName;
+    if (!resourceName) return null;
+
+    await client.query(
+      `UPDATE plataforma_conexoes SET dados_conta = $1 WHERE id = $2`,
+      [JSON.stringify({ ...dadosConta, [campoJson]: resourceName }), conexao.rows[0].id]
+    );
+
+    return resourceName;
+  } catch (err) {
+    console.error("ERRO obterOuCriarConversionActionGoogle:", err);
+    return null;
+  }
+}
+
+// Equivalente Google Ads de enviarEventoMetaConversionLeads — reporta de
+// volta pro Google Ads que um lead capturado por um Lead Form virou um lead
+// qualificado ou fechado, usando o gclid capturado na sincronizacao (ver
+// /google/sincronizar-campanhas). Sem gclid nao ha como casar o evento com
+// o clique original — leads sincronizados antes desta mudanca nao tem esse
+// campo preenchido e ficam sem poder mandar o evento.
+// ⚠️ ASSUMPTION: uploadClickConversions e conversionDateTime no formato
+// "yyyy-MM-dd HH:mm:ss+00:00" conferidos contra a documentacao oficial da
+// Google Ads API em 14/08/2026, mas ainda nao testados contra um gclid real
+// — mesmo padrao de risco que as outras integracoes Google Ads desta
+// plataforma tiveram no inicio (erros especificos so aparecem com trafego
+// real, corrigir conforme necessario).
+async function enviarEventoGoogleAdsConversionLeads(
+  usuarioId: number,
+  lead: any,
+  eventName: "Qualified Lead" | "Closed Won"
+): Promise<{ ok: boolean; erro?: string }> {
+
+  if (!lead?.gclid) {
+    return { ok: false, erro: "Lead sem gclid do Google Ads" };
+  }
+
+  const conexao = await resolverConexaoGoogleAds(usuarioId);
+
+  if ("erro" in conexao) {
+    return { ok: false, erro: conexao.erro };
+  }
+
+  try {
+
+    const chave = eventName === "Qualified Lead" ? "qualified" : "closed";
+
+    const conversionActionResourceName =
+      await obterOuCriarConversionActionGoogle(
+        usuarioId, conexao.customerId, conexao.accessToken,
+        conexao.loginCustomerId, chave, eventName
+      );
+
+    if (!conversionActionResourceName) {
+      return { ok: false, erro: "Não foi possível criar a ação de conversão no Google Ads" };
+    }
+
+    const conversionDateTime =
+      new Date().toISOString().slice(0, 19).replace("T", " ") + "+00:00";
+
+    const res = await fetch(
+      `${GOOGLE_ADS_API}/customers/${conexao.customerId}:uploadClickConversions`,
+      {
+        method: "POST",
+        headers: googleAdsHeaders(conexao.accessToken, conexao.loginCustomerId),
+        body: JSON.stringify({
+          conversions: [
+            {
+              gclid: lead.gclid,
+              conversionAction: conversionActionResourceName,
+              conversionDateTime,
+            },
+          ],
+          partialFailure: true,
+        }),
+      }
+    );
+
+    const data = await res.json() as any;
+
+    if (!res.ok) {
+      const erro = data?.error?.message || "Erro ao enviar conversão para o Google Ads";
+      console.error(`CONVERSION LEADS GOOGLE (${eventName}) erro:`, JSON.stringify(data));
+      return { ok: false, erro };
+    }
+
+    const falhaParcial = data?.partialFailureError;
+
+    if (falhaParcial) {
+      console.error(`CONVERSION LEADS GOOGLE (${eventName}) falha parcial:`, JSON.stringify(falhaParcial));
+      return { ok: false, erro: falhaParcial.message || "Google Ads rejeitou a conversão" };
+    }
+
+    return { ok: true };
+
+  } catch (err: any) {
+    console.error(`CONVERSION LEADS GOOGLE (${eventName}) excecao:`, err);
+    return { ok: false, erro: err?.message || "Erro ao enviar conversão para o Google Ads" };
+  }
 }
 
 async function googleAdsMutate(
@@ -6920,6 +7243,140 @@ async function obterConexaoTikTok(
   };
 }
 
+function hashSha256(valor: string): string {
+  return require("crypto")
+    .createHash("sha256")
+    .update(valor.trim().toLowerCase())
+    .digest("hex");
+}
+
+// Cria (ou reaproveita) o Pixel TikTok usado como event_source_id no envio
+// de eventos de qualificacao de lead — equivalente ao dataset da Meta
+// (obterOuCriarDatasetMetaUsuario) e a Conversion Action do Google
+// (obterOuCriarConversionActionGoogle). Guardado em
+// plataforma_conexoes.dados_conta.pixel_code pra nao recriar a cada envio.
+async function obterOuCriarPixelTikTok(
+  usuarioId: number,
+  advertiserId: string,
+  token: string
+): Promise<string | null> {
+  try {
+    const conexao = await client.query(
+      `SELECT id, dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      [usuarioId]
+    );
+
+    if (!conexao.rows.length) return null;
+
+    const dadosConta = conexao.rows[0].dados_conta ?? {};
+    const existente = dadosConta.pixel_code;
+
+    if (existente) {
+      return existente;
+    }
+
+    const criado = await tiktokFetch("/pixel/create/", token, {
+      method: "POST",
+      body: {
+        advertiser_id: advertiserId,
+        pixel_name: "Plataforma de Leads",
+      },
+    });
+
+    const pixelCode = criado.data?.pixel_code || criado.data?.data?.pixel_code;
+
+    if (!criado.ok || !pixelCode) {
+      console.error("ERRO obterOuCriarPixelTikTok:", criado.error, criado.data);
+      return null;
+    }
+
+    await client.query(
+      `UPDATE plataforma_conexoes SET dados_conta = $1 WHERE id = $2`,
+      [JSON.stringify({ ...dadosConta, pixel_code: pixelCode }), conexao.rows[0].id]
+    );
+
+    return pixelCode;
+  } catch (err) {
+    console.error("ERRO obterOuCriarPixelTikTok:", err);
+    return null;
+  }
+}
+
+// Equivalente TikTok de enviarEventoMetaConversionLeads. Diferente da Meta
+// (que casa pelo lead_id nativo) e do Google (que casa pelo gclid), o lead
+// sincronizado do TikTok (/lead/get/) nao expõe nenhum click id — o
+// casamento aqui usa Advanced Matching por telefone/email hasheados
+// (SHA-256), que e o mecanismo padrao da TikTok Events API quando nao ha
+// ttclid disponivel.
+// ⚠️ ASSUMPTION: endpoint /event/track/ (Events API v2), event_source "web"
+// + event_source_id do Pixel, conferidos contra a documentacao oficial da
+// TikTok Business API em 14/08/2026, mas ainda nao testados contra tráfego
+// real — essa e a integracao com menos certeza das duas construidas agora
+// (o mecanismo de conversao offline/CRM da TikTok tem mais de uma variante
+// documentada); se o envio falhar consistentemente, o primeiro lugar a
+// conferir e se a conta precisa de um "Offline Event Set" dedicado em vez
+// de reaproveitar um Pixel comum.
+async function enviarEventoTikTokConversionLeads(
+  usuarioId: number,
+  lead: any,
+  eventName: "Qualified Lead" | "Closed Won"
+): Promise<{ ok: boolean; erro?: string }> {
+
+  if (!lead?.email && !lead?.telefone) {
+    return { ok: false, erro: "Lead sem email ou telefone para casar com o TikTok" };
+  }
+
+  const conexao = await obterConexaoTikTok(usuarioId);
+
+  if (!conexao?.advertiserId) {
+    return { ok: false, erro: "TikTok não conectado" };
+  }
+
+  try {
+
+    const pixelCode =
+      await obterOuCriarPixelTikTok(usuarioId, conexao.advertiserId, conexao.token);
+
+    if (!pixelCode) {
+      return { ok: false, erro: "Não foi possível criar o pixel do TikTok" };
+    }
+
+    const eventoTikTok =
+      eventName === "Qualified Lead" ? "QualifiedLead" : "ClosedWon";
+
+    const telefoneDigitos = String(lead.telefone || "").replace(/\D/g, "");
+
+    const resultado = await tiktokFetch("/event/track/", conexao.token, {
+      method: "POST",
+      body: {
+        event_source: "web",
+        event_source_id: pixelCode,
+        data: [
+          {
+            event: eventoTikTok,
+            event_time: Math.floor(Date.now() / 1000),
+            user: {
+              email: lead.email ? hashSha256(lead.email) : undefined,
+              phone_number: telefoneDigitos ? hashSha256(telefoneDigitos) : undefined,
+            },
+          },
+        ],
+      },
+    });
+
+    if (!resultado.ok) {
+      console.error(`CONVERSION LEADS TIKTOK (${eventName}) erro:`, resultado.error, resultado.data);
+      return { ok: false, erro: resultado.error || "Erro ao enviar evento para o TikTok" };
+    }
+
+    return { ok: true };
+
+  } catch (err: any) {
+    console.error(`CONVERSION LEADS TIKTOK (${eventName}) excecao:`, err);
+    return { ok: false, erro: err?.message || "Erro ao enviar evento para o TikTok" };
+  }
+}
+
 // Lista contas de anunciante vinculadas ao token
 app.get("/tiktok/anunciantes", authMiddleware, async (c) => {
   const user: any = c.get("user");
@@ -7104,11 +7561,12 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
           ? new Date(Number(lead.submit_time) * 1000).toISOString()
           : null;
 
-        await client.query(
+        const leadInseridoTikTok = await client.query(
           `INSERT INTO leads
              (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
               origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))
+           RETURNING id`,
           [
             usuarioId, leadId, nome || "Lead TikTok", email, telefone,
             nomeCampanha, String(advertiserId),
@@ -7117,6 +7575,20 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
         );
 
         await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+
+        avaliarEEnviarQualificacaoLead(
+          {
+            id: leadInseridoTikTok.rows[0]?.id,
+            lead_id: leadId,
+            plataforma: "tiktok",
+            status: "novo",
+            email,
+            telefone,
+            respostas_qualificacao: respostasQualificacao
+          },
+          usuarioId
+        ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync tiktok):", err));
+
         totalLeads++;
       }
     }
@@ -12315,7 +12787,7 @@ app.post("/webhook/meta", async (c) => {
             // 📲 notificação WhatsApp para o dono da campanha
             await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
 
-            avaliarEEnviarQualificacaoMeta(
+            avaliarEEnviarQualificacaoLead(
               {
                 id: leadInserido.rows[0]?.id,
                 lead_id: leadgen_id,
@@ -12325,7 +12797,7 @@ app.post("/webhook/meta", async (c) => {
                 respostas_qualificacao: respostasQualificacao
               },
               usuarioId
-            ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (webhook meta):", err));
+            ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (webhook meta):", err));
           }
         }
       }
@@ -12679,9 +13151,9 @@ async function processarEventoWhatsApp(value: any) {
           await enriquecerLeadParaInteligencia(lead);
           const scoreData = calcularScoreLead(lead);
           lead.score = scoreData.score;
-          await avaliarEEnviarQualificacaoMeta(lead, usuarioId);
+          await avaliarEEnviarQualificacaoLead(lead, usuarioId);
         })
-        .catch(e => console.error("ERRO avaliarEEnviarQualificacaoMeta (whatsapp):", e));
+        .catch(e => console.error("ERRO avaliarEEnviarQualificacaoLead (whatsapp):", e));
     }
 
     if (conversa.status === "humano" || conversa.status === "encerrada") continue;
@@ -13579,6 +14051,20 @@ await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS meta_evento_qualificado_enviado_em TIMESTAMP,
     ADD COLUMN IF NOT EXISTS meta_evento_fechado_enviado_em TIMESTAMP;
+`);
+
+// Mesmo rastreio de envio, agora para Google Ads e TikTok (ver
+// avaliarEEnviarQualificacaoLead). gclid vem do lead_form_submission_data do
+// Google (capturado na sincronizacao) e e o identificador exigido pelo
+// uploadClickConversions — sem ele nao ha como reportar qualidade do lead
+// de volta pro Google.
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS gclid TEXT,
+    ADD COLUMN IF NOT EXISTS google_evento_qualificado_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS google_evento_fechado_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS tiktok_evento_qualificado_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS tiktok_evento_fechado_enviado_em TIMESTAMP;
 `);
 
 // Preenchido só em leads criados automaticamente a partir de uma conversa de
@@ -18469,8 +18955,8 @@ async function atualizarStatusLeadBackend(
   leadAtualizado.score_pontos =
     scoreData.pontos;
 
-  avaliarEEnviarQualificacaoMeta(leadAtualizado, usuarioId)
-    .catch(err => console.error("ERRO avaliarEEnviarQualificacaoMeta (atualizarStatusLeadBackend):", err));
+  avaliarEEnviarQualificacaoLead(leadAtualizado, usuarioId)
+    .catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (atualizarStatusLeadBackend):", err));
 
   return leadAtualizado;
 }
