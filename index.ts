@@ -18555,10 +18555,10 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     }
 
     const imageUrls =
-      [
+      [...new Set([
         ...(Array.isArray(cfg.imagens_urls) ? cfg.imagens_urls : []),
         ...(Array.isArray(cfg.image_urls) ? cfg.image_urls : [])
-      ].filter(Boolean);
+      ].filter(Boolean))];
 
     const hashes: string[] = [];
 
@@ -18567,7 +18567,12 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         await enviarImagemMetaPorUrl(token, adAccountId, String(urlImagem));
 
       if (uploadImagem.hash) {
-        hashes.push(uploadImagem.hash);
+        // A Meta hasheia por conteudo - URLs distintas da mesma imagem (ex.:
+        // espelhos de CDN diferentes) voltam com o hash igual; sem este
+        // dedupe, o card de carrossel se repete mesmo com URLs unicas.
+        if (!hashes.includes(uploadImagem.hash)) {
+          hashes.push(uploadImagem.hash);
+        }
       } else {
         // Não existe fallback seguro para reaproveitar cfg.imageHash aqui: hashes de
         // imagem na Meta são específicos por conta de anúncios, e o hash salvo em
