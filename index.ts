@@ -2625,7 +2625,7 @@ type TipoUsoIA =
   | "resumo_diario"
   | "relatorio"
   | "roteiro_whatsapp"
-  | "status_whatsapp_corretor";
+  | "classificacao_kanban_conversa";
 
 const IA_CUSTO_ESTIMADO_PADRAO = 0.08;
 const OPENAI_RESPONSES_URL =
@@ -12239,271 +12239,197 @@ type StatusLeadKanban =
   | "fechado"
   | "perdido";
 
-const OPCOES_STATUS_LEAD_WHATSAPP: Array<{
-  id: string;
-  status: StatusLeadKanban;
-  title: string;
-  description: string;
-}> = [
-  {
-    id: "lead_status_novo",
-    status: "novo",
-    title: "Novo",
-    description: "Ainda não iniciei o contato",
-  },
-  {
-    id: "lead_status_primeiro_contato",
-    status: "primeiro_contato",
-    title: "Primeiro contato",
-    description: "Primeiro contato realizado",
-  },
-  {
-    id: "lead_status_em_conversa",
-    status: "em_conversa",
-    title: "Em conversa",
-    description: "Negociação em andamento",
-  },
-  {
-    id: "lead_status_fechado",
-    status: "fechado",
-    title: "Fechado",
-    description: "Negócio concluído",
-  },
-  {
-    id: "lead_status_perdido",
-    status: "perdido",
-    title: "Perdido",
-    description: "Lead sem continuidade",
-  },
-];
-
-function normalizarRespostaStatusLead(valor: unknown): string {
-  return String(valor || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .trim()
-    .toLowerCase()
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ");
-}
-
-// Respostas de lista/botão são determinísticas e não precisam de IA. Também
-// aceita o número/nome digitado pelo corretor como alternativa ao toque.
-function statusLeadPorRespostaWhatsapp(body: any, texto: string): StatusLeadKanban | null {
-  const idSelecionado = String(
-    body?.listResponseMessage?.selectedRowId ||
-    body?.buttonsResponseMessage?.buttonId ||
-    ""
-  ).trim();
-
-  const opcaoPorId = OPCOES_STATUS_LEAD_WHATSAPP.find(
-    (opcao) => opcao.id === idSelecionado
+// Monta a transcrição completa da conversa (cliente + corretor, ordem
+// cronológica, rotulada por autor) pro classificador de status ler. Mesmo
+// filtro de direcao já usado em enriquecerLeadParaInteligencia/GET /leads
+// ('entrada'+'echo' = fala real de cliente e corretor; 'saida' fica de fora
+// por ser texto fixo do roteiro do bot, não sinal). Query irmã da de
+// GET /leads/:id/whatsapp (que traz tudo, incluindo 'saida', pra exibição
+// humana no drawer) — aqui filtramos pra só o que interessa como sinal de IA.
+async function construirTranscricaoRotuladaWhatsApp(leadId: number): Promise<string | null> {
+  const mensagens = await client.query(
+    `
+    SELECT wml.conteudo, wml.direcao
+    FROM whatsapp_mensagens_log wml
+    JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+    WHERE wc.lead_id = $1 AND wml.direcao IN ('entrada', 'echo')
+    ORDER BY wml.criado_em ASC
+    `,
+    [leadId]
   );
-  if (opcaoPorId) return opcaoPorId.status;
 
-  const resposta = normalizarRespostaStatusLead(texto);
-  const mapa: Record<string, StatusLeadKanban> = {
-    "1": "novo",
-    "novo": "novo",
-    "2": "primeiro_contato",
-    "primeiro contato": "primeiro_contato",
-    "3": "em_conversa",
-    "em conversa": "em_conversa",
-    "4": "fechado",
-    "fechado": "fechado",
-    "5": "perdido",
-    "perdido": "perdido",
-  };
-  return mapa[resposta] || null;
+  if (!mensagens.rows.length) return null;
+
+  return mensagens.rows
+    .map((m: any) => `${m.direcao === "entrada" ? "Cliente" : "Corretor"}: ${m.conteudo || ""}`)
+    .join("\n");
 }
 
-// Classifica a resposta livre do corretor (WhatsApp pessoal, Z-API) sobre o
-// andamento de um lead num dos 5 status do Kanban — nunca
-// adivinha: só aplica se a IA reportar confiança "alta"; qualquer falha de
-// parse/HTTP/confiança baixa ou IA pausada pelo admin vira status:null
-// (inconclusiva), e quem chama não deve tocar no status do lead nesse caso.
-// Roda pra todo corretor (não checa plano de IA — é a plataforma perguntando,
-// não um recurso de IA que ele contratou), mas respeita o kill-switch geral.
-async function classificarRespostaStatusLead(
-  usuarioId: number,
-  texto: string
-): Promise<{ status: StatusLeadKanban | null }> {
+// Lê a conversa real (cliente + corretor) e decide sozinha em qual dos 5
+// estágios do Kanban o lead deve estar — substitui a antiga pergunta pro
+// corretor via WhatsApp pessoal (Z-API). Nunca adivinha: só aplica o novo
+// status se a IA reportar confiança "alta"; qualquer falha de parse/HTTP,
+// confiança baixa ou IA pausada pelo admin vira status:null, e quem chama não
+// deve tocar no status do lead nesse caso — só tenta de novo no próximo
+// sweep, quando houver mensagem nova (ver processarClassificacaoStatusLeadIA).
+// Roda pra todo corretor (não checa plano de IA — é a plataforma decidindo
+// sozinha, não um recurso de IA que ele contratou), mas respeita o
+// kill-switch geral. Mesmo padrão dual-provider (OpenAI + JSON Schema
+// estrito, fallback Anthropic) de gerarAnaliseIAOpenAI.
+async function classificarStatusLeadPorConversa(
+  lead: any,
+  transcricao: string,
+  usuarioId: number
+): Promise<{ status: StatusLeadKanban | null; motivo: string | null }> {
   const configIA = await buscarConfigIA();
   if (configIA?.status !== "contratado") {
-    return { status: null };
+    return { status: null, motivo: null };
   }
 
-  const openaiKey = Bun.env.OPENAI_API_KEY;
-  if (!openaiKey) {
-    return { status: null };
-  }
+  const estagioCtx = estagioKanbanContexto(lead?.status || "novo");
+  const ctx = contextoNicho(lead);
 
   const systemMsg =
-    "Você classifica respostas informais em português de corretores brasileiros sobre o andamento de uma negociação com um cliente. " +
-    `Responda SOMENTE JSON no formato {"status":"novo"|"primeiro_contato"|"em_conversa"|"fechado"|"perdido"|null,"confianca":"alta"|"baixa"}, sem nenhum texto fora do JSON. ` +
-    `"novo" = contato ainda não iniciado; "primeiro_contato" = primeiro contato já realizado; "em_conversa" = negociação em andamento; ` +
-    `"fechado" = negócio fechado/vendido; "perdido" = cliente desistiu/não tem mais interesse; ` +
-    `use status:null e confianca:"baixa" se não conseguir identificar com clareza.`;
-  const prompt = `Resposta do corretor: "${texto}"`;
+    `Você analisa a conversa real de WhatsApp entre um corretor brasileiro (nicho: ${ctx.nicho}) e um cliente, e decide em qual estágio do funil de vendas (Kanban) o lead deve estar AGORA, com base só no conteúdo da conversa. ` +
+    `Os 5 estágios possíveis são: "novo" (contato ainda não iniciado), "primeiro_contato" (primeiro contato já feito, sem negociação real ainda), "em_conversa" (negociação em andamento — dúvidas, objeções, envio de proposta), "fechado" (negócio fechado/vendido, cliente confirmou compra/contratação), "perdido" (cliente desistiu, disse não ter mais interesse, parou de responder de forma definitiva ou recusou explicitamente). ` +
+    `O lead está registrado atualmente como "${estagioCtx.label}" (${estagioCtx.objetivo}) — mas ignore isso se a conversa mostrar claramente outro estágio: decida pelo conteúdo real da conversa, não pelo status atual. ` +
+    `Só use confianca:"alta" quando a conversa deixar claro o estágio; use "baixa" em qualquer caso de dúvida, conversa curta/ambígua, ou papo que não indica progresso real. ` +
+    `Responda SOMENTE JSON, em português do Brasil, sem texto fora do JSON.`;
+  const schemaDescricao =
+    `{"status":"novo"|"primeiro_contato"|"em_conversa"|"fechado"|"perdido","confianca":"alta"|"baixa","motivo":"string curta explicando a decisão"}`;
+  const userText = JSON.stringify({
+    status_atual: estagioCtx.chave,
+    conversa: transcricao,
+    objetivo: "Classificar o estágio real do funil com base na conversa completa entre corretor e cliente."
+  });
 
-  try {
-    const iaConf = await client.query("SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1");
-    const modelo =
-      textoOpcional(iaConf.rows[0]?.modelo) ||
-      textoOpcional(Bun.env.OPENAI_MODEL) ||
-      "gpt-5-mini";
-    const usarResponsesAPI =
-      modelo.startsWith("gpt-5") || modelo.startsWith("o1") || modelo.startsWith("o3") || modelo.startsWith("o4");
-
-    const respBody = usarResponsesAPI
-      ? { model: modelo, temperature: 1.0, instructions: systemMsg, input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }] }
-      : { model: modelo, temperature: 1.0, response_format: { type: "json_object" }, messages: [{ role: "system", content: systemMsg }, { role: "user", content: prompt }] };
-
-    const resp = await fetch(usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(respBody),
-    });
-    const data: any = await resp.json();
-    if (!resp.ok) {
-      console.error("CLASSIFICAR STATUS WHATSAPP ERROR:", data?.error?.message, "| model:", modelo);
-      return { status: null };
-    }
-
-    const textoResposta: string = usarResponsesAPI
-      ? extrairTextoRespostaOpenAI(data)
-      : (data?.choices?.[0]?.message?.content || "");
-
-    const usageNorm = {
-      input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
-      output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0),
+  const parseResultado = (texto: string): { status: StatusLeadKanban | null; motivo: string | null } => {
+    const limpo = texto.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    const parsed = JSON.parse(limpo);
+    const statusValidos: StatusLeadKanban[] = ["novo", "primeiro_contato", "em_conversa", "fechado", "perdido"];
+    return {
+      status: parsed?.confianca === "alta" && statusValidos.includes(parsed?.status) ? parsed.status : null,
+      motivo: textoOpcional(parsed?.motivo)
     };
-    const custo = calcularCustoEstimadoOpenAI(usageNorm);
-    await registrarUsoIA(usuarioId, "status_whatsapp_corretor", "whatsapp_perguntas_status_lead", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
+  };
 
-    let parsed: any = null;
+  const iaConf = await buscarConfigIA();
+
+  // ── Tenta OpenAI ──────────────────────────────────────────────
+  const openaiKey = Bun.env.OPENAI_API_KEY;
+  if (openaiKey) {
     try {
-      parsed = JSON.parse(textoResposta);
-    } catch {
-      return { status: null };
-    }
+      const modelo =
+        textoOpcional(iaConf?.modelo) || textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-5-mini";
+      const usarResponsesAPI =
+        modelo.startsWith("gpt-5") || modelo.startsWith("o1") || modelo.startsWith("o3") || modelo.startsWith("o4");
 
-    const statusValidos: StatusLeadKanban[] = [
-      "novo",
-      "primeiro_contato",
-      "em_conversa",
-      "fechado",
-      "perdido",
-    ];
-    if (parsed?.confianca === "alta" && statusValidos.includes(parsed?.status)) {
-      return { status: parsed.status };
+      const respBody = usarResponsesAPI
+        ? {
+            model: modelo,
+            instructions: systemMsg,
+            input: [{ role: "user", content: [{ type: "input_text", text: userText }] }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "classificacao_status_lead",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["status", "confianca", "motivo"],
+                  properties: {
+                    status: { type: "string", enum: ["novo", "primeiro_contato", "em_conversa", "fechado", "perdido"] },
+                    confianca: { type: "string", enum: ["alta", "baixa"] },
+                    motivo: { type: "string" }
+                  }
+                }
+              }
+            },
+            // "low" basta pra essa classificação (é um julgamento simples de
+            // enquadramento, não um raciocínio longo) e evita que os tokens de
+            // reasoning consumam o orçamento inteiro antes do JSON de saída
+            // (visto acontecer de verdade em teste: reasoning sozinho já
+            // gastava 256 dos 300 tokens, deixando a resposta "incomplete").
+            reasoning: { effort: "low" },
+            max_output_tokens: 600
+          }
+        : {
+            model: modelo,
+            temperature: 1.0,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: systemMsg + `\n\nResponda SOMENTE JSON no formato: ${schemaDescricao}` },
+              { role: "user", content: userText }
+            ],
+            max_tokens: 300
+          };
+
+      const resp = await fetch(usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(respBody)
+      });
+      const data: any = await resp.json();
+
+      if (resp.ok) {
+        const texto = usarResponsesAPI ? extrairTextoRespostaOpenAI(data) : (data?.choices?.[0]?.message?.content || "");
+        if (texto) {
+          const usage = {
+            input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
+            output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0)
+          };
+          const custo = calcularCustoEstimadoOpenAI(usage);
+          await registrarUsoIA(usuarioId, "classificacao_kanban_conversa", "lead", lead?.id ?? null, custo, usage.input_tokens, usage.output_tokens);
+          return parseResultado(texto);
+        }
+      } else {
+        console.error("CLASSIFICAR STATUS CONVERSA OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+      }
+    } catch (e) {
+      console.error("ERRO classificarStatusLeadPorConversa (OpenAI):", e);
     }
-    return { status: null };
-  } catch (e) {
-    console.error("ERRO classificarRespostaStatusLead:", e);
-    return { status: null };
   }
+
+  // ── Fallback: Anthropic ───────────────────────────────────────
+  const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) {
+    try {
+      const anthropicModelo = textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: anthropicModelo,
+          max_tokens: 300,
+          system: systemMsg + `\n\nResponda SOMENTE JSON no formato: ${schemaDescricao}`,
+          messages: [{ role: "user", content: userText }]
+        })
+      });
+      const data: any = await resp.json();
+
+      if (resp.ok) {
+        const texto = data?.content?.[0]?.text || "";
+        if (texto) {
+          const inTok = Number(data?.usage?.input_tokens || 0);
+          const outTok = Number(data?.usage?.output_tokens || 0);
+          const custo = calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok });
+          await registrarUsoIA(usuarioId, "classificacao_kanban_conversa", "lead", lead?.id ?? null, custo, inTok, outTok, "anthropic");
+          return parseResultado(texto);
+        }
+      } else {
+        console.error("CLASSIFICAR STATUS CONVERSA ANTHROPIC ERROR:", data?.error?.message);
+      }
+    } catch (e) {
+      console.error("ERRO classificarStatusLeadPorConversa (Anthropic):", e);
+    }
+  }
+
+  return { status: null, motivo: null };
 }
 
-// Trata a resposta do corretor no WhatsApp pessoal (Z-API) a uma pergunta de
-// status pendente (ver processarPerguntasStatusLead). Formato do payload
-// confirmado contra a doc oficial da Z-API (developer.z-api.io): type
-// "ReceivedCallback", phone, fromMe, text.message, buttonsResponseMessage e
-// listResponseMessage.selectedRowId.
-async function processarRespostaCorretorZapi(body: any) {
-  const telefoneOrigem = body?.phone || body?.from;
-  const idSelecionado = String(
-    body?.listResponseMessage?.selectedRowId ||
-    body?.buttonsResponseMessage?.buttonId ||
-    ""
-  ).trim();
-  const textoResposta = String(
-    body?.text?.message ||
-    body?.buttonsResponseMessage?.message ||
-    body?.listResponseMessage?.title ||
-    body?.listResponseMessage?.message ||
-    idSelecionado
-  ).trim();
-  if (!telefoneOrigem || !textoResposta) return;
-
-  const telefoneNormalizado = normalizarTelefoneWhatsApp(telefoneOrigem);
-  if (!telefoneNormalizado) return;
-
-  // Tabela pequena (corretores, não leads) — compara em JS, mesmo padrão já
-  // usado em vincularConversaAoLead pra não brigar com normalização no SQL.
-  const usuarios = await client.query(`SELECT id, whatsapp FROM usuarios WHERE whatsapp IS NOT NULL`);
-  const corretor = usuarios.rows.find(
-    (u: any) => normalizarTelefoneWhatsApp(u.whatsapp) === telefoneNormalizado
-  );
-  if (!corretor) return;
-
-  const pergunta = await client.query(
-    `SELECT * FROM whatsapp_perguntas_status_lead
-     WHERE usuario_id = $1 AND status IN ('pendente', 'expirada')
-       AND enviado_em > NOW() - INTERVAL '48 hours'
-     ORDER BY enviado_em DESC LIMIT 1`,
-    [corretor.id]
-  );
-  const perguntaRow = pergunta.rows[0];
-  if (!perguntaRow) return; // mensagem solta, sem pergunta pendente relacionada
-
-  const statusSelecionado = statusLeadPorRespostaWhatsapp(body, textoResposta);
-  const classificacao = statusSelecionado
-    ? { status: statusSelecionado }
-    : await classificarRespostaStatusLead(corretor.id, textoResposta);
-
-  if (classificacao.status) {
-    const leadAtual = await client.query(
-      `SELECT observacao, motivo_perda, score_manual FROM leads WHERE id = $1`,
-      [perguntaRow.lead_id]
-    );
-    const leadRow = leadAtual.rows[0];
-    const motivoPerda =
-      classificacao.status === "perdido"
-        ? `Perdido conforme WhatsApp: "${textoResposta}"`
-        : leadRow?.motivo_perda || null;
-
-    await atualizarStatusLeadBackend(
-      perguntaRow.lead_id,
-      corretor.id,
-      {
-        observacao: leadRow?.observacao || "",
-        status: classificacao.status,
-        motivo_perda: motivoPerda,
-        score_manual: leadRow?.score_manual || null,
-      },
-      "whatsapp_auto"
-    );
-
-    await client.query(
-      `UPDATE whatsapp_perguntas_status_lead
-       SET status = 'respondida', resposta_texto = $1, status_interpretado = $2, respondido_em = NOW()
-       WHERE id = $3`,
-      [textoResposta, classificacao.status, perguntaRow.id]
-    );
-  } else {
-    await client.query(
-      `UPDATE whatsapp_perguntas_status_lead
-       SET status = 'inconclusiva', resposta_texto = $1, respondido_em = NOW()
-       WHERE id = $2`,
-      [textoResposta, perguntaRow.id]
-    );
-
-    await client.query(
-      `INSERT INTO notificacoes (usuario_id, lead_id, tipo, titulo, mensagem)
-       VALUES ($1, $2, 'status_whatsapp_inconclusivo', $3, $4)`,
-      [
-        corretor.id,
-        perguntaRow.lead_id,
-        "Não entendi sua resposta",
-        "Não consegui entender sua resposta sobre um lead pelo WhatsApp. Atualize o status direto na plataforma.",
-      ]
-    ).catch((e: any) => console.error("ERRO ao inserir notificacao inconclusiva:", e));
-  }
-}
-
-// 🔥 WEBHOOK Z-API — eventos de conexão/desconexão + resposta do corretor a
-// uma pergunta de status de lead (ver processarRespostaCorretorZapi)
+// 🔥 WEBHOOK Z-API — eventos de conexão/desconexão do WhatsApp pessoal do
+// corretor usado pra notificações (novo lead, lembretes)
 app.post("/webhook/zapi", async (c) => {
   // Validate shared secret if configured
   const zapiSecret = Bun.env.ZAPI_WEBHOOK_SECRET;
@@ -12539,10 +12465,6 @@ app.post("/webhook/zapi", async (c) => {
           })
         }).catch((e: any) => console.error("[z-api webhook] erro ao enviar e-mail:", e));
       }
-    } else if (tipo === "ReceivedCallback" && body?.fromMe !== true && (body?.phone || body?.from)) {
-      await processarRespostaCorretorZapi(body).catch((e: any) =>
-        console.error("[z-api webhook] erro ao processar resposta do corretor:", e)
-      );
     }
 
     return c.json({ ok: true });
@@ -13993,13 +13915,11 @@ await client.query(`
   );
 `);
 
-// Pergunta que o bot manda pro WhatsApp PESSOAL do corretor (via Z-API, canal
-// separado do numero oficial que fala com o lead) perguntando o que aconteceu
-// com uma conversa que esfriou, pra mover o Kanban sozinho a partir da
-// resposta livre dele (ver processarPerguntasStatusLead/processarRespostaCorretorZapi).
-// Indice unico parcial garante no maximo 1 pergunta pendente por corretor por
-// vez — resposta e texto livre de celular, duas perguntas abertas ao mesmo
-// tempo tornariam a resposta ambigua.
+// Histórico do antigo fluxo que perguntava pro corretor no WhatsApp pessoal
+// (via Z-API) o status de um lead parado — substituído pelo classificador
+// automático que lê a conversa (ver classificarStatusLeadPorConversa /
+// processarClassificacaoStatusLeadIA). Tabela mantida só como histórico,
+// nada mais escreve nela.
 await client.query(`
   CREATE TABLE IF NOT EXISTS whatsapp_perguntas_status_lead (
     id                   SERIAL PRIMARY KEY,
@@ -14037,6 +13957,14 @@ await client.query(`
 
 await client.query(`
   CREATE INDEX IF NOT EXISTS idx_whatsapp_conversas_lead ON whatsapp_conversas(lead_id);
+`);
+
+// Marca quando a conversa foi lida pela última vez pelo classificador automático
+// de status (ver processarClassificacaoStatusLeadIA) — só entram no sweep as
+// conversas com mensagem (entrada/echo) mais nova que essa marca.
+await client.query(`
+  ALTER TABLE whatsapp_conversas
+    ADD COLUMN IF NOT EXISTS ultima_classificacao_ia_em TIMESTAMP;
 `);
 
 await client.query(`
@@ -18560,6 +18488,10 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       );
     }
 
+    // imagens_urls/image_urls às vezes acumulam a MESMA imagem varias vezes
+    // (URLs diferentes por parâmetro de cache do CDN, mesmo conteúdo) — sem
+    // dedupe aqui, cada URL vira um card de carrossel repetido e a Meta
+    // rejeita com "(#105) param child_attachments has too many elements".
     const imageUrls =
       [...new Set([
         ...(Array.isArray(cfg.imagens_urls) ? cfg.imagens_urls : []),
@@ -18573,9 +18505,9 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         await enviarImagemMetaPorUrl(token, adAccountId, String(urlImagem));
 
       if (uploadImagem.hash) {
-        // A Meta hasheia por conteudo - URLs distintas da mesma imagem (ex.:
+        // A Meta hasheia por conteúdo — URLs distintas da mesma imagem (ex.:
         // espelhos de CDN diferentes) voltam com o hash igual; sem este
-        // dedupe, o card de carrossel se repete mesmo com URLs unicas.
+        // dedupe, o card de carrossel se repete mesmo com URLs únicas.
         if (!hashes.includes(uploadImagem.hash)) {
           hashes.push(uploadImagem.hash);
         }
@@ -19358,14 +19290,15 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
 
 // Corpo compartilhado de atualização de status/observação de lead — usado pelo
 // PUT /leads/:id (corretor arrastando card / editando no drawer, origem
-// 'manual') e pelo fluxo automático de resposta do corretor via WhatsApp
-// (processarRespostaCorretorZapi, origem 'whatsapp_auto'). Mesmo SQL e mesmos
-// efeitos colaterais nos dois casos — só o texto do histórico muda com a origem.
+// 'manual') e pelo classificador automático que lê a conversa do WhatsApp
+// (processarClassificacaoStatusLeadIA, origem 'ia_conversa'). Mesmo SQL e
+// mesmos efeitos colaterais nos dois casos — só o texto do histórico muda
+// com a origem.
 async function atualizarStatusLeadBackend(
   leadId: string | number,
   usuarioId: number,
   dados: { observacao?: string | null; status: string; motivo_perda?: string | null; score_manual?: string | null },
-  origem: "manual" | "whatsapp_auto" = "manual"
+  origem: "manual" | "ia_conversa" = "manual"
 ) {
   const { observacao, status, motivo_perda, score_manual } = dados;
 
@@ -19434,8 +19367,8 @@ async function atualizarStatusLeadBackend(
         "Lead marcado como FECHADO";
     }
 
-    if (origem === "whatsapp_auto") {
-      descricao += " (confirmado pelo corretor via WhatsApp)";
+    if (origem === "ia_conversa") {
+      descricao += " (decidido por IA com base na conversa do WhatsApp)";
     }
 
     await client.query(
@@ -23873,65 +23806,6 @@ function normalizarTelefoneWhatsApp(valor: unknown): string {
   return numero ? (numero.startsWith("55") ? numero : `55${numero}`) : "";
 }
 
-// Envia uma lista nativa do WhatsApp com os cinco estágios do Kanban. Se a
-// instância/endpoint estiver indisponível, quem chama usa a pergunta em texto
-// como compatibilidade, sem deixar de contactar o corretor.
-async function enviarPerguntaStatusLeadWhatsApp(
-  telefone: string,
-  mensagem: string
-): Promise<boolean> {
-  const instanceId = Bun.env.ZAPI_INSTANCE_ID;
-  const token = Bun.env.ZAPI_TOKEN;
-
-  if (!instanceId || !token) {
-    console.warn("⚠️ Z-API: ZAPI_INSTANCE_ID ou ZAPI_TOKEN não configurados");
-    return false;
-  }
-
-  const phone = normalizarTelefoneWhatsApp(telefone);
-  if (!phone) {
-    console.warn("⚠️ Z-API: número vazio, envio da lista cancelado");
-    return false;
-  }
-
-  const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
-
-  try {
-    const res = await fetch(
-      `https://api.z-api.io/instances/${instanceId}/token/${token}/send-option-list`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(clientToken ? { "Client-Token": clientToken } : {}),
-        },
-        body: JSON.stringify({
-          phone,
-          message: mensagem,
-          optionList: {
-            title: "Status do lead",
-            buttonLabel: "Escolher status",
-            options: OPCOES_STATUS_LEAD_WHATSAPP.map(
-              ({ id, title, description }) => ({ id, title, description })
-            ),
-          },
-        }),
-      }
-    );
-    const resposta = await res.text();
-    if (res.ok) {
-      console.log(`[z-api] ✅ lista de status enviada para ${phone}`);
-      return true;
-    }
-
-    console.error(`[z-api] ❌ erro ao enviar lista ${res.status}:`, resposta);
-    return false;
-  } catch (e) {
-    console.error("[z-api] ❌ exceção ao enviar lista de status:", e);
-    return false;
-  }
-}
-
 async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
   const instanceId = Bun.env.ZAPI_INSTANCE_ID;
   const token      = Bun.env.ZAPI_TOKEN;
@@ -24772,114 +24646,120 @@ agendarLembretes();
 
 
 /* =========================
-   📋 PERGUNTA DE STATUS AO CORRETOR — Kanban automático via WhatsApp
-   Quando uma conversa em atendimento humano esfria (24h sem mensagem do
-   cliente nem do corretor), pergunta pro corretor no WhatsApp PESSOAL dele
-   (Z-API, canal separado do número oficial) o que aconteceu, e usa a
-   uma lista com os 5 estágios do Kanban. A opção tocada move o lead sem
-   depender de IA; texto livre continua aceito como compatibilidade.
+   🤖 CLASSIFICAÇÃO AUTOMÁTICA DE STATUS POR IA — Kanban 100% automático
+   A cada sweep, lê a conversa real (cliente + corretor) de toda conversa em
+   atendimento humano que teve mensagem nova desde a última classificação, e
+   deixa a IA decidir sozinha em qual dos 5 estágios do Kanban o lead deve
+   estar — sem perguntar nada pro corretor (ver classificarStatusLeadPorConversa
+   e construirTranscricaoRotuladaWhatsApp).
 ========================= */
 
-async function processarPerguntasStatusLead() {
+let classificacaoStatusIAEmAndamento = false;
+
+async function processarClassificacaoStatusLeadIA() {
+  if (classificacaoStatusIAEmAndamento) return;
+  classificacaoStatusIAEmAndamento = true;
+
   try {
-    // Só efetivamente manda mensagem em horário comercial (evita textar de madrugada).
-    const horaBRT = (new Date().getUTCHours() - 3 + 24) % 24;
-    if (horaBRT < 8 || horaBRT >= 20) return;
+    const configIA = await buscarConfigIA();
+    if (configIA?.status !== "contratado") return;
 
-    // Libera a vaga do corretor (índice único só permite 1 'pendente' por vez)
-    // e conta como tentativa consumida pra quem não respondeu em 24h.
-    await client.query(
-      `UPDATE whatsapp_perguntas_status_lead
-       SET status = 'expirada'
-       WHERE status = 'pendente' AND enviado_em <= NOW() - INTERVAL '24 hours'`
-    );
-
-    // Um candidato por corretor (o lead mais parado primeiro) — garante no
-    // máximo 1 pergunta nova por corretor por execução, reforçando a fila de
-    // um em um mesmo antes de bater no índice único.
-    const candidatos = await client.query(
-      `
-      SELECT DISTINCT ON (l.usuario_id)
-        l.id AS lead_id, l.usuario_id, l.nome AS lead_nome,
-        u.whatsapp AS corretor_whatsapp, u.nome AS corretor_nome,
-        ult.ultima_atividade
-      FROM leads l
-      INNER JOIN usuarios u ON u.id = l.usuario_id
-      INNER JOIN whatsapp_conversas wc ON wc.lead_id = l.id AND wc.status = 'humano'
-      INNER JOIN LATERAL (
-        SELECT MAX(wml.criado_em) AS ultima_atividade
-        FROM whatsapp_mensagens_log wml
-        WHERE wml.conversa_id = wc.id AND wml.direcao IN ('entrada','echo')
-      ) ult ON true
-      WHERE l.status IN ('novo','primeiro_contato','em_conversa')
-        AND u.whatsapp IS NOT NULL
-        AND u.notif_whatsapp_lead IS NOT FALSE
-        AND ult.ultima_atividade <= NOW() - INTERVAL '24 hours'
-        AND NOT EXISTS (
-          SELECT 1 FROM whatsapp_perguntas_status_lead p
-          WHERE p.lead_id = l.id AND p.enviado_em > ult.ultima_atividade
-            AND p.tentativa >= 2
-        )
-      ORDER BY l.usuario_id, ult.ultima_atividade ASC
-      `
-    );
-
-    for (const cand of candidatos.rows) {
-      // Quantas perguntas já foram feitas pra esse lead dentro dessa mesma
-      // janela de inatividade (reabre do zero se chegou mensagem nova depois).
-      const tentativasAnteriores = await client.query(
-        `SELECT COUNT(*) AS total FROM whatsapp_perguntas_status_lead
-         WHERE lead_id = $1 AND enviado_em > $2`,
-        [cand.lead_id, cand.ultima_atividade]
-      );
-      const tentativa = Number(tentativasAnteriores.rows[0]?.total || 0) + 1;
-
-      const perguntaTexto =
-        tentativa === 1
-          ? `Oi ${cand.corretor_nome}! Como está o lead *${cand.lead_nome}*? Escolha o status abaixo que eu atualizo o Kanban pra você. 📋`
-          : `Oi ${cand.corretor_nome}! Só confirmando: qual é o status atual do lead *${cand.lead_nome}*? Escolha uma opção abaixo.`;
-
-      // Índice único parcial (1 pendente por corretor) como trava final contra
-      // corrida entre execuções sobrepostas do cron.
-      const inserted = await client.query(
-        `INSERT INTO whatsapp_perguntas_status_lead (lead_id, usuario_id, tentativa, pergunta_texto)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (usuario_id) WHERE status = 'pendente' DO NOTHING
-         RETURNING id`,
-        [cand.lead_id, cand.usuario_id, tentativa, perguntaTexto]
-      );
-      if (!inserted.rows.length) continue;
-
-      const enviadoComOpcoes = await enviarPerguntaStatusLeadWhatsApp(
-        cand.corretor_whatsapp,
-        perguntaTexto
-      );
-      if (!enviadoComOpcoes) {
-        await enviarLembreteWhatsApp(
-          cand.corretor_whatsapp,
-          `${perguntaTexto}\n\nResponda com:\n1 - Novo\n2 - Primeiro contato\n3 - Em conversa\n4 - Fechado\n5 - Perdido`
-        );
+    // Teto global de custo/chamadas (mesma soma usada em motivoBloqueioIA) —
+    // rede de segurança pra esse classificador não gerar gasto sem limite;
+    // se estourou, pula o sweep inteiro e tenta de novo no próximo.
+    const limReq = Number(configIA?.limite_mensal_requisicoes || 0);
+    const limCusto = Number(configIA?.limite_mensal_custo || 0);
+    if (limReq > 0 || limCusto > 0) {
+      const usoGlobal = await client.query(`
+        SELECT COUNT(*) AS chamadas, COALESCE(SUM(custo_estimado), 0) AS custo
+        FROM ia_usos
+        WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+      `);
+      const chamadasGlobal = Number(usoGlobal.rows[0]?.chamadas || 0);
+      const custoGlobal = Number(usoGlobal.rows[0]?.custo || 0);
+      if ((limReq > 0 && chamadasGlobal >= limReq) || (limCusto > 0 && custoGlobal >= limCusto)) {
+        console.warn("[classificacao-status-ia] teto global de IA atingido, pulando este sweep");
+        return;
       }
+    }
 
-      await client.query(
-        `INSERT INTO notificacoes (usuario_id, lead_id, tipo, titulo, mensagem)
-         VALUES ($1, $2, 'pergunta_status_lead', $3, $4)`,
-        [cand.usuario_id, cand.lead_id, `Perguntamos sobre o lead ${cand.lead_nome} no seu WhatsApp`, perguntaTexto]
-      ).catch((e: any) => console.error("ERRO ao inserir notificacao pergunta status:", e));
+    // Conversas em atendimento humano com mensagem (entrada/echo) nova desde
+    // a última classificação — sem atividade nova não há nada pra reavaliar.
+    const conversas = await client.query(
+      `
+      SELECT l.*, wc.id AS conversa_id
+      FROM whatsapp_conversas wc
+      JOIN leads l ON l.id = wc.lead_id
+      WHERE wc.status = 'humano'
+        AND EXISTS (
+          SELECT 1 FROM whatsapp_mensagens_log wml
+          WHERE wml.conversa_id = wc.id
+            AND wml.direcao IN ('entrada', 'echo')
+            AND wml.criado_em > COALESCE(wc.ultima_classificacao_ia_em, '-infinity')
+        )
+      `
+    );
+
+    for (const row of conversas.rows) {
+      const statusAtual = row.status;
+      try {
+        const transcricao = await construirTranscricaoRotuladaWhatsApp(row.id);
+        if (!transcricao) continue;
+
+        await enriquecerLeadParaInteligencia(row);
+        const classificacao = await classificarStatusLeadPorConversa(row, transcricao, row.usuario_id);
+
+        if (classificacao.status && classificacao.status !== statusAtual) {
+          await atualizarStatusLeadBackend(
+            row.id,
+            row.usuario_id,
+            {
+              observacao: row.observacao || "",
+              status: classificacao.status,
+              motivo_perda: classificacao.status === "perdido" ? (classificacao.motivo || row.motivo_perda) : row.motivo_perda,
+              score_manual: row.score_manual || null
+            },
+            "ia_conversa"
+          );
+
+          await client.query(
+            `INSERT INTO notificacoes (usuario_id, lead_id, tipo, titulo, mensagem)
+             VALUES ($1, $2, 'lead_movido_ia', $3, $4)`,
+            [
+              row.usuario_id,
+              row.id,
+              `A IA moveu o lead ${row.nome} para "${estagioKanbanContexto(classificacao.status).label}"`,
+              classificacao.motivo || "Decisão automática com base na conversa do WhatsApp."
+            ]
+          ).catch((e: any) => console.error("ERRO ao inserir notificacao lead_movido_ia:", e));
+        }
+      } catch (e) {
+        console.error("ERRO ao classificar status por conversa (lead " + row.id + "):", e);
+      } finally {
+        await client.query(
+          `UPDATE whatsapp_conversas SET ultima_classificacao_ia_em = NOW() WHERE id = $1`,
+          [row.conversa_id]
+        ).catch(() => {});
+      }
     }
   } catch (e) {
-    console.error("ERRO CRON PERGUNTAS STATUS LEAD:", e);
+    console.error("ERRO CRON CLASSIFICACAO STATUS IA:", e);
+  } finally {
+    classificacaoStatusIAEmAndamento = false;
   }
 }
 
-function agendarPerguntasStatusLead() {
-  // Verifica a cada 30 minutos (mesmo padrão de agendarLembretes)
-  setInterval(processarPerguntasStatusLead, 30 * 60 * 1000);
+function agendarClassificacaoStatusLeadIA() {
+  // Sweep a cada 2h — não há pressa em mover o lead, e um intervalo maior
+  // reduz o gasto de IA (só reclassifica conversas com mensagem nova desde a
+  // última vez, mesmo padrão de setInterval + 1a chamada imediata de
+  // agendarLembretes).
+  setInterval(processarClassificacaoStatusLeadIA, 2 * 60 * 60 * 1000);
   // Roda uma vez ao iniciar
-  processarPerguntasStatusLead();
+  processarClassificacaoStatusLeadIA();
 }
 
-agendarPerguntasStatusLead();
+agendarClassificacaoStatusLeadIA();
 
 
 /* =========================
