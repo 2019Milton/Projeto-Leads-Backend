@@ -17489,9 +17489,6 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
         }
       }
 
-      const urlsPorOrdem = hashes
-        .map(hash => urlPorHash.get(hash))
-        .filter(Boolean) as string[];
       const urlsCriativo = [
         ...anexos.map((item: any) => item?.picture || item?.image_url),
         ...(creativeMeta?.asset_feed_spec?.images || []).map((item: any) => item?.url),
@@ -17504,11 +17501,24 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
         configuracoes.imagem_url,
         configuracoes.image_url
       ].filter(Boolean).map(String);
-      const urls = Array.from(new Set([
-        ...urlsPorOrdem,
-        ...urlsCriativo,
-        ...urlsLocais
-      ]));
+
+      // A Meta pode devolver várias URLs para o mesmo hash (imagem completa,
+      // thumbnail e novos links assinados a cada consulta). A identidade real
+      // da imagem é o hash; guardar todas as URLs fazia uma única arte aparecer
+      // repetida e a lista crescer toda vez que o editor era aberto.
+      const urls = hashes.length
+        ? hashes
+            .map((hash, indice) =>
+              urlPorHash.get(hash) ||
+              urlsCriativo[indice] ||
+              urlsLocais[indice] ||
+              (indice === 0 ? urlsCriativo[0] || urlsLocais[0] : "")
+            )
+            .filter(Boolean)
+        : Array.from(new Set([
+            ...urlsCriativo,
+            ...urlsLocais
+          ]));
 
       if (hashes.length) {
         configuracoes.imageHashes = hashes;
@@ -17516,10 +17526,12 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
         configuracoes.imageHash = hashes[0];
         configuracoes.image_hash = hashes[0];
       }
-      if (urls.length) {
-        configuracoes.imagens_urls = urls;
-        configuracoes.image_urls = urls;
-      }
+      // Sobrescreve também os formatos antigos para limpar URLs históricas já
+      // acumuladas no banco na próxima abertura da campanha.
+      configuracoes.imagens_urls = urls;
+      configuracoes.image_urls = urls;
+      configuracoes.imagem_url = urls[0] || null;
+      configuracoes.image_url = urls[0] || null;
       configuracoes.criativo = {
         ...(configuracoes.criativo || {}),
         creative_id: creativeId || configuracoes.criativo?.creative_id || null,
