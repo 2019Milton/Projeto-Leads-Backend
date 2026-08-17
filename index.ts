@@ -12888,19 +12888,86 @@ async function obterOuCriarConversaWhatsApp(usuarioId: number, telefoneCliente: 
 // Roda o roteiro configurado pelo corretor a partir do passo atual da conversa,
 // mandando mensagens em sequência até parar num passo tipo "pergunta" (espera
 // resposta do cliente) ou até um handoff (fim do roteiro ou passo marcado).
+// Decide se uma conversa parada "avançou bastante" ou não, pra escolher entre
+// reiniciar o roteiro do zero ou pular direto pro corretor quando o roteiro
+// ativo muda no meio de uma conversa em aberto (ver avancarBotWhatsApp).
+// Prioridade: usa o estágio do Kanban do lead vinculado (já calculado pela IA
+// que lê a conversa inteira — não precisa reprocessar aqui). Sem lead
+// vinculado ou status ainda não classificado, cai pra uma heurística simples:
+// já respondeu 2+ perguntas do bot = avançou bastante.
+async function conversaAvancouBastante(conversa: any): Promise<boolean> {
+  if (conversa.lead_id) {
+    const lead = await client.query(`SELECT status FROM leads WHERE id = $1`, [conversa.lead_id]);
+    const statusLead = lead.rows[0]?.status;
+    if (statusLead === "em_conversa" || statusLead === "fechado") return true;
+    if (statusLead === "novo" || statusLead === "primeiro_contato" || statusLead === "perdido") return false;
+  }
+  return Number(conversa.passo_atual || 0) >= 2;
+}
+
+// Mesmo canal do aviso de lead novo (WhatsApp pessoal do corretor via Z-API),
+// mas pra avisar que um lead que já tinha avançado bastante voltou a mandar
+// mensagem depois que o roteiro do bot mudou — esse caso pula o bot e vai
+// direto pro corretor, então sem esse aviso a mensagem passaria despercebida.
+async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: string) {
+  try {
+    const row = await client.query(
+      `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+    const u = row.rows[0];
+    if (!u?.whatsapp || u?.notif_whatsapp_lead === false) return;
+    const msg =
+      `🔥 *Lead quente voltou a falar!*\n\n` +
+      `📞 *Telefone:* ${telefoneCliente}\n` +
+      `Essa conversa já tinha avançado bastante antes, e o roteiro do bot mudou desde então — ` +
+      `por isso pulei direto pra você em vez de tentar continuar o bot do jeito errado.\n\n` +
+      `Acesse a plataforma para responder.`;
+    await enviarLembreteWhatsApp(u.whatsapp, msg);
+  } catch (e) {
+    console.error("Erro notif retorno lead avançado:", e);
+  }
+}
+
 async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
   if (conversa.status === "humano" || conversa.status === "encerrada") return;
 
   const configRes = await client.query(
-    `SELECT passos FROM whatsapp_bot_config WHERE usuario_id = $1 AND ativo = TRUE`,
+    `SELECT id, passos FROM whatsapp_bot_config WHERE usuario_id = $1 AND ativo = TRUE`,
     [conversa.usuario_id]
   );
-  const passos: any[] = configRes.rows[0]?.passos || [];
+  const roteiroAtivo = configRes.rows[0];
+  const passos: any[] = roteiroAtivo?.passos || [];
   if (!passos.length) return;
 
-  // Se estava aguardando resposta, o cliente acabou de responder: avança pro próximo.
-  // Senão (conversa nova), passo_atual (0) já é o próximo a executar.
-  let indice = conversa.status === "aguardando_resposta" ? conversa.passo_atual + 1 : conversa.passo_atual;
+  // Detecta troca de roteiro: a conversa estava esperando resposta usando um
+  // roteiro diferente do que está ativo agora. Continuar pelo índice antigo
+  // não faz sentido — pode cair numa pergunta sem nada a ver com o que já foi
+  // perguntado.
+  const trocouDeRoteiro =
+    conversa.status === "aguardando_resposta" &&
+    conversa.roteiro_id &&
+    conversa.roteiro_id !== roteiroAtivo.id;
+
+  let indice: number;
+
+  if (trocouDeRoteiro) {
+    if (await conversaAvancouBastante(conversa)) {
+      await client.query(
+        `UPDATE whatsapp_conversas SET status = 'humano', atualizado_em = NOW() WHERE id = $1`,
+        [conversa.id]
+      );
+      await notificarRetornoLeadAvancado(conversa.usuario_id, conversa.telefone_cliente)
+        .catch((e) => console.error("ERRO notificarRetornoLeadAvancado:", e));
+      return;
+    }
+    // Pouco avanço real: seguro reiniciar o roteiro novo do zero.
+    indice = 0;
+  } else {
+    // Se estava aguardando resposta, o cliente acabou de responder: avança pro próximo.
+    // Senão (conversa nova), passo_atual (0) já é o próximo a executar.
+    indice = conversa.status === "aguardando_resposta" ? conversa.passo_atual + 1 : conversa.passo_atual;
+  }
 
   while (indice < passos.length) {
     const passo = passos[indice];
@@ -12935,15 +13002,15 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
 
     if (passo.tipo === "pergunta") {
       await client.query(
-        `UPDATE whatsapp_conversas SET status = 'aguardando_resposta', passo_atual = $1, atualizado_em = NOW() WHERE id = $2`,
-        [indice, conversa.id]
+        `UPDATE whatsapp_conversas SET status = 'aguardando_resposta', passo_atual = $1, roteiro_id = $2, atualizado_em = NOW() WHERE id = $3`,
+        [indice, roteiroAtivo.id, conversa.id]
       );
       return;
     }
     if (passo.handoff_apos || ultimoPasso) {
       await client.query(
-        `UPDATE whatsapp_conversas SET status = 'humano', passo_atual = $1, atualizado_em = NOW() WHERE id = $2`,
-        [indice, conversa.id]
+        `UPDATE whatsapp_conversas SET status = 'humano', passo_atual = $1, roteiro_id = $2, atualizado_em = NOW() WHERE id = $3`,
+        [indice, roteiroAtivo.id, conversa.id]
       );
       return;
     }
@@ -14101,6 +14168,16 @@ await client.query(`
 await client.query(`
   ALTER TABLE whatsapp_conversas
     ADD COLUMN IF NOT EXISTS ultima_classificacao_ia_em TIMESTAMP;
+`);
+
+// Guarda QUAL roteiro estava ativo da última vez que o bot avançou essa
+// conversa — sem isso, passo_atual é só um número solto: se o corretor troca
+// de roteiro ativo enquanto a conversa está "aguardando_resposta", o sistema
+// não tem como saber que trocou e continuaria pelo índice errado, numa
+// pergunta que pode não ter nada a ver. Ver avancarBotWhatsApp.
+await client.query(`
+  ALTER TABLE whatsapp_conversas
+    ADD COLUMN IF NOT EXISTS roteiro_id INTEGER REFERENCES whatsapp_bot_config(id) ON DELETE SET NULL;
 `);
 
 await client.query(`
