@@ -12907,10 +12907,11 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number): Promis
   let nichoId: number | null = null;
   let nomeCampanha = "Campanha WhatsApp";
   let campanhaId: number | null = null;
+  let contaAnunciosId: string | null = null;
 
   if (sourceId) {
     const campRow = await client.query(
-      `SELECT id, nome, nicho_id FROM campanhas WHERE ad_id = $1 AND usuario_id = $2 LIMIT 1`,
+      `SELECT id, nome, nicho_id, conta_anuncios_id FROM campanhas WHERE ad_id = $1 AND usuario_id = $2 LIMIT 1`,
       [sourceId, usuarioId]
     ).catch(() => ({ rows: [] as any[] }));
 
@@ -12918,19 +12919,23 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number): Promis
       campanhaId = campRow.rows[0].id;
       nomeCampanha = campRow.rows[0].nome || nomeCampanha;
       nichoId = campRow.rows[0].nicho_id ?? null;
+      contaAnunciosId = campRow.rows[0].conta_anuncios_id ?? null;
     }
   }
 
+  // conta_anuncios_id precisa vir preenchido: /meta/metricas-campanhas conta os
+  // leads de cada campanha filtrando por ele (junto com o nome) — sem isso o
+  // card mostra "0 leads" mesmo com o lead certinho no banco.
   const leadInserido = await client.query(
     `
     INSERT INTO leads (
       usuario_id, lead_id, ctwa_clid, nome, email, telefone,
-      origem, plataforma, status, campanha, campanha_id, nicho_id, criado_em
+      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
     )
-    VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', 'novo', $5, $6, $7, NOW())
+    VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', 'novo', $5, $6, $7, $8, NOW())
     RETURNING id
     `,
-    [usuarioId, ctwaClid, "Lead WhatsApp (anúncio)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId]
+    [usuarioId, ctwaClid, "Lead WhatsApp (anúncio)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
   );
 
   const novoLeadId = leadInserido.rows[0].id;
