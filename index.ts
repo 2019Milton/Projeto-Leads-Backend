@@ -11863,8 +11863,14 @@ app.get("/whatsapp/diagnostico", authMiddleware, async (c) => {
 
 function validarPassosRoteiro(passos: any[]) {
   for (const passo of passos) {
-    if (!passo || !["mensagem", "pergunta"].includes(passo.tipo) || !String(passo.texto || "").trim()) {
-      return "Cada passo precisa de tipo ('mensagem' ou 'pergunta') e texto";
+    if (!passo || !["mensagem", "pergunta", "imagem", "audio"].includes(passo.tipo)) {
+      return "Cada passo precisa de um tipo válido (mensagem, pergunta, imagem ou audio)";
+    }
+    if (["mensagem", "pergunta"].includes(passo.tipo) && !String(passo.texto || "").trim()) {
+      return "Passos de mensagem/pergunta precisam de texto";
+    }
+    if (["imagem", "audio"].includes(passo.tipo) && !String(passo.midia_url || "").trim()) {
+      return "Passos de imagem/áudio precisam de um arquivo anexado";
     }
   }
   return null;
@@ -11991,6 +11997,95 @@ app.delete("/whatsapp/bot/:id", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO DELETE /whatsapp/bot/:id:", err);
     return c.json({ error: "Erro ao excluir roteiro do bot" }, 500);
+  }
+});
+
+// URL publica desse backend — usada pra montar o link de midia que a propria
+// Meta busca ao enviar um passo de imagem/audio (por isso a rota GET abaixo
+// nao pode ter authMiddleware).
+const URL_BACKEND_PUBLICA =
+  Bun.env.URL_BACKEND_PUBLICA || "https://function-bun-production-446a.up.railway.app";
+
+const WHATSAPP_BOT_MIDIA_MIME_PERMITIDOS: Record<string, string[]> = {
+  imagem: ["image/jpeg", "image/png", "image/webp"],
+  // formatos aceitos pela propria Meta pra mensagem de audio no WhatsApp Cloud API
+  audio: ["audio/mpeg", "audio/ogg", "audio/mp4", "audio/aac", "audio/amr"]
+};
+const WHATSAPP_BOT_MIDIA_TAMANHO_MAX = 15 * 1024 * 1024;
+
+app.post("/whatsapp-bot/midia", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const body = await c.req.formData();
+    const arquivo = body.get("arquivo") as File | null;
+    const tipo = String(body.get("tipo") || "");
+
+    if (!arquivo) {
+      return c.json({ error: "Arquivo não enviado" }, 400);
+    }
+    if (!["imagem", "audio"].includes(tipo)) {
+      return c.json({ error: "Tipo inválido" }, 400);
+    }
+
+    const mimeType = arquivo.type || "";
+    if (!WHATSAPP_BOT_MIDIA_MIME_PERMITIDOS[tipo].includes(mimeType)) {
+      return c.json({
+        error:
+          tipo === "imagem"
+            ? "Formato de imagem não suportado. Use JPEG, PNG ou WEBP."
+            : "Formato de áudio não suportado. Use MP3, OGG, M4A ou AMR."
+      }, 400);
+    }
+
+    const bytes = await arquivo.arrayBuffer();
+    if (bytes.byteLength > WHATSAPP_BOT_MIDIA_TAMANHO_MAX) {
+      return c.json({ error: "Arquivo muito grande (máximo 15MB)" }, 400);
+    }
+
+    const row = await client.query(
+      `INSERT INTO whatsapp_bot_midias (usuario_id, tipo, mime_type, dados)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [user.id, tipo, mimeType, Buffer.from(bytes)]
+    );
+
+    const id = row.rows[0].id;
+    return c.json({
+      id,
+      url: `${URL_BACKEND_PUBLICA}/whatsapp-bot/midia/${id}`,
+      tipo,
+      mime_type: mimeType
+    });
+  } catch (err) {
+    console.error("ERRO POST /whatsapp-bot/midia:", err);
+    return c.json({ error: "Erro ao enviar arquivo" }, 500);
+  }
+});
+
+// Sem authMiddleware de proposito: quem busca esse link e o servidor da Meta,
+// na hora de entregar a mensagem — nao o navegador do corretor logado.
+app.get("/whatsapp-bot/midia/:id", async (c) => {
+  try {
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) {
+      return c.text("Não encontrado", 404);
+    }
+
+    const row = await client.query(
+      `SELECT mime_type, dados FROM whatsapp_bot_midias WHERE id = $1`,
+      [id]
+    );
+    if (!row.rows.length) {
+      return c.text("Não encontrado", 404);
+    }
+
+    const { mime_type, dados } = row.rows[0];
+    return c.body(dados, 200, {
+      "Content-Type": mime_type,
+      "Cache-Control": "public, max-age=31536000, immutable"
+    });
+  } catch (err) {
+    console.error("ERRO GET /whatsapp-bot/midia/:id:", err);
+    return c.text("Erro ao carregar mídia", 500);
   }
 });
 
@@ -12809,17 +12904,30 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
 
   while (indice < passos.length) {
     const passo = passos[indice];
+
+    const midia =
+      passo.tipo === "imagem" ? { tipo: "image" as const, link: passo.midia_url }
+      : passo.tipo === "audio" ? { tipo: "audio" as const, link: passo.midia_url }
+      : undefined;
+
     const wamid = await enviarMensagemWhatsAppOficial(
       conversa.usuario_id,
       phoneNumberId,
       conversa.telefone_cliente,
-      passo.texto
+      passo.texto || "",
+      midia
     );
+
+    const conteudoLog =
+      passo.tipo === "imagem" ? `[imagem]${passo.texto ? " " + passo.texto : ""}`
+      : passo.tipo === "audio" ? "[audio]"
+      : passo.texto;
+
     if (wamid) {
       await client.query(
         `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3)
          ON CONFLICT (wamid) DO NOTHING`,
-        [conversa.id, wamid, passo.texto]
+        [conversa.id, wamid, conteudoLog]
       ).catch((e) => console.error("ERRO log saida whatsapp:", e));
     }
 
@@ -13905,6 +14013,19 @@ await client.query(`
   ALTER TABLE whatsapp_bot_config ADD COLUMN IF NOT EXISTS nome TEXT NOT NULL DEFAULT 'Roteiro padrão';
   CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bot_config_usuario_ativo
     ON whatsapp_bot_config(usuario_id) WHERE ativo = true;
+
+  -- Guarda o arquivo (imagem/audio) anexado num passo do roteiro do bot. Fica no
+  -- Postgres mesmo (sem S3/Cloudinary) — arquivo de passo de bot é pequeno, e a
+  -- rota GET /whatsapp-bot/midia/:id que serve isso precisa ser publica (sem
+  -- authMiddleware), porque quem busca o link é o servidor da Meta, nao o corretor.
+  CREATE TABLE IF NOT EXISTS whatsapp_bot_midias (
+    id            SERIAL PRIMARY KEY,
+    usuario_id    INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    tipo          TEXT NOT NULL CHECK (tipo IN ('imagem','audio')),
+    mime_type     TEXT NOT NULL,
+    dados         BYTEA NOT NULL,
+    criado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 
   CREATE TABLE IF NOT EXISTS whatsapp_conversas (
     id                  SERIAL PRIMARY KEY,
@@ -23873,11 +23994,15 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
 // Envio pela API oficial do WhatsApp (Cloud API) — caminho separado do Z-API acima.
 // Prefere o token limitado à WABA salvo no Embedded Signup. O token geral de sistema
 // só é usado como compatibilidade para conexões antigas do mesmo Business Manager.
+// midia opcional: passo de imagem/audio do roteiro do bot manda o link em vez
+// de texto puro. Imagem aceita legenda (caption); audio nao (a Cloud API nao
+// tem campo de legenda pra audio).
 async function enviarMensagemWhatsAppOficial(
   usuarioId: number,
   phoneNumberId: string,
   telefoneDestino: string,
-  texto: string
+  texto: string,
+  midia?: { tipo: "image" | "audio"; link: string }
 ) {
   const token = await obterTokenWhatsappUsuario(usuarioId);
   if (!token) {
@@ -23891,6 +24016,23 @@ async function enviarMensagemWhatsAppOficial(
     return;
   }
 
+  const payload = midia
+    ? {
+        messaging_product: "whatsapp",
+        to,
+        type: midia.tipo,
+        [midia.tipo]:
+          midia.tipo === "image" && texto
+            ? { link: midia.link, caption: texto }
+            : { link: midia.link }
+      }
+    : {
+        messaging_product: "whatsapp",
+        to,
+        type: "text",
+        text: { body: texto },
+      };
+
   try {
     const res = await fetch(
       `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${phoneNumberId}/messages`,
@@ -23900,12 +24042,7 @@ async function enviarMensagemWhatsAppOficial(
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to,
-          type: "text",
-          text: { body: texto },
-        }),
+        body: JSON.stringify(payload),
       }
     );
     const body = await res.json() as any;
