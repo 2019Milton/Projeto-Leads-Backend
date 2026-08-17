@@ -12886,7 +12886,7 @@ async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise
 // — só quando a conversa carrega um referral genuíno de anúncio Click-to-WhatsApp
 // (ctwa_clid presente). Sem isso, retorna null e o comportamento de sempre
 // (mensagem só registrada, sem virar lead) continua intacto.
-async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number): Promise<number | null> {
+async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeContato?: string | null): Promise<number | null> {
   const ctwaClid = conversa?.referral?.ctwa_clid;
   if (!ctwaClid) {
     return null;
@@ -12935,7 +12935,7 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number): Promis
     VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', 'novo', $5, $6, $7, $8, NOW())
     RETURNING id
     `,
-    [usuarioId, ctwaClid, "Lead WhatsApp (anúncio)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+    [usuarioId, ctwaClid, nomeContato || "Lead WhatsApp (anúncio)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
   );
 
   const novoLeadId = leadInserido.rows[0].id;
@@ -12946,7 +12946,7 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number): Promis
   );
 
   await notificarNovoLeadWhatsApp(usuarioId, {
-    nome: "Lead WhatsApp (anúncio)",
+    nome: nomeContato || "Lead WhatsApp (anúncio)",
     telefone: conversa.telefone_cliente,
     email: null,
     campanha: nomeCampanha
@@ -13008,6 +13008,16 @@ async function processarEventoWhatsApp(value: any) {
   }
 
   const numeroBusiness = String(value.metadata?.display_phone_number || "").replace(/\D/g, "");
+
+  // Nome de exibição do WhatsApp do cliente (só vem no payload junto da
+  // primeira mensagem, em value.contacts — não em cada msg individual).
+  const nomesContatos: Record<string, string> = {};
+  for (const contato of value.contacts || []) {
+    const nome = textoOpcional(contato?.profile?.name);
+    if (contato?.wa_id && nome) {
+      nomesContatos[String(contato.wa_id)] = nome;
+    }
+  }
 
   for (const msg of value.messages || []) {
     // ⚠️ Heurística provisória de detecção de eco (coexistência): assume que uma
@@ -13072,7 +13082,7 @@ async function processarEventoWhatsApp(value: any) {
       .catch(e => { console.error("ERRO vincularConversaAoLead:", e); return null; });
 
     if (!leadIdVinculado) {
-      leadIdVinculado = await criarLeadDeConversaCTWA(conversa, usuarioId)
+      leadIdVinculado = await criarLeadDeConversaCTWA(conversa, usuarioId, nomesContatos[String(telefoneCliente)] || null)
         .catch(e => { console.error("ERRO criarLeadDeConversaCTWA:", e); return null; });
     }
 
