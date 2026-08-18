@@ -4633,7 +4633,14 @@ function extrairLeadsActionsMeta(actions: any[] = []) {
     "onsite_conversion.lead_grouped",
     "onsite_conversion.lead",
     "lead",
-    "offsite_conversion.fb_pixel_lead"
+    "offsite_conversion.fb_pixel_lead",
+    // Campanha de destino WhatsApp (Click-to-WhatsApp) não gera nenhuma action
+    // com "lead" no nome — a Meta reporta como conversa iniciada. Confirmado
+    // direto na API: era por isso que campanha de WhatsApp sempre contava 0
+    // leads aqui, mesmo com conversas reais acontecendo (CPL ficava
+    // indefinido e a tela de Ganho Projetado caía na mensagem de "conecte
+    // sua conta", mesmo já conectada).
+    "onsite_conversion.messaging_conversation_started_7d"
   ];
 
   for (const tipo of prioridade) {
