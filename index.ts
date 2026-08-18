@@ -1180,6 +1180,10 @@ async function avaliarEEnviarQualificacaoLead(
     return avaliarEEnviarQualificacaoTikTok(leadRow, usuarioId);
   }
 
+  if (rede === "kwai") {
+    return avaliarEEnviarQualificacaoKwai(leadRow, usuarioId);
+  }
+
   if (rede === "linkedin") {
     return avaliarEEnviarQualificacaoLinkedIn(leadRow, usuarioId);
   }
@@ -1390,6 +1394,23 @@ async function avaliarEEnviarQualificacaoLinkedIn(
   } catch (err) {
     console.error("ERRO avaliarEEnviarQualificacaoLinkedIn:", err);
   }
+}
+
+// Stub Kwai de avaliarEEnviarQualificacaoMeta/Google/TikTok/LinkedIn — ainda
+// não existe nenhum mecanismo de conversão de evento (equivalente à
+// Conversions API) disponível pra Kuaishou Marketing API: a integração
+// depende de aprovação formal de parceiro que o projeto ainda não tem (ver
+// cabeçalho da seção KWAI ADS e o comentário em OAUTH_PROVEDORES.kwai).
+// Mantido como no-op só pra já existir o ponto de encaixe no dispatcher
+// (avaliarEEnviarQualificacaoLead), sem quebrar leads que vierem com
+// plataforma = 'kwai' no futuro. Quando a aprovação sair, espelhar aqui o
+// mesmo par de eventos (Qualified Lead / Closed Won) que as demais
+// plataformas já mandam.
+async function avaliarEEnviarQualificacaoKwai(
+  leadRow: any,
+  usuarioId: number
+) {
+  return;
 }
 
 // Fase 2 do Conversion Leads: monta a config de Ad Set que faz a Meta
@@ -5069,7 +5090,7 @@ async function sincronizarTodasCampanhas() {
     const conexoesOutrasPlataformas = await client.query(`
       SELECT usuario_id, plataforma
       FROM plataforma_conexoes
-      WHERE plataforma IN ('google', 'tiktok', 'linkedin')
+      WHERE plataforma IN ('google', 'tiktok', 'linkedin', 'kwai')
         AND status = 'conectado'
       ORDER BY usuario_id, plataforma
     `);
@@ -5081,6 +5102,8 @@ async function sincronizarTodasCampanhas() {
         ? googleSyncEmAndamento
         : plataforma === "tiktok"
         ? tiktokSyncEmAndamento
+        : plataforma === "kwai"
+        ? kwaiSyncEmAndamento
         : linkedinSyncEmAndamento;
 
       if (trava.has(usuarioId)) {
@@ -5094,6 +5117,11 @@ async function sincronizarTodasCampanhas() {
           await sincronizarGoogleAdsUsuario(usuarioId);
         } else if (plataforma === "tiktok") {
           await sincronizarTikTokAdsUsuario(usuarioId);
+        } else if (plataforma === "kwai") {
+          // Nunca haverá conexão 'kwai' real aqui até o OAuth existir (ver
+          // OAUTH_PROVEDORES.kwai) — sincronizarKwaiAdsUsuario sempre lança
+          // um erro amigável hoje, o catch abaixo trata isso normalmente.
+          await sincronizarKwaiAdsUsuario(usuarioId);
         } else {
           await sincronizarLinkedInAdsUsuario(usuarioId);
         }
@@ -5745,6 +5773,11 @@ app.get("/auth/:plataforma/callback", async (c) => {
     }
 
     // TikTok usa JSON body e estrutura de resposta diferente do padrão OAuth2
+    // TODO(kwai): OAUTH_PROVEDORES.kwai ainda tem authUrl/tokenUrl vazios de
+    // proposito (sem fluxo self-service documentado), entao /auth/kwai/login
+    // ja retorna 503 antes de chegar aqui — nao da pra saber se o token
+    // endpoint da Kuaishou tambem vai precisar de um branch especial como o
+    // da TikTok acima ate termos a documentacao oficial de parceiro.
     let access_token: string;
     let refresh_token: string | null = null;
     let dadosConta: Record<string, any> = {};
@@ -8615,6 +8648,645 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
   } catch (err: any) {
     console.error("ERRO /tiktok/anuncio:", err);
     return c.json({ error: "Erro ao criar anúncio TikTok", detalhe: err?.message || err }, 500);
+  }
+});
+
+/* =========================
+   🎬 KWAI ADS
+   Kuaishou Marketing API (磁力引擎 / "Magnetic Engine"). FASE 1 — ESQUELETO
+   ESTRUTURAL, NÃO INTEGRAÇÃO REAL: a Kuaishou exige aprovação formal de
+   parceiro pra liberar client_id/secret e documentação de campos, que o
+   projeto ainda não tem (ver o comentário em OAUTH_PROVEDORES.kwai — por
+   isso authUrl/tokenUrl ficam vazios lá, e /auth/kwai/login já retorna 503
+   antes de qualquer coisa aqui embaixo rodar).
+   Diferente da seção TIKTOK ADS (que serviu de molde pra shape de todas as
+   rotas abaixo), NENHUMA chamada de rede real pra Kuaishou é feita nesta
+   seção — não temos como confirmar o schema de request/response de um
+   parceiro sem acesso à documentação oficial, e adivinhar formato de campo
+   arriscaria quebrar de forma silenciosa quando a integração de verdade for
+   plugada. Toda validação de banco (conexão existe? anunciante selecionado?
+   arquivo enviado?) é real; só o passo final ("chamar a API da Kuaishou")
+   devolve um erro amigável em português avisando que a integração está
+   pendente de aprovação. Rotas de criação (campanha/adgroup/anúncio) não
+   gravam linha em `campanhas` quando stubadas — ver comentário em
+   POST /kwai/campanha sobre por que essa escolha foi feita.
+   Quando a aprovação de parceiro sair: trocar cada bloco "🚧 STUB" abaixo
+   pela chamada real via kwaiFetch/fetch, no mesmo padrão desta função ou
+   rota TikTok equivalente citada no comentário.
+========================= */
+
+const kwaiSyncEmAndamento = new Set<number>();
+
+// Gateway real da Kuaishou Marketing API por documentação pública — os PATHS
+// específicos abaixo dele (advertiser/get, campaign/create etc.) ainda NÃO
+// estão confirmados contra docs oficiais de parceiro (ver cabeçalho da
+// seção). Por isso nenhuma rota abaixo faz fetch() de verdade usando esta
+// constante ainda — só existe pronta pra quando a aprovação sair.
+const KWAI_API = "https://ad.e.kuaishou.com/rest/openapi";
+
+function kwaiHeaders(token: string) {
+  return { "Access-Token": token, "Content-Type": "application/json" };
+}
+
+// Wrapper espelhando tiktokFetch — o envelope {code, message, data} aqui é um
+// CHUTE baseado no padrão comum de outras APIs de ads (a própria TikTok usa
+// esse formato), NÃO confirmado contra documentação oficial da Kuaishou.
+// Ainda não é chamado por nenhuma rota desta seção (ver nota em KWAI_API);
+// existe só como scaffold pronto pra quando o schema real for confirmado.
+async function kwaiFetch(
+  endpoint: string,
+  token: string,
+  opts: { method?: string; body?: any } = {}
+): Promise<{ ok: boolean; data: any; error: string | null }> {
+  try {
+    const res = await fetch(`${KWAI_API}${endpoint}`, {
+      method: opts.method || "GET",
+      headers: kwaiHeaders(token),
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    const data = await res.json() as any;
+    if (data.code !== 0) {
+      return { ok: false, data, error: data.message || "Erro na API do Kwai" };
+    }
+    return { ok: true, data, error: null };
+  } catch (err: any) {
+    return { ok: false, data: null, error: err?.message || "Erro de rede ao chamar a API do Kwai" };
+  }
+}
+
+// Busca token + conta de anúncios (advertiser_id) + identidade já
+// selecionadas pelo usuário — mesmo shape de obterConexaoTikTok.
+async function obterConexaoKwai(
+  usuarioId: number
+): Promise<{
+  token: string;
+  advertiserId: string | null;
+  identityId: string | null;
+  identityType: string | null;
+} | null> {
+  const conn = await client.query(
+    `SELECT access_token, dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'kwai' LIMIT 1`,
+    [usuarioId]
+  );
+  if (!conn.rows.length) return null;
+  const dadosConta = conn.rows[0].dados_conta ?? {};
+  return {
+    token: conn.rows[0].access_token,
+    advertiserId: dadosConta.advertiser_id ?? null,
+    identityId: dadosConta.identity_id ?? null,
+    identityType: dadosConta.identity_type ?? null
+  };
+}
+
+const KWAI_AVISO_INDISPONIVEL =
+  "Integração com a API do Kwai Ads ainda não está disponível — aguardando aprovação da API Kwai.";
+
+// Lista contas de anunciante vinculadas ao token (equivalente ao
+// /tiktok/anunciantes). 🚧 STUB: a checagem de conexão é real; a chamada de
+// listagem de verdade ainda não existe.
+app.get("/kwai/anunciantes", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conn = await client.query(
+      `SELECT access_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'kwai' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows.length) return c.json({ error: "Kwai nao conectado" }, 400);
+
+    return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 503);
+  } catch (err: any) {
+    console.error("ERRO /kwai/anunciantes:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Salva o anunciante selecionado pelo usuário — puro UPDATE em
+// plataforma_conexoes.dados_conta, sem chamada de rede nenhuma (igual ao
+// /tiktok/selecionar-anunciante), então é real e funcional desde já.
+app.post("/kwai/selecionar-anunciante", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const { advertiser_id } = await c.req.json();
+    if (!advertiser_id) return c.json({ error: "advertiser_id obrigatorio" }, 400);
+
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object('advertiser_id', $1::text),
+           atualizado_em = NOW()
+       WHERE usuario_id = $2 AND plataforma = 'kwai'`,
+      [String(advertiser_id), user.id]
+    );
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /kwai/selecionar-anunciante:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Sincroniza campanhas e leads do Kwai Ads (equivalente a
+// sincronizarTikTokAdsUsuario). Compartilhada entre o botão manual e o ciclo
+// automático (ver sincronizarTodasCampanhas). 🚧 STUB: a checagem de conexão
+// e de anunciante selecionado é real; a sincronização de verdade (buscar
+// campanha/lead na Kuaishou, upsert em `campanhas`/`leads`, disparar
+// avaliarEEnviarQualificacaoLead) ainda não existe — na prática esta função
+// nunca chega a rodar hoje, porque não existe fluxo de OAuth funcional pra
+// criar uma conexão 'kwai' de verdade (ver OAUTH_PROVEDORES.kwai).
+async function sincronizarKwaiAdsUsuario(usuarioId: number) {
+  const conn = await client.query(
+    `SELECT access_token, dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'kwai' LIMIT 1`,
+    [usuarioId]
+  );
+  if (!conn.rows.length) throw new Error("Kwai nao conectado");
+
+  const dadosConta = conn.rows[0].dados_conta ?? {};
+  const advertiserId = dadosConta.advertiser_id;
+
+  if (!advertiserId) {
+    throw new Error("Selecione a conta de anunciante Kwai antes de sincronizar");
+  }
+
+  // TODO(kwai): espelhar aqui o mesmo padrão de sincronizarTikTokAdsUsuario
+  // (busca campaign/get + lead/get paginado, upsert em campanhas/leads,
+  // chamada de avaliarEEnviarQualificacaoLead por lead novo) assim que a
+  // aprovação de parceiro sair e o schema de resposta for confirmado.
+  throw new Error(KWAI_AVISO_INDISPONIVEL);
+}
+
+app.post("/kwai/sincronizar-campanhas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+
+  if (kwaiSyncEmAndamento.has(user.id)) {
+    return c.json({ error: "Sincronizacao Kwai ja em andamento" }, 429);
+  }
+  kwaiSyncEmAndamento.add(user.id);
+
+  try {
+    return c.json(await sincronizarKwaiAdsUsuario(user.id));
+  } catch (err: any) {
+    console.error("ERRO KWAI SINCRONIZAR:", err);
+    return c.json({ error: err?.message || "Erro ao sincronizar Kwai" }, 500);
+  } finally {
+    kwaiSyncEmAndamento.delete(user.id);
+  }
+});
+
+// Pausa/ativa uma campanha Kwai (equivalente ao /tiktok/toggle-campanha).
+// 🚧 STUB: a busca/atualização local em `campanhas` é real; a chamada real
+// pra pausar/ativar na Kuaishou ainda não existe — por ora só refletimos o
+// status localmente, mesmo espírito de tolerância que o TikTok usa quando a
+// conexão não está disponível (ver /tiktok/restaurar-campanha). Na prática
+// nenhuma linha com plataforma = 'kwai' existe em `campanhas` hoje, porque
+// POST /kwai/campanha não grava nada (ver comentário lá) — esta rota fica
+// inerte, mas estruturalmente pronta.
+app.post("/kwai/toggle-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id, status } = await c.req.json();
+
+    if (!campaign_id || !["ACTIVE", "PAUSED"].includes(status)) {
+      return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
+    }
+
+    const campanhaBanco = await client.query(
+      `SELECT id
+       FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'kwai'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = $1, atualizado_em = NOW() WHERE id = $2`,
+      [status, campanhaBanco.rows[0].id]
+    );
+
+    return c.json({
+      sucesso: true,
+      aviso: `${KWAI_AVISO_INDISPONIVEL} O status foi alterado apenas na plataforma, não na Kuaishou.`
+    });
+  } catch (err: any) {
+    console.error("ERRO /kwai/toggle-campanha:", err);
+    return c.json({ error: "Erro ao alterar campanha" }, 500);
+  }
+});
+
+// Exclui (marca como DELETED) uma campanha Kwai — equivalente ao
+// /tiktok/excluir-campanha. 🚧 STUB: mesma lógica do toggle acima — exclusão
+// real na Kuaishou ainda não existe, marca como excluída só localmente.
+app.post("/kwai/excluir-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id } = await c.req.json();
+
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id obrigatorio" }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id
+       FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'kwai'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = 'DELETED', atualizado_em = NOW() WHERE id = $1`,
+      [campanha.rows[0].id]
+    );
+
+    return c.json({
+      sucesso: true,
+      aviso: `${KWAI_AVISO_INDISPONIVEL} A campanha foi excluída apenas na plataforma.`
+    });
+  } catch (err: any) {
+    console.error("ERRO /kwai/excluir-campanha:", err);
+    return c.json({ error: "Erro ao excluir campanha" }, 500);
+  }
+});
+
+// Restaura (volta pra PAUSED) uma campanha Kwai excluída no histórico local —
+// equivalente ao /tiktok/restaurar-campanha. 🚧 STUB: mesmo espírito de
+// tolerância que o TikTok usa quando a conexão não está disponível.
+app.post("/kwai/restaurar-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id } = await c.req.json();
+
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id obrigatorio" }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'kwai' AND UPPER(status) = 'DELETED'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({ error: "Campanha excluída não encontrada para este usuário" }, 404);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = 'PAUSED', atualizado_em = NOW() WHERE id = $1`,
+      [campanha.rows[0].id]
+    );
+
+    return c.json({
+      sucesso: true,
+      aviso: `${KWAI_AVISO_INDISPONIVEL} A campanha foi restaurada apenas no histórico local.`
+    });
+  } catch (err: any) {
+    console.error("ERRO /kwai/restaurar-campanha:", err);
+    return c.json({ error: "Erro ao restaurar campanha" }, 500);
+  }
+});
+
+// Upload de imagem de criativo para o Kwai Ads (equivalente ao
+// /tiktok/upload-imagem). 🚧 STUB: validação de arquivo/conexão/anunciante é
+// real; o upload de verdade pra Kuaishou ainda não existe.
+app.post("/kwai/upload-imagem", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+
+    const imagem = body.get("imagem") as File;
+    const usuario_id = body.get("usuario_id");
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+    if (!imagem) {
+      return c.json({ error: "Imagem não enviada" }, 400);
+    }
+
+    const conexao = await obterConexaoKwai(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Kwai não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Conta de anúncios Kwai não selecionada" }, 400);
+    }
+
+    return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 503);
+  } catch (err: any) {
+    console.error("ERRO /kwai/upload-imagem:", err?.message || err);
+    return c.json({ error: err?.message || "Erro upload imagem Kwai" }, 500);
+  }
+});
+
+// Upload de vídeo de criativo para o Kwai Ads (equivalente ao
+// /tiktok/upload-video). 🚧 STUB: mesmo padrão do upload de imagem acima.
+app.post("/kwai/upload-video", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+
+    const video = body.get("video") as File;
+    const usuario_id = body.get("usuario_id");
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+    if (!video) {
+      return c.json({ error: "Vídeo não enviado" }, 400);
+    }
+
+    const conexao = await obterConexaoKwai(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Kwai não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Conta de anúncios Kwai não selecionada" }, 400);
+    }
+
+    return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 503);
+  } catch (err: any) {
+    console.error("ERRO /kwai/upload-video:", err?.message || err);
+    return c.json({ error: err?.message || "Erro upload vídeo Kwai" }, 500);
+  }
+});
+
+// Lista identidades disponíveis do anunciante conectado (equivalente ao
+// /tiktok/identidades). 🚧 STUB.
+app.get("/kwai/identidades", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await obterConexaoKwai(user.id);
+    if (!conexao) return c.json({ error: "Kwai nao conectado" }, 400);
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anunciante Kwai antes de buscar identidades" }, 400);
+    }
+
+    return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 503);
+  } catch (err: any) {
+    console.error("ERRO /kwai/identidades:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Salva a identidade escolhida pelo usuário para publicar os anúncios —
+// puro UPDATE, sem chamada de rede (igual ao /tiktok/selecionar-identidade),
+// então é real e funcional desde já.
+app.post("/kwai/selecionar-identidade", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const { identity_id, identity_type } = await c.req.json();
+    if (!identity_id || !identity_type) {
+      return c.json({ error: "identity_id e identity_type obrigatorios" }, 400);
+    }
+
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb)
+         || jsonb_build_object('identity_id', $1::text, 'identity_type', $2::text),
+           atualizado_em = NOW()
+       WHERE usuario_id = $3 AND plataforma = 'kwai'`,
+      [String(identity_id), String(identity_type), user.id]
+    );
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /kwai/selecionar-identidade:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Busca de interesses para segmentação (equivalente ao
+// /tiktok/direcionamento/interesses). 🚧 STUB: devolve data vazio pro
+// frontend de autocomplete não quebrar, com o motivo no campo error.
+app.post("/kwai/direcionamento/interesses", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, busca } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const termo = textoOpcional(busca).slice(0, 80);
+    if (termo.length < 2) {
+      return c.json({ data: [] });
+    }
+
+    const conexao = await obterConexaoKwai(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Conecte a Kwai antes de buscar interesses", data: [] }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios Kwai antes de buscar interesses", data: [] }, 400);
+    }
+
+    return c.json({ error: KWAI_AVISO_INDISPONIVEL, data: [] }, 400);
+  } catch (err) {
+    console.error("ERRO BUSCA INTERESSES KWAI:", err);
+    return c.json({ error: "Erro ao buscar interesses Kwai", data: [] }, 500);
+  }
+});
+
+// Busca de localizações para segmentação (equivalente ao
+// /tiktok/direcionamento/localizacao). 🚧 STUB: mesmo padrão da busca de
+// interesses acima.
+app.post("/kwai/direcionamento/localizacao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, busca } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const termo = textoOpcional(busca).slice(0, 80);
+    if (termo.length < 2) {
+      return c.json({ data: [] });
+    }
+
+    const conexao = await obterConexaoKwai(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Conecte a Kwai antes de buscar localizações", data: [] }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios Kwai antes de buscar localizações", data: [] }, 400);
+    }
+
+    return c.json({ error: KWAI_AVISO_INDISPONIVEL, data: [] }, 400);
+  } catch (err) {
+    console.error("ERRO BUSCA LOCALIZACAO KWAI:", err);
+    return c.json({ error: "Erro ao buscar localização Kwai", data: [] }, 500);
+  }
+});
+
+// Cria a Campanha no Kwai Ads (equivalente ao /tiktok/campanha). 🚧 STUB
+// DELIBERADO: diferente das rotas acima, esta e as três seguintes
+// (adgroup/formularios/anúncio) formam o pipeline de PUBLICAÇÃO de campanha —
+// e aqui a decisão de produto é NÃO gravar linha nenhuma em `campanhas`
+// enquanto a integração real não existir. Se gravássemos (como o TikTok faz,
+// com status='PAUSED' logo após o create), o usuário veria uma campanha
+// "fantasma" em Minhas Campanhas que nunca vai poder ser publicada de
+// verdade, sem nenhum aviso — pior experiência do que simplesmente barrar a
+// criação com uma mensagem clara. Quando a aprovação de parceiro sair,
+// espelhar aqui o fluxo completo do /tiktok/campanha (POST campaign/create
+// via kwaiFetch + INSERT INTO campanhas com plataforma='kwai').
+app.post("/kwai/campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id } = await c.req.json().catch(() => ({}));
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    const conexao = await obterConexaoKwai(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Kwai não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios Kwai antes de criar a campanha" }, 400);
+    }
+
+    return c.json({ error: `${KWAI_AVISO_INDISPONIVEL} Nenhuma campanha foi criada.` }, 503);
+  } catch (err: any) {
+    console.error("ERRO /kwai/campanha:", err);
+    return c.json({ error: "Erro ao criar campanha Kwai" }, 500);
+  }
+});
+
+// Cria o Grupo de Anúncios no Kwai Ads (equivalente ao /tiktok/adgroup).
+// 🚧 STUB — mesma decisão de não gravar nada explicada em POST /kwai/campanha
+// (e, na prática, nunca haverá campaign_id real de Kwai pra passar aqui,
+// já que a rota acima não cria nenhum).
+app.post("/kwai/adgroup", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, campaign_id } = await c.req.json().catch(() => ({}));
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+    if (!campaign_id) {
+      return c.json({ error: "campaign_id não enviado" }, 400);
+    }
+
+    const conexao = await obterConexaoKwai(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Kwai não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios Kwai antes de criar o grupo de anúncios" }, 400);
+    }
+
+    return c.json({ error: `${KWAI_AVISO_INDISPONIVEL} Nenhum grupo de anúncios foi criado.` }, 503);
+  } catch (err: any) {
+    console.error("ERRO /kwai/adgroup:", err);
+    return c.json({ error: "Erro ao criar grupo de anúncios Kwai" }, 500);
+  }
+});
+
+// Lista os formulários instantâneos (Lead Gen Form) já existentes do
+// anunciante conectado (equivalente ao /tiktok/formularios). 🚧 STUB: mesmo
+// tratamento tolerante que o TikTok já usa quando a listagem falha — devolve
+// lista vazia com aviso (200), nunca erro, pro frontend oferecer o campo de
+// ID manual como alternativa.
+app.get("/kwai/formularios", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await obterConexaoKwai(user.id);
+    if (!conexao) return c.json({ error: "Kwai nao conectado" }, 400);
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anunciante Kwai antes de listar formularios" }, 400);
+    }
+
+    return c.json({
+      formularios: [],
+      aviso: "Não foi possível listar formulários do Kwai — integração aguardando aprovação da API. Informe o ID manualmente."
+    });
+  } catch (err: any) {
+    console.error("ERRO /kwai/formularios:", err);
+    return c.json({
+      formularios: [],
+      aviso: "Não foi possível listar formulários do Kwai — integração aguardando aprovação da API. Informe o ID manualmente."
+    });
+  }
+});
+
+// Cria o Anúncio (criativo + ad) no Kwai Ads (equivalente ao
+// /tiktok/anuncio) — é aqui que, numa integração real, a linha de campanhas
+// receberia adset_id/ad_id/form_id (mesmo padrão do TikTok/Meta). 🚧 STUB:
+// mesma decisão de não gravar nada explicada em POST /kwai/campanha — mas as
+// validações de campo obrigatório (form_id/adgroup_id/criativo) são reais,
+// pro frontend já poder validar o wizard contra este contrato hoje.
+app.post("/kwai/anuncio", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id,
+      adgroup_id,
+      form_id,
+      identity_id,
+      identity_type,
+      image_ids,
+      image_id,
+      video_id
+    } = await c.req.json().catch(() => ({}));
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) {
+      return negarAcessoConta(c);
+    }
+
+    if (!form_id) {
+      return c.json({ error: "form_id (Instant Form) não enviado" }, 400);
+    }
+    if (!adgroup_id) {
+      return c.json({ error: "adgroup_id não enviado" }, 400);
+    }
+
+    const conexao = await obterConexaoKwai(usuarioId);
+    if (!conexao) {
+      return c.json({ error: "Kwai não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios Kwai antes de publicar o anúncio" }, 400);
+    }
+
+    const identidadeId = textoOpcional(identity_id) || conexao.identityId;
+    const identidadeTipo = textoOpcional(identity_type) || conexao.identityType;
+    if (!identidadeId || !identidadeTipo) {
+      return c.json({ error: "Selecione a identidade Kwai antes de publicar o anúncio" }, 400);
+    }
+
+    const imagens: string[] =
+      Array.isArray(image_ids) && image_ids.length
+        ? image_ids
+        : image_id
+        ? [image_id]
+        : [];
+
+    if (!imagens.length && !video_id) {
+      return c.json({ error: "Envie ao menos uma imagem ou vídeo para o anúncio Kwai" }, 400);
+    }
+
+    return c.json({ error: `${KWAI_AVISO_INDISPONIVEL} Nenhum anúncio foi criado.` }, 503);
+  } catch (err: any) {
+    console.error("ERRO /kwai/anuncio:", err);
+    return c.json({ error: "Erro ao criar anúncio Kwai", detalhe: err?.message || err }, 500);
   }
 });
 
@@ -13370,6 +14042,56 @@ app.post("/webhook/tiktok", async (c) => {
   }
 });
 
+/* =========================
+   🎬 WEBHOOK KWAI — leads em tempo real
+   🚧 STUB: diferente do webhook do TikTok acima, o payload/challenge reais de
+   verificação da Kuaishou Marketing API ainda NÃO estão confirmados —
+   aprovação de parceiro pendente (ver cabeçalho da seção KWAI ADS e o
+   comentário em OAUTH_PROVEDORES.kwai). Só a validação do segredo (mesmo
+   padrão do /webhook/tiktok, header Authorization: Bearer) é real; o corpo
+   do evento é só logado cru, sem tentar interpretar um schema adivinhado.
+========================= */
+
+// Placeholder de verificação de endpoint — ajustar quando a Kuaishou publicar
+// o mecanismo real de challenge/verificação de webhook.
+app.get("/webhook/kwai", async (c) => {
+  const challenge = c.req.query("challenge");
+  if (challenge) return c.text(challenge);
+  return c.text("Kwai webhook ativo");
+});
+
+app.post("/webhook/kwai", async (c) => {
+  // Validação do segredo, se configurado (mesmo padrão do /webhook/tiktok) —
+  // opcional e sem efeito nenhum enquanto KWAI_WEBHOOK_SECRET não for setado.
+  const kwaiSecret = Bun.env.KWAI_WEBHOOK_SECRET;
+  if (kwaiSecret) {
+    const auth = c.req.header("authorization") || "";
+    const provided = auth.replace(/^Bearer\s+/i, "").trim();
+    if (
+      !provided ||
+      provided.length !== kwaiSecret.length ||
+      !timingSafeEqual(Buffer.from(provided), Buffer.from(kwaiSecret))
+    ) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    console.log("WEBHOOK KWAI RECEBIDO (schema ainda nao confirmado, log cru):", JSON.stringify(body));
+
+    // TODO(kwai): quando a Kuaishou aprovar o parceiro e publicar o schema de
+    // eventos de lead, espelhar aqui o mesmo fluxo do /webhook/tiktok acima:
+    // identificar o usuário pelo advertiser_id, buscar o lead completo via
+    // kwaiFetch, extrair nome/email/telefone e inserir em `leads` com
+    // plataforma = 'kwai' (mesmo formato de INSERT usado na sincronização).
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK KWAI:", err);
+    return c.json({ error: "Erro webhook Kwai" }, 500);
+  }
+});
+
 type StatusLeadKanban =
   | "novo"
   | "primeiro_contato"
@@ -15347,6 +16069,19 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS linkedin_evento_fechado_enviado_em TIMESTAMP;
 `);
 
+// Mesmo rastreio de envio, agora para o Kwai Ads (ver
+// avaliarEEnviarQualificacaoLead / avaliarEEnviarQualificacaoKwai). Colunas
+// criadas desde já mesmo sem nenhum mecanismo de envio real ainda (ver
+// cabeçalho da seção KWAI ADS) — evita repetir o mesmo bug de esquecer de
+// adicionar a coluna depois quando a integração de conversão for
+// implementada de fato (ver nota em GET /leads e no endpoint de estatísticas
+// de conversão sobre esse exato problema já ter acontecido antes).
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS kwai_evento_qualificado_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS kwai_evento_fechado_enviado_em TIMESTAMP;
+`);
+
 // Preenchido só em leads criados automaticamente a partir de uma conversa de
 // WhatsApp originada de anúncio Click-to-WhatsApp (ver criarLeadDeConversaCTWA)
 // — não tem leadgen_id (lead_id fica NULL), então esse é o identificador usado
@@ -15987,6 +16722,14 @@ app.get("/campanhas", authMiddleware, async (c) => {
       [user.id]
     ).then(r => r.rows[0]?.id || null);
 
+    // Kwai segue o mesmo padrão — nunca vai bater com nada na prática hoje
+    // (nenhuma conexão 'kwai' real existe sem OAuth funcionando, ver
+    // OAUTH_PROVEDORES.kwai), mas fica pronto pra quando existir.
+    const contaAnunciosIdKwai = await client.query(
+      `SELECT dados_conta->>'advertiser_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'kwai' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
     const nichoSlug =
       textoOpcional(c.req.query("nicho"));
 
@@ -16065,11 +16808,12 @@ app.get("/campanhas", authMiddleware, async (c) => {
           OR (c.plataforma = 'google' AND c.conta_anuncios_id = $4)
           OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $5)
           OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $6)
+          OR (c.plataforma = 'kwai' AND c.conta_anuncios_id = $7)
         )
         AND ($3::text IS NULL OR COALESCE(n.slug, nd.slug) = $3)
       ORDER BY c.id DESC
       `,
-      [user.id, contaAnunciosId ?? null, nichoSlug ?? null, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn]
+      [user.id, contaAnunciosId ?? null, nichoSlug ?? null, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn, contaAnunciosIdKwai]
     );
 
     console.log("CAMPANHAS:", campanhas.rows);
@@ -16778,6 +17522,28 @@ async function carregarMetricasLinkedInCampanhas(
   }
 }
 
+// Stub Kwai de carregarMetricasGoogleCampanhas/TikTokCampanhas/LinkedInCampanhas
+// — sempre indisponível hoje, sem nenhuma chamada real pra Kuaishou Marketing
+// API (aprovação de parceiro pendente, ver cabeçalho da seção KWAI ADS). Já
+// fica plugada no Promise.all() abaixo pra ativar sem mudança estrutural
+// quando a aprovação sair e o schema real de relatório for confirmado.
+async function carregarMetricasKwaiCampanhas(
+  usuarioId: number,
+  inicio: string,
+  fim: string,
+  hoje: string
+): Promise<{
+  disponivel: boolean;
+  erro: string | null;
+  metricas: Map<string, MetricasCampanhaExterna>;
+}> {
+  return {
+    disponivel: false,
+    erro: "Métricas indisponíveis — integração Kwai aguardando aprovação da API",
+    metricas: new Map()
+  };
+}
+
 // 📊 métricas reais das campanhas
 app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
@@ -16818,6 +17584,14 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
     const contaAnunciosIdLinkedIn = await client.query(
       `SELECT dados_conta->>'ad_account_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
+    // Kwai segue o mesmo padrão — nunca vai bater com nada na prática hoje
+    // (nenhuma conexão 'kwai' real existe sem OAuth funcionando, ver
+    // OAUTH_PROVEDORES.kwai), mas fica pronto pra quando existir.
+    const contaAnunciosIdKwai = await client.query(
+      `SELECT dados_conta->>'advertiser_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'kwai' LIMIT 1`,
       [user.id]
     ).then(r => r.rows[0]?.id || null);
 
@@ -16896,14 +17670,15 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           OR (c.plataforma = 'google' AND c.conta_anuncios_id = $3)
           OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $4)
           OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $5)
+          OR (c.plataforma = 'kwai' AND c.conta_anuncios_id = $6)
         )
       ORDER BY c.id DESC
       `,
-      [user.id, contaAnunciosId, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn]
+      [user.id, contaAnunciosId, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn, contaAnunciosIdKwai]
     );
 
     const periodoMetricas = intervaloMetricasCampanhas(30);
-    const [metricasGoogle, metricasTikTok, metricasLinkedIn] = await Promise.all([
+    const [metricasGoogle, metricasTikTok, metricasLinkedIn, metricasKwai] = await Promise.all([
       carregarMetricasGoogleCampanhas(
         user.id,
         periodoMetricas.inicio,
@@ -16917,6 +17692,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         periodoMetricas.hoje
       ),
       carregarMetricasLinkedInCampanhas(
+        user.id,
+        periodoMetricas.inicio,
+        periodoMetricas.fim,
+        periodoMetricas.hoje
+      ),
+      carregarMetricasKwaiCampanhas(
         user.id,
         periodoMetricas.inicio,
         periodoMetricas.fim,
@@ -17202,6 +17983,25 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           metaDisponivel = true;
         } else {
           erroMeta = metricasLinkedIn.erro;
+        }
+      } else if (campanha.campaign_id && plataformaCampanha === "kwai") {
+        if (metricasKwai.disponivel) {
+          const metrica =
+            metricasKwai.metricas.get(String(campanha.campaign_id)) ||
+            metricasCampanhaVazias();
+          dados = {
+            impressions: metrica.impressoes,
+            clicks: metrica.cliques,
+            reach: metrica.alcance,
+            spend: metrica.gasto,
+            cpc: metrica.cpc,
+            ctr: metrica.ctr,
+          };
+          grafico = metrica.grafico;
+          gastoHojeCampanha = metrica.gasto_hoje;
+          metaDisponivel = true;
+        } else {
+          erroMeta = metricasKwai.erro;
         }
       }
 
@@ -20344,7 +21144,19 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
         COUNT(*) FILTER (
           WHERE tiktok_evento_fechado_enviado_em IS NOT NULL
           AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'tiktok'
-        )::int AS fechados_enviados_tiktok
+        )::int AS fechados_enviados_tiktok,
+
+        COUNT(*) FILTER (
+          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'kwai'
+        )::int AS total_leads_kwai,
+        COUNT(*) FILTER (
+          WHERE kwai_evento_qualificado_enviado_em IS NOT NULL
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'kwai'
+        )::int AS qualificados_enviados_kwai,
+        COUNT(*) FILTER (
+          WHERE kwai_evento_fechado_enviado_em IS NOT NULL
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'kwai'
+        )::int AS fechados_enviados_kwai
       FROM leads
       WHERE usuario_id = $1
       `,
@@ -20354,7 +21166,8 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
     const {
       total_leads_meta, qualificados_enviados, fechados_enviados,
       total_leads_google, qualificados_enviados_google, fechados_enviados_google,
-      total_leads_tiktok, qualificados_enviados_tiktok, fechados_enviados_tiktok
+      total_leads_tiktok, qualificados_enviados_tiktok, fechados_enviados_tiktok,
+      total_leads_kwai, qualificados_enviados_kwai, fechados_enviados_kwai
     } = resumo.rows[0];
 
     const taxa = (num: number, den: number) => den > 0 ? (num / den) * 100 : null;
@@ -20369,7 +21182,9 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
         google_evento_qualificado_enviado_em,
         google_evento_fechado_enviado_em,
         tiktok_evento_qualificado_enviado_em,
-        tiktok_evento_fechado_enviado_em
+        tiktok_evento_fechado_enviado_em,
+        kwai_evento_qualificado_enviado_em,
+        kwai_evento_fechado_enviado_em
       FROM leads
       WHERE usuario_id = $1
       AND (
@@ -20379,12 +21194,15 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
         OR google_evento_fechado_enviado_em IS NOT NULL
         OR tiktok_evento_qualificado_enviado_em IS NOT NULL
         OR tiktok_evento_fechado_enviado_em IS NOT NULL
+        OR kwai_evento_qualificado_enviado_em IS NOT NULL
+        OR kwai_evento_fechado_enviado_em IS NOT NULL
       )
       ORDER BY
         COALESCE(
           meta_evento_fechado_enviado_em, meta_evento_qualificado_enviado_em,
           google_evento_fechado_enviado_em, google_evento_qualificado_enviado_em,
-          tiktok_evento_fechado_enviado_em, tiktok_evento_qualificado_enviado_em
+          tiktok_evento_fechado_enviado_em, tiktok_evento_qualificado_enviado_em,
+          kwai_evento_fechado_enviado_em, kwai_evento_qualificado_enviado_em
         ) DESC
       LIMIT 10
       `,
@@ -20410,11 +21228,18 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       taxa_qualificacao_tiktok: taxa(qualificados_enviados_tiktok, total_leads_tiktok),
       taxa_fechamento_tiktok: taxa(fechados_enviados_tiktok, total_leads_tiktok),
 
+      total_leads_kwai,
+      qualificados_enviados_kwai,
+      fechados_enviados_kwai,
+      taxa_qualificacao_kwai: taxa(qualificados_enviados_kwai, total_leads_kwai),
+      taxa_fechamento_kwai: taxa(fechados_enviados_kwai, total_leads_kwai),
+
       ultimos_eventos: ultimosEventos.rows.map(row => {
         const fechadoEm =
           row.meta_evento_fechado_enviado_em ||
           row.google_evento_fechado_enviado_em ||
-          row.tiktok_evento_fechado_enviado_em;
+          row.tiktok_evento_fechado_enviado_em ||
+          row.kwai_evento_fechado_enviado_em;
         return {
           nome: row.nome,
           plataforma: row.plataforma,
@@ -20423,7 +21248,8 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
             fechadoEm ||
             row.meta_evento_qualificado_enviado_em ||
             row.google_evento_qualificado_enviado_em ||
-            row.tiktok_evento_qualificado_enviado_em
+            row.tiktok_evento_qualificado_enviado_em ||
+            row.kwai_evento_qualificado_enviado_em
         };
       })
     });
@@ -20476,6 +21302,8 @@ app.get("/leads", authMiddleware, async (c) => {
         l.google_evento_fechado_enviado_em,
         l.tiktok_evento_qualificado_enviado_em,
         l.tiktok_evento_fechado_enviado_em,
+        l.kwai_evento_qualificado_enviado_em,
+        l.kwai_evento_fechado_enviado_em,
         COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma,
         wt.transcricao AS whatsapp_transcricao
       FROM leads l
