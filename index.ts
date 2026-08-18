@@ -21204,7 +21204,7 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
           tiktok_evento_fechado_enviado_em, tiktok_evento_qualificado_enviado_em,
           kwai_evento_fechado_enviado_em, kwai_evento_qualificado_enviado_em
         ) DESC
-      LIMIT 10
+      LIMIT 30
       `,
       [user.id]
     );
