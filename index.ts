@@ -19035,49 +19035,56 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
 
-    // Mesma regra de fallback de plataforma usada em GET /leads
-    // (COALESCE(plataforma, origem, 'formulario')), pra "Leads da Meta" bater
-    // com o resto do app em vez de usar um critério próprio. Google e TikTok
-    // seguem o mesmo padrão de 3 números (total/qualificados/fechados) que a
-    // Meta já tinha, só trocando as colunas de rastreio.
+    // Parecido com o fallback de plataforma usado em GET /leads (mesma ideia
+    // de COALESCE entre plataforma/origem/'formulario'), mas com um ajuste: leads
+    // vindos de conversa CTWA (criarLeadDeConversaCTWA) gravam
+    // plataforma='whatsapp' (o canal — pra mostrar o ícone certo em outras
+    // telas) mesmo vindo de um anúncio Meta (origem='meta'). Sem o
+    // NULLIF abaixo, esses leads não batiam em nenhum dos 3 baldes (nem meta,
+    // nem google, nem tiktok) e sumiam da contagem de qualificados/fechados
+    // enviados mesmo já tendo sido enviados de verdade — foi visto acontecer
+    // com um lead real que tinha o badge "Qualificação enviada à Meta" na
+    // Central de Leads mas não aparecia aqui. Google e TikTok seguem o mesmo
+    // padrão de 3 números (total/qualificados/fechados) que a Meta já tinha,
+    // só trocando as colunas de rastreio.
     const resumo = await client.query(
       `
       SELECT
         COUNT(*) FILTER (
           WHERE lead_id IS NOT NULL
-          AND COALESCE(plataforma, origem, 'formulario') = 'meta'
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
         )::int AS total_leads_meta,
         COUNT(*) FILTER (
           WHERE meta_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(plataforma, origem, 'formulario') = 'meta'
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
         )::int AS qualificados_enviados,
         COUNT(*) FILTER (
           WHERE meta_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(plataforma, origem, 'formulario') = 'meta'
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
         )::int AS fechados_enviados,
 
         COUNT(*) FILTER (
-          WHERE COALESCE(plataforma, origem, 'formulario') = 'google'
+          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'google'
         )::int AS total_leads_google,
         COUNT(*) FILTER (
           WHERE google_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(plataforma, origem, 'formulario') = 'google'
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'google'
         )::int AS qualificados_enviados_google,
         COUNT(*) FILTER (
           WHERE google_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(plataforma, origem, 'formulario') = 'google'
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'google'
         )::int AS fechados_enviados_google,
 
         COUNT(*) FILTER (
-          WHERE COALESCE(plataforma, origem, 'formulario') = 'tiktok'
+          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'tiktok'
         )::int AS total_leads_tiktok,
         COUNT(*) FILTER (
           WHERE tiktok_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(plataforma, origem, 'formulario') = 'tiktok'
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'tiktok'
         )::int AS qualificados_enviados_tiktok,
         COUNT(*) FILTER (
           WHERE tiktok_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(plataforma, origem, 'formulario') = 'tiktok'
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'tiktok'
         )::int AS fechados_enviados_tiktok
       FROM leads
       WHERE usuario_id = $1
@@ -19097,7 +19104,7 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       `
       SELECT
         nome,
-        COALESCE(plataforma, origem, 'formulario') AS plataforma,
+        COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') AS plataforma,
         meta_evento_qualificado_enviado_em,
         meta_evento_fechado_enviado_em,
         google_evento_qualificado_enviado_em,
