@@ -1157,17 +1157,30 @@ async function avaliarEEnviarQualificacaoLead(
   leadRow: any,
   usuarioId: number
 ) {
-  const plataforma = leadRow?.plataforma || leadRow?.origem;
+  // "plataforma" na tabela leads é sobrecarregado: pra leads nativos vale o
+  // nome da rede de anúncio (google/tiktok/linkedin), mas pra leads criados
+  // a partir de uma conversa de WhatsApp (CTWA da Meta ou o equivalente via
+  // link wa.me do LinkedIn, ver criarLeadDeConversaLinkedIn) ele vale
+  // sempre 'whatsapp' — quem diz a rede de origem nesse caso é "origem".
+  // Por isso os dois campos são checados, não só "plataforma": sem isso,
+  // um lead LinkedIn vindo do WhatsApp (plataforma='whatsapp', origem=
+  // 'linkedin') cairia no fallback da Meta e nunca mandaria conversão pro
+  // LinkedIn.
+  const plataformaLead = leadRow?.plataforma;
+  const rede =
+    (!plataformaLead || plataformaLead === "whatsapp")
+      ? (leadRow?.origem || plataformaLead)
+      : plataformaLead;
 
-  if (plataforma === "google") {
+  if (rede === "google") {
     return avaliarEEnviarQualificacaoGoogle(leadRow, usuarioId);
   }
 
-  if (plataforma === "tiktok") {
+  if (rede === "tiktok") {
     return avaliarEEnviarQualificacaoTikTok(leadRow, usuarioId);
   }
 
-  if (plataforma === "linkedin") {
+  if (rede === "linkedin") {
     return avaliarEEnviarQualificacaoLinkedIn(leadRow, usuarioId);
   }
 
@@ -1317,7 +1330,11 @@ async function avaliarEEnviarQualificacaoLinkedIn(
 ) {
   try {
 
-    if (!leadRow?.lead_id) {
+    // enviarEventoLinkedInConversionLeads casa o evento por e-mail hasheado
+    // (não existe um click id disponível nem pra lead nativo de Lead Gen
+    // Form nem pro lead criado via conversa de WhatsApp — ver
+    // criarLeadDeConversaLinkedIn) — sem e-mail não há como enviar.
+    if (!leadRow?.email) {
       return;
     }
 
@@ -8645,12 +8662,12 @@ function linkedinHeaders(token: string) {
 async function linkedinFetch(
   endpoint: string,
   token: string,
-  opts: { method?: string; body?: any } = {}
+  opts: { method?: string; body?: any; headers?: Record<string, string> } = {}
 ): Promise<{ ok: boolean; status: number; data: any; error: string | null; id: string | null }> {
   try {
     const res = await fetch(`${LINKEDIN_API}${endpoint}`, {
       method: opts.method || "GET",
-      headers: linkedinHeaders(token),
+      headers: { ...linkedinHeaders(token), ...(opts.headers || {}) },
       body: opts.body ? JSON.stringify(opts.body) : undefined
     });
     const texto = await res.text();
@@ -8830,7 +8847,7 @@ app.post("/linkedin/campanha", authMiddleware, async (c) => {
 app.post("/linkedin/adgroup", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const { usuario_id, campaign_id, daily_budget, configuracoes_avancadas } = await c.req.json();
+    const { usuario_id, campaign_id, daily_budget, configuracoes_avancadas, destino } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
@@ -8845,6 +8862,19 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
       return c.json({ error: "Orçamento diário é obrigatório para a campanha LinkedIn" }, 400);
     }
 
+    const destinoResolvido = resolverDestinoCampanha(destino);
+
+    // Mesma checagem que a Meta já faz antes de criar um Ad Set com destino
+    // WhatsApp (ver montarDestinoAdsetMeta/rota de adset) — sem número
+    // conectado não há pra onde o clique no anúncio levar.
+    let whatsappPhoneNumber: string | null = null;
+    if (destinoResolvido === "whatsapp") {
+      whatsappPhoneNumber = await obterNumeroWhatsappConectadoUsuario(usuarioId);
+      if (!whatsappPhoneNumber) {
+        return c.json({ error: "Conecte o WhatsApp da plataforma (aba Whatsapp Bot) antes de publicar uma campanha LinkedIn com destino WhatsApp." }, 400);
+      }
+    }
+
     const avancadas = configuracoes_avancadas || {};
 
     // ASSUMPTION MAIS ARRISCADA DESTA SEÇÃO: exige lance manual (unitCost) —
@@ -8854,12 +8884,16 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
     // diário, limitado entre R$5 e R$50) até isso ser validado.
     const lanceCpc = Math.min(50, Math.max(5, orcamento * 0.1));
 
+    // LinkedIn não tem um objetivo "abrir conversa no WhatsApp" nativo (ao
+    // contrário da Meta) — destino=whatsapp usa WEBSITE_VISITS, otimizado
+    // pra clique, com o anúncio linkando pra um link wa.me (ver
+    // /linkedin/anuncio). destino=lead_ads usa LEAD_GENERATION normalmente.
     const payloadCampaign: any = {
       account: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
       campaignGroup: `urn:li:sponsoredCampaignGroup:${campaign_id}`,
       name: `Campaign Leads ${Date.now()}`,
       type: "SPONSORED_UPDATES",
-      objectiveType: "LEAD_GENERATION",
+      objectiveType: destinoResolvido === "whatsapp" ? "WEBSITE_VISITS" : "LEAD_GENERATION",
       costType: "CPC",
       unitCost: { amount: lanceCpc.toFixed(2), currencyCode: "BRL" },
       dailyBudget: { amount: orcamento.toFixed(2), currencyCode: "BRL" },
@@ -9024,19 +9058,35 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
 // serve de conteúdo pro anúncio) e a Creative que vincula esse post ao Lead
 // Gen Form escolhido. Equivalente ao /meta/anuncio e /tiktok/anuncio — é
 // aqui que a linha de campanhas recebe ad_id/form_id.
+// Gera o texto pré-preenchido do link wa.me com uma tag curta de atribuição
+// ([LI-<campaign_id>]) no final — é essa tag que criarLeadDeConversaLinkedIn
+// procura na primeira mensagem recebida pra saber de qual campanha veio,
+// já que o LinkedIn não manda nenhum equivalente ao referral/ctwa_clid da
+// Meta. Trade-off aceito: se o cliente apagar a tag antes de enviar, o lead
+// ainda é criado quando o bot responde, mas sem atribuição de campanha.
+function montarLinkWhatsappLinkedIn(numero: string, campaignGroupId: string, textoAnuncio?: string): string {
+  const mensagem = `${textoOpcional(textoAnuncio) || "Olá! Vi o anúncio no LinkedIn e quero saber mais."} [LI-${campaignGroupId}]`;
+  return `https://wa.me/${numero}?text=${encodeURIComponent(mensagem)}`;
+}
+
 app.post("/linkedin/anuncio", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const {
       usuario_id, campaign_id, adgroup_id, form_id,
-      texto, cta, configuracoes_avancadas, image_urn, daily_budget
+      texto, cta, titulo, configuracoes_avancadas, image_urn, daily_budget, destino
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
 
-    if (!form_id) return c.json({ error: "form_id (Lead Gen Form) não enviado" }, 400);
+    const destinoResolvido = resolverDestinoCampanha(destino);
+
+    if (destinoResolvido !== "whatsapp" && !form_id) {
+      return c.json({ error: "form_id (Lead Gen Form) não enviado" }, 400);
+    }
     if (!adgroup_id) return c.json({ error: "adgroup_id (Campaign) não enviado" }, 400);
+    if (!campaign_id) return c.json({ error: "campaign_id (Campaign Group) não enviado" }, 400);
 
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
@@ -9046,10 +9096,22 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
 
     const avancadas = configuracoes_avancadas || {};
 
+    let waLink: string | null = null;
+    if (destinoResolvido === "whatsapp") {
+      const numero = await obterNumeroWhatsappConectadoUsuario(usuarioId);
+      if (!numero) {
+        return c.json({ error: "Conecte o WhatsApp da plataforma antes de publicar uma campanha LinkedIn com destino WhatsApp." }, 400);
+      }
+      waLink = montarLinkWhatsappLinkedIn(numero, String(campaign_id), texto);
+    }
+
     // ASSUMPTION: Posts API com feedDistribution NONE é o mecanismo atual do
     // LinkedIn pra Direct Sponsored Content (a antiga API dedicada
     // adDirectSponsoredContents foi descontinuada) — conferir contra a
-    // documentação vigente na primeira publicação real.
+    // documentação vigente na primeira publicação real. Pro destino
+    // whatsapp, o post é um "article share" (link com preview) apontando
+    // pro link wa.me, em vez de mídia própria — content aceita só UM dos
+    // dois (media OU article), não os dois juntos.
     const payloadPost: any = {
       author: conexao.orgUrn,
       commentary: texto || "Quer mais clientes? 🚀",
@@ -9063,7 +9125,15 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
       isReshareDisabledByAuthor: true,
     };
 
-    if (image_urn) {
+    if (destinoResolvido === "whatsapp") {
+      payloadPost.content = {
+        article: {
+          source: waLink,
+          title: truncarSemCortarPalavra(textoOpcional(titulo) || "Fale com a gente no WhatsApp", 70),
+          description: truncarSemCortarPalavra(texto || "", 100) || undefined,
+        }
+      };
+    } else if (image_urn) {
       payloadPost.content = { media: { id: image_urn } };
     }
 
@@ -9086,16 +9156,21 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
     // Form (aqui como leadgenCallToAction dentro de content) — conferir
     // contra a Creatives API oficial assim que houver uma conta real pra
     // testar; se a criação rejeitar esse campo, esse é o ponto a ajustar.
+    // Pro destino whatsapp não há callToAction de lead gen nenhum — o
+    // clique já vai direto pro link do post (article.source).
     const payloadCreative: any = {
       campaign: `urn:li:sponsoredCampaign:${adgroup_id}`,
       type: "SPONSORED_UPDATES",
       content: { reference: postUrn },
-      leadgenCallToAction: {
-        destination: `urn:li:leadGenForm:${form_id}`,
-        label: cta || "Saiba mais",
-      },
       status: "PAUSED",
     };
+
+    if (destinoResolvido !== "whatsapp") {
+      payloadCreative.leadgenCallToAction = {
+        destination: `urn:li:leadGenForm:${form_id}`,
+        label: cta || "Saiba mais",
+      };
+    }
 
     const respostaCreative = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/creatives`, conexao.accessToken, {
       method: "POST",
@@ -9116,7 +9191,9 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
       ...avancadas,
       texto,
       cta,
-      form_id: String(form_id),
+      destino: destinoResolvido,
+      form_id: form_id ? String(form_id) : null,
+      wa_link: waLink,
       post_urn: postUrn,
       image_urn: image_urn || null,
     };
@@ -9133,7 +9210,7 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
       [
         String(adgroup_id),
         String(creativeId),
-        String(form_id),
+        form_id ? String(form_id) : null,
         numeroOpcional(daily_budget),
         JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
@@ -9175,8 +9252,16 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
 
     const statusLinkedIn = status === "ACTIVE" ? "ACTIVE" : "PAUSED";
 
+    // A API Rest.li do LinkedIn distingue PARTIAL_UPDATE de um POST comum
+    // (que criaria um recurso novo) pelo header X-RestLi-Method — sem ele,
+    // um corpo {patch:{$set:...}} contra a URL de um recurso existente não
+    // tem efeito de update nenhum. Confirmado contra a documentação padrão
+    // Rest.li do LinkedIn (não testado ainda contra tráfego real).
+    const headersPartialUpdate = { "X-RestLi-Method": "PARTIAL_UPDATE" };
+
     const grupoRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`, conexao.accessToken, {
       method: "POST",
+      headers: headersPartialUpdate,
       body: { patch: { $set: { status: statusLinkedIn } } }
     });
     if (!grupoRes.ok) {
@@ -9186,6 +9271,7 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
     if (adset_id) {
       const campanhaRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns/${adset_id}`, conexao.accessToken, {
         method: "POST",
+        headers: headersPartialUpdate,
         body: { patch: { $set: { status: statusLinkedIn } } }
       });
       console.log("TOGGLE CAMPAIGN LINKEDIN:", campanhaRes);
@@ -9294,30 +9380,46 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
   // 🔥 BUSCA LEADS (respostas de Lead Gen Form dos últimos 30 dias)
   // ASSUMPTION: endpoint/formato de listagem de leadGenFormResponses
   // conferido só contra a documentação pública — o mais provável de
-  // precisar de ajuste depois do Lead Gen Forms em si.
+  // precisar de ajuste depois do Lead Gen Forms em si. A busca é UMA SÓ
+  // chamada em nível de conta (não por formulário) — cada resposta é
+  // casada com sua campanha via o urn do formulário embutido na própria
+  // resposta, não pela ordem do loop (uma versão anterior desta função
+  // fazia uma chamada idêntica por formulário e atribuía TODO lead
+  // retornado ao formulário do loop atual, o que corrompia a atribuição de
+  // campanha em qualquer conta com mais de um Lead Gen Form).
   const trintaDiasAtras = Date.now() - 30 * 24 * 60 * 60 * 1000;
   let totalLeads = 0;
 
   const formulariosDaConta = await client.query(
-    `SELECT DISTINCT form_id FROM campanhas WHERE usuario_id = $1 AND plataforma = 'linkedin' AND form_id IS NOT NULL`,
+    `SELECT form_id, nome, nicho_id FROM campanhas WHERE usuario_id = $1 AND plataforma = 'linkedin' AND form_id IS NOT NULL`,
     [usuarioId]
   );
+  const campanhaPorFormId = new Map<string, { nome: string; nicho_id: number | null }>();
+  for (const row of formulariosDaConta.rows) {
+    campanhaPorFormId.set(String(row.form_id), { nome: row.nome, nicho_id: row.nicho_id ?? null });
+  }
 
-  for (const { form_id: formId } of formulariosDaConta.rows) {
-    const leadsRes = await linkedinFetch(
-      `/leadGenFormResponses?q=leadType&owner=(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})&leadType=SPONSORED&submittedAtAfter=${trintaDiasAtras}`,
-      token
-    );
+  const leadsRes = await linkedinFetch(
+    `/leadGenFormResponses?q=leadType&owner=(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})&leadType=SPONSORED&submittedAtAfter=${trintaDiasAtras}`,
+    token
+  );
 
-    if (!leadsRes.ok) {
-      console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
-      continue;
-    }
-
+  if (!leadsRes.ok) {
+    console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
+  } else {
     const leadsList = leadsRes.data?.elements ?? [];
 
     for (const lead of leadsList) {
-      const leadId = String(lead.id ?? `${formId}-${lead.submittedAt}`);
+      // ASSUMPTION: nome/posição exatos do campo que identifica o formulário
+      // de origem dentro da resposta — tentados 3 caminhos plausíveis da
+      // documentação pública, com fallback pra "campanha desconhecida" em
+      // vez de atribuir errado se nenhum bater.
+      const formUrnResposta = String(
+        lead.formResponse?.leadGenFormUrn || lead.leadGenFormUrn || lead.leadGenForm || ""
+      );
+      const formIdResposta = formUrnResposta.split(":").pop() || "";
+
+      const leadId = String(lead.id ?? `${formIdResposta || "linkedin"}-${lead.submittedAt}`);
 
       const jaExiste = await client.query(
         `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
@@ -9325,16 +9427,9 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
       );
       if (jaExiste.rows.length > 0) continue;
 
-      let nomeCampanha = "Campanha LinkedIn";
-      let nichoId: number | null = null;
-      const campRow = await client.query(
-        `SELECT nome, nicho_id FROM campanhas WHERE form_id = $1 AND usuario_id = $2 LIMIT 1`,
-        [String(formId), usuarioId]
-      );
-      if (campRow.rows.length) {
-        nomeCampanha = campRow.rows[0].nome;
-        nichoId = campRow.rows[0].nicho_id ?? null;
-      }
+      const campanhaEncontrada = formIdResposta ? campanhaPorFormId.get(formIdResposta) : null;
+      const nomeCampanha = campanhaEncontrada?.nome || "Campanha LinkedIn";
+      const nichoId = campanhaEncontrada?.nicho_id ?? null;
 
       let nome = "";
       let email = "";
@@ -9421,6 +9516,10 @@ async function enviarEventoLinkedInConversionLeads(
   eventName: "Qualified Lead" | "Closed Won"
 ): Promise<{ ok: boolean; erro?: string }> {
   try {
+    if (!lead?.email) {
+      return { ok: false, erro: "Lead sem e-mail — sem identificador pra casar com o clique no LinkedIn" };
+    }
+
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return { ok: false, erro: conexao.erro };
 
@@ -14074,6 +14173,79 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
   return novoLeadId;
 }
 
+// Equivalente LinkedIn de criarLeadDeConversaCTWA — o LinkedIn não manda
+// nenhum referral/click id junto da primeira mensagem (diferente da Meta,
+// que usa ctwa_clid), então a atribuição usa uma tag "[LI-<campaign_id>]"
+// embutida no texto pré-preenchido do link wa.me do anúncio (ver
+// montarLinkWhatsappLinkedIn em /linkedin/anuncio), procurada aqui na
+// primeira mensagem recebida. Chamado em processarEventoWhatsApp como
+// fallback só quando criarLeadDeConversaCTWA não achar nada — cobre tanto
+// "mensagem realmente veio de um anúncio LinkedIn" quanto "mensagem
+// orgânica qualquer" (nesse caso a tag simplesmente não bate e a função
+// retorna null sem side effect nenhum).
+async function criarLeadDeConversaLinkedIn(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  nomeContato?: string | null
+): Promise<number | null> {
+  const match = String(textoMensagem || "").match(/\[LI-(\d+)\]/);
+  if (!match) {
+    return null;
+  }
+  const campaignGroupId = match[1];
+
+  // Mesma proteção contra corrida que criarLeadDeConversaCTWA usa.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const campRow = await client.query(
+    `SELECT id, nome, nicho_id, conta_anuncios_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
+    [campaignGroupId, usuarioId]
+  );
+  // Tag presente mas sem campanha correspondente (apagada, ou mensagem
+  // forjada por outro motivo) — não cria lead com atribuição inventada.
+  if (!campRow.rows.length) {
+    return null;
+  }
+
+  const { id: campanhaId, nome: nomeCampanhaRow, nicho_id: nichoId, conta_anuncios_id: contaAnunciosId } = campRow.rows[0];
+  const nomeCampanha = nomeCampanhaRow || "Campanha LinkedIn";
+
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, nome, email, telefone,
+      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+    )
+    VALUES ($1, NULL, $2, NULL, $3, 'linkedin', 'whatsapp', 'novo', $4, $5, $6, $7, NOW())
+    RETURNING id
+    `,
+    [usuarioId, nomeContato || "Lead WhatsApp (LinkedIn)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: nomeContato || "Lead WhatsApp (LinkedIn)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (LinkedIn wa.me):", e));
+
+  return novoLeadId;
+}
+
 // Preenche nicho_slug/nicho_nome + o transcript de mensagens do WhatsApp
 // (direcao IN 'entrada'/'echo' — fala do cliente e fala real do corretor pelo
 // próprio app; 'saida' fica de fora porque é texto fixo do roteiro do bot,
@@ -14203,6 +14375,13 @@ async function processarEventoWhatsApp(value: any) {
     if (!leadIdVinculado) {
       leadIdVinculado = await criarLeadDeConversaCTWA(conversa, usuarioId, nomesContatos[String(telefoneCliente)] || null)
         .catch(e => { console.error("ERRO criarLeadDeConversaCTWA:", e); return null; });
+    }
+
+    // Nenhuma mensagem da Meta trazia referral (não veio de um Click-to-WhatsApp
+    // da Meta) — tenta a atribuição LinkedIn via tag no texto antes de desistir.
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaLinkedIn(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
+        .catch(e => { console.error("ERRO criarLeadDeConversaLinkedIn:", e); return null; });
     }
 
     if (leadIdVinculado) {
