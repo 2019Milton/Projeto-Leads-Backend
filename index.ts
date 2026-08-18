@@ -1167,6 +1167,10 @@ async function avaliarEEnviarQualificacaoLead(
     return avaliarEEnviarQualificacaoTikTok(leadRow, usuarioId);
   }
 
+  if (plataforma === "linkedin") {
+    return avaliarEEnviarQualificacaoLinkedIn(leadRow, usuarioId);
+  }
+
   return avaliarEEnviarQualificacaoMeta(leadRow, usuarioId);
 }
 
@@ -1301,6 +1305,73 @@ async function avaliarEEnviarQualificacaoTikTok(
 
   } catch (err) {
     console.error("ERRO avaliarEEnviarQualificacaoTikTok:", err);
+  }
+}
+
+// Equivalente LinkedIn de avaliarEEnviarQualificacaoMeta — casa pelo lead_id
+// nativo do Lead Gen Form (leadGenFormResponse urn), mesmo mecanismo que a
+// Meta usa (ver enviarEventoLinkedInConversionLeads).
+async function avaliarEEnviarQualificacaoLinkedIn(
+  leadRow: any,
+  usuarioId: number
+) {
+  try {
+
+    if (!leadRow?.lead_id) {
+      return;
+    }
+
+    const usuario = await client.query(
+      `SELECT plano FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) {
+      return;
+    }
+
+    const scoreData = calcularScoreLead(leadRow);
+
+    if (
+      scoreData.score === "quente" &&
+      !leadRow.linkedin_evento_qualificado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoLinkedInConversionLeads(
+          usuarioId,
+          leadRow,
+          "Qualified Lead"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET linkedin_evento_qualificado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+    if (
+      leadRow.status === "fechado" &&
+      !leadRow.linkedin_evento_fechado_enviado_em
+    ) {
+      const resultado =
+        await enviarEventoLinkedInConversionLeads(
+          usuarioId,
+          leadRow,
+          "Closed Won"
+        );
+
+      if (resultado.ok) {
+        await client.query(
+          `UPDATE leads SET linkedin_evento_fechado_enviado_em = NOW() WHERE id = $1`,
+          [leadRow.id]
+        );
+      }
+    }
+
+  } catch (err) {
+    console.error("ERRO avaliarEEnviarQualificacaoLinkedIn:", err);
   }
 }
 
@@ -4981,7 +5052,7 @@ async function sincronizarTodasCampanhas() {
     const conexoesOutrasPlataformas = await client.query(`
       SELECT usuario_id, plataforma
       FROM plataforma_conexoes
-      WHERE plataforma IN ('google', 'tiktok')
+      WHERE plataforma IN ('google', 'tiktok', 'linkedin')
         AND status = 'conectado'
       ORDER BY usuario_id, plataforma
     `);
@@ -4991,7 +5062,9 @@ async function sincronizarTodasCampanhas() {
       const plataforma = String(conexao.plataforma);
       const trava = plataforma === "google"
         ? googleSyncEmAndamento
-        : tiktokSyncEmAndamento;
+        : plataforma === "tiktok"
+        ? tiktokSyncEmAndamento
+        : linkedinSyncEmAndamento;
 
       if (trava.has(usuarioId)) {
         console.log(`⏭️ AUTO SYNC ${plataforma} pulado para usuário ${usuarioId} — sincronização manual em andamento`);
@@ -5002,8 +5075,10 @@ async function sincronizarTodasCampanhas() {
       try {
         if (plataforma === "google") {
           await sincronizarGoogleAdsUsuario(usuarioId);
-        } else {
+        } else if (plataforma === "tiktok") {
           await sincronizarTikTokAdsUsuario(usuarioId);
+        } else {
+          await sincronizarLinkedInAdsUsuario(usuarioId);
         }
       } catch (err) {
         console.error(`ERRO AUTO SYNC ${plataforma} USUÁRIO ${usuarioId}:`, err);
@@ -5498,7 +5573,10 @@ const OAUTH_PROVEDORES: Record<string, {
   linkedin: {
     authUrl: "https://www.linkedin.com/oauth/v2/authorization",
     tokenUrl: "https://www.linkedin.com/oauth/v2/accessToken",
-    scope: "r_ads r_ads_reporting rw_ads",
+    // r_marketing_leadgen_automation adicionado pra Lead Gen Forms API (ver
+    // secao LINKEDIN ADS) — sem ele /linkedin/formulario e a sincronizacao de
+    // respostas de formulario sao rejeitadas mesmo com rw_ads concedido.
+    scope: "r_ads r_ads_reporting rw_ads r_marketing_leadgen_automation",
     clientIdEnv: "LINKEDIN_ADS_CLIENT_ID",
     clientSecretEnv: "LINKEDIN_ADS_CLIENT_SECRET",
     redirectUriEnv: "LINKEDIN_ADS_REDIRECT_URI",
@@ -8522,6 +8600,865 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
     return c.json({ error: "Erro ao criar anúncio TikTok", detalhe: err?.message || err }, 500);
   }
 });
+
+/* =========================
+   💼 LINKEDIN ADS
+   API REST do LinkedIn Marketing (Campaign Manager + Lead Gen Forms).
+   ⚠️ PRIMEIRA VERSÃO — nenhuma chamada abaixo foi testada contra tráfego
+   real ainda (acesso à Advertising API do LinkedIn depende de aprovação
+   externa, ver plano de estruturação). Nomes de campo/enums conferidos
+   contra a documentação pública em 17/08/2026 mas com o mesmo nível de
+   risco que Google Ads/TikTok tiveram no início desta plataforma — espere
+   precisar de 1-2 rounds de ajuste assim que houver conexão real.
+   Só o caminho destino=lead_ads (Lead Gen Form nativo) está implementado
+   aqui; destino=whatsapp para o LinkedIn é um passo seguinte deliberado
+   (não existe CTA nativo de "abrir WhatsApp" no LinkedIn Ads — precisa de
+   um mecanismo de atribuição próprio via link wa.me, ver plano).
+========================= */
+
+const linkedinSyncEmAndamento = new Set<number>();
+
+const LINKEDIN_API_VERSION = "202601"; // YYYYMM — LinkedIn versiona por mês, revisar ~1x/ano
+const LINKEDIN_API = "https://api.linkedin.com/rest";
+
+// Geo padrão (Brasil) usada como alvo de segmentação quando a campanha não
+// define localização própria — ASSUMPTION: URN numérico do Brasil conferido
+// contra exemplos da documentação do LinkedIn, não contra uma chamada real
+// ao Geo Search da conta conectada. Se a criação da campanha falhar com erro
+// de targeting inválido, esse é o primeiro lugar a checar.
+const LINKEDIN_GEO_URN_BRASIL = "urn:li:geo:106057199";
+
+function linkedinHeaders(token: string) {
+  return {
+    "Authorization": `Bearer ${token}`,
+    "Content-Type": "application/json",
+    "LinkedIn-Version": LINKEDIN_API_VERSION,
+    "X-Restli-Protocol-Version": "2.0.0",
+  };
+}
+
+// Wrapper fino equivalente ao tiktokFetch — além do envelope de erro,
+// extrai o id do recurso criado. ASSUMPTION: a API REST do LinkedIn (padrão
+// Rest.li) devolve o id no header x-restli-id em criações — algumas versões
+// também ecoam no corpo; os dois são checados aqui pra reduzir o risco de
+// quebrar por causa disso especificamente.
+async function linkedinFetch(
+  endpoint: string,
+  token: string,
+  opts: { method?: string; body?: any } = {}
+): Promise<{ ok: boolean; status: number; data: any; error: string | null; id: string | null }> {
+  try {
+    const res = await fetch(`${LINKEDIN_API}${endpoint}`, {
+      method: opts.method || "GET",
+      headers: linkedinHeaders(token),
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    const texto = await res.text();
+    let data: any = {};
+    try { data = texto ? JSON.parse(texto) : {}; } catch { data = { raw: texto }; }
+
+    const idHeader = res.headers.get("x-restli-id") || res.headers.get("x-linkedin-id");
+    const id = idHeader || data?.id || null;
+
+    if (!res.ok) {
+      return {
+        ok: false, status: res.status, data,
+        error: data?.message || `Erro na API do LinkedIn (HTTP ${res.status})`,
+        id: null
+      };
+    }
+    return { ok: true, status: res.status, data, error: null, id: id ? String(id) : null };
+  } catch (err: any) {
+    return { ok: false, status: 0, data: null, error: err?.message || "Erro de rede ao chamar a API do LinkedIn", id: null };
+  }
+}
+
+// Busca token + conta de anúncios + organização (dona do Direct Sponsored
+// Content) já selecionadas pelo usuário. Diferente do Google, o LinkedIn não
+// devolve refresh_token garantido (só com o produto "Programmatic Refresh
+// Tokens" aprovado à parte) — o access_token dura ~60 dias; expirando sem
+// esse produto, o usuário precisa reconectar manualmente pela tela.
+async function resolverConexaoLinkedIn(
+  usuarioId: number
+): Promise<{ erro: string } | { accessToken: string; adAccountId: string; orgUrn: string | null }> {
+  const conn = await client.query(
+    `SELECT access_token, dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+    [usuarioId]
+  );
+  if (!conn.rows.length || !conn.rows[0].access_token) {
+    return { erro: "LinkedIn Ads não conectado" };
+  }
+  const dadosConta = conn.rows[0].dados_conta ?? {};
+  if (!dadosConta.ad_account_id) {
+    return { erro: "Selecione a conta de anúncios do LinkedIn antes de publicar" };
+  }
+  return {
+    accessToken: conn.rows[0].access_token,
+    adAccountId: String(dadosConta.ad_account_id),
+    orgUrn: dadosConta.org_urn || null,
+  };
+}
+
+// Lista as contas de anúncio (Ad Accounts) que o token consegue administrar.
+app.get("/linkedin/contas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conn = await client.query(
+      `SELECT access_token FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [user.id]
+    );
+    const token = conn.rows[0]?.access_token;
+    if (!token) return c.json({ error: "LinkedIn Ads não conectado" }, 400);
+
+    // ASSUMPTION: q=search sem filtro devolve as contas às quais o usuário
+    // do token tem acesso — conferir contra a Ad Accounts API oficial na
+    // primeira conexão real.
+    const resposta = await linkedinFetch(`/adAccounts?q=search`, token);
+    if (!resposta.ok) {
+      return c.json({
+        error: resposta.error || "Erro ao listar contas do LinkedIn Ads",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    const contas = (resposta.data?.elements || []).map((conta: any) => ({
+      id: String(conta.id),
+      nome: conta.name || `Conta ${conta.id}`,
+      status: conta.status,
+      moeda: conta.currency || "BRL",
+      // Contas do tipo BUSINESS trazem a organização vinculada em "reference"
+      // — é essa organização que vira a "página" do Direct Sponsored Content.
+      org_urn: conta.reference || null,
+    }));
+
+    return c.json({ contas });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/contas:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Salva a conta de anúncios do LinkedIn selecionada pelo usuário (mesmo
+// padrão do /google/selecionar-conta).
+app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const { ad_account_id, org_urn } = await c.req.json();
+    const contaId = textoOpcional(ad_account_id);
+    if (!contaId) return c.json({ error: "ad_account_id obrigatório" }, 400);
+
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
+             'ad_account_id', $1::text,
+             'org_urn', $2::text
+           ),
+           atualizado_em = NOW()
+       WHERE usuario_id = $3 AND plataforma = 'linkedin'`,
+      [contaId, textoOpcional(org_urn), user.id]
+    );
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/selecionar-conta:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Cria o Campaign Group (container superior, equivalente ao /meta/campanha e
+// /tiktok/campanha) — targeting/orçamento/lance reais só existem um nível
+// abaixo, no Campaign (ver /linkedin/adgroup). campaign_id no banco guarda o
+// id do Campaign Group, adset_id guarda o id do Campaign — mesma convenção
+// de colunas que Meta (campaign→adset) e TikTok (campaign→adgroup) já usam.
+app.post("/linkedin/campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, nome, configuracoes_avancadas, publicacao_grupo_id } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const resposta = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaignGroups`, conexao.accessToken, {
+      method: "POST",
+      body: {
+        account: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
+        name: nome || "Campanha Leads Plataforma",
+        status: "DRAFT",
+      }
+    });
+
+    if (!resposta.ok || !resposta.id) {
+      console.error("ERRO CAMPANHA LINKEDIN:", resposta.data);
+      return c.json({
+        error: resposta.error || "Erro ao criar campanha no LinkedIn",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    const campaignGroupId = resposta.id;
+
+    await client.query(
+      `INSERT INTO campanhas (
+        usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
+        configuracoes_avancadas, plataforma, publicacao_grupo_id
+      )
+      VALUES ($1,$2,$3,$4,$5,'plataforma',$6,'linkedin',$7)`,
+      [
+        usuarioId,
+        campaignGroupId,
+        conexao.adAccountId,
+        nome || "Campanha Plataforma",
+        "PAUSED",
+        JSON.stringify(configuracoes_avancadas || {}),
+        textoOpcional(publicacao_grupo_id) || null
+      ]
+    );
+
+    return c.json({ id: campaignGroupId, campaign_id: campaignGroupId });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/campanha:", err);
+    return c.json({ error: "Erro ao criar campanha LinkedIn" }, 500);
+  }
+});
+
+// Cria o Campaign (targeting geo + orçamento diário + lance + objetivo
+// LEAD_GENERATION) dentro do Campaign Group — equivalente ao /meta/adset e
+// /tiktok/adgroup.
+app.post("/linkedin/adgroup", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, campaign_id, daily_budget, configuracoes_avancadas } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    if (!campaign_id) return c.json({ error: "campaign_id (Campaign Group) não enviado" }, 400);
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const orcamento = numeroOpcional(daily_budget);
+    if (!orcamento || orcamento <= 0) {
+      return c.json({ error: "Orçamento diário é obrigatório para a campanha LinkedIn" }, 400);
+    }
+
+    const avancadas = configuracoes_avancadas || {};
+
+    // ASSUMPTION MAIS ARRISCADA DESTA SEÇÃO: exige lance manual (unitCost) —
+    // o LinkedIn tem opções de lance automático, mas o campo/enum exato
+    // varia por tipo de otimização e não foi possível confirmar sem uma
+    // conta real. Usa CPC com um lance conservador (10% do orçamento
+    // diário, limitado entre R$5 e R$50) até isso ser validado.
+    const lanceCpc = Math.min(50, Math.max(5, orcamento * 0.1));
+
+    const payloadCampaign: any = {
+      account: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
+      campaignGroup: `urn:li:sponsoredCampaignGroup:${campaign_id}`,
+      name: `Campaign Leads ${Date.now()}`,
+      type: "SPONSORED_UPDATES",
+      objectiveType: "LEAD_GENERATION",
+      costType: "CPC",
+      unitCost: { amount: lanceCpc.toFixed(2), currencyCode: "BRL" },
+      dailyBudget: { amount: orcamento.toFixed(2), currencyCode: "BRL" },
+      locale: { country: "BR", language: "pt" },
+      runSchedule: { start: Date.now() },
+      targetingCriteria: {
+        include: {
+          and: [
+            { or: { "urn:li:adTargetingFacet:locations": [textoOpcional(avancadas.geo_urn) || LINKEDIN_GEO_URN_BRASIL] } }
+          ]
+        }
+      },
+      status: "PAUSED",
+    };
+
+    const resposta = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns`, conexao.accessToken, {
+      method: "POST",
+      body: payloadCampaign
+    });
+
+    if (!resposta.ok || !resposta.id) {
+      console.error("ERRO ADGROUP LINKEDIN:", resposta.data);
+      return c.json({
+        error: resposta.error || "Erro ao criar grupo de segmentação no LinkedIn",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    return c.json({ adgroup_id: resposta.id });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/adgroup:", err);
+    return c.json({ error: "Erro ao criar grupo de segmentação LinkedIn" }, 500);
+  }
+});
+
+// Upload de imagem como asset do LinkedIn (equivalente ao /meta/upload-imagem
+// e /google/upload-imagem) — o LinkedIn exige um fluxo em 2 passos:
+// initializeUpload (reserva a URN e devolve uma uploadUrl assinada) e depois
+// um PUT dos bytes crus nessa URL. Corta pra 1200x627 (proporção
+// recomendada do LinkedIn pra imagem única em Sponsored Content), mesmo
+// mecanismo de sharp já usado pro Google Display.
+async function cortarImagemLinkedIn(bytes: ArrayBuffer) {
+  return sharp(Buffer.from(bytes))
+    .resize(1200, 627, { fit: "cover", position: "attention" })
+    .jpeg({ quality: 88 })
+    .toBuffer();
+}
+
+app.post("/linkedin/upload-imagem", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+    const imagem = body.get("imagem") as File;
+    const usuario_id = body.get("usuario_id");
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+    if (!imagem) return c.json({ error: "Imagem não enviada" }, 400);
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const init = await linkedinFetch(`/images?action=initializeUpload`, conexao.accessToken, {
+      method: "POST",
+      body: { initializeUploadRequest: { owner: `urn:li:sponsoredAccount:${conexao.adAccountId}` } }
+    });
+
+    const uploadUrl = init.data?.value?.uploadUrl;
+    const imagemUrn = init.data?.value?.image;
+
+    if (!init.ok || !uploadUrl || !imagemUrn) {
+      console.error("ERRO INIT UPLOAD IMAGEM LINKEDIN:", init.data);
+      return c.json({ error: init.error || "Erro ao iniciar upload de imagem no LinkedIn", detalhe: init.data }, 400);
+    }
+
+    const bytesCortados = await cortarImagemLinkedIn(await imagem.arrayBuffer());
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { "Authorization": `Bearer ${conexao.accessToken}` },
+      body: bytesCortados
+    });
+
+    if (!uploadRes.ok) {
+      console.error("ERRO PUT UPLOAD IMAGEM LINKEDIN:", uploadRes.status, await uploadRes.text().catch(() => ""));
+      return c.json({ error: "Erro ao enviar bytes da imagem para o LinkedIn" }, 502);
+    }
+
+    return c.json({ image_urn: imagemUrn });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/upload-imagem:", err);
+    return c.json({ error: err.message || "Erro ao enviar imagem para o LinkedIn" }, 500);
+  }
+});
+
+// Cria o Lead Gen Form (equivalente ao /google/formulario) — diferente da
+// TikTok (só permite escolher um formulário já criado manualmente), o
+// LinkedIn tem API própria de criação, igual ao Google.
+// ⚠️ ASSUMPTION MAIS ARRISCADA DE TODA A SEÇÃO: shape exato do corpo
+// (nomes de campo de pergunta/consentimento) conferido só contra a
+// documentação pública, não contra uma resposta real da API — é o ponto
+// mais provável de precisar de ajuste no primeiro teste real.
+app.post("/linkedin/formulario", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id, nome_negocio, headline, descricao,
+      obrigado_titulo, obrigado_texto, privacidade_url
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    // Limites de caracteres do LinkedIn Lead Gen Form (headline 60,
+    // descrição 160, nome do formulário 256) — truncados pra não derrubar a
+    // criação inteira com um texto vindo da IA/usuário passando do limite.
+    const payloadFormulario: any = {
+      account: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
+      name: truncarSemCortarPalavra(textoOpcional(nome_negocio) || "Formulário Plataforma de Leads", 256),
+      headline: truncarSemCortarPalavra(textoOpcional(headline) || "Receba mais informações", 60),
+      description: truncarSemCortarPalavra(textoOpcional(descricao) || "Deixe seus dados e entraremos em contato.", 160),
+      privacyPolicy: {
+        privacyPolicyUrl: urlOpcional(privacidade_url, "https://plataformadeleads.com.br/privacidade"),
+      },
+      locale: { country: "BR", language: "pt" },
+      questions: [
+        { questionType: "PREFILL", predefinedField: "FIRST_NAME" },
+        { questionType: "PREFILL", predefinedField: "LAST_NAME" },
+        { questionType: "PREFILL", predefinedField: "EMAIL_ADDRESS" },
+        { questionType: "PREFILL", predefinedField: "PHONE_NUMBER" },
+      ],
+      confirmationMessage: {
+        headline: truncarSemCortarPalavra(textoOpcional(obrigado_titulo) || "Obrigado!", 60),
+        detailMessage: truncarSemCortarPalavra(textoOpcional(obrigado_texto) || "Recebemos seus dados. Em breve entraremos em contato.", 160),
+      },
+    };
+
+    const resposta = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/leadGenForms`, conexao.accessToken, {
+      method: "POST",
+      body: payloadFormulario
+    });
+
+    if (!resposta.ok || !resposta.id) {
+      console.error("ERRO FORMULARIO LINKEDIN:", resposta.data);
+      return c.json({
+        error: resposta.error || "Erro ao criar formulário no LinkedIn",
+        detalhe: resposta.data
+      }, 400);
+    }
+
+    return c.json({ resource_name: resposta.id, form_id: resposta.id });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/formulario:", err);
+    return c.json({ error: err.message || "Erro ao criar formulário no LinkedIn" }, 500);
+  }
+});
+
+// Cria o Post (Direct Sponsored Content — não publica organicamente, só
+// serve de conteúdo pro anúncio) e a Creative que vincula esse post ao Lead
+// Gen Form escolhido. Equivalente ao /meta/anuncio e /tiktok/anuncio — é
+// aqui que a linha de campanhas recebe ad_id/form_id.
+app.post("/linkedin/anuncio", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id, campaign_id, adgroup_id, form_id,
+      texto, cta, configuracoes_avancadas, image_urn, daily_budget
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    if (!form_id) return c.json({ error: "form_id (Lead Gen Form) não enviado" }, 400);
+    if (!adgroup_id) return c.json({ error: "adgroup_id (Campaign) não enviado" }, 400);
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+    if (!conexao.orgUrn) {
+      return c.json({ error: "Nenhuma organização (Página do LinkedIn) vinculada à conta de anúncios selecionada" }, 400);
+    }
+
+    const avancadas = configuracoes_avancadas || {};
+
+    // ASSUMPTION: Posts API com feedDistribution NONE é o mecanismo atual do
+    // LinkedIn pra Direct Sponsored Content (a antiga API dedicada
+    // adDirectSponsoredContents foi descontinuada) — conferir contra a
+    // documentação vigente na primeira publicação real.
+    const payloadPost: any = {
+      author: conexao.orgUrn,
+      commentary: texto || "Quer mais clientes? 🚀",
+      visibility: "PUBLIC",
+      distribution: {
+        feedDistribution: "NONE",
+        targetEntities: [],
+        thirdPartyDistributionChannels: [],
+      },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: true,
+    };
+
+    if (image_urn) {
+      payloadPost.content = { media: { id: image_urn } };
+    }
+
+    const respostaPost = await linkedinFetch(`/posts`, conexao.accessToken, {
+      method: "POST",
+      body: payloadPost
+    });
+
+    if (!respostaPost.ok || !respostaPost.id) {
+      console.error("ERRO POST LINKEDIN:", respostaPost.data);
+      return c.json({
+        error: respostaPost.error || "Erro ao criar conteúdo do anúncio no LinkedIn",
+        detalhe: respostaPost.data
+      }, 400);
+    }
+
+    const postUrn = respostaPost.id;
+
+    // ASSUMPTION MAIS ARRISCADA: campo exato de vínculo Creative→Lead Gen
+    // Form (aqui como leadgenCallToAction dentro de content) — conferir
+    // contra a Creatives API oficial assim que houver uma conta real pra
+    // testar; se a criação rejeitar esse campo, esse é o ponto a ajustar.
+    const payloadCreative: any = {
+      campaign: `urn:li:sponsoredCampaign:${adgroup_id}`,
+      type: "SPONSORED_UPDATES",
+      content: { reference: postUrn },
+      leadgenCallToAction: {
+        destination: `urn:li:leadGenForm:${form_id}`,
+        label: cta || "Saiba mais",
+      },
+      status: "PAUSED",
+    };
+
+    const respostaCreative = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/creatives`, conexao.accessToken, {
+      method: "POST",
+      body: payloadCreative
+    });
+
+    if (!respostaCreative.ok || !respostaCreative.id) {
+      console.error("ERRO CREATIVE LINKEDIN:", respostaCreative.data);
+      return c.json({
+        error: respostaCreative.error || "Erro ao criar o anúncio (creative) no LinkedIn",
+        detalhe: respostaCreative.data
+      }, 400);
+    }
+
+    const creativeId = respostaCreative.id;
+
+    const configuracoesPersistidas = {
+      ...avancadas,
+      texto,
+      cta,
+      form_id: String(form_id),
+      post_urn: postUrn,
+      image_urn: image_urn || null,
+    };
+
+    await client.query(
+      `UPDATE campanhas
+       SET adset_id = $1,
+           ad_id = $2,
+           form_id = $3,
+           daily_budget = $4,
+           configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $5::jsonb,
+           atualizado_em = NOW()
+       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'linkedin'`,
+      [
+        String(adgroup_id),
+        String(creativeId),
+        String(form_id),
+        numeroOpcional(daily_budget),
+        JSON.stringify(configuracoesPersistidas),
+        String(campaign_id),
+        usuarioId
+      ]
+    );
+
+    return c.json({ id: String(creativeId), ad_id: String(creativeId) });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/anuncio:", err);
+    return c.json({ error: "Erro ao criar anúncio LinkedIn", detalhe: err?.message || err }, 500);
+  }
+});
+
+// Pausa/ativa Campaign Group + Campaign (equivalente ao /meta/toggle-campanha
+// e /tiktok/toggle-campanha).
+app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id, status } = await c.req.json();
+
+    if (!campaign_id || !["ACTIVE", "PAUSED"].includes(status)) {
+      return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
+    }
+
+    const campanhaBanco = await client.query(
+      `SELECT id, adset_id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'
+       LIMIT 1`,
+      [campaign_id, user.id]
+    );
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+    }
+    const { adset_id } = campanhaBanco.rows[0];
+
+    const conexao = await resolverConexaoLinkedIn(user.id);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const statusLinkedIn = status === "ACTIVE" ? "ACTIVE" : "PAUSED";
+
+    const grupoRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`, conexao.accessToken, {
+      method: "POST",
+      body: { patch: { $set: { status: statusLinkedIn } } }
+    });
+    if (!grupoRes.ok) {
+      return c.json({ error: grupoRes.error || "Erro ao alterar campanha no LinkedIn" }, 400);
+    }
+
+    if (adset_id) {
+      const campanhaRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns/${adset_id}`, conexao.accessToken, {
+        method: "POST",
+        body: { patch: { $set: { status: statusLinkedIn } } }
+      });
+      console.log("TOGGLE CAMPAIGN LINKEDIN:", campanhaRes);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = $1, atualizado_em = NOW() WHERE id = $2`,
+      [status, campanhaBanco.rows[0].id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/toggle-campanha:", err);
+    return c.json({ error: "Erro ao alterar campanha" }, 500);
+  }
+});
+
+// Exclui o Campaign Group criado pela plataforma quando uma etapa seguinte
+// (Campaign, formulário ou anúncio) falha — mesma ideia do
+// /google/excluir-campanha, evita deixar rascunhos órfãos na conta do
+// usuário a cada tentativa que falhar no meio do caminho.
+app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id } = await c.req.json();
+    if (!campaign_id) return c.json({ error: "campaign_id obrigatorio" }, 400);
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
+      [campaign_id, user.id]
+    );
+    if (!campanha.rows.length) {
+      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
+    }
+
+    const conexao = await resolverConexaoLinkedIn(user.id);
+    if (!("erro" in conexao)) {
+      await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`, conexao.accessToken, {
+        method: "DELETE"
+      }).catch(err => console.warn("AVISO exclusao campaign group LinkedIn (nao bloqueante):", err));
+    }
+
+    await client.query(
+      `UPDATE campanhas SET status = 'DELETED', atualizado_em = NOW() WHERE id = $1`,
+      [campanha.rows[0].id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/excluir-campanha:", err);
+    return c.json({ error: "Erro ao excluir campanha LinkedIn" }, 500);
+  }
+});
+
+// Sincroniza campanhas e leads (Lead Gen Form Responses) do LinkedIn Ads —
+// mesmo padrão de polling do Google/TikTok (o LinkedIn também não tem
+// webhook de leads em tempo real pra este produto).
+async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
+  const conn = await client.query(
+    `SELECT access_token, dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+    [usuarioId]
+  );
+  if (!conn.rows.length) throw new Error("LinkedIn não conectado");
+
+  const token = conn.rows[0].access_token;
+  const dadosConta = conn.rows[0].dados_conta ?? {};
+  const adAccountId = dadosConta.ad_account_id;
+  if (!adAccountId) throw new Error("Selecione a conta de anúncios do LinkedIn antes de sincronizar");
+
+  // 🔥 BUSCA CAMPANHAS (Campaign Groups — mesmo nível que vira campaign_id no banco)
+  const campanhasRes = await linkedinFetch(`/adAccounts/${adAccountId}/adCampaignGroups?q=search`, token);
+  if (!campanhasRes.ok) {
+    console.error("ERRO CAMPANHAS LINKEDIN:", campanhasRes.data);
+    throw new Error(campanhasRes.error || "Erro ao buscar campanhas LinkedIn");
+  }
+
+  const campanhas = campanhasRes.data?.elements ?? [];
+  console.log("LINKEDIN CAMPANHAS:", campanhas.length);
+
+  for (const campanha of campanhas) {
+    const campaignGroupId = String(campanha.id);
+    const nomeCampanha = campanha.name || "Campanha LinkedIn";
+    const statusCampanha = String(campanha.status || "PAUSED").toUpperCase();
+
+    const existe = await client.query(
+      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+      [campaignGroupId, usuarioId]
+    );
+
+    if (existe.rows.length > 0) {
+      await client.query(
+        `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
+         WHERE campaign_id = $3 AND usuario_id = $4`,
+        [nomeCampanha, statusCampanha, campaignGroupId, usuarioId]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
+         VALUES ($1, $2, $3, $4, $5, 'linkedin', 'linkedin', NOW())`,
+        [usuarioId, campaignGroupId, String(adAccountId), nomeCampanha, statusCampanha]
+      );
+    }
+  }
+
+  // 🔥 BUSCA LEADS (respostas de Lead Gen Form dos últimos 30 dias)
+  // ASSUMPTION: endpoint/formato de listagem de leadGenFormResponses
+  // conferido só contra a documentação pública — o mais provável de
+  // precisar de ajuste depois do Lead Gen Forms em si.
+  const trintaDiasAtras = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  let totalLeads = 0;
+
+  const formulariosDaConta = await client.query(
+    `SELECT DISTINCT form_id FROM campanhas WHERE usuario_id = $1 AND plataforma = 'linkedin' AND form_id IS NOT NULL`,
+    [usuarioId]
+  );
+
+  for (const { form_id: formId } of formulariosDaConta.rows) {
+    const leadsRes = await linkedinFetch(
+      `/leadGenFormResponses?q=leadType&owner=(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})&leadType=SPONSORED&submittedAtAfter=${trintaDiasAtras}`,
+      token
+    );
+
+    if (!leadsRes.ok) {
+      console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
+      continue;
+    }
+
+    const leadsList = leadsRes.data?.elements ?? [];
+
+    for (const lead of leadsList) {
+      const leadId = String(lead.id ?? `${formId}-${lead.submittedAt}`);
+
+      const jaExiste = await client.query(
+        `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+        [leadId, usuarioId]
+      );
+      if (jaExiste.rows.length > 0) continue;
+
+      let nomeCampanha = "Campanha LinkedIn";
+      let nichoId: number | null = null;
+      const campRow = await client.query(
+        `SELECT nome, nicho_id FROM campanhas WHERE form_id = $1 AND usuario_id = $2 LIMIT 1`,
+        [String(formId), usuarioId]
+      );
+      if (campRow.rows.length) {
+        nomeCampanha = campRow.rows[0].nome;
+        nichoId = campRow.rows[0].nicho_id ?? null;
+      }
+
+      let nome = "";
+      let email = "";
+      let telefone = "";
+      const respostasQualificacao: any[] = [];
+
+      for (const resposta of lead.formResponse?.answers ?? []) {
+        const campo = String(resposta.questionField?.predefinedField ?? "").toUpperCase();
+        const valor = resposta.answerDetails?.textQuestionAnswer?.answer ?? "";
+        if (campo === "FIRST_NAME") nome = `${valor} ${nome}`.trim();
+        else if (campo === "LAST_NAME") nome = `${nome} ${valor}`.trim();
+        else if (campo === "EMAIL_ADDRESS") email = valor;
+        else if (campo === "PHONE_NUMBER") telefone = valor;
+        else respostasQualificacao.push({ pergunta: campo, resposta: valor });
+      }
+
+      const leadInseridoLinkedIn = await client.query(
+        `INSERT INTO leads
+           (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'linkedin','linkedin','novo',$8,$9,COALESCE(to_timestamp($10::bigint / 1000), NOW()))
+         RETURNING id`,
+        [
+          usuarioId, leadId, nome || "Lead LinkedIn", email, telefone,
+          nomeCampanha, String(adAccountId),
+          JSON.stringify(respostasQualificacao), nichoId, lead.submittedAt ?? null
+        ]
+      );
+
+      await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+
+      avaliarEEnviarQualificacaoLead(
+        {
+          id: leadInseridoLinkedIn.rows[0]?.id,
+          lead_id: leadId,
+          plataforma: "linkedin",
+          status: "novo",
+          email,
+          telefone,
+          respostas_qualificacao: respostasQualificacao
+        },
+        usuarioId
+      ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync linkedin):", err));
+
+      totalLeads++;
+    }
+  }
+
+  await client.query(
+    `UPDATE plataforma_conexoes SET atualizado_em = NOW() WHERE usuario_id = $1 AND plataforma = 'linkedin'`,
+    [usuarioId]
+  );
+
+  return { sucesso: true, campanhas: campanhas.length, leads_novos: totalLeads };
+}
+
+app.post("/linkedin/sincronizar-campanhas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  if (linkedinSyncEmAndamento.has(user.id)) {
+    return c.json({ error: "Sincronizacao LinkedIn ja em andamento" }, 429);
+  }
+  linkedinSyncEmAndamento.add(user.id);
+  try {
+    return c.json(await sincronizarLinkedInAdsUsuario(user.id));
+  } catch (err: any) {
+    console.error("ERRO LINKEDIN SINCRONIZAR:", err);
+    return c.json({ error: err?.message || "Erro ao sincronizar LinkedIn" }, 500);
+  } finally {
+    linkedinSyncEmAndamento.delete(user.id);
+  }
+});
+
+// Equivalente LinkedIn de enviarEventoMetaConversionLeads — LinkedIn
+// Conversions API, casando pelo lead_id nativo (urn do leadGenFormResponse).
+// ASSUMPTION: shape do evento conferido contra a documentação pública da
+// Conversions API, não testado contra uma conversion rule real ainda —
+// além disso, diferente de Meta/Google/TikTok, o LinkedIn exige que a
+// Conversion Rule já exista manualmente no Campaign Manager antes (não há
+// endpoint de criação automática confirmado) — se o envio falhar
+// consistentemente, esse é o primeiro ponto a verificar com o Milton.
+async function enviarEventoLinkedInConversionLeads(
+  usuarioId: number,
+  lead: any,
+  eventName: "Qualified Lead" | "Closed Won"
+): Promise<{ ok: boolean; erro?: string }> {
+  try {
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return { ok: false, erro: conexao.erro };
+
+    const conn = await client.query(
+      `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [usuarioId]
+    );
+    const conversionRuleUrn =
+      eventName === "Qualified Lead"
+        ? conn.rows[0]?.dados_conta?.conversion_rule_qualified_urn
+        : conn.rows[0]?.dados_conta?.conversion_rule_closed_urn;
+
+    if (!conversionRuleUrn) {
+      return { ok: false, erro: `Conversion Rule "${eventName}" não configurada para o LinkedIn` };
+    }
+
+    const resposta = await linkedinFetch(`/conversionEvents`, conexao.accessToken, {
+      method: "POST",
+      body: {
+        conversion: conversionRuleUrn,
+        conversionHappenedAt: Date.now(),
+        conversionValue: { currencyCode: "BRL", amount: "0" },
+        user: { userIds: [{ idType: "SHA256_EMAIL", idValue: lead.email ? hashSha256(lead.email) : undefined }] },
+        eventId: `lead-${lead.id}-${eventName.replace(/\s+/g, "-").toLowerCase()}`,
+      }
+    });
+
+    if (!resposta.ok) {
+      console.error(`ERRO ENVIO CONVERSAO LINKEDIN (${eventName}):`, resposta.data);
+      return { ok: false, erro: resposta.error || "Erro ao enviar evento pro LinkedIn" };
+    }
+
+    return { ok: true };
+  } catch (err: any) {
+    console.error(`ERRO enviarEventoLinkedInConversionLeads (${eventName}):`, err);
+    return { ok: false, erro: err?.message || "Erro interno" };
+  }
+}
 
 /* =========================
    📷 INSTAGRAM LOGIN (Business Login)
@@ -14221,6 +15158,16 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS tiktok_evento_fechado_enviado_em TIMESTAMP;
 `);
 
+// Mesmo rastreio de envio, agora para o LinkedIn Ads (ver
+// avaliarEEnviarQualificacaoLead / enviarEventoLinkedInConversionLeads). Casa
+// pelo lead_id nativo (urn do leadGenFormResponse), igual a Meta — nao
+// precisa de um campo de click id equivalente ao gclid do Google.
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS linkedin_evento_qualificado_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS linkedin_evento_fechado_enviado_em TIMESTAMP;
+`);
+
 // Preenchido só em leads criados automaticamente a partir de uma conversa de
 // WhatsApp originada de anúncio Click-to-WhatsApp (ver criarLeadDeConversaCTWA)
 // — não tem leadgen_id (lead_id fica NULL), então esse é o identificador usado
@@ -14856,6 +15803,11 @@ app.get("/campanhas", authMiddleware, async (c) => {
       [user.id]
     ).then(r => r.rows[0]?.id || null);
 
+    const contaAnunciosIdLinkedIn = await client.query(
+      `SELECT dados_conta->>'ad_account_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
     const nichoSlug =
       textoOpcional(c.req.query("nicho"));
 
@@ -14933,11 +15885,12 @@ app.get("/campanhas", authMiddleware, async (c) => {
           OR (COALESCE(c.plataforma, 'meta') = 'meta' AND c.conta_anuncios_id = $2)
           OR (c.plataforma = 'google' AND c.conta_anuncios_id = $4)
           OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $5)
+          OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $6)
         )
         AND ($3::text IS NULL OR COALESCE(n.slug, nd.slug) = $3)
       ORDER BY c.id DESC
       `,
-      [user.id, contaAnunciosId ?? null, nichoSlug ?? null, contaAnunciosIdGoogle, contaAnunciosIdTikTok]
+      [user.id, contaAnunciosId ?? null, nichoSlug ?? null, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn]
     );
 
     console.log("CAMPANHAS:", campanhas.rows);
@@ -15557,6 +16510,95 @@ async function carregarMetricasTikTokCampanhas(
   }
 }
 
+// Equivalente LinkedIn de carregarMetricasGoogleCampanhas/TikTokCampanhas —
+// usa a Ad Analytics API com pivot CAMPAIGN_GROUP pra casar diretamente com
+// campaign_id (que no LinkedIn guarda o id do Campaign Group, ver seção
+// LINKEDIN ADS). ASSUMPTION: nome dos campos/formato de data conferidos só
+// contra a documentação pública — não testado contra tráfego real ainda.
+async function carregarMetricasLinkedInCampanhas(
+  usuarioId: number,
+  inicio: string,
+  fim: string,
+  hoje: string
+): Promise<{
+  disponivel: boolean;
+  erro: string | null;
+  metricas: Map<string, MetricasCampanhaExterna>;
+}> {
+  const metricas = new Map<string, MetricasCampanhaExterna>();
+
+  try {
+    const conexao = await client.query(
+      `SELECT access_token, dados_conta
+       FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'linkedin' AND status = 'conectado'
+       LIMIT 1`,
+      [usuarioId]
+    );
+    const row = conexao.rows[0];
+    const adAccountId = row?.dados_conta?.ad_account_id;
+    if (!row?.access_token || !adAccountId) {
+      return { disponivel: false, erro: null, metricas };
+    }
+
+    const [anoI, mesI, diaI] = inicio.split("-").map(Number);
+    const [anoF, mesF, diaF] = fim.split("-").map(Number);
+
+    const params = new URLSearchParams({
+      q: "analytics",
+      pivot: "CAMPAIGN_GROUP",
+      accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
+      timeGranularity: "DAILY",
+      fields: "campaignGroup,impressions,clicks,costInLocalCurrency,dateRange",
+    });
+    params.set(
+      "dateRange",
+      `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
+    );
+
+    const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, row.access_token);
+    if (!resposta.ok) {
+      return { disponivel: false, erro: resposta.error || "Métricas indisponíveis no LinkedIn Ads", metricas };
+    }
+
+    for (const item of resposta.data?.elements ?? []) {
+      const campaignGroupUrn = String(item.campaignGroup || "");
+      const campaignGroupId = campaignGroupUrn.split(":").pop() || "";
+      if (!campaignGroupId) continue;
+
+      const atual = metricas.get(campaignGroupId) || metricasCampanhaVazias();
+      const impressoes = Number(item.impressions || 0);
+      const cliques = Number(item.clicks || 0);
+      const gasto = Number(item.costInLocalCurrency || 0);
+      const dr = item.dateRange?.start;
+      const data = dr ? `${dr.year}-${String(dr.month).padStart(2, "0")}-${String(dr.day).padStart(2, "0")}` : "";
+
+      atual.impressoes += impressoes;
+      atual.cliques += cliques;
+      atual.gasto += gasto;
+      if (data === hoje) atual.gasto_hoje += gasto;
+      atual.grafico.push({
+        data,
+        clicks: cliques,
+        ctr: impressoes > 0 ? (cliques / impressoes) * 100 : 0,
+        gasto,
+        impressoes,
+      });
+      metricas.set(campaignGroupId, atual);
+    }
+
+    for (const valor of metricas.values()) finalizarMetricasCampanha(valor);
+    return { disponivel: true, erro: null, metricas };
+  } catch (err: any) {
+    console.error("ERRO MÉTRICAS LINKEDIN CAMPANHAS:", err);
+    return {
+      disponivel: false,
+      erro: err?.message || "Métricas indisponíveis no LinkedIn Ads",
+      metricas,
+    };
+  }
+}
+
 // 📊 métricas reais das campanhas
 app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
@@ -15592,6 +16634,11 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
     const contaAnunciosIdTikTok = await client.query(
       `SELECT dados_conta->>'advertiser_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      [user.id]
+    ).then(r => r.rows[0]?.id || null);
+
+    const contaAnunciosIdLinkedIn = await client.query(
+      `SELECT dados_conta->>'ad_account_id' AS id FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
       [user.id]
     ).then(r => r.rows[0]?.id || null);
 
@@ -15669,14 +16716,15 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           OR (COALESCE(c.plataforma, 'meta') = 'meta' AND ($2::text IS NULL OR c.conta_anuncios_id = $2))
           OR (c.plataforma = 'google' AND c.conta_anuncios_id = $3)
           OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $4)
+          OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $5)
         )
       ORDER BY c.id DESC
       `,
-      [user.id, contaAnunciosId, contaAnunciosIdGoogle, contaAnunciosIdTikTok]
+      [user.id, contaAnunciosId, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn]
     );
 
     const periodoMetricas = intervaloMetricasCampanhas(30);
-    const [metricasGoogle, metricasTikTok] = await Promise.all([
+    const [metricasGoogle, metricasTikTok, metricasLinkedIn] = await Promise.all([
       carregarMetricasGoogleCampanhas(
         user.id,
         periodoMetricas.inicio,
@@ -15684,6 +16732,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         periodoMetricas.hoje
       ),
       carregarMetricasTikTokCampanhas(
+        user.id,
+        periodoMetricas.inicio,
+        periodoMetricas.fim,
+        periodoMetricas.hoje
+      ),
+      carregarMetricasLinkedInCampanhas(
         user.id,
         periodoMetricas.inicio,
         periodoMetricas.fim,
@@ -15950,6 +17004,25 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           metaDisponivel = true;
         } else {
           erroMeta = metricasTikTok.erro;
+        }
+      } else if (campanha.campaign_id && plataformaCampanha === "linkedin") {
+        if (metricasLinkedIn.disponivel) {
+          const metrica =
+            metricasLinkedIn.metricas.get(String(campanha.campaign_id)) ||
+            metricasCampanhaVazias();
+          dados = {
+            impressions: metrica.impressoes,
+            clicks: metrica.cliques,
+            reach: metrica.alcance,
+            spend: metrica.gasto,
+            cpc: metrica.cpc,
+            ctr: metrica.ctr,
+          };
+          grafico = metrica.grafico;
+          gastoHojeCampanha = metrica.gasto_hoje;
+          metaDisponivel = true;
+        } else {
+          erroMeta = metricasLinkedIn.erro;
         }
       }
 
