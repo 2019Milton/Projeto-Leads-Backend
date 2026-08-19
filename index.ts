@@ -15498,7 +15498,8 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS ia_provider TEXT DEFAULT 'auto',
     ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     ADD COLUMN IF NOT EXISTS is_parceiro BOOLEAN DEFAULT false,
-    ADD COLUMN IF NOT EXISTS parceiro_id INTEGER;
+    ADD COLUMN IF NOT EXISTS parceiro_id INTEGER,
+    ADD COLUMN IF NOT EXISTS resumo_semanal_enviado_em TIMESTAMP;
 `);
 
 await client.query(`
@@ -26518,6 +26519,215 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
     console.error("[z-api] ❌ exceção:", e);
   }
 }
+
+// =========================
+// 📊 RESUMO SEMANAL POR WHATSAPP — só para corretores com o WhatsApp Bot conectado
+// =========================
+// Mesmo canal de envio do aviso de "novo lead chegou" (enviarLembreteWhatsApp, via Z-API) —
+// o que muda é o destinatário: em vez do número pessoal de notificação (usuarios.whatsapp),
+// vai pro número que o próprio corretor cadastrou no WhatsApp Bot (plataforma_conexoes,
+// plataforma='whatsapp', dados_conta.numero).
+
+// Total de gasto dos últimos 7 dias, best-effort por plataforma — cada uma isolada em seu
+// próprio try/catch pra uma falha numa API não derrubar o resumo inteiro nem travar o loop
+// que roda pra todos os corretores.
+async function obterGastoSemanalMeta(usuarioId: number): Promise<number | null> {
+  try {
+    const conn = await client.query(
+      `SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+      [usuarioId]
+    );
+    if (!conn.rows.length) return null;
+    const token = conn.rows[0].access_token;
+    const contaAds = await obterContaAnuncios(token, conn.rows[0].conta_anuncios_id);
+    if (!contaAds) return null;
+    const insights: any = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAds.id}/insights?fields=spend&date_preset=last_7d&access_token=${token}`
+    ).then(r => r.json());
+    return Number(insights?.data?.[0]?.spend || 0);
+  } catch (e) {
+    console.error("[resumo-semanal] erro gasto Meta:", e);
+    return null;
+  }
+}
+
+async function obterGastoSemanalGoogle(usuarioId: number): Promise<number | null> {
+  try {
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) return null;
+    const conn = await client.query(
+      `SELECT refresh_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' AND status = 'conectado' LIMIT 1`,
+      [usuarioId]
+    );
+    const row = conn.rows[0];
+    const customerId = row?.dados_conta?.customer_id;
+    if (!row?.refresh_token || !customerId) return null;
+    const accessToken = await obterAccessTokenGoogle(row.refresh_token);
+    const resultados = await googleAdsQuery(
+      customerId, accessToken,
+      "SELECT metrics.cost_micros FROM customer WHERE segments.date DURING LAST_7_DAYS",
+      row.dados_conta?.login_customer_id || null
+    );
+    const micros = (resultados as any[]).reduce((soma, r: any) => soma + Number(r.metrics?.costMicros || 0), 0);
+    return micros / 1_000_000;
+  } catch (e) {
+    console.error("[resumo-semanal] erro gasto Google:", e);
+    return null;
+  }
+}
+
+async function obterGastoSemanalTikTok(usuarioId: number): Promise<number | null> {
+  try {
+    const conn = await client.query(
+      `SELECT access_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' AND status = 'conectado' LIMIT 1`,
+      [usuarioId]
+    );
+    const row = conn.rows[0];
+    const advertiserId = row?.dados_conta?.advertiser_id;
+    if (!row?.access_token || !advertiserId) return null;
+    const hoje = new Date().toISOString().slice(0, 10);
+    const seteDiasAtras = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const registros = await relatorioTikTokCampanhas(row.access_token, String(advertiserId), seteDiasAtras, hoje, ["campaign_id"]);
+    return registros.reduce((soma, r: any) => soma + Number(r.metrics?.spend || 0), 0);
+  } catch (e) {
+    console.error("[resumo-semanal] erro gasto TikTok:", e);
+    return null;
+  }
+}
+
+async function montarResumoSemanalCorretor(usuarioId: number) {
+  const [campanhasAtivas, leadsSemana, leadsQuentes, leadsFechados] = await Promise.all([
+    client.query(
+      `SELECT COUNT(*) AS total FROM campanhas
+       WHERE usuario_id = $1 AND UPPER(status) IN ('ACTIVE','ENABLED') AND COALESCE(status, '') <> 'DELETED'`,
+      [usuarioId]
+    ),
+    client.query(
+      `SELECT COUNT(*) AS total FROM leads WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days'`,
+      [usuarioId]
+    ),
+    client.query(
+      `SELECT COUNT(*) AS total FROM leads
+       WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days' AND (score = 'quente' OR score_manual = 'quente')`,
+      [usuarioId]
+    ),
+    client.query(
+      `SELECT COUNT(*) AS total FROM leads
+       WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days' AND status = 'fechado'`,
+      [usuarioId]
+    ),
+  ]);
+
+  const [gastoMeta, gastoGoogle, gastoTikTok] = await Promise.all([
+    obterGastoSemanalMeta(usuarioId),
+    obterGastoSemanalGoogle(usuarioId),
+    obterGastoSemanalTikTok(usuarioId),
+  ]);
+
+  const gastoTotal = [gastoMeta, gastoGoogle, gastoTikTok]
+    .filter((v): v is number => v !== null)
+    .reduce((a, b) => a + b, 0);
+
+  return {
+    campanhas_ativas: Number(campanhasAtivas.rows[0]?.total || 0),
+    leads_semana: Number(leadsSemana.rows[0]?.total || 0),
+    leads_quentes: Number(leadsQuentes.rows[0]?.total || 0),
+    leads_fechados: Number(leadsFechados.rows[0]?.total || 0),
+    gasto_total: gastoTotal,
+  };
+}
+
+function formatarMoedaBRLTexto(valor: number) {
+  return valor.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+async function enviarResumoSemanalCorretor(usuarioId: number, numeroBot: string) {
+  const resumo = await montarResumoSemanalCorretor(usuarioId);
+  const cpl = resumo.leads_semana > 0 ? resumo.gasto_total / resumo.leads_semana : null;
+
+  const msg =
+    `📊 *Resumo da sua semana*\n\n` +
+    `📢 Campanhas ativas: *${resumo.campanhas_ativas}*\n` +
+    `🧲 Leads na semana: *${resumo.leads_semana}*\n` +
+    `🔥 Leads quentes: *${resumo.leads_quentes}*\n` +
+    `✅ Leads fechados: *${resumo.leads_fechados}*\n` +
+    `💰 Valor investido: *${formatarMoedaBRLTexto(resumo.gasto_total)}*\n` +
+    (cpl !== null ? `📈 Custo por lead: *${formatarMoedaBRLTexto(cpl)}*\n` : "") +
+    `\nAcesse a plataforma para ver todos os detalhes.`;
+
+  await enviarLembreteWhatsApp(numeroBot, msg);
+}
+
+function diaEHoraBrasilAgora() {
+  const partes = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Sao_Paulo",
+    weekday: "short",
+    hour: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const mapa: Record<string, string> = {};
+  for (const p of partes) mapa[p.type] = p.value;
+  return { diaSemana: mapa.weekday, hora: Number(mapa.hour) };
+}
+
+// Roda a cada hora (mesmo padrão de verificarAlertasRailway abaixo); só dispara de fato às
+// segundas-feiras, na janela das 8h (horário de Brasília). resumo_semanal_enviado_em em
+// "usuarios" garante que nunca manda duas vezes na mesma semana mesmo que o processo
+// reinicie/redeploy no meio da janela — um setInterval sozinho reseta a cada deploy, então
+// não dá pra confiar só nele pra um intervalo de 7 dias num projeto com deploy frequente.
+async function verificarResumosSemanaisWhatsApp() {
+  try {
+    const { diaSemana, hora } = diaEHoraBrasilAgora();
+    if (diaSemana !== "Mon" || hora !== 8) return;
+
+    const usuarios = await client.query(`
+      SELECT u.id, pc.dados_conta->>'numero' AS numero_bot
+      FROM usuarios u
+      JOIN plataforma_conexoes pc ON pc.usuario_id = u.id AND pc.plataforma = 'whatsapp' AND pc.status = 'conectado'
+      WHERE COALESCE(u.notif_whatsapp_lead, true) = true
+        AND pc.dados_conta->>'numero' IS NOT NULL
+        AND (u.resumo_semanal_enviado_em IS NULL OR u.resumo_semanal_enviado_em < NOW() - INTERVAL '6 days')
+    `);
+
+    for (const usuario of usuarios.rows) {
+      try {
+        await enviarResumoSemanalCorretor(usuario.id, usuario.numero_bot);
+        await client.query(`UPDATE usuarios SET resumo_semanal_enviado_em = NOW() WHERE id = $1`, [usuario.id]);
+        console.log(`[resumo-semanal] enviado para usuário ${usuario.id}`);
+      } catch (e) {
+        console.error(`[resumo-semanal] erro usuário ${usuario.id}:`, e);
+      }
+    }
+  } catch (e) {
+    console.error("[resumo-semanal] erro geral:", e);
+  }
+}
+
+setInterval(verificarResumosSemanaisWhatsApp, 60 * 60 * 1000);
+verificarResumosSemanaisWhatsApp();
+
+// Dispara o resumo semanal do próprio usuário na hora, fora da janela de segunda 8h —
+// existe só pra dar um jeito de testar/conferir o envio sem esperar a próxima segunda.
+app.post("/whatsapp-bot/resumo-semanal/testar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await client.query(
+      `SELECT dados_conta->>'numero' AS numero FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado' LIMIT 1`,
+      [user.id]
+    );
+    const numero = conexao.rows[0]?.numero;
+    if (!numero) {
+      return c.json({ error: "WhatsApp Bot não conectado ou sem número cadastrado." }, 400);
+    }
+    await enviarResumoSemanalCorretor(user.id, numero);
+    return c.json({ sucesso: true, numero });
+  } catch (err: any) {
+    console.error("ERRO teste resumo semanal:", err);
+    return c.json({ error: "Erro ao enviar resumo de teste" }, 500);
+  }
+});
 
 // Envio pela API oficial do WhatsApp (Cloud API) — caminho separado do Z-API acima.
 // Prefere o token limitado à WABA salvo no Embedded Signup. O token geral de sistema
