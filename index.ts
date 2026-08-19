@@ -18580,6 +18580,338 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
   }
 });
 
+// Resumo (comparativo com o CPL médio anterior) + agrupamento mensal (quando periodo=anual),
+// compartilhado por /google/performance-diaria e /tiktok/performance-diaria — mesma lógica que
+// /meta/performance-diaria já usa inline, extraída aqui só para as duas rotas novas (a rota da
+// Meta foi deixada como está, já em produção, pra não arriscar quebrar o que já funciona).
+function montarResumoPerformanceDiaria(diasPerformance: any[], periodo: string) {
+  const totalGasto = diasPerformance.reduce((total, dia) => total + dia.gasto, 0);
+  const totalLeads = diasPerformance.reduce((total, dia) => total + dia.leads, 0);
+
+  const hoje = diasPerformance[diasPerformance.length - 1] || null;
+  const diasAnteriores = diasPerformance.slice(0, -1);
+  const gastoAnterior = diasAnteriores.reduce((total, dia) => total + dia.gasto, 0);
+  const leadsAnteriores = diasAnteriores.reduce((total, dia) => total + dia.leads, 0);
+  const mediaCplAnterior = leadsAnteriores > 0 ? gastoAnterior / leadsAnteriores : null;
+  const cplHoje = hoje?.custo_por_lead ?? null;
+  const economiaPercentual =
+    mediaCplAnterior && cplHoje && cplHoje > 0
+      ? ((mediaCplAnterior - cplHoje) / mediaCplAnterior) * 100
+      : null;
+
+  const registros =
+    periodo === "anual"
+      ? Object.values(
+          diasPerformance.reduce((acc: any, dia: any) => {
+            const chave = dia.data.slice(0, 7);
+            if (!acc[chave]) {
+              acc[chave] = {
+                periodo: chave, data: chave, gasto: 0, leads: 0,
+                leads_meta: null, leads_plataforma: 0,
+                cliques: 0, impressoes: 0, alcance: 0, custo_por_lead: null,
+              };
+            }
+            acc[chave].gasto += dia.gasto;
+            acc[chave].leads += dia.leads;
+            acc[chave].leads_plataforma += dia.leads_plataforma;
+            acc[chave].cliques += dia.cliques;
+            acc[chave].impressoes += dia.impressoes;
+            acc[chave].alcance += dia.alcance || 0;
+            acc[chave].custo_por_lead = acc[chave].leads > 0 ? acc[chave].gasto / acc[chave].leads : null;
+            return acc;
+          }, {})
+        )
+      : diasPerformance;
+
+  return {
+    resumo: {
+      gasto_total: totalGasto,
+      leads_total: totalLeads,
+      leads_total_plataforma: totalLeads,
+      custo_por_lead_medio: totalLeads > 0 ? totalGasto / totalLeads : null,
+      hoje,
+      media_cpl_anterior: mediaCplAnterior,
+      economia_percentual: economiaPercentual,
+      status:
+        economiaPercentual === null ? "dados_insuficientes"
+        : economiaPercentual >= 0 ? "melhor_que_media"
+        : "acima_da_media",
+    },
+    registros,
+  };
+}
+
+// Mesmo formato de resposta de /meta/performance-diaria (conta_anuncios, resumo, dias, registros),
+// pra reaproveitar a mesma renderização no frontend. Diferença deliberada: aqui não existe um
+// "leads que o Google registrou" pra comparar com os leads reais (ao contrário da Meta, cujo
+// campo `actions` do Graph API dá esse número) — leads_meta fica null e o único número de leads
+// mostrado é o real, salvo na Central de Leads. Ver conversa com o Milton sobre a confusão que o
+// par "Leads (Meta) / Leads (Plataforma)" causava: pra Google/TikTok, evitamos criar esse mesmo
+// par com um número "reportado pela plataforma" que nem é totalmente confiável pra começo de conversa.
+app.get("/google/performance-diaria", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
+    const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
+    const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
+
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ error: "Google Ads nao configurado" }, 400);
+    }
+
+    const conn = await client.query(
+      `SELECT refresh_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    );
+    const row = conn.rows[0];
+    const customerId = row?.dados_conta?.customer_id;
+    const loginCustomerId = row?.dados_conta?.login_customer_id || null;
+
+    if (!row?.refresh_token || !customerId) {
+      return c.json({ error: "Google Ads nao conectado" }, 400);
+    }
+
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - (dias - 1));
+    inicio.setHours(0, 0, 0, 0);
+    const fim = new Date();
+    fim.setHours(23, 59, 59, 999);
+    const since = inicio.toISOString().slice(0, 10);
+    const until = fim.toISOString().slice(0, 10);
+
+    const accessToken = await obterAccessTokenGoogle(row.refresh_token);
+
+    // Mesmo filtro que a Meta já faz (só soma gasto de campanhas criadas por essa plataforma,
+    // não a conta inteira) — evita mostrar gasto de campanhas do Google Ads que nunca passaram
+    // por aqui.
+    const campanhaIdsResult = await client.query(
+      `SELECT DISTINCT campaign_id FROM campanhas
+       WHERE usuario_id = $1 AND plataforma = 'google' AND campaign_id IS NOT NULL
+         AND COALESCE(status, '') <> 'DELETED'`,
+      [user.id]
+    );
+    const campaignIdsUsuario = new Set(campanhaIdsResult.rows.map((r: any) => String(r.campaign_id)));
+
+    let contaInfo: any = null;
+    try {
+      const contaResults = await googleAdsQuery(
+        customerId, accessToken,
+        "SELECT customer.descriptive_name, customer.currency_code FROM customer LIMIT 1",
+        loginCustomerId
+      );
+      contaInfo = (contaResults[0] as any)?.customer ?? null;
+    } catch (_) {}
+
+    const googlePorDia = new Map<string, { spend: number; clicks: number; impressions: number; reach: number }>();
+
+    if (campaignIdsUsuario.size > 0) {
+      const resultados = await googleAdsQuery(
+        customerId, accessToken,
+        `SELECT campaign.id, segments.date, metrics.impressions, metrics.clicks, metrics.cost_micros
+         FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}'`,
+        loginCustomerId
+      );
+      for (const item of resultados as any[]) {
+        const campaignId = String((item as any).campaign?.id || "");
+        if (!campaignIdsUsuario.has(campaignId)) continue;
+        const data = String((item as any).segments?.date || "");
+        const atual = googlePorDia.get(data) || { spend: 0, clicks: 0, impressions: 0, reach: 0 };
+        atual.spend += Number((item as any).metrics?.costMicros || 0) / 1_000_000;
+        atual.clicks += Number((item as any).metrics?.clicks || 0);
+        atual.impressions += Number((item as any).metrics?.impressions || 0);
+        googlePorDia.set(data, atual);
+      }
+
+      // Alcance (unique_users) só existe pra alguns tipos de campanha no Google — best-effort,
+      // mesmo padrão de tolerância a falha já usado em carregarMetricasGoogleCampanhas.
+      try {
+        const alcanceResultados = await googleAdsQuery(
+          customerId, accessToken,
+          `SELECT segments.date, metrics.unique_users, campaign.id
+           FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}'`,
+          loginCustomerId
+        );
+        for (const item of alcanceResultados as any[]) {
+          const campaignId = String((item as any).campaign?.id || "");
+          if (!campaignIdsUsuario.has(campaignId)) continue;
+          const data = String((item as any).segments?.date || "");
+          const atual = googlePorDia.get(data);
+          if (atual) atual.reach += Number((item as any).metrics?.uniqueUsers || 0);
+        }
+      } catch (_) {}
+    }
+
+    const leadsBanco = await client.query(
+      `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
+       FROM leads WHERE usuario_id = $1 AND plataforma = 'google' AND criado_em >= $2
+       GROUP BY DATE(criado_em)`,
+      [user.id, inicio]
+    );
+    const leadsBancoPorDia = new Map(
+      leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
+    );
+
+    const datasPeriodo = Array.from({ length: dias }, (_, index) => {
+      const data = new Date(inicio);
+      data.setDate(inicio.getDate() + index);
+      return data.toISOString().slice(0, 10);
+    });
+
+    const diasPerformance = datasPeriodo.map((data) => {
+      const linha = googlePorDia.get(data) || { spend: 0, clicks: 0, impressions: 0, reach: 0 };
+      const leadsPlataforma = leadsBancoPorDia.get(data) || 0;
+      const gasto = Number(linha.spend || 0);
+      return {
+        data,
+        gasto,
+        leads: leadsPlataforma,
+        leads_meta: null,
+        leads_plataforma: leadsPlataforma,
+        custo_por_lead: leadsPlataforma > 0 ? gasto / leadsPlataforma : null,
+        cliques: Number(linha.clicks || 0),
+        impressoes: Number(linha.impressions || 0),
+        alcance: Number(linha.reach || 0),
+      };
+    });
+
+    const { resumo, registros } = montarResumoPerformanceDiaria(diasPerformance, periodo);
+
+    return c.json({
+      conta_anuncios: {
+        id: customerId,
+        nome: contaInfo?.descriptiveName || customerId,
+        moeda: contaInfo?.currencyCode || "BRL",
+      },
+      periodo,
+      periodo_dias: dias,
+      periodo_inicio: since,
+      periodo_fim: until,
+      agrupamento: periodo === "anual" ? "mensal" : "diario",
+      resumo,
+      dias: diasPerformance,
+      registros,
+    });
+  } catch (err: any) {
+    console.error("ERRO PERFORMANCE DIARIA GOOGLE:", err);
+    return c.json({ error: "Erro ao buscar performance diaria do Google Ads", detalhe: err?.message || err }, 500);
+  }
+});
+
+// Mesmo racional do /google/performance-diaria acima (mesmo formato de resposta, leads_meta
+// sempre null). Reaproveita relatorioTikTokCampanhas (já usada por carregarMetricasTikTokCampanhas)
+// em vez de montar uma chamada nova à Report API do TikTok.
+app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
+    const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
+    const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
+
+    const conn = await client.query(
+      `SELECT access_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      [user.id]
+    );
+    const row = conn.rows[0];
+    const advertiserId = row?.dados_conta?.advertiser_id;
+    if (!row?.access_token || !advertiserId) {
+      return c.json({ error: "TikTok Ads nao conectado" }, 400);
+    }
+
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - (dias - 1));
+    inicio.setHours(0, 0, 0, 0);
+    const fim = new Date();
+    fim.setHours(23, 59, 59, 999);
+    const since = inicio.toISOString().slice(0, 10);
+    const until = fim.toISOString().slice(0, 10);
+
+    const campanhaIdsResult = await client.query(
+      `SELECT DISTINCT campaign_id FROM campanhas
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' AND campaign_id IS NOT NULL
+         AND COALESCE(status, '') <> 'DELETED'`,
+      [user.id]
+    );
+    const campaignIdsUsuario = new Set(campanhaIdsResult.rows.map((r: any) => String(r.campaign_id)));
+
+    const tiktokPorDia = new Map<string, { spend: number; clicks: number; impressions: number; reach: number }>();
+
+    if (campaignIdsUsuario.size > 0) {
+      const registros = await relatorioTikTokCampanhas(
+        row.access_token, String(advertiserId), since, until, ["campaign_id", "stat_time_day"]
+      );
+      for (const item of registros) {
+        const campaignId = String(item.dimensions?.campaign_id || "");
+        if (!campaignIdsUsuario.has(campaignId)) continue;
+        const data = String(item.dimensions?.stat_time_day || "").slice(0, 10);
+        const atual = tiktokPorDia.get(data) || { spend: 0, clicks: 0, impressions: 0, reach: 0 };
+        atual.spend += Number(item.metrics?.spend || 0);
+        atual.clicks += Number(item.metrics?.clicks || 0);
+        atual.impressions += Number(item.metrics?.impressions || 0);
+        atual.reach += Number(item.metrics?.reach || 0);
+        tiktokPorDia.set(data, atual);
+      }
+    }
+
+    const leadsBanco = await client.query(
+      `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
+       FROM leads WHERE usuario_id = $1 AND plataforma = 'tiktok' AND criado_em >= $2
+       GROUP BY DATE(criado_em)`,
+      [user.id, inicio]
+    );
+    const leadsBancoPorDia = new Map(
+      leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
+    );
+
+    const datasPeriodo = Array.from({ length: dias }, (_, index) => {
+      const data = new Date(inicio);
+      data.setDate(inicio.getDate() + index);
+      return data.toISOString().slice(0, 10);
+    });
+
+    const diasPerformance = datasPeriodo.map((data) => {
+      const linha = tiktokPorDia.get(data) || { spend: 0, clicks: 0, impressions: 0, reach: 0 };
+      const leadsPlataforma = leadsBancoPorDia.get(data) || 0;
+      const gasto = Number(linha.spend || 0);
+      return {
+        data,
+        gasto,
+        leads: leadsPlataforma,
+        leads_meta: null,
+        leads_plataforma: leadsPlataforma,
+        custo_por_lead: leadsPlataforma > 0 ? gasto / leadsPlataforma : null,
+        cliques: Number(linha.clicks || 0),
+        impressoes: Number(linha.impressions || 0),
+        alcance: Number(linha.reach || 0),
+      };
+    });
+
+    const { resumo, registros } = montarResumoPerformanceDiaria(diasPerformance, periodo);
+
+    return c.json({
+      conta_anuncios: {
+        id: String(advertiserId),
+        nome: String(advertiserId),
+        moeda: "BRL",
+      },
+      periodo,
+      periodo_dias: dias,
+      periodo_inicio: since,
+      periodo_fim: until,
+      agrupamento: periodo === "anual" ? "mensal" : "diario",
+      resumo,
+      dias: diasPerformance,
+      registros,
+    });
+  } catch (err: any) {
+    console.error("ERRO PERFORMANCE DIARIA TIKTOK:", err);
+    return c.json({ error: "Erro ao buscar performance diaria do TikTok Ads", detalhe: err?.message || err }, 500);
+  }
+});
+
 app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: any) => {
   try {
     const user: any = c.get("user");
