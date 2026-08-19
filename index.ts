@@ -15058,11 +15058,23 @@ async function processarEventoWhatsApp(value: any) {
   }
 
   for (const msg of value.messages || []) {
+    const numeroOrigem = String(msg.from || "").replace(/\D/g, "");
+
+    // Mensagens vindas do nosso próprio número de notificações internas (Z-API, usado por
+    // enviarLembreteWhatsApp — ex: o resumo semanal enviado pro próprio número do WhatsApp
+    // Bot) não são de um cliente de verdade: a Meta entrega isso como mensagem recebida
+    // igual a qualquer outra, mas processar normalmente criaria uma conversa/lead fantasma
+    // e poderia disparar o roteiro automático respondendo de volta pra esse número.
+    const numeroZapi = await obterNumeroZAPI();
+    if (numeroZapi && numeroOrigem === numeroZapi) {
+      console.log(`[whatsapp-webhook] mensagem do número interno de notificações (${numeroZapi}) ignorada, não é cliente`);
+      continue;
+    }
+
     // ⚠️ Heurística provisória de detecção de eco (coexistência): assume que uma
     // mensagem "de" o próprio número business é o corretor respondendo pelo app dele.
     // VERIFICAR contra a doc atual da Meta o campo real que marca isso antes de ir
     // pra produção — coexistência é feature nova e pode expor um flag dedicado.
-    const numeroOrigem = String(msg.from || "").replace(/\D/g, "");
     const ehEco = numeroOrigem && numeroBusiness && numeroOrigem === numeroBusiness;
 
     if (ehEco) {
@@ -26517,6 +26529,34 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
     }
   } catch (e) {
     console.error("[z-api] ❌ exceção:", e);
+  }
+}
+
+// Número WhatsApp conectado à nossa instância Z-API (a partir de onde
+// enviarLembreteWhatsApp manda notificações internas — novo lead, resumo semanal etc.).
+// Usado por processarEventoWhatsApp pra reconhecer e ignorar essas mensagens quando elas
+// chegam como "recebidas" no WhatsApp Bot de algum corretor (destinatário = número do
+// bot dele), evitando criar conversa/lead fantasma ou disparar o roteiro automático de volta
+// pra esse número. Cacheado em memória — o número de uma instância Z-API não muda em uso
+// normal, só refaz a chamada se a primeira tentativa falhar.
+let numeroZapiCache: string | null = null;
+async function obterNumeroZAPI(): Promise<string | null> {
+  if (numeroZapiCache) return numeroZapiCache;
+  const instanceId = Bun.env.ZAPI_INSTANCE_ID;
+  const token = Bun.env.ZAPI_TOKEN;
+  if (!instanceId || !token) return null;
+  try {
+    const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
+    const res = await fetch(`https://api.z-api.io/instances/${instanceId}/token/${token}/device`, {
+      headers: clientToken ? { "Client-Token": clientToken } : {},
+    });
+    const data: any = await res.json();
+    const phone = String(data?.phone || "").replace(/\D/g, "");
+    if (phone) numeroZapiCache = phone;
+    return numeroZapiCache;
+  } catch (e) {
+    console.error("[z-api] erro ao obter número do device:", e);
+    return null;
   }
 }
 
