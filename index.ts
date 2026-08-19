@@ -5621,7 +5621,14 @@ const OAUTH_PROVEDORES: Record<string, {
     // r_marketing_leadgen_automation adicionado pra Lead Gen Forms API (ver
     // secao LINKEDIN ADS) — sem ele /linkedin/formulario e a sincronizacao de
     // respostas de formulario sao rejeitadas mesmo com rw_ads concedido.
-    scope: "r_ads r_ads_reporting rw_ads r_marketing_leadgen_automation",
+    // w_organization_social adicionado pra /linkedin/anuncio: a criacao do
+    // anuncio publica um Post em nome da organizacao (POST /posts) antes de
+    // vira-lo Creative patrocinado — esse endpoint pertence a API de Posts/
+    // Community Management, nao ao Marketing Developer Platform, e exige
+    // esse escopo separado mesmo com rw_ads concedido (bug confirmado nesta
+    // auditoria: campanha/adgroup/imagem/formulario podiam ser criados com
+    // sucesso e só o anuncio final falhar com 403 por falta desse escopo).
+    scope: "r_ads r_ads_reporting rw_ads r_marketing_leadgen_automation w_organization_social",
     clientIdEnv: "LINKEDIN_ADS_CLIENT_ID",
     clientSecretEnv: "LINKEDIN_ADS_CLIENT_SECRET",
     redirectUriEnv: "LINKEDIN_ADS_REDIRECT_URI",
@@ -7088,8 +7095,12 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
           ad: {
             finalUrls: [url],
             responsiveSearchAd: {
-              headlines: listaTitulos.slice(0, 15).map(text => ({ text })),
-              descriptions: listaDescricoes.slice(0, 4).map(text => ({ text })),
+              // Trunca no limite real da Google (30/90 chars) antes de enviar —
+              // reforço de segurança independente da validação do frontend
+              // (se ela for contornada, a Google rejeitaria com TOO_LONG em
+              // vez de simplesmente aceitar um texto cortado sem querer).
+              headlines: listaTitulos.slice(0, 15).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
+              descriptions: listaDescricoes.slice(0, 4).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
             },
           },
         },
@@ -8310,20 +8321,22 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
       return c.json({ error: "Selecione a conta de anúncios TikTok antes de criar a campanha" }, 400);
     }
 
-    // ASSUMPTION: enum objective_type ("LEAD_GENERATION") e nomes de campo de
-    // orçamento (budget_mode/budget) conforme documentação pública do
-    // campaign/create — confirmar contra o SDK oficial na Fase 2B.
+    // ASSUMPTION: enum objective_type ("LEAD_GENERATION") conforme
+    // documentação pública do campaign/create — confirmar contra o SDK
+    // oficial na Fase 2B.
+    //
+    // Orçamento fica SEMPRE no ad group (/tiktok/adgroup), não aqui — sem
+    // CBO configurado, setar budget_mode/budget nos dois níveis ao mesmo
+    // tempo (campanha E ad group) é ambíguo pra API da TikTok e arriscava
+    // rejeição ou double-booking de orçamento. Campanha fica sempre
+    // BUDGET_MODE_INFINITE; quem limita o gasto de verdade é o ad group.
     const payloadCampanha: any = {
       advertiser_id: conexao.advertiserId,
       campaign_name: nome || "Campanha Leads Plataforma",
       objective_type: "LEAD_GENERATION",
-      budget_mode: daily_budget ? "BUDGET_MODE_DAY" : "BUDGET_MODE_INFINITE",
+      budget_mode: "BUDGET_MODE_INFINITE",
       operation_status: "DISABLE"
     };
-
-    if (daily_budget) {
-      payloadCampanha.budget = numeroOpcional(daily_budget);
-    }
 
     const resposta = await tiktokFetch("/campaign/create/", conexao.token, {
       method: "POST",
@@ -8401,10 +8414,16 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
       return c.json({ error: "Selecione ao menos uma localização para segmentar a campanha TikTok" }, 400);
     }
 
-    const orcamento = numeroOpcional(daily_budget);
-    if (!orcamento || orcamento <= 0) {
+    // daily_budget chega multiplicado por 100 (mesma convenção usada pra
+    // Meta, que trabalha em centavos) — mas a TikTok espera o valor "cru" na
+    // moeda da conta (R$50/dia = manda 50, não 5000). Sem essa divisão, uma
+    // campanha configurada pra R$50/dia era criada na TikTok com orçamento
+    // de R$5.000/dia (bug confirmado nesta auditoria).
+    const orcamentoCentavos = numeroOpcional(daily_budget);
+    if (!orcamentoCentavos || orcamentoCentavos <= 0) {
       return c.json({ error: "Orçamento diário é obrigatório para o grupo de anúncios TikTok" }, 400);
     }
+    const orcamento = orcamentoCentavos / 100;
 
     const inicio = textoOpcional(avancadas.inicio);
     const fim = textoOpcional(avancadas.fim);
@@ -9369,7 +9388,7 @@ async function linkedinFetch(
 // esse produto, o usuário precisa reconectar manualmente pela tela.
 async function resolverConexaoLinkedIn(
   usuarioId: number
-): Promise<{ erro: string } | { accessToken: string; adAccountId: string; orgUrn: string | null }> {
+): Promise<{ erro: string } | { accessToken: string; adAccountId: string; orgUrn: string | null; moeda: string }> {
   const conn = await client.query(
     `SELECT access_token, dados_conta FROM plataforma_conexoes
      WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
@@ -9386,6 +9405,11 @@ async function resolverConexaoLinkedIn(
     accessToken: conn.rows[0].access_token,
     adAccountId: String(dadosConta.ad_account_id),
     orgUrn: dadosConta.org_urn || null,
+    // Fallback BRL cobre conexões selecionadas antes desse campo existir —
+    // sem isso a moeda de orçamento/lance sempre foi fixada em BRL na
+    // criação do adgroup, rejeitada pela LinkedIn se a conta de anúncios
+    // for cobrada em outra moeda (bug confirmado nesta auditoria).
+    moeda: dadosConta.moeda || "BRL",
   };
 }
 
@@ -9433,7 +9457,7 @@ app.get("/linkedin/contas", authMiddleware, async (c) => {
 app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
-    const { ad_account_id, org_urn } = await c.req.json();
+    const { ad_account_id, org_urn, moeda } = await c.req.json();
     const contaId = textoOpcional(ad_account_id);
     if (!contaId) return c.json({ error: "ad_account_id obrigatório" }, 400);
 
@@ -9441,11 +9465,12 @@ app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
       `UPDATE plataforma_conexoes
        SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
              'ad_account_id', $1::text,
-             'org_urn', $2::text
+             'org_urn', $2::text,
+             'moeda', $3::text
            ),
            atualizado_em = NOW()
-       WHERE usuario_id = $3 AND plataforma = 'linkedin'`,
-      [contaId, textoOpcional(org_urn), user.id]
+       WHERE usuario_id = $4 AND plataforma = 'linkedin'`,
+      [contaId, textoOpcional(org_urn), textoOpcional(moeda) || "BRL", user.id]
     );
     return c.json({ sucesso: true });
   } catch (err: any) {
@@ -9567,8 +9592,8 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
       type: "SPONSORED_UPDATES",
       objectiveType: destinoResolvido === "whatsapp" ? "WEBSITE_VISITS" : "LEAD_GENERATION",
       costType: "CPC",
-      unitCost: { amount: lanceCpc.toFixed(2), currencyCode: "BRL" },
-      dailyBudget: { amount: orcamento.toFixed(2), currencyCode: "BRL" },
+      unitCost: { amount: lanceCpc.toFixed(2), currencyCode: conexao.moeda },
+      dailyBudget: { amount: orcamento.toFixed(2), currencyCode: conexao.moeda },
       locale: { country: "BR", language: "pt" },
       runSchedule: { start: Date.now() },
       targetingCriteria: {
