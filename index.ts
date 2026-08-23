@@ -21450,11 +21450,22 @@ app.post("/teste/notif-whatsapp", authMiddleware, async (c) => {
 app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    // Mesmo NULLIF já usado em /leads/meta-conversao/estatisticas: leads criados a partir
+    // de uma conversa (CTWA da Meta, wa.me do LinkedIn etc.) gravam plataforma='whatsapp'
+    // (o canal de conversão) mesmo vindo de um anúncio real — quem diz a rede de anúncio
+    // nesse caso é "origem". Sem o NULLIF, esses leads formavam um balde "whatsapp" à parte,
+    // desligado da plataforma que pagou pelo anúncio. canal_whatsapp deixa o front saber
+    // quais linhas são desse tipo pra poder rotular como "Meta Ads · WhatsApp" em vez de só
+    // "Meta Ads" (perderia a info de que veio de conversa, não formulário) ou só "whatsapp"
+    // (perderia de qual plataforma veio o anúncio).
     const result = await client.query(
-      `SELECT COALESCE(plataforma, 'meta') AS plataforma, COUNT(*)::int AS total
+      `SELECT
+         COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') AS plataforma,
+         (plataforma = 'whatsapp') AS canal_whatsapp,
+         COUNT(*)::int AS total
        FROM leads
        WHERE usuario_id = $1
-       GROUP BY COALESCE(plataforma, 'meta')
+       GROUP BY 1, 2
        ORDER BY total DESC`,
       [user.id]
     );
