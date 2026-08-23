@@ -6119,8 +6119,12 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
         [user.id]
       ),
       client.query(
+        // criado_em é timestamp sem timezone armazenado em UTC — comparar direto com
+        // CURRENT_DATE (também UTC) faz "hoje" virar "ontem" assim que passa das 21h em
+        // Brasília (UTC-3), horário em que o dia UTC já virou mas o dia local não.
         `SELECT COUNT(*) AS total FROM leads
-         WHERE usuario_id = $1 AND plataforma = 'google' AND criado_em::date = CURRENT_DATE`,
+         WHERE usuario_id = $1 AND plataforma = 'google'
+         AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date`,
         [user.id]
       ),
     ]);
@@ -12384,6 +12388,9 @@ app.get(
       [usuario_id, adAccountId]
     );
 
+    // criado_em é timestamp sem timezone armazenado em UTC — comparar direto com
+    // CURRENT_DATE (também UTC) faz "hoje" virar "ontem" assim que passa das 21h em
+    // Brasília (UTC-3), horário em que o dia UTC já virou mas o dia local não.
     const leadsHojeBanco = await client.query(
       `
       SELECT COUNT(*) as total
@@ -12393,7 +12400,7 @@ app.get(
         COALESCE(origem, 'manual') <> 'meta'
         OR conta_anuncios_id = $2
       )
-      AND DATE(criado_em) = CURRENT_DATE
+      AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
       `,
       [usuario_id, adAccountId]
     );
