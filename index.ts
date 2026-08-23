@@ -2734,7 +2734,8 @@ type TipoUsoIA =
   | "resumo_diario"
   | "relatorio"
   | "roteiro_whatsapp"
-  | "classificacao_kanban_conversa";
+  | "classificacao_kanban_conversa"
+  | "transcricao_audio";
 
 const IA_CUSTO_ESTIMADO_PADRAO = 0.08;
 const OPENAI_RESPONSES_URL =
@@ -13276,6 +13277,94 @@ async function obterTokenWhatsappUsuario(usuarioId: number) {
   return resultado.rows[0]?.access_token || Bun.env.WHATSAPP_SYSTEM_USER_TOKEN || "";
 }
 
+// Transcreve uma mensagem de áudio do WhatsApp (voz do cliente ou do corretor) via Whisper
+// da OpenAI, pra que classificarStatusLeadPorConversa tenha conteúdo real pra ler em
+// conversas por áudio — sem isso, toda mensagem de áudio vira só "[audio]" (echo) ou fica
+// vazia (entrada), invisível pro classificador. Best-effort: nunca lança, só retorna null se
+// faltar OPENAI_API_KEY, a mídia já tiver expirado no lado da Meta, ou o Whisper falhar —
+// nesses casos a mensagem mantém o placeholder que já existia antes dessa feature.
+async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Promise<string | null> {
+  const openaiKey = Bun.env.OPENAI_API_KEY;
+  if (!openaiKey || !mediaId) return null;
+
+  try {
+    // Mesmo gate global que classificarStatusLeadPorConversa já respeita — se o admin
+    // pausou a IA da plataforma (custo, manutenção etc.), transcrição de áudio pausa junto
+    // em vez de continuar gerando custo de Whisper sozinha.
+    const configIA = await buscarConfigIA();
+    if (configIA?.status !== "contratado") return null;
+
+    const token = await obterTokenWhatsappUsuario(usuarioId);
+    if (!token) return null;
+
+    const infoRes = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${mediaId}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const info: any = await infoRes.json();
+    if (!infoRes.ok || !info?.url) {
+      console.warn("[transcricao-audio] falha ao obter URL da mídia:", info);
+      return null;
+    }
+
+    const audioRes = await fetch(info.url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!audioRes.ok) {
+      console.warn("[transcricao-audio] falha ao baixar áudio:", audioRes.status);
+      return null;
+    }
+    const audioBuffer = await audioRes.arrayBuffer();
+
+    const mimeType = String(info.mime_type || "audio/ogg").split(";")[0].trim();
+    const extensao =
+      mimeType === "audio/mpeg" ? "mp3" :
+      mimeType === "audio/mp4"  ? "m4a" :
+      mimeType === "audio/amr"  ? "amr" : "ogg";
+
+    const form = new FormData();
+    form.append("file", new Blob([audioBuffer], { type: mimeType }), `audio.${extensao}`);
+    form.append("model", "whisper-1");
+    form.append("language", "pt");
+
+    const transcricaoRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${openaiKey}` },
+      body: form,
+    });
+    const transcricao: any = await transcricaoRes.json();
+    if (!transcricaoRes.ok || !transcricao?.text) {
+      console.warn("[transcricao-audio] Whisper falhou:", transcricao);
+      return null;
+    }
+
+    const texto = String(transcricao.text).trim() || null;
+    if (texto) {
+      // Whisper cobra por minuto de áudio, não por token — sem a duração exata no payload
+      // do WhatsApp, usa uma estimativa fixa conservadora (~1min) só pra manter o teto
+      // mensal de custo de IA (mesmo que processarClassificacaoStatusLeadIA já respeita)
+      // ciente desse gasto também.
+      registrarUsoIA(usuarioId, "transcricao_audio", "whatsapp_mensagem", mediaId, 0.01, 0, 0, "openai")
+        .catch((e: any) => console.error("[transcricao-audio] erro ao registrar uso IA:", e));
+    }
+    return texto;
+  } catch (e) {
+    console.error("[transcricao-audio] exceção:", e);
+    return null;
+  }
+}
+
+// Roda a transcrição e atualiza a mensagem já salva (com o placeholder) — desacoplado de
+// propósito do fluxo principal: o webhook do WhatsApp precisa responder rápido pra Meta não
+// re-entregar o evento, e transcrição pode levar alguns segundos. Nunca é aguardado por quem
+// chama (fire-and-forget com .catch), só grava se conseguir um texto real.
+async function transcreverEAtualizarMensagemAudio(usuarioId: number, mediaId: string, mensagemLogId: number) {
+  const texto = await transcreverAudioWhatsApp(usuarioId, mediaId);
+  if (!texto) return;
+  await client.query(
+    `UPDATE whatsapp_mensagens_log SET conteudo = $1 WHERE id = $2`,
+    [texto, mensagemLogId]
+  ).catch((e: any) => console.error("[transcricao-audio] erro ao salvar transcrição:", e));
+}
+
 // Dados públicos (não são segredos) que o frontend precisa pra chamar FB.init/FB.login
 // do Embedded Signup. Sem authMiddleware de propósito — usado antes do usuário logar
 // o popup do Facebook, mesmo padrão do SDK JS do Meta.
@@ -15116,6 +15205,13 @@ async function processarEventoWhatsApp(value: any) {
       continue;
     }
 
+    // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
+    if (msg.type === "audio" && msg.audio?.id) {
+      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logRes.rows[0].id).catch((e: any) =>
+        console.error("[transcricao-audio] erro entrada:", e)
+      );
+    }
+
     // Guarda cru o referral (anúncio "clique para WhatsApp" que originou a
     // conversa), se vier e ainda não tiver sido guardado — usado por
     // criarLeadDeConversaCTWA logo abaixo pra decidir se cria lead novo.
@@ -15205,11 +15301,19 @@ async function processarEcoWhatsApp(value: any) {
     if (!conversaId) continue;
 
     const conteudo = msg.text?.body || (msg.type ? `[${msg.type}]` : null);
-    await client.query(
+    const logEcoRes = await client.query(
       `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'echo', $3)
-       ON CONFLICT (wamid) DO NOTHING`,
+       ON CONFLICT (wamid) DO NOTHING
+       RETURNING id`,
       [conversaId, msg.id, conteudo]
-    ).catch((e) => console.error("ERRO log eco whatsapp:", e));
+    ).catch((e) => { console.error("ERRO log eco whatsapp:", e); return { rows: [] as any[] }; });
+
+    // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
+    if (msg.type === "audio" && msg.audio?.id && logEcoRes.rows[0]?.id) {
+      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logEcoRes.rows[0].id).catch((e: any) =>
+        console.error("[transcricao-audio] erro echo:", e)
+      );
+    }
   }
 }
 
