@@ -13338,12 +13338,15 @@ async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Pro
 
     const texto = String(transcricao.text).trim() || null;
     if (texto) {
+      console.log(`[transcricao-audio] sucesso, mediaId=${mediaId}: "${texto.slice(0, 80)}${texto.length > 80 ? "..." : ""}"`);
       // Whisper cobra por minuto de áudio, não por token — sem a duração exata no payload
       // do WhatsApp, usa uma estimativa fixa conservadora (~1min) só pra manter o teto
       // mensal de custo de IA (mesmo que processarClassificacaoStatusLeadIA já respeita)
       // ciente desse gasto também.
       registrarUsoIA(usuarioId, "transcricao_audio", "whatsapp_mensagem", mediaId, 0.01, 0, 0, "openai")
         .catch((e: any) => console.error("[transcricao-audio] erro ao registrar uso IA:", e));
+    } else {
+      console.warn(`[transcricao-audio] Whisper retornou texto vazio pra mediaId=${mediaId}`);
     }
     return texto;
   } catch (e) {
@@ -15193,6 +15196,13 @@ async function processarEventoWhatsApp(value: any) {
 
     // Dedupe por wamid: Meta reentrega webhook "pelo menos uma vez". Se o insert
     // conflitar, essa mensagem já foi processada antes — não avança o roteiro de novo.
+    // Log de diagnóstico: msg.type não fica visível no log bruto do webhook (a linha é
+    // truncada antes de chegar nesse campo), então sem isso não dá pra saber depois se uma
+    // mensagem sem texto era áudio, figurinha, localização etc. — nem se transcrição rodou.
+    if (!msg.text?.body) {
+      console.log(`[whatsapp-webhook] mensagem ${msg.id} sem texto — type=${msg.type}, audio.id=${msg.audio?.id || "-"}`);
+    }
+
     const logRes = await client.query(
       `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo)
        VALUES ($1, $2, 'entrada', $3)
@@ -15207,6 +15217,7 @@ async function processarEventoWhatsApp(value: any) {
 
     // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
     if (msg.type === "audio" && msg.audio?.id) {
+      console.log(`[transcricao-audio] iniciando transcrição da mensagem ${msg.id} (entrada)`);
       transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logRes.rows[0].id).catch((e: any) =>
         console.error("[transcricao-audio] erro entrada:", e)
       );
@@ -15310,6 +15321,7 @@ async function processarEcoWhatsApp(value: any) {
 
     // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
     if (msg.type === "audio" && msg.audio?.id && logEcoRes.rows[0]?.id) {
+      console.log(`[transcricao-audio] iniciando transcrição da mensagem ${msg.id} (echo)`);
       transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logEcoRes.rows[0].id).catch((e: any) =>
         console.error("[transcricao-audio] erro echo:", e)
       );
