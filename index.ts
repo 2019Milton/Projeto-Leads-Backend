@@ -3905,6 +3905,13 @@ async function gerarSugestaoComercialOpenAI(
 // modelo passar sem crítica.
 function construirContextoCampanhaIA(campanha: any) {
   const cfg = campanha?.configuracoes_avancadas || {};
+  const plataformaCampanha = campanha?.plataforma || "meta";
+  // configuracoes_avancadas e um JSON escrito pelo assistente de criacao da
+  // Meta — campos como cbo/advantage_audience/bid_strategy simplesmente nao
+  // existem pra campanhas Google/TikTok/LinkedIn/Kwai. Sem essa checagem, os
+  // defaults abaixo fabricavam fatos da Meta (ex: "cbo_ativo: true") pra
+  // campanhas de outras redes que nunca tiveram esses campos configurados.
+  const ehMeta = plataformaCampanha === "meta";
 
   const gasto = Number(campanha?.gasto || 0);
   const leads = Number(campanha?.leads || 0);
@@ -3947,7 +3954,7 @@ function construirContextoCampanhaIA(campanha: any) {
       nicho: campanha?.nicho || cfg.nicho || null,
       objetivo: campanha?.objetivo || "Leads",
       status: campanha?.status || null,
-      plataforma: campanha?.origem || "meta"
+      plataforma: plataformaCampanha
     },
     desempenho_periodo_30d: {
       gasto_total: gasto,
@@ -3976,7 +3983,7 @@ function construirContextoCampanhaIA(campanha: any) {
       publicos_personalizados: Array.isArray(cfg.custom_audiences)
         ? cfg.custom_audiences.length
         : 0,
-      publico_advantage_meta: cfg.advantage_audience ?? true
+      ...(ehMeta ? { publico_advantage_meta: cfg.advantage_audience ?? true } : {})
     },
     posicionamento: {
       plataformas: cfg.plataformas || null,
@@ -3999,10 +4006,10 @@ function construirContextoCampanhaIA(campanha: any) {
       link_destino: cfg.link || null
     },
     lance_orcamento: {
-      controle_custo: cfg.bid_strategy || "automatico_meta",
+      controle_custo: ehMeta ? (cfg.bid_strategy || "automatico_meta") : (cfg.bid_strategy || null),
       valor_controle: cfg.bid_amount || null,
-      cbo_ativo: cfg.cbo ?? true,
-      janela_atribuicao: cfg.attribution_spec || "padrao_meta",
+      ...(ehMeta ? { cbo_ativo: cfg.cbo ?? true } : {}),
+      janela_atribuicao: ehMeta ? (cfg.attribution_spec || "padrao_meta") : (cfg.attribution_spec || null),
       categoria_especial: cfg.categoria_especial || null
     },
     formulario_leads: {
@@ -4018,8 +4025,19 @@ function construirContextoCampanhaIA(campanha: any) {
   };
 }
 
+const NOMES_PLATAFORMA_IA: Record<string, string> = {
+  meta: "Meta Ads (Facebook/Instagram)",
+  google: "Google Ads",
+  tiktok: "TikTok Ads",
+  linkedin: "LinkedIn Ads",
+  kwai: "Kwai Ads"
+};
+
 async function gerarAnaliseTrafegoPagoIA(campanha: any) {
   const contexto = construirContextoCampanhaIA(campanha);
+  const plataformaAnalise = contexto.identificacao.plataforma || "meta";
+  const ehMetaAnalise = plataformaAnalise === "meta";
+  const nomePlataformaAnalise = NOMES_PLATAFORMA_IA[plataformaAnalise] || "midia paga";
 
   const fallback = sugestaoIAFallback(
     "Analise de campanha IA",
@@ -4035,12 +4053,19 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
     ]
   );
 
+  const siglasPermitidas = ehMetaAnalise ? "CPL, CTR, CPC, CBO, CTA" : "CPL, CTR, CPC, CTA";
+  const segmentacaoAdvantage = ehMetaAnalise ? ", Advantage+" : "";
+  const clausulaLanceOrcamento = ehMetaAnalise
+    ? "avalie a estrategia de lance/CBO e a janela de atribuicao; "
+    : "avalie a estrategia de lance e orcamento configurada; ";
+  const clausulaAjusteCbo = ehMetaAnalise ? "ativar/desativar CBO, " : "";
+
   const systemMsg =
-    "IDIOMA OBRIGATORIO: escreva TODA a resposta em portugues do Brasil (pt-BR) — todo texto de todo campo do JSON, sem excecao. Nunca responda em ingles ou em qualquer outro idioma. Siglas do mercado de midia paga (CPL, CTR, CPC, CBO, CTA) podem ser mantidas como estao, mas todas as frases ao redor delas devem ser em portugues. " +
-    "Voce e um gestor de trafego pago senior, especialista em Meta Ads (Facebook/Instagram) para geracao de leads no mercado brasileiro, com anos de experiencia otimizando campanhas para corretores (seguros, imoveis, planos de saude, suplementos, SaaS). " +
-    "Analise a campanha como faria uma auditoria profissional real: avalie CPL, CTR, CPC e frequencia contra o que e tipico para Meta Ads de geracao de leads no Brasil (sem inventar numeros de terceiros, apenas usando seu conhecimento geral de mercado como referencia qualitativa); avalie o pacing do orcamento (gasto real vs. orcamento projetado para os dias ativos); avalie se a segmentacao (idade, genero, interesses, localidades, publicos customizados, Advantage+) esta ampla ou estreita demais para o volume de dados que ja existe; avalie o criativo (tipo, copy, CTA) e sinais de possivel fadiga (frequencia alta com CTR caindo); avalie a estrategia de lance/CBO e a janela de atribuicao; avalie a fricção do formulario de leads (quantidade de perguntas, formulario de qualidade). " +
+    `IDIOMA OBRIGATORIO: escreva TODA a resposta em portugues do Brasil (pt-BR) — todo texto de todo campo do JSON, sem excecao. Nunca responda em ingles ou em qualquer outro idioma. Siglas do mercado de midia paga (${siglasPermitidas}) podem ser mantidas como estao, mas todas as frases ao redor delas devem ser em portugues. ` +
+    `Voce e um gestor de trafego pago senior, especialista em ${nomePlataformaAnalise} para geracao de leads no mercado brasileiro, com anos de experiencia otimizando campanhas para corretores (seguros, imoveis, planos de saude, suplementos, SaaS). ` +
+    `Analise a campanha como faria uma auditoria profissional real: avalie CPL, CTR, CPC e frequencia contra o que e tipico para ${nomePlataformaAnalise} de geracao de leads no Brasil (sem inventar numeros de terceiros, apenas usando seu conhecimento geral de mercado como referencia qualitativa); avalie o pacing do orcamento (gasto real vs. orcamento projetado para os dias ativos); avalie se a segmentacao (idade, genero, interesses, localidades, publicos customizados${segmentacaoAdvantage}) esta ampla ou estreita demais para o volume de dados que ja existe; avalie o criativo (tipo, copy, CTA) e sinais de possivel fadiga (frequencia alta com CTR caindo); ${clausulaLanceOrcamento}avalie a fricção do formulario de leads (quantidade de perguntas, formulario de qualidade). ` +
     "Considere tambem quantos dias a campanha esta ativa e quantos leads/impressoes ja existem: com poucos dias ou poucos dados, deixe claro que e cedo para conclusoes fortes e recomende continuar coletando dados antes de mudancas bruscas, em vez de sugerir uma acao agressiva baseada em amostra pequena. " +
-    "De recomendacoes concretas e priorizadas (o que fazer primeiro, o que testar, o que NAO mexer ainda) pensando sempre em gerar mais leads pelo menor custo possivel, considerando tanto as configuracoes atuais quanto os ajustes que poderiam ser feitos e ainda nao foram (ex: reduzir perguntas do formulario, ativar/desativar CBO, testar novo criativo, ampliar ou restringir publico, ajustar orcamento). Use somente os dados reais recebidos, nunca invente metricas, nomes ou configuracoes que nao foram informadas. " +
+    `De recomendacoes concretas e priorizadas (o que fazer primeiro, o que testar, o que NAO mexer ainda) pensando sempre em gerar mais leads pelo menor custo possivel, considerando tanto as configuracoes atuais quanto os ajustes que poderiam ser feitos e ainda nao foram (ex: reduzir perguntas do formulario, ${clausulaAjusteCbo}testar novo criativo, ampliar ou restringir publico, ajustar orcamento). Use somente os dados reais recebidos, nunca invente metricas, nomes ou configuracoes que nao foram informadas. ` +
     "Lembrete final: a resposta inteira (titulo, resumo, diagnostico, acao_principal, mensagens, motivos, campos, recomendacoes) deve estar em portugues do Brasil, com linguagem direta e profissional, sem emojis.";
 
   const schemaProperties = {
@@ -4071,7 +4096,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
 
   const userText = JSON.stringify({
     objetivo:
-      "Fazer uma auditoria completa desta campanha de trafego pago (Meta Ads, geracao de leads) como um especialista senior faria, cobrindo desempenho, segmentacao, criativo, lance/orcamento e formulario, e recomendar os ajustes que realmente aumentam leads pelo menor custo.",
+      `Fazer uma auditoria completa desta campanha de trafego pago (${nomePlataformaAnalise}, geracao de leads) como um especialista senior faria, cobrindo desempenho, segmentacao, criativo, lance/orcamento e formulario, e recomendar os ajustes que realmente aumentam leads pelo menor custo.`,
     campanha: contexto
   });
 
@@ -18597,37 +18622,11 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
     const hoje =
       diasPerformance[diasPerformance.length - 1] || null;
 
-    const diasAnteriores =
-      diasPerformance.slice(0, -1);
-
-    const gastoAnterior =
-      diasAnteriores.reduce(
-        (total: number, dia: any) =>
-          total + dia.gasto,
-        0
-      );
-
-    const leadsAnteriores =
-      diasAnteriores.reduce(
-        (total: number, dia: any) =>
-          total + dia.leads,
-        0
-      );
-
-    const mediaCplAnterior =
-      leadsAnteriores > 0
-        ? gastoAnterior / leadsAnteriores
-        : null;
-
-    const cplHoje =
-      hoje?.custo_por_lead ?? null;
-
-    const economiaPercentual =
-      mediaCplAnterior &&
-      cplHoje &&
-      cplHoje > 0
-        ? ((mediaCplAnterior - cplHoje) / mediaCplAnterior) * 100
-        : null;
+    // Tendência calculada com calcularTendenciaCPL (janela de dias, não só "hoje" contra
+    // o resto) — ver definição da função para o motivo: um único dia costuma ter poucos
+    // leads (às vezes 1), o que fazia esse percentual oscilar demais pra ser confiável.
+    const { media_cpl_anterior: mediaCplAnterior, economia_percentual: economiaPercentual } =
+      calcularTendenciaCPL(diasPerformance);
 
     const registros =
       periodo === "anual"
@@ -18722,20 +18721,47 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
 // compartilhado por /google/performance-diaria e /tiktok/performance-diaria — mesma lógica que
 // /meta/performance-diaria já usa inline, extraída aqui só para as duas rotas novas (a rota da
 // Meta foi deixada como está, já em produção, pra não arriscar quebrar o que já funciona).
+// Compara a média de CPL dos últimos `tamanhoJanela` dias (padrão 3) contra a média do
+// restante do período, em vez de "só hoje" contra o resto. Motivo: um único dia
+// normalmente tem poucos leads (às vezes 1) — CPL calculado sobre uma amostra tão pequena
+// oscila muito de uma hora pra outra conforme o gasto do dia acumula sem lead novo ainda,
+// o que fazia esse percentual de "tendência" pular de forma enganosa (ex: 27% pior virar
+// 30% pior em poucos minutos, sem nenhuma mudança real na campanha). Uma janela de alguns
+// dias suaviza esse ruído de amostra pequena sem deixar de mostrar uma tendência real.
+function calcularTendenciaCPL(diasPerformance: any[], tamanhoJanela = 3) {
+  if (diasPerformance.length <= tamanhoJanela) {
+    return { media_cpl_anterior: null, economia_percentual: null };
+  }
+
+  const janelaRecente = diasPerformance.slice(-tamanhoJanela);
+  const janelaAnterior = diasPerformance.slice(0, -tamanhoJanela);
+
+  const somar = (dias: any[], campo: string) =>
+    dias.reduce((total: number, dia: any) => total + (dia[campo] || 0), 0);
+
+  const gastoRecente = somar(janelaRecente, "gasto");
+  const leadsRecente = somar(janelaRecente, "leads");
+  const gastoAnterior = somar(janelaAnterior, "gasto");
+  const leadsAnterior = somar(janelaAnterior, "leads");
+
+  const cplRecente = leadsRecente > 0 ? gastoRecente / leadsRecente : null;
+  const mediaCplAnterior = leadsAnterior > 0 ? gastoAnterior / leadsAnterior : null;
+
+  const economiaPercentual =
+    mediaCplAnterior && cplRecente
+      ? ((mediaCplAnterior - cplRecente) / mediaCplAnterior) * 100
+      : null;
+
+  return { media_cpl_anterior: mediaCplAnterior, economia_percentual: economiaPercentual };
+}
+
 function montarResumoPerformanceDiaria(diasPerformance: any[], periodo: string) {
   const totalGasto = diasPerformance.reduce((total, dia) => total + dia.gasto, 0);
   const totalLeads = diasPerformance.reduce((total, dia) => total + dia.leads, 0);
 
   const hoje = diasPerformance[diasPerformance.length - 1] || null;
-  const diasAnteriores = diasPerformance.slice(0, -1);
-  const gastoAnterior = diasAnteriores.reduce((total, dia) => total + dia.gasto, 0);
-  const leadsAnteriores = diasAnteriores.reduce((total, dia) => total + dia.leads, 0);
-  const mediaCplAnterior = leadsAnteriores > 0 ? gastoAnterior / leadsAnteriores : null;
-  const cplHoje = hoje?.custo_por_lead ?? null;
-  const economiaPercentual =
-    mediaCplAnterior && cplHoje && cplHoje > 0
-      ? ((mediaCplAnterior - cplHoje) / mediaCplAnterior) * 100
-      : null;
+  const { media_cpl_anterior: mediaCplAnterior, economia_percentual: economiaPercentual } =
+    calcularTendenciaCPL(diasPerformance);
 
   const registros =
     periodo === "anual"
