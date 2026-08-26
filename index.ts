@@ -6292,7 +6292,7 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
 
     const leadsResults = await googleAdsQuery(
       customerId, accessToken,
-      `SELECT lead_form_submission_data.id, lead_form_submission_data.campaign_id,
+      `SELECT lead_form_submission_data.id, lead_form_submission_data.campaign,
               lead_form_submission_data.submission_date_time,
               lead_form_submission_data.lead_form_submission_fields,
               lead_form_submission_data.gclid
@@ -6315,7 +6315,9 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
 
       let nomeCampanha = "Campanha Google Ads";
       let nichoId: number | null = null;
-      const campaignIdLead = dadosLead.campaignId ? String(dadosLead.campaignId) : "";
+      // lead_form_submission_data.campaign vem como resource name
+      // ("customers/123/campaigns/456"), nao como ID numerico direto.
+      const campaignIdLead = String(dadosLead.campaign || "").split("/").pop() || "";
       if (campaignIdLead) {
         const campRow = await client.query(
           `SELECT nome, nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 LIMIT 1`,
