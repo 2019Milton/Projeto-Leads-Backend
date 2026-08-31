@@ -2823,7 +2823,7 @@ function detectarSinaisIA(lead: any, ml: any) {
 // pela pontuação por regras e pelas features do ML (calcularScoreLead,
 // extrairFeaturesMLLead) — único lugar que decide "qual nicho é esse lead".
 type ChaveNicho =
-  | "imoveis" | "saude" | "suplementos" | "saas"
+  | "imoveis" | "saude" | "suplementos" | "saas" | "higienizacao"
   | "educacao" | "auto" | "consorcio";
 
 function detectarChaveNicho(lead: any): ChaveNicho | null {
@@ -2834,6 +2834,7 @@ function detectarChaveNicho(lead: any): ChaveNicho | null {
   if (slug.includes("saude")  || slug.includes("saúde")  || nome.includes("saúde") || nome.includes("saude")) return "saude";
   if (slug.includes("suplement") || nome.includes("suplement")) return "suplementos";
   if (slug.includes("saas") || slug.includes("plataforma") || nome.includes("saas") || nome.includes("plataforma")) return "saas";
+  if (slug.includes("higien") || nome.includes("higien")) return "higienizacao";
   if (slug.includes("educa") || nome.includes("educa") || nome.includes("curso") || nome.includes("ensino")) return "educacao";
   if (slug.includes("auto") || nome.includes("auto") || nome.includes("veículo") || nome.includes("veiculo") || nome.includes("carro")) return "auto";
   if (slug.includes("consorcio") || slug.includes("consórcio") || nome.includes("consórcio") || nome.includes("consorcio")) return "consorcio";
@@ -2850,6 +2851,7 @@ const VOCABULARIO_NICHO: Record<ChaveNicho, string[]> = {
   saude: ["cobertura", "sinistro", "carencia", "carência", "reembolso", "internacao", "internação", "operadora", "mensalidade", "dependente"],
   suplementos: ["assinatura", "recorrencia", "recorrência", "whey", "creatina", "treino", "academia", "hipertrofia", "emagrecimento", "dose"],
   saas: ["implantacao", "implantação", "licenca", "licença", "usuarios", "usuários", "integracao", "integração", "trial", "onboarding"],
+  higienizacao: ["estofado", "colchao", "colchão", "carpete", "tapete", "sofa", "sofá", "acaro", "ácaro", "mofo", "pos obra", "pós obra", "agendamento", "orcamento", "orçamento"],
   educacao: ["matricula", "matrícula", "turma", "bolsa", "certificado", "presencial", "carga horaria", "carga horária", "professor", "aula"],
   auto: ["seminovo", "revisao", "revisão", "test drive", "quilometragem", "troca", "financiamento", "entrada", "placa", "laudo"],
   consorcio: ["carta de credito", "carta de crédito", "contemplacao", "contemplação", "lance", "grupo", "cota", "assembleia"]
@@ -2862,6 +2864,7 @@ function contextoNicho(lead: any) {
   const isSaude      = chave === "saude";
   const isSuplemento = chave === "suplementos";
   const isSaas       = chave === "saas";
+  const isHigienizacao = chave === "higienizacao";
   const isEducacao   = chave === "educacao";
   const isAuto       = chave === "auto";
   const isConsorcio  = chave === "consorcio";
@@ -2952,6 +2955,28 @@ function contextoNicho(lead: any) {
     msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda faz sentido conhecer a plataforma. Posso retomar com informações mais alinhadas ao seu caso de uso.`,
     msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para oportunidades na plataforma?`,
     system: "Você é uma IA comercial especializada em plataformas SaaS e software. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em caso de uso, tamanho de equipe, ferramentas atuais e ROI da solução."
+  };
+
+  if (isHigienizacao) return {
+    nicho: "Higienização",
+    produto: "serviço de higienização",
+    produto_pl: "serviços de higienização",
+    verbo_interesse: "contratar uma higienização",
+    qualificadores: ["tipo de item ou ambiente", "região atendida", "frequência desejada", "urgência do agendamento"],
+    perguntas: [
+      "O que você gostaria de higienizar? (estofado, colchão, carpete, pós-obra...)",
+      "Qual a cidade ou região do atendimento?",
+      "Prefere um serviço avulso ou recorrente?",
+      "Tem alguma urgência para agendar?",
+      "Já contratou higienização profissional antes?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse na higienização. Qual o melhor horário para eu confirmar sua visita hoje?`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para te passar um orçamento certeiro, me conta: o que você quer higienizar e qual a região do atendimento?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse em agendar uma higienização? Posso te enviar um orçamento sem compromisso.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que você tinha interesse em higienização. Ainda faz sentido agendar? Tenho horários disponíveis essa semana.`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse na higienização. Posso retomar com um orçamento atualizado.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades de higienização?`,
+    system: "Você é uma IA comercial especializada em serviços de higienização (estofados, colchões, carpetes, pós-obra). Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em tipo de serviço, região atendida e urgência do agendamento."
   };
 
   if (isEducacao) return {
@@ -4062,7 +4087,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
 
   const systemMsg =
     `IDIOMA OBRIGATORIO: escreva TODA a resposta em portugues do Brasil (pt-BR) — todo texto de todo campo do JSON, sem excecao. Nunca responda em ingles ou em qualquer outro idioma. Siglas do mercado de midia paga (${siglasPermitidas}) podem ser mantidas como estao, mas todas as frases ao redor delas devem ser em portugues. ` +
-    `Voce e um gestor de trafego pago senior, especialista em ${nomePlataformaAnalise} para geracao de leads no mercado brasileiro, com anos de experiencia otimizando campanhas para corretores (seguros, imoveis, planos de saude, suplementos, SaaS). ` +
+    `Voce e um gestor de trafego pago senior, especialista em ${nomePlataformaAnalise} para geracao de leads no mercado brasileiro, com anos de experiencia otimizando campanhas para corretores (seguros, imoveis, planos de saude, suplementos, SaaS, higienizacao). ` +
     `Analise a campanha como faria uma auditoria profissional real: avalie CPL, CTR, CPC e frequencia contra o que e tipico para ${nomePlataformaAnalise} de geracao de leads no Brasil (sem inventar numeros de terceiros, apenas usando seu conhecimento geral de mercado como referencia qualitativa); avalie o pacing do orcamento (gasto real vs. orcamento projetado para os dias ativos); avalie se a segmentacao (idade, genero, interesses, localidades, publicos customizados${segmentacaoAdvantage}) esta ampla ou estreita demais para o volume de dados que ja existe; avalie o criativo (tipo, copy, CTA) e sinais de possivel fadiga (frequencia alta com CTR caindo); ${clausulaLanceOrcamento}avalie a fricção do formulario de leads (quantidade de perguntas, formulario de qualidade). ` +
     "Considere tambem quantos dias a campanha esta ativa e quantos leads/impressoes ja existem: com poucos dias ou poucos dados, deixe claro que e cedo para conclusoes fortes e recomende continuar coletando dados antes de mudancas bruscas, em vez de sugerir uma acao agressiva baseada em amostra pequena. " +
     `De recomendacoes concretas e priorizadas (o que fazer primeiro, o que testar, o que NAO mexer ainda) pensando sempre em gerar mais leads pelo menor custo possivel, considerando tanto as configuracoes atuais quanto os ajustes que poderiam ser feitos e ainda nao foram (ex: reduzir perguntas do formulario, ${clausulaAjusteCbo}testar novo criativo, ampliar ou restringir publico, ajustar orcamento). Use somente os dados reais recebidos, nunca invente metricas, nomes ou configuracoes que nao foram informadas. ` +
@@ -15841,7 +15866,8 @@ await client.query(`
     ('imoveis',     'Imóveis',          '#2563EB'),
     ('saude',       'Planos de Saúde',  '#DC2626'),
     ('suplementos', 'Suplementos',      '#EA580C'),
-    ('saas',        'Plataforma / SaaS','#7C3AED')
+    ('saas',        'Plataforma / SaaS','#7C3AED'),
+    ('higienizacao','Higienização',     '#16A34A')
   ON CONFLICT (slug) DO UPDATE SET cor = EXCLUDED.cor, nome = EXCLUDED.nome;
 `);
 
@@ -15886,6 +15912,16 @@ await client.query(`
     objetivo     TEXT,
     marca        TEXT,
     publico_alvo TEXT
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas_higienizacao (
+    campanha_id    INTEGER PRIMARY KEY REFERENCES campanhas(id) ON DELETE CASCADE,
+    tipo_servico   TEXT,
+    frequencia     TEXT,
+    area_atendida  TEXT,
+    publico_alvo   TEXT
   );
 `);
 
@@ -15961,6 +15997,21 @@ async function copiarDadosNichoCampanha(
            (campanha_id, produto, objetivo, marca, publico_alvo)
          VALUES ($1, $2, $3, $4, $5)`,
         [novaCampanhaId, d.produto, d.objetivo, d.marca, d.publico_alvo]
+      );
+    }
+  } else if (nichoSlug === "higienizacao") {
+    const r = await dbClient.query(
+      `SELECT tipo_servico, frequencia, area_atendida, publico_alvo
+       FROM campanhas_higienizacao WHERE campanha_id = $1`,
+      [origCampanhaId]
+    );
+    if (r.rows.length > 0) {
+      const d = r.rows[0];
+      await dbClient.query(
+        `INSERT INTO campanhas_higienizacao
+           (campanha_id, tipo_servico, frequencia, area_atendida, publico_alvo)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [novaCampanhaId, d.tipo_servico, d.frequencia, d.area_atendida, d.publico_alvo]
       );
     }
   }
@@ -16984,6 +17035,8 @@ app.get("/campanhas", authMiddleware, async (c) => {
           OR
           EXISTS (SELECT 1 FROM campanhas_suplementos cp WHERE cp.campanha_id = c.id) AND ni.slug = 'suplementos'
           OR
+          EXISTS (SELECT 1 FROM campanhas_higienizacao chg WHERE chg.campanha_id = c.id) AND ni.slug = 'higienizacao'
+          OR
           EXISTS (SELECT 1 FROM leads l WHERE l.campanha = c.nome AND l.nicho_id = ni.id AND l.usuario_id = c.usuario_id LIMIT 1)
         )
         LIMIT 1
@@ -17802,6 +17855,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         cp.objetivo AS objetivo_nicho,
         cp.marca,
         cp.publico_alvo,
+        chg.tipo_servico,
+        chg.frequencia,
+        chg.area_atendida,
+        chg.publico_alvo AS publico_alvo_higienizacao,
         COALESCE(dono_origem.email,     dono.email)     AS criado_por_email,
         COALESCE(dono_origem.nome,      dono.nome)      AS criado_por_nome,
         COALESCE(dono_origem.sobrenome, dono.sobrenome) AS criado_por_sobrenome,
@@ -17850,6 +17907,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         ON cs.campanha_id = c.id
       LEFT JOIN campanhas_suplementos cp
         ON cp.campanha_id = c.id
+      LEFT JOIN campanhas_higienizacao chg
+        ON chg.campanha_id = c.id
       WHERE
         c.usuario_id = $1
         AND (
@@ -18304,7 +18363,10 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         produto: campanha.produto ?? campanha.configuracoes_avancadas?.produto,
         objetivo: campanha.objetivo_nicho ?? campanha.configuracoes_avancadas?.objetivo,
         marca: campanha.marca ?? campanha.configuracoes_avancadas?.marca,
-        publico_alvo: campanha.publico_alvo ?? campanha.configuracoes_avancadas?.publico_alvo
+        publico_alvo: campanha.publico_alvo ?? campanha.publico_alvo_higienizacao ?? campanha.configuracoes_avancadas?.publico_alvo,
+        tipo_servico: campanha.tipo_servico ?? campanha.configuracoes_avancadas?.tipo_servico,
+        frequencia: campanha.frequencia ?? campanha.configuracoes_avancadas?.frequencia,
+        area_atendida: campanha.area_atendida ?? campanha.configuracoes_avancadas?.area_atendida
       };
 
       metricas.push({
@@ -23975,6 +24037,32 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       interesses: "marketing digital, gestao de leads, Facebook Ads, CRM, vendas online, automacao de marketing, empreendedorismo",
       idadeMin: "25", idadeMax: "55",
       obrigadoTextoSufixo: "nossa equipe vai te mostrar como a plataforma pode transformar seus resultados"
+    },
+    higienizacao: {
+      topicoDefault: "servico de higienizacao",
+      especialidade: "servicos de higienizacao e limpeza especializada (estofados, colchoes, carpetes, pos-obra) no Brasil",
+      v1exemplos: [
+        "Agende hoje e garanta desconto especial",
+        "Vagas limitadas essa semana",
+        "Ultimas vagas com condicao especial"
+      ],
+      v1texto: "crie urgencia em torno de vagas limitadas na agenda ou desconto por tempo limitado",
+      v2exemplos: [
+        "Sua casa limpa e livre de acaros, do jeito que sua familia merece",
+        "Ambientes saudaveis para quem voce ama",
+        "Renove seus estofados e respire um ar mais puro em casa"
+      ],
+      v2texto: "evoque bem-estar, saude da familia e ambiente limpo e livre de acaros e bactérias",
+      v3exemplos: [
+        "Equipamentos profissionais e resultado visivel",
+        "Higienizacao profunda com produtos hipoalergenicos",
+        "Antes e depois que voce vai notar na hora"
+      ],
+      v3texto: "destaque diferenciais tecnicos: equipamento profissional, produtos certificados e hipoalergenicos, garantia do servico",
+      perguntas: "Qual item ou ambiente voce quer higienizar?\nQual a cidade ou regiao do atendimento?\nPrefere um servico avulso ou recorrente?",
+      interesses: "limpeza residencial, higienizacao de estofados, limpeza pos-obra, casa limpa, bem-estar em casa, produtos de limpeza",
+      idadeMin: "25", idadeMax: "60",
+      obrigadoTextoSufixo: "nossa equipe vai entrar em contato para agendar sua higienizacao"
     }
   };
 
@@ -24019,6 +24107,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_objetivo: "",
       nicho_marca: "",
       nicho_publico_alvo: "",
+      nicho_tipo_servico: "",
+      nicho_frequencia: "",
       cbo: true,
       attribution_spec: "7d_click_1d_view",
       google_titulo_1: incluirGoogle ? truncarSemCortarPalavra(titulo, 30) : "",
@@ -24073,6 +24163,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_objetivo: v?.nicho_objetivo || v?.objetivo_nicho || "",
       nicho_marca: v?.nicho_marca || v?.marca || "",
       nicho_publico_alvo: v?.nicho_publico_alvo || v?.publico_alvo || "",
+      nicho_tipo_servico: v?.nicho_tipo_servico || v?.tipo_servico || "",
+      nicho_frequencia: v?.nicho_frequencia || v?.frequencia || "",
       cbo: v?.cbo ?? true,
       attribution_spec: v?.attribution_spec || "7d_click_1d_view",
       // Limites defensivos (30/90/90/25 chars) mesmo que a IA ignore o pedido no prompt —
@@ -24154,7 +24246,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Campos opcionais de nicho: preencha SEMPRE que a informacao estiver disponivel no contexto do usuario, mesmo que de forma indireta ou implicita — nao deixe de preencher um campo por excesso de cautela. Deixe vazio APENAS quando o usuario realmente nao deu nenhuma pista sobre aquele campo.\n` +
       `Para imoveis: nicho_tipo_imovel (residencial|comercial|rural), nicho_finalidade (venda|locacao), nicho_valor_min, nicho_valor_max.\n` +
       `Para saude: nicho_operadora, nicho_tipo_plano (individual|familiar|empresarial), nicho_cobertura (basica|intermediaria|premium), nicho_acomodacao (enfermaria|apartamento).\n` +
-      `Para suplementos: nicho_produto (whey|creatina|pre_workout|bcaa|multivitaminico|colageno|outro), nicho_objetivo (ganho_massa|emagrecimento|performance|saude), nicho_marca, nicho_publico_alvo (iniciantes|intermediario|avancado).\n\n` +
+      `Para suplementos: nicho_produto (whey|creatina|pre_workout|bcaa|multivitaminico|colageno|outro), nicho_objetivo (ganho_massa|emagrecimento|performance|saude), nicho_marca, nicho_publico_alvo (iniciantes|intermediario|avancado).\n` +
+      `Para higienizacao: nicho_tipo_servico (estofados|colchoes|carpetes_tapetes|pos_obra|ar_condicionado|caixa_dagua|geral), nicho_frequencia (avulso|recorrente), nicho_publico_alvo (residencial|comercial|industrial).\n\n` +
       (incluirGoogle
         ? `Campos extras OBRIGATORIOS por causa do Google Ads (anuncio Display, respeite os limites de caracteres a risca):\n` +
           `google_titulo_1, google_titulo_2, google_titulo_3 (3 titulos curtos e DIFERENTES entre si, cada um com no maximo 30 caracteres),\n` +
@@ -26055,10 +26148,10 @@ app.put("/usuario/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 4
+      nicho_ids.length > 5
     ) {
       return c.json(
-        { error: "Informe entre 1 e 3 nichos" },
+        { error: "Informe entre 1 e 5 nichos" },
         400
       );
     }
@@ -26128,10 +26221,10 @@ app.put("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 4
+      nicho_ids.length > 5
     ) {
       return c.json(
-        { error: "Informe entre 1 e 3 nichos" },
+        { error: "Informe entre 1 e 5 nichos" },
         400
       );
     }
@@ -26187,7 +26280,11 @@ app.post("/campanhas/manual", authMiddleware, async (c) => {
       produto,
       objetivo,
       marca,
-      publico_alvo
+      publico_alvo,
+      // campos de higienização
+      tipo_servico,
+      frequencia,
+      area_atendida
     } = body;
 
     if (!nome) {
@@ -26252,6 +26349,14 @@ app.post("/campanhas/manual", authMiddleware, async (c) => {
          VALUES ($1, $2, $3, $4, $5)`,
         [campanhaId, produto ?? null, objetivo ?? null,
          marca ?? null, publico_alvo ?? null]
+      );
+    } else if (slug === "higienizacao") {
+      await client.query(
+        `INSERT INTO campanhas_higienizacao
+           (campanha_id, tipo_servico, frequencia, area_atendida, publico_alvo)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [campanhaId, tipo_servico ?? null, frequencia ?? null,
+         area_atendida ?? null, publico_alvo ?? null]
       );
     }
 
@@ -26357,6 +26462,12 @@ app.get("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
     } else if (camp.slug === "suplementos") {
       const r = await client.query(
         `SELECT * FROM campanhas_suplementos WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      dados = r.rows[0] ?? null;
+    } else if (camp.slug === "higienizacao") {
+      const r = await client.query(
+        `SELECT * FROM campanhas_higienizacao WHERE campanha_id = $1`,
         [campanhaId]
       );
       dados = r.rows[0] ?? null;
@@ -26563,6 +26674,20 @@ app.put("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
         [campanhaId,
          body.produto ?? null, body.objetivo ?? null,
          body.marca ?? null, body.publico_alvo ?? null]
+      );
+    } else if (slug === "higienizacao") {
+      await client.query(
+        `INSERT INTO campanhas_higienizacao
+           (campanha_id, tipo_servico, frequencia, area_atendida, publico_alvo)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (campanha_id) DO UPDATE SET
+           tipo_servico  = EXCLUDED.tipo_servico,
+           frequencia    = EXCLUDED.frequencia,
+           area_atendida = EXCLUDED.area_atendida,
+           publico_alvo  = EXCLUDED.publico_alvo`,
+        [campanhaId,
+         body.tipo_servico ?? null, body.frequencia ?? null,
+         body.area_atendida ?? null, body.publico_alvo ?? null]
       );
     } else {
       return c.json({ error: "Campanha sem nicho definido" }, 400);
