@@ -21770,8 +21770,7 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       `
       SELECT
         COUNT(*) FILTER (
-          WHERE lead_id IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
+          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
         )::int AS total_leads_meta,
         COUNT(*) FILTER (
           WHERE meta_evento_qualificado_enviado_em IS NOT NULL
