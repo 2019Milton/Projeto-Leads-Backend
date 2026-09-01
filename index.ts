@@ -26641,19 +26641,35 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       }, 400);
     }
 
-    // 🔗 link real do anúncio (post publicado) para abrir em outra aba
+    // 🔗 link real do anúncio (post publicado) para abrir em outra aba — cada
+    // rede tem seu próprio permalink (effective_object_story_id no Facebook,
+    // instagram_permalink_url no Instagram); usa o da rede pedida em ad_format
+    // e só cai pro link da outra rede se o pedido não tiver um disponível
+    // (ex: anúncio nunca rodou no Instagram), pra nunca linkar Instagram
+    // selecionado com uma URL do Facebook (ou vice-versa) sem avisar.
     let linkAnuncio: string | null = null;
+    let linkRede: "facebook" | "instagram" | null = null;
+    const formatoInstagram = adFormat.toUpperCase().startsWith("INSTAGRAM");
 
     try {
       const creativeRes = await fetch(
-        `https://graph.facebook.com/v19.0/${adId}?fields=creative{effective_object_story_id}&access_token=${token}`
+        `https://graph.facebook.com/v19.0/${adId}?fields=creative{effective_object_story_id,instagram_permalink_url}&access_token=${token}`
       );
       const creativeData: any = await creativeRes.json();
       const storyId = creativeData?.creative?.effective_object_story_id || null;
+      const linkFacebook = storyId ? `https://www.facebook.com/${storyId}` : null;
+      const linkInstagram = creativeData?.creative?.instagram_permalink_url || null;
 
-      linkAnuncio = storyId
-        ? `https://www.facebook.com/${storyId}`
-        : null;
+      if (formatoInstagram && linkInstagram) {
+        linkAnuncio = linkInstagram;
+        linkRede = "instagram";
+      } else if (linkFacebook) {
+        linkAnuncio = linkFacebook;
+        linkRede = "facebook";
+      } else if (linkInstagram) {
+        linkAnuncio = linkInstagram;
+        linkRede = "instagram";
+      }
     } catch (errCreative) {
       console.error("ERRO LINK REAL ANUNCIO META:", errCreative);
     }
@@ -26663,9 +26679,10 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       linkAnuncio = actId
         ? `https://adsmanager.facebook.com/adsmanager/manage/ads?act=${encodeURIComponent(actId)}&selected_ad_ids=${encodeURIComponent(adId)}`
         : null;
+      linkRede = null;
     }
 
-    return c.json({ preview_html: previewHtml, link_anuncio: linkAnuncio });
+    return c.json({ preview_html: previewHtml, link_anuncio: linkAnuncio, link_rede: linkRede });
 
   } catch (err) {
     console.error("ERRO GET /campanhas/:id/preview-anuncio:", err);
