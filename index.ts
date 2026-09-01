@@ -7477,6 +7477,69 @@ async function obterConexaoTikTok(
   };
 }
 
+// Mesmo formato de /google/status-completo — usado pelo card "Status TikTok"
+// do Dashboard (campanhas, gasto e leads de hoje, com sincronizacao manual).
+app.get("/tiktok/status-completo", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await obterConexaoTikTok(user.id);
+    if (!conexao || !conexao.token) {
+      return c.json({ conectado: false });
+    }
+
+    const [conn, campanhasCount, leadsHojeCount] = await Promise.all([
+      client.query(
+        `SELECT atualizado_em FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+        [user.id]
+      ),
+      client.query(
+        `SELECT COUNT(*) FILTER (WHERE UPPER(status) = 'ACTIVE') AS ativas, COUNT(*) AS total
+         FROM campanhas WHERE usuario_id = $1 AND plataforma = 'tiktok'`,
+        [user.id]
+      ),
+      client.query(
+        // Mesmo cuidado de timezone dos outros /status-completo: criado_em é
+        // UTC sem timezone, comparar direto com CURRENT_DATE vira "ontem" ~21h Brasília.
+        `SELECT COUNT(*) AS total FROM leads
+         WHERE usuario_id = $1 AND plataforma = 'tiktok'
+         AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date`,
+        [user.id]
+      ),
+    ]);
+
+    const base = {
+      conectado: true,
+      conta_selecionada: Boolean(conexao.advertiserId),
+      advertiser_id: conexao.advertiserId,
+      ultimo_sync: conn.rows[0]?.atualizado_em ?? null,
+      campanhas_ativas: Number(campanhasCount.rows[0]?.ativas ?? 0),
+      campanhas_total: Number(campanhasCount.rows[0]?.total ?? 0),
+      leads_hoje: Number(leadsHojeCount.rows[0]?.total ?? 0),
+    };
+
+    if (!conexao.advertiserId) {
+      return c.json({ ...base, gasto_hoje: null });
+    }
+
+    try {
+      const hojeStr = new Date().toISOString().slice(0, 10);
+      const relatorioHoje = await relatorioTikTokCampanhas(
+        conexao.token, conexao.advertiserId, hojeStr, hojeStr, ["advertiser_id"]
+      );
+      const gastoHoje = relatorioHoje.reduce(
+        (soma, item) => soma + Number(item.metrics?.spend || 0), 0
+      );
+      return c.json({ ...base, gasto_hoje: gastoHoje });
+    } catch (errApi: any) {
+      console.error("ERRO /tiktok/status-completo (API TikTok):", errApi.message);
+      return c.json({ ...base, gasto_hoje: null, aviso: "Nao foi possivel consultar dados ao vivo do TikTok Ads" });
+    }
+  } catch (err: any) {
+    console.error("ERRO /tiktok/status-completo:", err);
+    return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
 function hashSha256(valor: string): string {
   return require("crypto")
     .createHash("sha256")
