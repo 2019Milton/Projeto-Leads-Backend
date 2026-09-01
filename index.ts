@@ -24626,6 +24626,67 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   }
 });
 
+// Direção visual por nicho para o gerador de criativos com IA (/ia/gerar-banner) —
+// injetada no prompt do gpt-image-1 além do que o usuário escreveu, pra puxar o
+// resultado pro que costuma converter bem NESSE mercado especificamente, em vez
+// de deixar o modelo "adivinhar" um estilo genérico. Mesma ideia do nichoConfig
+// usado no gerador de copy (/ia/campanhas/criador — cada nicho tem tom/exemplos
+// próprios), só que aqui é direção visual em vez de texto do anúncio.
+const DIRECAO_VISUAL_NICHO: Record<string, string> = {
+  imoveis:
+    "Real estate advertising creative. Aspirational architectural photography style: warm natural lighting, wide inviting angles that convey spaciousness, tasteful modern interiors or striking exteriors. Evoke lifestyle and comfort, not just the building itself. Avoid cluttered, dark, or amateur-looking compositions.",
+  saude:
+    "Health insurance advertising creative. Clean, warm, trustworthy palette (soft blues, greens, or neutral tones). Genuine-feeling imagery of care, family well-being, or approachable healthcare moments — avoid cold clinical sterility or stiff stock-photo poses. The mood should convey safety and peace of mind.",
+  suplementos:
+    "Sports nutrition / fitness advertising creative. High energy, dynamic angles, strong contrast and saturated colors. Athletic bodies in motion or dramatic product shots (steam, water droplets, powder splashes). Bold, confident, motivational mood — this audience responds to intensity, not softness.",
+  saas:
+    "SaaS / tech platform advertising creative. Modern, clean, minimal composition: soft gradients (blues/purples), abstract tech motifs, subtle UI or dashboard mockup elements, generous negative space. Professional and trustworthy, never busy or cluttered. Avoid generic corporate stock-photo clichés like handshakes.",
+  higienizacao:
+    "Cleaning / sanitization service advertising creative. Emphasize visible cleanliness and freshness: crisp whites, bright light-filled spaces, satisfying before/after contrast when relevant, professional equipment or spotless results. Convey hygiene and reliability.",
+  telecom:
+    "B2B telecom / IT infrastructure advertising creative. Corporate, confident, professional: deep blues or dark tones with sharp accent highlights, abstract network/connectivity motifs (subtle signal or circuit graphics), clean modern office or data-center imagery. Convey reliability and technical competence — never childish or overly playful.",
+  educacao:
+    "Education / online course advertising creative. Bright, optimistic, aspirational imagery of growth, achievement, or focused learning. Clean modern layout with clear visual hierarchy.",
+  auto:
+    "Automotive advertising creative. Dynamic angles, glossy premium finish, dramatic lighting on the vehicle as the hero element. Convey performance and desirability.",
+  consorcio:
+    "Consórcio (Brazilian group-buying credit) advertising creative. Trustworthy, aspirational imagery tied to the goal (home, car, etc.), optimistic tone, clear and confident composition."
+};
+
+const DIRECAO_VISUAL_GENERICA =
+  "Professional advertising creative with a single clear focal point and a mood appropriate to the product or service described below.";
+
+// Monta o prompt real enviado ao gpt-image-1: contexto de nicho (quando conhecido)
+// + diretrizes de qualidade sempre aplicadas + o pedido do usuário como prioridade
+// máxima. Sem isso o modelo recebia só o texto cru do usuário, sem nenhuma direção
+// sobre o que funciona bem nesse mercado nem sobre legibilidade/composição.
+function construirPromptCriativoIA(promptUsuario: string, nichoSlug: string | null, modoEditar: boolean): string {
+  const direcaoNicho = (nichoSlug && DIRECAO_VISUAL_NICHO[nichoSlug]) || DIRECAO_VISUAL_GENERICA;
+
+  const diretrizesQualidade =
+    "- Single clear focal point — avoid busy or cluttered compositions.\n" +
+    "- Professional photography/rendering quality: sharp, well-lit, high production value — like a real paid ad from a strong brand in this industry, not an amateur stock photo or generic AI render.\n" +
+    "- If the request includes any text to display on the image, render it in large, bold, highly legible typography with strong contrast against the background, positioned with safe margins (never cropped at the edges), and keep the wording short and punchy.\n" +
+    "- No distorted hands/faces/anatomy, no nonsensical or garbled text, no unwanted watermarks or logos.\n" +
+    "- Should feel native to a real social media ad feed (Meta/Instagram) — not an obviously staged or generic stock photo.";
+
+  if (modoEditar) {
+    return (
+      `Editing task on the provided image, for a ${nichoSlug || "general"} advertising creative: ${promptUsuario}\n\n` +
+      "IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL original elements, colors, composition, and style. Only add, modify, or remove exactly what is described above. Do NOT recreate the image from scratch. The result must look like a natural modification of the original image.\n\n" +
+      `INDUSTRY CONTEXT for any new/modified elements: ${direcaoNicho}\n\n` +
+      `QUALITY GUIDELINES for any new/modified elements:\n${diretrizesQualidade}`
+    );
+  }
+
+  return (
+    "You are creating a high-converting advertising creative image for a social media ad feed (Meta/Instagram/Facebook).\n\n" +
+    `INDUSTRY CONTEXT: ${direcaoNicho}\n\n` +
+    `CREATIVE QUALITY GUIDELINES (always apply):\n${diretrizesQualidade}\n\n` +
+    `SPECIFIC REQUEST FROM THE ADVERTISER (top priority — follow this exactly; use the guidance above only to fill in gaps or elevate quality where the request didn't specify):\n"${promptUsuario}"`
+  );
+}
+
 app.post("/ia/gerar-banner", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -24637,7 +24698,10 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
 
     const body = await c.req.json().catch(() => ({}));
     const prompt = textoOpcional(body.prompt);
-    if (!prompt) return c.json({ error: "Descreva o banner antes de gerar." }, 400);
+    if (!prompt) return c.json({ error: "Descreva o criativo antes de gerar." }, 400);
+
+    const nichoSlug = textoOpcional(body.nicho);
+    const promptFinal = construirPromptCriativoIA(prompt, nichoSlug, body.modo === "editar");
 
     const modoEditar: boolean = body.modo === "editar";
 
@@ -24664,11 +24728,8 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       formData.append("output_format", "png");
 
       if (modoEditar && imagensBase64.length === 1) {
-        // Modo editar: prompt instrui o modelo a manter a imagem base e só modificar o solicitado
-        const promptEdicao = `Editing task on the provided image: ${prompt}
-
-IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL original elements, colors, composition, and style. Only add, modify, or remove exactly what is described above. Do NOT recreate the image from scratch. The result must look like a natural modification of the original image.`;
-        formData.append("prompt", promptEdicao);
+        // Modo editar: promptFinal já inclui a instrução de manter a imagem base
+        formData.append("prompt", promptFinal);
 
         const { data, tipo } = imagensBase64[0];
         const buffer = Buffer.from(data, "base64");
@@ -24676,7 +24737,7 @@ IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL o
         formData.append("image", blob, "base.png");
       } else {
         // Modo gerar com referências visuais
-        formData.append("prompt", prompt);
+        formData.append("prompt", promptFinal);
         for (let i = 0; i < imagensBase64.length; i++) {
           const { data, tipo } = imagensBase64[i];
           const buffer = Buffer.from(data, "base64");
@@ -24694,7 +24755,7 @@ IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL o
       const result: any = await resp.json();
       if (!resp.ok) {
         console.error("GERAR BANNER GPT-IMAGE-1 ERROR:", result?.error?.message);
-        return c.json({ error: result?.error?.message || "Erro ao gerar banner com as imagens selecionadas." }, 500);
+        return c.json({ error: result?.error?.message || "Erro ao gerar criativo com as imagens selecionadas." }, 500);
       }
       imagemBase64 = result?.data?.[0]?.b64_json || "";
     } else {
@@ -24707,7 +24768,7 @@ IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL o
         },
         body: JSON.stringify({
           model: "gpt-image-1",
-          prompt,
+          prompt: promptFinal,
           n: 1,
           size: "1024x1024",
           output_format: "png"
@@ -24717,7 +24778,7 @@ IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL o
       const result: any = await resp.json();
       if (!resp.ok) {
         console.error("GERAR BANNER GPT-IMAGE-1 TEXT ERROR:", result?.error?.message);
-        return c.json({ error: result?.error?.message || "Erro ao gerar banner." }, 500);
+        return c.json({ error: result?.error?.message || "Erro ao gerar criativo." }, 500);
       }
       imagemBase64 = result?.data?.[0]?.b64_json || "";
     }
@@ -24729,7 +24790,7 @@ IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL o
     return c.json({ sucesso: true, imagem_base64: imagemBase64 });
   } catch (err) {
     console.error("GERAR BANNER EXCEPTION:", err);
-    return c.json({ error: "Erro interno ao gerar banner." }, 500);
+    return c.json({ error: "Erro interno ao gerar criativo." }, 500);
   }
 });
 
