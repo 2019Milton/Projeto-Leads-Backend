@@ -15152,6 +15152,19 @@ async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise
   return leadEncontrado.id;
 }
 
+// A API de Lead Ads e a de Conversion Leads não expõem se um lead veio do
+// Facebook ou do Instagram (um mesmo anúncio pode rodar nos dois ao mesmo
+// tempo) — mas o referral de Click-to-WhatsApp sim: source_url aponta pra
+// um link do instagram.com quando a pessoa clicou vindo do Instagram, ou
+// fb.me/facebook.com quando veio do Facebook. image_url serve de reforço
+// (hosts *cdninstagram.com / instagram.*.fna.fbcdn.net só existem pro IG).
+function detectarRedeOrigemReferral(referral: any): string | null {
+  const pistas = `${referral?.source_url || ""} ${referral?.image_url || ""}`.toLowerCase();
+  if (!pistas.trim()) return null;
+  if (pistas.includes("instagram")) return "instagram";
+  return "facebook";
+}
+
 // Cria um lead novo a partir de uma conversa de WhatsApp sem lead correspondente
 // — só quando a conversa carrega um referral genuíno de anúncio Click-to-WhatsApp
 // (ctwa_clid presente). Sem isso, retorna null e o comportamento de sempre
@@ -15173,6 +15186,7 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
   }
 
   const sourceId = conversa.referral?.source_id ? String(conversa.referral.source_id) : null;
+  const redeOrigem = detectarRedeOrigemReferral(conversa.referral);
 
   let nichoId: number | null = null;
   let nomeCampanha = "Campanha WhatsApp";
@@ -15200,12 +15214,12 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
     `
     INSERT INTO leads (
       usuario_id, lead_id, ctwa_clid, nome, email, telefone,
-      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+      origem, plataforma, rede_origem, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
     )
-    VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', 'novo', $5, $6, $7, $8, NOW())
+    VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', $5, 'novo', $6, $7, $8, $9, NOW())
     RETURNING id
     `,
-    [usuarioId, ctwaClid, nomeContato || "Lead WhatsApp (anúncio)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+    [usuarioId, ctwaClid, nomeContato || "Lead WhatsApp (anúncio)", conversa.telefone_cliente, redeOrigem, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
   );
 
   const novoLeadId = leadInserido.rows[0].id;
@@ -16509,6 +16523,33 @@ await client.query(`
 await client.query(`
   ALTER TABLE leads ADD COLUMN IF NOT EXISTS ctwa_clid TEXT;
 `);
+
+// Preenchido só em leads de Click-to-WhatsApp (ver criarLeadDeConversaCTWA):
+// 'facebook' ou 'instagram', extraído do referral.source_url que a Meta manda
+// no clique do anúncio (instagram.com/... = Instagram; fb.me/... = Facebook).
+// Isso é diferente de origem (rede que pagou o anúncio, ex: 'meta') e de
+// plataforma (canal de conversão, ex: 'whatsapp') — é o posicionamento
+// específico dentro da Meta que nem a API de Lead Ads nem a de Conversion
+// Leads expõem, mas o referral de CTWA sim.
+await client.query(`
+  ALTER TABLE leads ADD COLUMN IF NOT EXISTS rede_origem TEXT;
+`);
+
+// Backfill único (idempotente — só toca linhas ainda NULL): leads de CTWA
+// criados antes dessa coluna existir já têm o referral salvo em
+// whatsapp_conversas, então dá pra preencher rede_origem retroativamente
+// sem esperar uma nova mensagem chegar.
+await client.query(`
+  UPDATE leads l
+  SET rede_origem = CASE
+    WHEN (wc.referral->>'source_url' ILIKE '%instagram%' OR wc.referral->>'image_url' ILIKE '%instagram%') THEN 'instagram'
+    ELSE 'facebook'
+  END
+  FROM whatsapp_conversas wc
+  WHERE wc.lead_id = l.id
+    AND wc.referral IS NOT NULL
+    AND l.rede_origem IS NULL
+`).catch(err => console.error("AVISO backfill leads.rede_origem:", err.message));
 
 await client.query(`
   ALTER TABLE meta_conexoes
@@ -22088,6 +22129,7 @@ app.get("/leads", authMiddleware, async (c) => {
         l.kwai_evento_qualificado_enviado_em,
         l.kwai_evento_fechado_enviado_em,
         COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma,
+        l.rede_origem,
         wt.transcricao AS whatsapp_transcricao
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
