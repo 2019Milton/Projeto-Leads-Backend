@@ -4408,7 +4408,7 @@ const masterMiddleware = async (c: any, next: any) => {
 async function listarContasAnuncios(token: string) {
 
   const adAccounts = await fetch(
-    `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account,business{id,name}&access_token=${token}`
+    `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account,spend_cap,amount_spent,business{id,name}&access_token=${token}`
   ).then(r => r.json());
 
   console.log(
@@ -12648,6 +12648,8 @@ app.get(
         pagamento_habilitado: pagamentoHabilitado,
         possui_pagamento: pagamentoHabilitado,
         saldo_zerado: saldoPrePagoZerado,
+        limite_gastos: conta.spend_cap ? Number(conta.spend_cap) / 100 : null,
+        gasto_periodo_atual: conta.amount_spent ? Number(conta.amount_spent) / 100 : null,
         pendencia_pagamento: pendenciaPagamento,
         erro_pagamento: pendenciaPagamento
           ? "Sua conta tem uma pendência financeira registrada na Meta — isso pode acontecer mesmo com saldo disponível, quando a Meta tentou cobrar um método automático e a cobrança falhou. Para resolver: acesse o Gerenciador de Anúncios > Faturamento, verifique se há cobranças em aberto e confirme ou atualize o método de pagamento."
@@ -12711,6 +12713,70 @@ app.get(
         detalhe: err?.message || err
       }, 500);
     }
+});
+
+// Atualiza o "Limite de gastos da conta" (spend_cap) diretamente na Meta —
+// mesmo campo editavel em Cobranca e pagamentos > Limite de gastos da conta
+// no Gerenciador de Anuncios. Serve como teto de seguranca contra gasto
+// descontrolado, independente de qual metodo de pagamento a Meta usa.
+app.post("/meta/limite-gastos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, limite } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const limiteNumero = numeroOpcional(limite);
+    if (!limiteNumero || limiteNumero <= 0) {
+      return c.json({ error: "Informe um limite de gastos válido" }, 400);
+    }
+
+    const conn = await client.query(
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+
+    if (!conn.rows.length) {
+      return c.json({ error: "Meta não conectada" }, 400);
+    }
+
+    const token = conn.rows[0].access_token;
+
+    const contaAds = await obterContaAnuncios(token, conn.rows[0].conta_anuncios_id);
+    if (!contaAds) {
+      return c.json({ error: "Nenhuma conta de anúncios encontrada" }, 400);
+    }
+
+    const spendCapCentavos = Math.round(limiteNumero * 100);
+
+    const resultado = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAds.id}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spend_cap: spendCapCentavos,
+          access_token: token
+        })
+      }
+    ).then(r => r.json());
+
+    if (resultado?.error) {
+      console.error("ERRO AO ATUALIZAR LIMITE DE GASTOS META:", resultado.error);
+      return c.json({
+        error:
+          resultado.error.error_user_msg ||
+          resultado.error.message ||
+          "Erro ao atualizar limite de gastos na Meta"
+      }, 400);
+    }
+
+    return c.json({ ok: true, limite: limiteNumero });
+  } catch (err) {
+    console.error("ERRO /meta/limite-gastos:", err);
+    return c.json({ error: "Erro ao atualizar limite de gastos" }, 500);
+  }
 });
 
 app.post("/meta/tos-aceitar", authMiddleware, async (c) => {
