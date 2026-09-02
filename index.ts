@@ -12736,7 +12736,9 @@ app.get(
         pagamento_habilitado: pagamentoHabilitado,
         possui_pagamento: pagamentoHabilitado,
         saldo_zerado: saldoPrePagoZerado,
-        limite_gastos: conta.spend_cap ? Number(conta.spend_cap) / 100 : null,
+        // spend_cap já vem em reais da Meta (não em centavos, ver comentário em
+        // /meta/limite-gastos) — diferente de amount_spent logo abaixo, que É centavos.
+        limite_gastos: conta.spend_cap ? Number(conta.spend_cap) : null,
         gasto_periodo_atual: conta.amount_spent ? Number(conta.amount_spent) / 100 : null,
         pendencia_pagamento: pendenciaPagamento,
         erro_pagamento: pendenciaPagamento
@@ -12836,15 +12838,17 @@ app.post("/meta/limite-gastos", authMiddleware, async (c) => {
       return c.json({ error: "Nenhuma conta de anúncios encontrada" }, 400);
     }
 
-    const spendCapCentavos = Math.round(limiteNumero * 100);
-
+    // spend_cap é o único campo de orçamento da Marketing API que NÃO usa a unidade
+    // menor da moeda (diferente de daily_budget/amount_spent, que são centavos) —
+    // a própria doc da Meta diz "Value specified in standard denomination of the
+    // currency, e.g. 23.50 for USD $23.50". Manda direto em reais, sem x100.
     const resultado = await fetch(
       `https://graph.facebook.com/v19.0/${contaAds.id}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          spend_cap: spendCapCentavos,
+          spend_cap: limiteNumero,
           access_token: token
         })
       }
