@@ -12842,6 +12842,8 @@ app.post("/meta/limite-gastos", authMiddleware, async (c) => {
     // menor da moeda (diferente de daily_budget/amount_spent, que são centavos) —
     // a própria doc da Meta diz "Value specified in standard denomination of the
     // currency, e.g. 23.50 for USD $23.50". Manda direto em reais, sem x100.
+    console.log(`LIMITE GASTOS META: usuario=${usuarioId} conta=${contaAds.id} limiteNumero=${limiteNumero} spend_cap_enviado=${limiteNumero}`);
+
     const resultado = await fetch(
       `https://graph.facebook.com/v19.0/${contaAds.id}`,
       {
@@ -12853,6 +12855,8 @@ app.post("/meta/limite-gastos", authMiddleware, async (c) => {
         })
       }
     ).then(r => r.json());
+
+    console.log("LIMITE GASTOS META RESPOSTA:", JSON.stringify(resultado));
 
     if (resultado?.error) {
       console.error("ERRO AO ATUALIZAR LIMITE DE GASTOS META:", resultado.error);
