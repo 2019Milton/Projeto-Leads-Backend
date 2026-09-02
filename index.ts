@@ -12692,6 +12692,78 @@ app.get(
         ? "metodo_detectado"
         : "nao_identificado";
 
+    // 💳 GASTO ESTIMADO NO CARTÃO DE BACKUP
+    // Aproximação: quando o saldo pré-pago zera, a Meta passa a cobrar o
+    // método de pagamento de backup (se houver) para manter os anúncios
+    // ativos. A API não informa gasto por método de pagamento (confirmado
+    // via /activities — extra_data de ad_account_billing_charge só traz
+    // currency/new_value/transaction_id/action/type), então aproximamos:
+    // guardamos o amount_spent no instante em que o saldo zerou, e tratamos
+    // qualquer gasto adicional a partir dali como presumivelmente no cartão.
+    let gastoCartaoEstimado: number | null = null;
+
+    if (pagamentoManual) {
+
+      const gastoAtualCentavos =
+        conta.amount_spent ? Number(conta.amount_spent) / 100 : null;
+
+      if (gastoAtualCentavos !== null) {
+
+        const checkpointRes = await client.query(
+          "SELECT gasto_no_momento_zerado FROM meta_saldo_zerado WHERE usuario_id = $1",
+          [usuario_id]
+        );
+
+        let checkpoint =
+          checkpointRes.rows[0]?.gasto_no_momento_zerado != null
+            ? Number(checkpointRes.rows[0].gasto_no_momento_zerado)
+            : null;
+
+        // Gasto atual menor que o checkpoint = o limite/gasto foi redefinido
+        // na Meta (ex: botão "Redefinir" no Gerenciador de Anúncios) desde o
+        // último checkpoint — ele não é mais válido para o ciclo atual.
+        if (checkpoint !== null && gastoAtualCentavos < checkpoint) {
+
+          await client.query(
+            "DELETE FROM meta_saldo_zerado WHERE usuario_id = $1",
+            [usuario_id]
+          );
+
+          checkpoint = null;
+        }
+
+        if (saldoPrePagoZerado) {
+
+          if (checkpoint === null) {
+
+            await client.query(
+              `
+              INSERT INTO meta_saldo_zerado (usuario_id, gasto_no_momento_zerado)
+              VALUES ($1, $2)
+              ON CONFLICT (usuario_id) DO UPDATE
+              SET gasto_no_momento_zerado = EXCLUDED.gasto_no_momento_zerado,
+                  zerado_em = CURRENT_TIMESTAMP
+              `,
+              [usuario_id, gastoAtualCentavos]
+            );
+
+            checkpoint = gastoAtualCentavos;
+          }
+
+          gastoCartaoEstimado = Math.max(0, gastoAtualCentavos - checkpoint);
+
+        } else if (checkpoint !== null) {
+
+          // Saldo foi reabastecido — limpa o checkpoint. Um novo ciclo só
+          // começa quando o saldo zerar de novo.
+          await client.query(
+            "DELETE FROM meta_saldo_zerado WHERE usuario_id = $1",
+            [usuario_id]
+          );
+        }
+      }
+    }
+
     // 🔥 STATUS FINAL
     return c.json({
 
@@ -12740,6 +12812,11 @@ app.get(
         // /meta/limite-gastos) — diferente de amount_spent logo abaixo, que É centavos.
         limite_gastos: conta.spend_cap ? Number(conta.spend_cap) : null,
         gasto_periodo_atual: conta.amount_spent ? Number(conta.amount_spent) / 100 : null,
+        gasto_cartao_estimado: gastoCartaoEstimado,
+        gasto_cartao_estimado_observacao:
+          gastoCartaoEstimado !== null
+            ? "Estimativa: a Meta não informa gasto por método de pagamento em nenhum endpoint da API. Este valor é o gasto acumulado desde que o saldo pré-pago zerou, presumindo que a cobrança passou a ser feita no método de pagamento de backup a partir daí."
+            : null,
         pendencia_pagamento: pendenciaPagamento,
         erro_pagamento: pendenciaPagamento
           ? "Sua conta tem uma pendência financeira registrada na Meta — isso pode acontecer mesmo com saldo disponível, quando a Meta tentou cobrar um método automático e a cobrança falhou. Para resolver: acesse o Gerenciador de Anúncios > Faturamento, verifique se há cobranças em aberto e confirme ou atualize o método de pagamento."
@@ -15675,6 +15752,18 @@ await client.query(`
     page_id TEXT NOT NULL,
     criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(usuario_id, page_id)
+  );
+`);
+
+// Checkpoint de "saldo pré-pago zerou" — guarda o gasto acumulado (amount_spent)
+// no instante em que o saldo pré-pago da Meta foi visto zerado pela primeira vez
+// no ciclo atual. Usado para estimar gasto no cartão de backup (Meta não expõe
+// isso por método de pagamento em nenhum endpoint, ver /meta/status-completo).
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_saldo_zerado (
+    usuario_id INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    gasto_no_momento_zerado NUMERIC(12,2) NOT NULL,
+    zerado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
