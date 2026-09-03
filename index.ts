@@ -12808,9 +12808,17 @@ app.get(
         pagamento_habilitado: pagamentoHabilitado,
         possui_pagamento: pagamentoHabilitado,
         saldo_zerado: saldoPrePagoZerado,
-        // spend_cap já vem em reais da Meta (não em centavos, ver comentário em
-        // /meta/limite-gastos) — diferente de amount_spent logo abaixo, que É centavos.
-        limite_gastos: conta.spend_cap ? Number(conta.spend_cap) : null,
+        // spend_cap é ASSIMÉTRICO entre escrita e leitura (confirmado ao vivo em
+        // 2026-09-03, conta real do Milton: enviamos spend_cap=100, Meta aceitou e
+        // o Gerenciador de Anúncios mostrou R$100,00 — mas o GET imediatamente
+        // seguinte devolveu spend_cap="10000"). Ou seja: POST aceita em reais
+        // (documentado, ver comentário em /meta/limite-gastos, confirmado 3x ao
+        // vivo), mas GET devolve em centavos, como todo outro campo monetário da
+        // Marketing API (amount_spent incluso). NÃO remover o /100 aqui de novo
+        // sem reconfirmar ao vivo — já foi removido por engano uma vez (achando
+        // que a mesma "doc de escrita" também valia pra leitura) e causou exibir
+        // 100x o valor real (10000 em vez de 100) pro usuário.
+        limite_gastos: conta.spend_cap ? Number(conta.spend_cap) / 100 : null,
         gasto_periodo_atual: conta.amount_spent ? Number(conta.amount_spent) / 100 : null,
         gasto_cartao_estimado: gastoCartaoEstimado,
         gasto_cartao_estimado_observacao:
@@ -12915,10 +12923,13 @@ app.post("/meta/limite-gastos", authMiddleware, async (c) => {
       return c.json({ error: "Nenhuma conta de anúncios encontrada" }, 400);
     }
 
-    // spend_cap é o único campo de orçamento da Marketing API que NÃO usa a unidade
-    // menor da moeda (diferente de daily_budget/amount_spent, que são centavos) —
-    // a própria doc da Meta diz "Value specified in standard denomination of the
+    // POST de spend_cap é o único caso na Marketing API que NÃO usa a unidade menor
+    // da moeda (diferente de daily_budget/amount_spent, que são centavos) — a
+    // própria doc da Meta diz "Value specified in standard denomination of the
     // currency, e.g. 23.50 for USD $23.50". Manda direto em reais, sem x100.
+    // ATENÇÃO: isso vale só pra ESCRITA (POST) — a LEITURA (GET, campo spend_cap
+    // em /meta/status-completo) devolve em centavos, igual todo o resto. Ver
+    // comentário detalhado lá antes de mexer em qualquer um dos dois lados.
     console.log(`LIMITE GASTOS META: usuario=${usuarioId} conta=${contaAds.id} limiteNumero=${limiteNumero} spend_cap_enviado=${limiteNumero}`);
 
     const resultado = await fetch(
