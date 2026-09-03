@@ -1621,6 +1621,116 @@ function montarCallToActionMeta(destino: DestinoCampanhaMeta, ctaType: string, f
     : { type: ctaType, value: { lead_gen_form_id: formId } };
 }
 
+// Carrossel misto (imagens + vídeo) com criativo diferente por rede — Facebook
+// recebe o carrossel completo (imagens + vídeo na posição escolhida), Instagram
+// recebe só vídeo OU só o carrossel de imagens (a Meta não aceita video_label
+// misturado com image_label num carrossel do Instagram). Usa asset_feed_spec +
+// asset_customization_rules (mecanismo nativo da Meta pra criativo por
+// posicionamento dentro do MESMO anúncio, sem duplicar conjunto/orçamento).
+// AINDA NÃO CONFIRMADO AO VIVO se este mecanismo funciona com destino Lead Ads
+// (lead_gen_form_id) ou WhatsApp — call_to_action_types aqui só aceita o TIPO
+// (string), diferente do call_to_action completo {type,value} que
+// montarCallToActionMeta monta pro object_story_spec tradicional. Ver teste em
+// /debug/testar-asset-feed-spec antes de confiar nisso em produção.
+function construirAssetFeedSpecMisto(params: {
+  imageHashes: string[];
+  videoId: string;
+  videoThumbnailUrl: string | null;
+  videoPosicaoCarrossel: number | null;
+  instagramUsaVideo: boolean;
+  tituloAnuncio: string;
+  descricaoAnuncio: string;
+  texto: string;
+  linkDestino: string;
+  ctaType: string;
+}): Record<string, any> | null {
+
+  if (!params.videoId || params.imageHashes.length === 0) {
+    return null;
+  }
+
+  const posicao =
+    params.videoPosicaoCarrossel === null
+      ? params.imageHashes.length
+      : Math.max(0, Math.min(params.videoPosicaoCarrossel, params.imageHashes.length));
+
+  const rotuloImagem = (i: number) => `img_${i}`;
+  const ROTULO_VIDEO = "video_principal";
+  const ROTULO_TITULO = "titulo_principal";
+  const ROTULO_DESCRICAO = "descricao_principal";
+  const ROTULO_LINK = "link_principal";
+  const ROTULO_CORPO = "corpo_principal";
+  const ROTULO_CARROSSEL_FACEBOOK = "carrossel_facebook";
+  const ROTULO_CARROSSEL_INSTAGRAM_IMAGENS = "carrossel_instagram_imagens";
+
+  const camposComuns = {
+    link_url_label: { name: ROTULO_LINK },
+    title_label: { name: ROTULO_TITULO },
+    description_label: { name: ROTULO_DESCRICAO }
+  };
+
+  const cardsImagem = params.imageHashes.map((_, i) => ({
+    image_label: { name: rotuloImagem(i) },
+    ...camposComuns
+  }));
+
+  const cardVideo = {
+    video_label: { name: ROTULO_VIDEO },
+    ...camposComuns
+  };
+
+  const cardsFacebook = [...cardsImagem];
+  cardsFacebook.splice(posicao, 0, cardVideo);
+
+  const regraInstagram = params.instagramUsaVideo
+    ? {
+        customization_spec: { publisher_platforms: ["instagram"] },
+        video_label: { name: ROTULO_VIDEO },
+        ...camposComuns
+      }
+    : {
+        customization_spec: { publisher_platforms: ["instagram"] },
+        carousel_label: { name: ROTULO_CARROSSEL_INSTAGRAM_IMAGENS }
+      };
+
+  return {
+    images: params.imageHashes.map((hash, i) => ({
+      hash,
+      adlabels: [{ name: rotuloImagem(i) }]
+    })),
+    videos: [
+      {
+        video_id: params.videoId,
+        adlabels: [{ name: ROTULO_VIDEO }],
+        ...(params.videoThumbnailUrl ? { thumbnail_url: params.videoThumbnailUrl } : {})
+      }
+    ],
+    titles: [{ text: params.tituloAnuncio, adlabels: [{ name: ROTULO_TITULO }] }],
+    descriptions: [{ text: params.descricaoAnuncio, adlabels: [{ name: ROTULO_DESCRICAO }] }],
+    bodies: [{ text: params.texto, adlabels: [{ name: ROTULO_CORPO }] }],
+    link_urls: [{ website_url: params.linkDestino, adlabels: [{ name: ROTULO_LINK }] }],
+    call_to_action_types: [params.ctaType],
+    ad_formats: ["CAROUSEL_FORMAT"],
+    carousels: [
+      {
+        adlabels: [{ name: ROTULO_CARROSSEL_FACEBOOK }],
+        child_attachments: cardsFacebook
+      },
+      {
+        adlabels: [{ name: ROTULO_CARROSSEL_INSTAGRAM_IMAGENS }],
+        child_attachments: cardsImagem
+      }
+    ],
+    asset_customization_rules: [
+      {
+        customization_spec: { publisher_platforms: ["facebook"] },
+        carousel_label: { name: ROTULO_CARROSSEL_FACEBOOK }
+      },
+      regraInstagram
+    ]
+  };
+}
+
 async function registrarErroPublicacaoCampanha(
   campanhaId: number,
   mensagem: string
@@ -11645,6 +11755,85 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
   }
 });
 
+
+// TEMPORÁRIO — spike de verificação pro carrossel misto (imagens+vídeo) com
+// criativo por rede. Cria um adcreative de teste (não publica, não gasta,
+// não fica preso a nenhum anúncio) só pra confirmar se a Meta aceita a forma
+// de asset_feed_spec construída em construirAssetFeedSpecMisto, e se
+// funciona com destino Lead Ads/WhatsApp. Remover depois da verificação.
+app.post("/debug/testar-asset-feed-spec", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id,
+      image_hashes,
+      video_id,
+      destino,
+      form_id
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conn = await client.query(
+      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+    if (!conn.rows.length) return c.json({ error: "Meta não conectada" }, 400);
+
+    const token = conn.rows[0].access_token;
+    const contaAnunciosId = await obterContaAnunciosSelecionadaIdUsuario(usuarioId);
+
+    const destinoResolvido = resolverDestinoCampanha(destino);
+    const ctaPayload = montarCallToActionMeta(destinoResolvido, "LEARN_MORE", form_id || null);
+
+    const assetFeedSpec = construirAssetFeedSpecMisto({
+      imageHashes: Array.isArray(image_hashes) ? image_hashes : [],
+      videoId: video_id,
+      videoThumbnailUrl: null,
+      videoPosicaoCarrossel: null,
+      instagramUsaVideo: true,
+      tituloAnuncio: "Teste asset_feed_spec",
+      descricaoAnuncio: "Teste de verificacao",
+      texto: "Teste de verificacao — carrossel misto",
+      linkDestino: "https://plataformadeleads.com.br",
+      ctaType: "LEARN_MORE"
+    });
+
+    const bodyEnviado: Record<string, any> = {
+      name: `TESTE asset_feed_spec ${Date.now()}`,
+      asset_feed_spec: assetFeedSpec,
+      access_token: token
+    };
+
+    // Lead Ads/WhatsApp precisam do object_type + a ligacao com o form/whatsapp
+    // em algum lugar — como object_story_spec nao é usado aqui, testamos
+    // adicionar isso diretamente no nivel do creative pra ver se a Meta aceita.
+    if (destinoResolvido === "whatsapp") {
+      bodyEnviado.object_type = "SHARE";
+    } else if (form_id) {
+      bodyEnviado.object_type = "SHARE";
+    }
+
+    const resultado = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAnunciosId}/adcreatives`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bodyEnviado)
+      }
+    ).then(r => r.json());
+
+    return c.json({
+      payload_enviado: assetFeedSpec,
+      cta_payload_referencia: ctaPayload,
+      resultado_meta: resultado
+    });
+
+  } catch (err: any) {
+    return c.json({ error: err?.message || String(err) }, 500);
+  }
+});
 
 app.post("/meta/upload-video", authMiddleware, async (c) => {
 
