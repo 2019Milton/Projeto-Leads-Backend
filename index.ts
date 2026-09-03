@@ -21009,13 +21009,35 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     const dailyBudget =
       numeroOpcional(daily_budget);
 
+    // CBO (Campaign Budget Optimization) determina se o orçamento vive na
+    // CAMPANHA ou no CONJUNTO DE ANÚNCIOS — mandar daily_budget pro lado
+    // errado faz a Meta rejeitar com "Você só pode definir um orçamento de
+    // conjunto de anúncios ou um orçamento de campanha". `avancadas.cbo` (o
+    // que o frontend manda, herdado do que já está salvo localmente) pode
+    // estar desatualizado ou nunca ter sido preenchido corretamente — a
+    // única fonte confiável é perguntar direto pra Meta se a campanha JÁ tem
+    // daily_budget/lifetime_budget hoje (mesma lógica de GET /campanhas/:id/sincronizar,
+    // linha ~20535). Falha na consulta cai de volta pro flag local antigo,
+    // em vez de assumir silenciosamente que não é CBO.
+    let campanhaTemOrcamentoProprio = false;
+    try {
+      const campanhaMetaAtual = await fetch(
+        `https://graph.facebook.com/v19.0/${campaign_id}?fields=daily_budget,lifetime_budget&access_token=${token}`
+      ).then(r => r.json());
+      campanhaTemOrcamentoProprio =
+        campanhaMetaAtual?.daily_budget !== undefined ||
+        campanhaMetaAtual?.lifetime_budget !== undefined;
+    } catch {}
+
+    const cboAtivo = campanhaTemOrcamentoProprio || Boolean(avancadas.cbo);
+
     const payloadAdset: any = {
       targeting,
       access_token: token
     };
 
-    // Com CBO a estrategia de lance vive na campanha, nao no adset.
-    if (avancadas.cbo) {
+    // Com CBO a estrategia de lance (e o orçamento) vivem na campanha, nao no adset.
+    if (cboAtivo) {
       const payloadCampanhaLance: any = {
         bid_strategy: bidStrategy || "LOWEST_COST_WITHOUT_CAP",
         access_token: token
@@ -21023,6 +21045,10 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
       if (bidAmount !== null && bidStrategyExigeValor(payloadCampanhaLance.bid_strategy)) {
         payloadCampanhaLance.bid_amount = Math.round(bidAmount * 100);
+      }
+
+      if (dailyBudget !== null) {
+        payloadCampanhaLance.daily_budget = dailyBudget;
       }
 
       const campanhaLanceRes = await enviarPayloadMetaComFallbackBid(
@@ -21042,7 +21068,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       payloadAdset.bid_strategy = bidStrategy;
     }
 
-    if (dailyBudget !== null) {
+    if (dailyBudget !== null && !cboAtivo) {
       payloadAdset.daily_budget = dailyBudget;
     }
 
