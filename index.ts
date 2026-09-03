@@ -11784,6 +11784,14 @@ app.post("/debug/testar-asset-feed-spec", authMiddleware, async (c) => {
     const token = conn.rows[0].access_token;
     const contaAnunciosId = await obterContaAnunciosSelecionadaIdUsuario(usuarioId);
 
+    if (!video_id) {
+      const [imagens, videos] = await Promise.all([
+        fetch(`https://graph.facebook.com/v19.0/${contaAnunciosId}/adimages?fields=hash,name&limit=5&access_token=${token}`).then(r => r.json()),
+        fetch(`https://graph.facebook.com/v19.0/${contaAnunciosId}/advideos?fields=id,title,status&limit=5&access_token=${token}`).then(r => r.json())
+      ]);
+      return c.json({ modo: "descoberta", imagens, videos });
+    }
+
     const destinoResolvido = resolverDestinoCampanha(destino);
     const ctaPayload = montarCallToActionMeta(destinoResolvido, "LEARN_MORE", form_id || null);
 
