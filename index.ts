@@ -21180,6 +21180,13 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       ).catch(() => null);
     }
 
+    // Se a atualização do criativo (imagem/vídeo/texto) falhar, a edição
+    // ainda segue e salva o resto (orçamento, segmentação etc) — mas o
+    // usuário precisa saber que o visual do anúncio não mudou, em vez de só
+    // ver "atualizado com sucesso" enquanto o anúncio real continua com o
+    // criativo antigo.
+    let criativoAtualizadoComErro: any = null;
+
     // 🎨 ATUALIZAR CRIATIVO se campos visuais foram alterados
     try {
       const adId = campanhaBanco.rows[0]?.ad_id;
@@ -21320,21 +21327,75 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           objectStorySpec.instagram_actor_id = instagramActorId;
         }
 
-        const novoCreativo = await fetch(
-          `https://graph.facebook.com/v19.0/${contaAnunciosId}/adcreatives`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              name: `Criativo Leads ${Date.now()}`,
-              object_story_spec: objectStorySpec,
-              access_token: token
-            })
+        const criarCreativoEdicao = async (spec: Record<string, any>) =>
+          fetch(
+            `https://graph.facebook.com/v19.0/${contaAnunciosId}/adcreatives`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                name: `Criativo Leads ${Date.now()}`,
+                object_story_spec: spec,
+                access_token: token
+              })
+            }
+          ).then(r => r.json());
+
+        let novoCreativo = await criarCreativoEdicao(objectStorySpec);
+
+        // Mesmo self-healing já usado na criação (POST /meta/campanha) e no
+        // attribution_spec logo acima nesta mesma função: um instagram_actor_id
+        // desatualizado (a Página trocou a conta do Instagram vinculada, por
+        // exemplo) derruba a criação do criativo INTEIRO — a Meta valida o
+        // object_story_spec todo junto, então até o vídeo/imagem novos ficam de
+        // fora quando só o campo do Instagram está errado. Primeiro tenta buscar
+        // o id atual e válido direto na Meta (self-healing de verdade, não só
+        // desistir do Instagram); só cai pro Facebook-only se nem isso resolver.
+        if (!novoCreativo?.id && objectStorySpec.instagram_actor_id) {
+          const erroCreativo = String(
+            novoCreativo?.error?.error_user_msg ||
+            novoCreativo?.error?.message ||
+            ""
+          ).toLowerCase();
+
+          if (
+            erroCreativo.includes("instagram_actor_id") ||
+            erroCreativo.includes("instagram account")
+          ) {
+            console.warn(
+              "EDITAR CAMPANHA: instagram_actor_id salvo está inválido, buscando o atual na Meta:",
+              novoCreativo?.error
+            );
+
+            const contasInstagramAtuais =
+              await listarContasInstagramAnuncio(token, contaAnunciosId);
+            const instagramActorIdAtual =
+              contasInstagramAtuais[0]?.id || null;
+
+            if (
+              instagramActorIdAtual &&
+              instagramActorIdAtual !== objectStorySpec.instagram_actor_id
+            ) {
+              novoCreativo = await criarCreativoEdicao({
+                ...objectStorySpec,
+                instagram_actor_id: instagramActorIdAtual
+              });
+
+              if (novoCreativo?.id) {
+                avancadas.instagram_actor_id = instagramActorIdAtual;
+              }
+            }
+
+            if (!novoCreativo?.id) {
+              const specSemInstagram = { ...objectStorySpec };
+              delete specSemInstagram.instagram_actor_id;
+              novoCreativo = await criarCreativoEdicao(specSemInstagram);
+            }
           }
-        ).then(r => r.json());
+        }
 
         if (novoCreativo?.id) {
-          await fetch(
+          const anexarRes = await fetch(
             `https://graph.facebook.com/v19.0/${adId}`,
             {
               method: "POST",
@@ -21344,17 +21405,27 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
                 access_token: token
               })
             }
-          ).catch(() => null);
+          ).then(r => r.json()).catch(e => ({ error: { message: String(e) } }));
 
-          avancadas.creative_id = novoCreativo.id;
-          if (avancadas.criativo) {
-            avancadas.criativo.creative_id = novoCreativo.id;
+          if (anexarRes?.error) {
+            // Criativo foi criado na Meta mas não ficou vinculado a este anúncio
+            // — sem isso o que o usuário vê continua sendo o criativo antigo,
+            // mesmo com um criativo novo (órfão) já existindo na conta.
+            criativoAtualizadoComErro = anexarRes.error;
+            console.warn("EDITAR CAMPANHA: criativo criado mas não vinculado ao anúncio:", anexarRes.error);
+          } else {
+            avancadas.creative_id = novoCreativo.id;
+            if (avancadas.criativo) {
+              avancadas.criativo.creative_id = novoCreativo.id;
+            }
           }
         } else {
+          criativoAtualizadoComErro = novoCreativo?.error || { message: "Erro desconhecido ao criar criativo" };
           console.warn("EDITAR CAMPANHA: criativo não atualizado na Meta:", novoCreativo?.error);
         }
       }
-    } catch (errCreativo) {
+    } catch (errCreativo: any) {
+      criativoAtualizadoComErro = { message: errCreativo?.message || String(errCreativo) };
       console.warn("EDITAR CAMPANHA: erro ao atualizar criativo (ignorado):", errCreativo);
     }
 
@@ -21377,7 +21448,12 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     );
 
     return c.json({
-      sucesso: true
+      sucesso: true,
+      aviso: criativoAtualizadoComErro
+        ? "As demais alterações foram salvas, mas não foi possível atualizar o criativo (imagem/vídeo/texto) do anúncio na Meta: " +
+          (criativoAtualizadoComErro.error_user_msg || criativoAtualizadoComErro.message || "erro desconhecido") +
+          ". O anúncio publicado continua com o criativo anterior."
+        : null
     });
 
   } catch (err) {
