@@ -24810,9 +24810,9 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     ? body.plataformas.filter((p: unknown) => typeof p === "string")
     : ["meta"];
   const incluirGoogle = plataformas.includes("google");
-  const nomesPlataformas = plataformas
-    .map(p => ({ meta: "Meta Ads", tiktok: "TikTok Ads", google: "Google Ads" }[p]))
-    .filter(Boolean) as string[];
+  const nomesPlataformas = Array.from(new Set(plataformas
+    .map(p => ({ meta: "Meta Ads", facebook: "Meta Ads", instagram: "Meta Ads", tiktok: "TikTok Ads", google: "Google Ads" }[p]))
+    .filter(Boolean))) as string[];
 
   const nichoConfig: Record<string, {
     topicoDefault: string;
