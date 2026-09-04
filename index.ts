@@ -14698,6 +14698,328 @@ app.get("/whatsapp-bot/midia/:id", async (c) => {
   }
 });
 
+/* =========================
+   💰 FINANCEIRO (cobrança mensal por usuário)
+========================= */
+
+const FINANCEIRO_ARQUIVO_MIME_PERMITIDOS = [
+  "application/pdf", "image/jpeg", "image/png", "image/webp"
+];
+const FINANCEIRO_ARQUIVO_TAMANHO_MAX = 15 * 1024 * 1024; // 15MB, mesmo teto do whatsapp_bot_midias
+
+async function lerArquivoFinanceiro(c: any): Promise<
+  { erro: string } | { erro: null; mimeType: string; bytes: Buffer }
+> {
+  const body = await c.req.formData();
+  const arquivo = body.get("arquivo") as File | null;
+
+  if (!arquivo) {
+    return { erro: "Arquivo não enviado" } as any;
+  }
+
+  const mimeType = arquivo.type || "";
+  if (!FINANCEIRO_ARQUIVO_MIME_PERMITIDOS.includes(mimeType)) {
+    return { erro: "Formato não suportado. Use PDF, JPEG, PNG ou WEBP." } as any;
+  }
+
+  const bytesArrayBuffer = await arquivo.arrayBuffer();
+  if (bytesArrayBuffer.byteLength > FINANCEIRO_ARQUIVO_TAMANHO_MAX) {
+    return { erro: "Arquivo muito grande (máximo 15MB)" } as any;
+  }
+
+  return { erro: null, mimeType, bytes: Buffer.from(bytesArrayBuffer) };
+}
+
+function linhaFinanceiroParaJson(linha: any) {
+  return {
+    id: linha.id,
+    usuario_id: linha.usuario_id,
+    mes_referencia: linha.mes_referencia,
+    valor: Number(linha.valor),
+    status: linha.status,
+    tem_comprovante: linha.comprovante_dados !== null && linha.comprovante_dados !== undefined,
+    comprovante_enviado_em: linha.comprovante_enviado_em,
+    tem_nf: linha.nf_dados !== null && linha.nf_dados !== undefined,
+    nf_enviada_em: linha.nf_enviada_em,
+    observacao: linha.observacao,
+    criado_em: linha.criado_em
+  };
+}
+
+// 🔹 Usuário comum — vê só os próprios lançamentos.
+app.get("/financeiro/meus-lancamentos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    const result = await client.query(
+      `SELECT id, usuario_id, mes_referencia, valor, status,
+              comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+              observacao, criado_em
+       FROM financeiro_lancamentos
+       WHERE usuario_id = $1
+       ORDER BY mes_referencia DESC`,
+      [user.id]
+    );
+
+    return c.json(result.rows.map(linhaFinanceiroParaJson));
+  } catch (err) {
+    console.error("ERRO GET /financeiro/meus-lancamentos:", err);
+    return c.json({ error: "Erro ao carregar lançamentos" }, 500);
+  }
+});
+
+// 🔹 Usuário comum sobe o comprovante de pagamento de um lançamento próprio.
+app.post("/financeiro/lancamentos/:id/comprovante", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const dono = await client.query(
+      `SELECT usuario_id FROM financeiro_lancamentos WHERE id = $1`,
+      [id]
+    );
+    if (!dono.rows.length || dono.rows[0].usuario_id !== user.id) {
+      return c.json({ error: "Lançamento não encontrado" }, 404);
+    }
+
+    const arquivo = await lerArquivoFinanceiro(c);
+    if (arquivo.erro) return c.json({ error: arquivo.erro }, 400);
+
+    await client.query(
+      `UPDATE financeiro_lancamentos
+       SET comprovante_dados = $1, comprovante_mime = $2, comprovante_enviado_em = NOW(),
+           status = CASE WHEN status = 'aguardando_pagamento' THEN 'comprovante_enviado' ELSE status END
+       WHERE id = $3`,
+      [arquivo.bytes, arquivo.mimeType, id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO POST /financeiro/lancamentos/:id/comprovante:", err);
+    return c.json({ error: "Erro ao enviar comprovante" }, 500);
+  }
+});
+
+// 🔹 Baixa o comprovante ou a NF de um lançamento — dono do lançamento ou super_admin.
+async function servirArquivoFinanceiro(c: any, coluna: "comprovante" | "nf") {
+  const user: any = c.get("user");
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) return c.text("Não encontrado", 404);
+
+  const row = await client.query(
+    `SELECT usuario_id, ${coluna}_dados AS dados, ${coluna}_mime AS mime
+     FROM financeiro_lancamentos WHERE id = $1`,
+    [id]
+  );
+
+  if (!row.rows.length || !row.rows[0].dados) {
+    return c.text("Não encontrado", 404);
+  }
+
+  const linha = row.rows[0];
+  if (linha.usuario_id !== user.id && user.tipo !== "super_admin") {
+    return c.text("Acesso negado", 403);
+  }
+
+  return c.body(linha.dados, 200, {
+    "Content-Type": linha.mime || "application/octet-stream"
+  });
+}
+
+app.get("/financeiro/lancamentos/:id/comprovante", authMiddleware, (c) =>
+  servirArquivoFinanceiro(c, "comprovante")
+);
+
+app.get("/financeiro/lancamentos/:id/nf", authMiddleware, (c) =>
+  servirArquivoFinanceiro(c, "nf")
+);
+
+// 🔹 Admin — lista usuários (exceto contas administrativas) com o resumo do
+// lançamento mais recente de cada um, pra montar a tabela do painel.
+app.get("/admin/financeiro/usuarios", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const result = await client.query(
+      `SELECT
+         u.id, u.nome, u.sobrenome, u.email,
+         ultimo.mes_referencia AS ultimo_mes_referencia,
+         ultimo.valor AS ultimo_valor,
+         ultimo.status AS ultimo_status
+       FROM usuarios u
+       LEFT JOIN LATERAL (
+         SELECT mes_referencia, valor, status
+         FROM financeiro_lancamentos f
+         WHERE f.usuario_id = u.id
+         ORDER BY mes_referencia DESC
+         LIMIT 1
+       ) ultimo ON true
+       WHERE u.tipo NOT IN ('super_admin', 'master')
+       ORDER BY u.nome NULLS LAST, u.email`
+    );
+
+    return c.json(result.rows.map((linha: any) => ({
+      id: linha.id,
+      nome: [linha.nome, linha.sobrenome].filter(Boolean).join(" ") || linha.email,
+      email: linha.email,
+      ultimo_lancamento: linha.ultimo_mes_referencia
+        ? {
+            mes_referencia: linha.ultimo_mes_referencia,
+            valor: Number(linha.ultimo_valor),
+            status: linha.ultimo_status
+          }
+        : null
+    })));
+  } catch (err) {
+    console.error("ERRO GET /admin/financeiro/usuarios:", err);
+    return c.json({ error: "Erro ao carregar usuários" }, 500);
+  }
+});
+
+// 🔹 Admin — histórico completo de lançamentos de um usuário específico.
+app.get("/admin/financeiro/usuarios/:usuarioId/lancamentos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const usuarioId = Number(c.req.param("usuarioId"));
+    if (!Number.isFinite(usuarioId)) return c.json({ error: "Usuário inválido" }, 400);
+
+    const result = await client.query(
+      `SELECT id, usuario_id, mes_referencia, valor, status,
+              comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+              observacao, criado_em
+       FROM financeiro_lancamentos
+       WHERE usuario_id = $1
+       ORDER BY mes_referencia DESC`,
+      [usuarioId]
+    );
+
+    return c.json(result.rows.map(linhaFinanceiroParaJson));
+  } catch (err) {
+    console.error("ERRO GET /admin/financeiro/usuarios/:usuarioId/lancamentos:", err);
+    return c.json({ error: "Erro ao carregar lançamentos" }, 500);
+  }
+});
+
+// 🔹 Admin — lança (ou atualiza, se já existir pro mesmo usuário+mês) a cobrança do mês.
+app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const { usuario_id, mes_referencia, valor, observacao } = await c.req.json();
+
+    const usuarioId = Number(usuario_id);
+    const valorNumero = Number(valor);
+
+    if (!Number.isFinite(usuarioId)) {
+      return c.json({ error: "Usuário inválido" }, 400);
+    }
+    if (!mes_referencia || !/^\d{4}-\d{2}(-\d{2})?$/.test(String(mes_referencia))) {
+      return c.json({ error: "Mês de referência inválido" }, 400);
+    }
+    if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+      return c.json({ error: "Informe um valor válido" }, 400);
+    }
+
+    // Normaliza sempre pro dia 1 do mês — evita duas linhas pro mesmo mês por
+    // causa de um dia diferente vindo do front.
+    const mesNormalizado = `${String(mes_referencia).slice(0, 7)}-01`;
+
+    const result = await client.query(
+      `INSERT INTO financeiro_lancamentos (usuario_id, mes_referencia, valor, observacao)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (usuario_id, mes_referencia)
+       DO UPDATE SET valor = EXCLUDED.valor, observacao = EXCLUDED.observacao
+       RETURNING id, usuario_id, mes_referencia, valor, status,
+                 comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+                 observacao, criado_em`,
+      [usuarioId, mesNormalizado, valorNumero, textoOpcional(observacao) || null]
+    );
+
+    return c.json(linhaFinanceiroParaJson(result.rows[0]));
+  } catch (err) {
+    console.error("ERRO POST /admin/financeiro/lancamentos:", err);
+    return c.json({ error: "Erro ao lançar cobrança" }, 500);
+  }
+});
+
+// 🔹 Admin — edita valor/observação de um lançamento existente.
+app.put("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const { valor, observacao } = await c.req.json();
+    const valorNumero = Number(valor);
+    if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+      return c.json({ error: "Informe um valor válido" }, 400);
+    }
+
+    const result = await client.query(
+      `UPDATE financeiro_lancamentos
+       SET valor = $1, observacao = $2
+       WHERE id = $3
+       RETURNING id, usuario_id, mes_referencia, valor, status,
+                 comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+                 observacao, criado_em`,
+      [valorNumero, textoOpcional(observacao) || null, id]
+    );
+
+    if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
+
+    return c.json(linhaFinanceiroParaJson(result.rows[0]));
+  } catch (err) {
+    console.error("ERRO PUT /admin/financeiro/lancamentos/:id:", err);
+    return c.json({ error: "Erro ao atualizar lançamento" }, 500);
+  }
+});
+
+// 🔹 Admin sobe a Nota Fiscal de um lançamento — isso confirma o pagamento.
+app.post("/admin/financeiro/lancamentos/:id/nf", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const arquivo = await lerArquivoFinanceiro(c);
+    if (arquivo.erro) return c.json({ error: arquivo.erro }, 400);
+
+    const result = await client.query(
+      `UPDATE financeiro_lancamentos
+       SET nf_dados = $1, nf_mime = $2, nf_enviada_em = NOW(), status = 'pago'
+       WHERE id = $3
+       RETURNING id`,
+      [arquivo.bytes, arquivo.mimeType, id]
+    );
+
+    if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO POST /admin/financeiro/lancamentos/:id/nf:", err);
+    return c.json({ error: "Erro ao enviar nota fiscal" }, 500);
+  }
+});
+
 // Passos genéricos usados quando a IA não está disponível/configurada ou falha —
 // mesmo roteiro que já aparecia como placeholder no textarea, nunca deixa o
 // corretor sem nada na tela.
@@ -16964,6 +17286,27 @@ await client.query(`
     mime_type     TEXT NOT NULL,
     dados         BYTEA NOT NULL,
     criado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- Painel Financeiro: um lancamento = a cobranca de um usuario num mes.
+  -- Arquivo pequeno (comprovante/NF) guardado direto como BYTEA, mesmo
+  -- padrao de whatsapp_bot_midias acima — sem S3/Cloudinary.
+  CREATE TABLE IF NOT EXISTS financeiro_lancamentos (
+    id                     SERIAL PRIMARY KEY,
+    usuario_id             INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    mes_referencia         DATE NOT NULL,
+    valor                  NUMERIC(10,2) NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'aguardando_pagamento'
+                             CHECK (status IN ('aguardando_pagamento','comprovante_enviado','pago')),
+    comprovante_dados      BYTEA,
+    comprovante_mime       TEXT,
+    comprovante_enviado_em TIMESTAMP,
+    nf_dados               BYTEA,
+    nf_mime                TEXT,
+    nf_enviada_em          TIMESTAMP,
+    observacao             TEXT,
+    criado_em              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(usuario_id, mes_referencia)
   );
 
   CREATE TABLE IF NOT EXISTS whatsapp_conversas (
