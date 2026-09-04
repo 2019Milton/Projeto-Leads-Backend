@@ -11769,7 +11769,8 @@ app.post("/debug/testar-asset-feed-spec", authMiddleware, async (c) => {
       image_hashes,
       video_id,
       destino,
-      form_id
+      form_id,
+      page_id: pageIdTeste
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -11814,13 +11815,12 @@ app.post("/debug/testar-asset-feed-spec", authMiddleware, async (c) => {
       access_token: token
     };
 
-    // Lead Ads/WhatsApp precisam do object_type + a ligacao com o form/whatsapp
-    // em algum lugar — como object_story_spec nao é usado aqui, testamos
-    // adicionar isso diretamente no nivel do creative pra ver se a Meta aceita.
-    if (destinoResolvido === "whatsapp") {
-      bodyEnviado.object_type = "SHARE";
-    } else if (form_id) {
-      bodyEnviado.object_type = "SHARE";
+    // Erro anterior ("Selecionar criativo do anuncio" / blame_field creative.object_story_id)
+    // indicou que falta contexto de Pagina — testando um object_story_spec "casca"
+    // (so page_id, sem link_data/video_data, ja que o conteudo real vem do
+    // asset_feed_spec) como companheiro, padrao comum em Dynamic Creative Ads.
+    if (pageIdTeste) {
+      bodyEnviado.object_story_spec = { page_id: pageIdTeste };
     }
 
     const resultado = await fetch(
