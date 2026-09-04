@@ -1621,113 +1621,129 @@ function montarCallToActionMeta(destino: DestinoCampanhaMeta, ctaType: string, f
     : { type: ctaType, value: { lead_gen_form_id: formId } };
 }
 
-// Carrossel misto (imagens + vídeo) com criativo diferente por rede — Facebook
-// recebe o carrossel completo (imagens + vídeo na posição escolhida), Instagram
-// recebe só vídeo OU só o carrossel de imagens (a Meta não aceita video_label
-// misturado com image_label num carrossel do Instagram). Usa asset_feed_spec +
-// asset_customization_rules (mecanismo nativo da Meta pra criativo por
-// posicionamento dentro do MESMO anúncio, sem duplicar conjunto/orçamento).
-// AINDA NÃO CONFIRMADO AO VIVO se este mecanismo funciona com destino Lead Ads
-// (lead_gen_form_id) ou WhatsApp — call_to_action_types aqui só aceita o TIPO
-// (string), diferente do call_to_action completo {type,value} que
-// montarCallToActionMeta monta pro object_story_spec tradicional. Ver teste em
-// /debug/testar-asset-feed-spec antes de confiar nisso em produção.
-function construirAssetFeedSpecMisto(params: {
-  imageHashes: string[];
-  videoId: string;
+// Monta o conteúdo do criativo (link_data OU video_data, pra usar dentro de
+// object_story_spec) considerando vídeo + imagens juntos. Duas situações:
+//
+// 1) Instagram NÃO está selecionado: a Meta aceita video_id como mais um card
+//    dentro de link_data.child_attachments (confirmado no field reference
+//    oficial do AdCreativeLinkDataChildAttachment — só "não suportado pra
+//    anúncios do Instagram"), então monta um carrossel de verdade misturando
+//    imagens e vídeo, na posição escolhida pelo usuário.
+//
+// 2) Instagram está selecionado junto: testado ao vivo contra uma conta real
+//    (asset_feed_spec com criativo diferente por posicionamento) e a Meta
+//    rejeitou a tentativa de ter dois carrosséis distintos por rede dentro do
+//    mesmo anúncio ("Vários ativos images não podem ser aplicados à regra");
+//    o mecanismo certo pra isso é mais profundo do que a documentação pública
+//    deixa claro. Em vez de arriscar mais engenharia reversa, usa a escolha
+//    explícita do usuário (vídeo OU imagens) pras duas redes juntas — mesmo
+//    criativo em ambas, sem tentar dividir por posicionamento.
+function montarConteudoCriativoMeta(params: {
+  hashes: string[];
+  videoId: string | null;
   videoThumbnailUrl: string | null;
+  instagramSelecionado: boolean;
+  escolhaMidiaInstagram: string;
   videoPosicaoCarrossel: number | null;
-  instagramUsaVideo: boolean;
   tituloAnuncio: string;
   descricaoAnuncio: string;
   texto: string;
   linkDestino: string;
-  ctaType: string;
-}): Record<string, any> | null {
+  ctaPayload: Record<string, any>;
+}): { link_data?: Record<string, any>; video_data?: Record<string, any> } {
 
-  if (!params.videoId || params.imageHashes.length === 0) {
-    return null;
+  const temVideo = Boolean(params.videoId);
+  const temImagens = params.hashes.length > 0;
+  const mensagem = params.texto || "Quer mais clientes? 🚀";
+
+  const montarVideoData = (): Record<string, any> => {
+    const videoData: Record<string, any> = {
+      video_id: params.videoId,
+      title: params.tituloAnuncio,
+      message: mensagem,
+      call_to_action: params.ctaPayload
+    };
+    if (params.hashes[0]) {
+      videoData.image_hash = params.hashes[0];
+    } else if (params.videoThumbnailUrl) {
+      videoData.image_url = params.videoThumbnailUrl;
+    }
+    return videoData;
+  };
+
+  const montarCarrosselImagens = (): Record<string, any> => ({
+    message: mensagem,
+    multi_share_end_card: false,
+    child_attachments: params.hashes.map((hash, i) => ({
+      link: params.linkDestino,
+      image_hash: hash,
+      name: i === 0 ? params.tituloAnuncio : `Slide ${i + 1}`,
+      description: params.descricaoAnuncio,
+      call_to_action: params.ctaPayload
+    }))
+  });
+
+  if (temVideo && temImagens && params.instagramSelecionado) {
+    return params.escolhaMidiaInstagram === "imagens"
+      ? { link_data: montarCarrosselImagens() }
+      : { video_data: montarVideoData() };
   }
 
-  const posicao =
-    params.videoPosicaoCarrossel === null
-      ? params.imageHashes.length
-      : Math.max(0, Math.min(params.videoPosicaoCarrossel, params.imageHashes.length));
+  if (temVideo && temImagens) {
+    const posicao =
+      params.videoPosicaoCarrossel === null
+        ? params.hashes.length
+        : Math.max(0, Math.min(params.videoPosicaoCarrossel, params.hashes.length));
 
-  const rotuloImagem = (i: number) => `img_${i}`;
-  const ROTULO_VIDEO = "video_principal";
-  const ROTULO_TITULO = "titulo_principal";
-  const ROTULO_DESCRICAO = "descricao_principal";
-  const ROTULO_LINK = "link_principal";
-  const ROTULO_CORPO = "corpo_principal";
-  const ROTULO_CARROSSEL_FACEBOOK = "carrossel_facebook";
-  const ROTULO_CARROSSEL_INSTAGRAM_IMAGENS = "carrossel_instagram_imagens";
+    const cardsImagem = params.hashes.map(hash => ({
+      link: params.linkDestino,
+      image_hash: hash,
+      description: params.descricaoAnuncio,
+      call_to_action: params.ctaPayload
+    }));
 
-  const camposComuns = {
-    link_url_label: { name: ROTULO_LINK },
-    title_label: { name: ROTULO_TITULO },
-    description_label: { name: ROTULO_DESCRICAO }
-  };
+    const cardVideo: Record<string, any> = {
+      link: params.linkDestino,
+      video_id: params.videoId,
+      description: params.descricaoAnuncio,
+      call_to_action: params.ctaPayload
+    };
+    if (params.videoThumbnailUrl) {
+      cardVideo.picture = params.videoThumbnailUrl;
+    }
 
-  const cardsImagem = params.imageHashes.map((_, i) => ({
-    image_label: { name: rotuloImagem(i) },
-    ...camposComuns
-  }));
+    const cards: Record<string, any>[] = [...cardsImagem];
+    cards.splice(posicao, 0, cardVideo);
+    cards.forEach((card, i) => {
+      card.name = i === 0 ? params.tituloAnuncio : `Slide ${i + 1}`;
+    });
 
-  const cardVideo = {
-    video_label: { name: ROTULO_VIDEO },
-    ...camposComuns
-  };
-
-  const cardsFacebook = [...cardsImagem];
-  cardsFacebook.splice(posicao, 0, cardVideo);
-
-  const regraInstagram = params.instagramUsaVideo
-    ? {
-        customization_spec: { publisher_platforms: ["instagram"] },
-        video_label: { name: ROTULO_VIDEO },
-        ...camposComuns
+    return {
+      link_data: {
+        message: mensagem,
+        multi_share_end_card: false,
+        child_attachments: cards
       }
-    : {
-        customization_spec: { publisher_platforms: ["instagram"] },
-        carousel_label: { name: ROTULO_CARROSSEL_INSTAGRAM_IMAGENS }
-      };
+    };
+  }
+
+  if (temVideo) {
+    return { video_data: montarVideoData() };
+  }
+
+  if (params.hashes.length > 1) {
+    return { link_data: montarCarrosselImagens() };
+  }
 
   return {
-    images: params.imageHashes.map((hash, i) => ({
-      hash,
-      adlabels: [{ name: rotuloImagem(i) }]
-    })),
-    videos: [
-      {
-        video_id: params.videoId,
-        adlabels: [{ name: ROTULO_VIDEO }],
-        ...(params.videoThumbnailUrl ? { thumbnail_url: params.videoThumbnailUrl } : {})
-      }
-    ],
-    titles: [{ text: params.tituloAnuncio, adlabels: [{ name: ROTULO_TITULO }] }],
-    descriptions: [{ text: params.descricaoAnuncio, adlabels: [{ name: ROTULO_DESCRICAO }] }],
-    bodies: [{ text: params.texto, adlabels: [{ name: ROTULO_CORPO }] }],
-    link_urls: [{ website_url: params.linkDestino, adlabels: [{ name: ROTULO_LINK }] }],
-    call_to_action_types: [params.ctaType],
-    ad_formats: ["CAROUSEL"],
-    carousels: [
-      {
-        adlabels: [{ name: ROTULO_CARROSSEL_FACEBOOK }],
-        child_attachments: cardsFacebook
-      },
-      {
-        adlabels: [{ name: ROTULO_CARROSSEL_INSTAGRAM_IMAGENS }],
-        child_attachments: cardsImagem
-      }
-    ],
-    asset_customization_rules: [
-      {
-        customization_spec: { publisher_platforms: ["facebook"] },
-        carousel_label: { name: ROTULO_CARROSSEL_FACEBOOK }
-      },
-      regraInstagram
-    ]
+    link_data: {
+      message: mensagem,
+      link: params.linkDestino,
+      image_hash: params.hashes[0] || "",
+      name: params.tituloAnuncio,
+      description: params.descricaoAnuncio,
+      call_to_action: params.ctaPayload
+    }
   };
 }
 
@@ -11756,93 +11772,6 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
 });
 
 
-// TEMPORÁRIO — spike de verificação pro carrossel misto (imagens+vídeo) com
-// criativo por rede. Cria um adcreative de teste (não publica, não gasta,
-// não fica preso a nenhum anúncio) só pra confirmar se a Meta aceita a forma
-// de asset_feed_spec construída em construirAssetFeedSpecMisto, e se
-// funciona com destino Lead Ads/WhatsApp. Remover depois da verificação.
-app.post("/debug/testar-asset-feed-spec", authMiddleware, async (c) => {
-  try {
-    const user: any = c.get("user");
-    const {
-      usuario_id,
-      image_hashes,
-      video_id,
-      destino,
-      form_id,
-      page_id: pageIdTeste
-    } = await c.req.json();
-
-    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
-    if (!usuarioId) return negarAcessoConta(c);
-
-    const conn = await client.query(
-      "SELECT access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
-      [usuarioId]
-    );
-    if (!conn.rows.length) return c.json({ error: "Meta não conectada" }, 400);
-
-    const token = conn.rows[0].access_token;
-    const contaAnunciosId = await obterContaAnunciosSelecionadaIdUsuario(usuarioId);
-
-    if (!video_id) {
-      const [imagens, videos] = await Promise.all([
-        fetch(`https://graph.facebook.com/v19.0/${contaAnunciosId}/adimages?fields=hash,name&limit=5&access_token=${token}`).then(r => r.json()),
-        fetch(`https://graph.facebook.com/v19.0/${contaAnunciosId}/advideos?fields=id,title,status&limit=5&access_token=${token}`).then(r => r.json())
-      ]);
-      return c.json({ modo: "descoberta", imagens, videos });
-    }
-
-    const destinoResolvido = resolverDestinoCampanha(destino);
-    const ctaPayload = montarCallToActionMeta(destinoResolvido, "LEARN_MORE", form_id || null);
-
-    const assetFeedSpec = construirAssetFeedSpecMisto({
-      imageHashes: Array.isArray(image_hashes) ? image_hashes : [],
-      videoId: video_id,
-      videoThumbnailUrl: null,
-      videoPosicaoCarrossel: null,
-      instagramUsaVideo: true,
-      tituloAnuncio: "Teste asset_feed_spec",
-      descricaoAnuncio: "Teste de verificacao",
-      texto: "Teste de verificacao — carrossel misto",
-      linkDestino: "https://plataformadeleads.com.br",
-      ctaType: "LEARN_MORE"
-    });
-
-    const bodyEnviado: Record<string, any> = {
-      name: `TESTE asset_feed_spec ${Date.now()}`,
-      asset_feed_spec: assetFeedSpec,
-      access_token: token
-    };
-
-    // Erro anterior ("Selecionar criativo do anuncio" / blame_field creative.object_story_id)
-    // indicou que falta contexto de Pagina — testando um object_story_spec "casca"
-    // (so page_id, sem link_data/video_data, ja que o conteudo real vem do
-    // asset_feed_spec) como companheiro, padrao comum em Dynamic Creative Ads.
-    if (pageIdTeste) {
-      bodyEnviado.object_story_spec = { page_id: pageIdTeste };
-    }
-
-    const resultado = await fetch(
-      `https://graph.facebook.com/v19.0/${contaAnunciosId}/adcreatives`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(bodyEnviado)
-      }
-    ).then(r => r.json());
-
-    return c.json({
-      payload_enviado: assetFeedSpec,
-      cta_payload_referencia: ctaPayload,
-      resultado_meta: resultado
-    });
-
-  } catch (err: any) {
-    return c.json({ error: err?.message || String(err) }, 500);
-  }
-});
-
 app.post("/meta/upload-video", authMiddleware, async (c) => {
 
   try {
@@ -12129,30 +12058,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         ? [imageHash]
         : [];
 
-    const isCarrossel = hashes.length > 1;
-
     const ctaType = cta || "LEARN_MORE";
-
-    const linkDataBase: Record<string, any> = {
-      message: texto || "Quer mais clientes? 🚀"
-    };
-
-    if (isCarrossel) {
-      linkDataBase.child_attachments = hashes.map((hash, i) => ({
-        link: linkDestino,
-        image_hash: hash,
-        name: i === 0 ? tituloAnuncio : `Slide ${i + 1}`,
-        description: descricaoAnuncio,
-        call_to_action: montarCallToActionMeta(destino, ctaType, form_id)
-      }));
-      linkDataBase.multi_share_end_card = false;
-    } else {
-      linkDataBase.link = linkDestino;
-      linkDataBase.image_hash = hashes[0] || imageHash;
-      linkDataBase.name = tituloAnuncio;
-      linkDataBase.description = descricaoAnuncio;
-      linkDataBase.call_to_action = montarCallToActionMeta(destino, ctaType, form_id);
-    }
 
     // 🔥 INSTAGRAM ACTOR (necessario para o anuncio veicular no Instagram)
     const plataformasSelecionadas: string[] =
@@ -12176,23 +12082,24 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       }
     }
 
-    const videoData: Record<string, any> = {
-      video_id: videoMetaId,
-      title: tituloAnuncio,
-      message: texto || "Quer mais clientes? 🚀",
-      call_to_action: montarCallToActionMeta(destino, ctaType, form_id)
+    const conteudoCriativo = montarConteudoCriativoMeta({
+      hashes,
+      videoId: videoMetaId || null,
+      videoThumbnailUrl,
+      instagramSelecionado: plataformasSelecionadas.includes("instagram"),
+      escolhaMidiaInstagram: textoOpcional(avancadas.escolha_midia_instagram),
+      videoPosicaoCarrossel: numeroOpcional(avancadas.video_posicao_carrossel),
+      tituloAnuncio,
+      descricaoAnuncio,
+      texto,
+      linkDestino,
+      ctaPayload: montarCallToActionMeta(destino, ctaType, form_id)
+    });
+
+    const objectStorySpec: Record<string, any> = {
+      page_id,
+      ...conteudoCriativo
     };
-
-    // Meta exige image_hash ou image_url no video_data
-    if (hashes[0]) {
-      videoData.image_hash = hashes[0];
-    } else if (videoThumbnailUrl) {
-      videoData.image_url = videoThumbnailUrl;
-    }
-
-    const objectStorySpec: Record<string, any> = videoMetaId
-      ? { page_id, video_data: videoData }
-      : { page_id, link_data: linkDataBase };
 
     if (instagramActorId) {
       objectStorySpec.instagram_actor_id = instagramActorId;
@@ -21465,55 +21372,30 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         pageId &&
         (destinoOriginal === "whatsapp" || formId)
       ) {
-        const isCarrossel = imageHashes.length > 1;
-
         const ctaPayload = montarCallToActionMeta(
           destinoOriginal,
           ctaType,
           formId || null
         );
 
-        let objectStorySpec: Record<string, any>;
+        const conteudoCriativo = montarConteudoCriativoMeta({
+          hashes: imageHashes,
+          videoId: videoId || null,
+          videoThumbnailUrl: null,
+          instagramSelecionado: Array.isArray(avancadas?.plataformas) && avancadas.plataformas.includes("instagram"),
+          escolhaMidiaInstagram: textoOpcional(avancadas.escolha_midia_instagram),
+          videoPosicaoCarrossel: numeroOpcional(avancadas.video_posicao_carrossel),
+          tituloAnuncio,
+          descricaoAnuncio,
+          texto,
+          linkDestino,
+          ctaPayload
+        });
 
-        if (videoId) {
-          objectStorySpec = {
-            page_id: pageId,
-            video_data: {
-              video_id: videoId,
-              title: tituloAnuncio,
-              message: texto,
-              call_to_action: ctaPayload,
-              ...(imageHashes[0] ? { image_hash: imageHashes[0] } : {})
-            }
-          };
-        } else if (isCarrossel) {
-          objectStorySpec = {
-            page_id: pageId,
-            link_data: {
-              message: texto,
-              multi_share_end_card: false,
-              child_attachments: imageHashes.map((hash, i) => ({
-                link: linkDestino,
-                image_hash: hash,
-                name: i === 0 ? tituloAnuncio : `Slide ${i + 1}`,
-                description: descricaoAnuncio,
-                call_to_action: ctaPayload
-              }))
-            }
-          };
-        } else {
-          objectStorySpec = {
-            page_id: pageId,
-            link_data: {
-              message: texto,
-              link: linkDestino,
-              image_hash: imageHashes[0] || "",
-              name: tituloAnuncio,
-              description: descricaoAnuncio,
-              call_to_action: ctaPayload
-            }
-          };
-        }
+        const objectStorySpec: Record<string, any> = {
+          page_id: pageId,
+          ...conteudoCriativo
+        };
 
         // Instagram actor
         const instagramActorId =
