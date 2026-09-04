@@ -21672,7 +21672,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     const adAccountId = contaAds.id;
 
     const pages = await fetch(
-      `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
+      `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}&access_token=${token}`
     ).then(r => r.json());
 
     if (!Array.isArray(pages.data) || !pages.data.length) {
@@ -21983,41 +21983,95 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       link_data: linkDataBase
     };
 
-    if (Array.isArray(cfg.plataformas) && cfg.plataformas.includes("instagram")) {
-      // Prioriza a conta de Instagram vinculada à conta de anúncios ATUAL (a que vai
-      // criar o anúncio de verdade) em vez do cfg.instagram_actor_id salvo — esse valor
-      // pode ter sido gravado quando a campanha (ou a que ela foi duplicada) usava outra
-      // conta de anúncios conectada, e a Meta rejeita a criação inteira do criativo com
-      // "(#100) Param instagram_actor_id must be a valid Instagram account id" quando o
-      // id não pertence à conta de anúncios em uso.
+    const instagramSelecionado =
+      Array.isArray(cfg.plataformas) && cfg.plataformas.includes("instagram");
+
+    if (instagramSelecionado) {
+      const instagramPaginaId =
+        textoOpcional(page.instagram_business_account?.id) ||
+        textoOpcional(page.connected_instagram_account?.id) ||
+        null;
       const contasInstagramAnuncio =
         await listarContasInstagramAnuncio(token, adAccountId);
-      const instagramActorId =
-        contasInstagramAnuncio[0]?.id ||
-        textoOpcional(cfg.instagram_actor_id) ||
+      const instagramContaId =
+        textoOpcional(contasInstagramAnuncio[0]?.id) ||
         null;
 
-      if (!instagramActorId) {
+      if (!instagramPaginaId && !instagramContaId) {
         return await falhar(
           "Nenhuma conta do Instagram está vinculada à sua conta de anúncios da Meta conectada. Vincule uma conta do Instagram a essa conta de anúncios no Gerenciador de Negócios antes de publicar para o Instagram."
         );
       }
 
-      objectStorySpec.instagram_actor_id = instagramActorId;
+      if (instagramPaginaId) {
+        // O creative original que efetivamente entregou no Instagram não enviou
+        // instagram_actor_id no object_story_spec. A Meta resolveu o vínculo da
+        // Página e devolveu a identidade aplicada no campo instagram_user_id.
+        console.log("PUBLICAR_RECEBIDA_IDENTIDADE_INSTAGRAM:", JSON.stringify({
+          estrategia: "page_linked_instagram_user",
+          page_id: pageId,
+          instagram_user_id: instagramPaginaId,
+          disponivel_na_conta_anuncios: contasInstagramAnuncio.some(
+            (conta: any) => String(conta.id) === String(instagramPaginaId)
+          )
+        }));
+      } else {
+        // Compatibilidade para uma conta de Instagram liberada diretamente para a
+        // conta de anúncios, mas sem vínculo retornado na Página selecionada.
+        objectStorySpec.instagram_actor_id = instagramContaId;
+      }
     }
 
-    const creativeMeta = await fetch(
-      `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: `Criativo Leads ${Date.now()}`,
-          object_story_spec: objectStorySpec,
-          access_token: token
-        })
+    const criarCreativeRecebido = async (spec: Record<string, any>) => {
+      const payloadCreative = {
+        name: `Criativo Leads ${Date.now()}`,
+        object_story_spec: spec,
+        access_token: token
+      };
+
+      // Registra a estrutura exata enviada à Meta, sem expor o token de acesso.
+      console.log(
+        "PUBLICAR_RECEBIDA_ADCREATIVE_PAYLOAD:",
+        JSON.stringify({ ...payloadCreative, access_token: "[REDACTED]" })
+      );
+
+      return fetch(
+        `https://graph.facebook.com/v19.0/${adAccountId}/adcreatives`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payloadCreative)
+        }
+      ).then(r => r.json());
+    };
+
+    let creativeMeta =
+      await criarCreativeRecebido(objectStorySpec);
+
+    // Mesmo fallback já comprovado no fluxo normal de publicação: se a Meta
+    // rejeitar o instagram_actor_id de uma conta sem vínculo direto à Página,
+    // deixa a plataforma usar a identidade page-backed.
+    if (!creativeMeta?.id && objectStorySpec.instagram_actor_id) {
+      const erroCreativo = String(
+        creativeMeta?.error?.error_user_msg ||
+        creativeMeta?.error?.message ||
+        ""
+      ).toLowerCase();
+
+      if (
+        erroCreativo.includes("instagram_actor_id") ||
+        erroCreativo.includes("instagram account")
+      ) {
+        console.warn(
+          "PUBLICAR_RECEBIDA: instagram_actor_id rejeitado; tentando identidade page-backed:",
+          creativeMeta?.error
+        );
+        const specSemInstagramActor = { ...objectStorySpec };
+        delete specSemInstagramActor.instagram_actor_id;
+        creativeMeta =
+          await criarCreativeRecebido(specSemInstagramActor);
       }
-    ).then(r => r.json());
+    }
 
     if (!creativeMeta.id) {
       return await falhar(
