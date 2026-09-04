@@ -21400,10 +21400,14 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           ...conteudoCriativo
         };
 
-        // Instagram actor
+        // Instagram actor — só faz sentido mandar esse campo quando o Instagram
+        // continua marcado nesta edição. Sem essa checagem, remover o Instagram
+        // de uma campanha que já teve instagram_actor_id salvo antes deixava o
+        // campo "vazando" pro criativo mesmo depois de desmarcado.
         const instagramActorId =
-          textoOpcional(avancadas.instagram_actor_id) ||
-          textoOpcional(cfgBanco.instagram_actor_id);
+          Array.isArray(avancadas?.plataformas) && avancadas.plataformas.includes("instagram")
+            ? textoOpcional(avancadas.instagram_actor_id) || textoOpcional(cfgBanco.instagram_actor_id)
+            : "";
 
         if (instagramActorId) {
           objectStorySpec.instagram_actor_id = instagramActorId;
