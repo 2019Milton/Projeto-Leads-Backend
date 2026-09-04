@@ -27336,27 +27336,45 @@ async function obterGastoSemanalTikTok(usuarioId: number): Promise<number | null
 }
 
 async function montarResumoSemanalCorretor(usuarioId: number) {
-  const [campanhasAtivas, leadsSemana, leadsQuentes, leadsFechados] = await Promise.all([
-    client.query(
-      `SELECT COUNT(*) AS total FROM campanhas
-       WHERE usuario_id = $1 AND UPPER(status) IN ('ACTIVE','ENABLED') AND COALESCE(status, '') <> 'DELETED'`,
-      [usuarioId]
-    ),
-    client.query(
-      `SELECT COUNT(*) AS total FROM leads WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days'`,
-      [usuarioId]
-    ),
-    client.query(
-      `SELECT COUNT(*) AS total FROM leads
-       WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days' AND (score = 'quente' OR score_manual = 'quente')`,
-      [usuarioId]
-    ),
-    client.query(
-      `SELECT COUNT(*) AS total FROM leads
-       WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days' AND status = 'fechado'`,
-      [usuarioId]
-    ),
-  ]);
+  const [campanhasRows, leadsSemana, leadsSemanaAnterior, leadsQuentes, leadsFechados, leadsPorCampanha] =
+    await Promise.all([
+      client.query(
+        `SELECT nome, status FROM campanhas
+         WHERE usuario_id = $1 AND COALESCE(status, '') <> 'DELETED'
+         ORDER BY nome`,
+        [usuarioId]
+      ),
+      client.query(
+        `SELECT COUNT(*) AS total FROM leads WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days'`,
+        [usuarioId]
+      ),
+      client.query(
+        `SELECT COUNT(*) AS total FROM leads
+         WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '14 days' AND criado_em < NOW() - INTERVAL '7 days'`,
+        [usuarioId]
+      ),
+      client.query(
+        `SELECT COUNT(*) AS total FROM leads
+         WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days' AND (score = 'quente' OR score_manual = 'quente')`,
+        [usuarioId]
+      ),
+      client.query(
+        `SELECT COUNT(*) AS total FROM leads
+         WHERE usuario_id = $1 AND criado_em >= NOW() - INTERVAL '7 days' AND status = 'fechado'`,
+        [usuarioId]
+      ),
+      // leads.campanha guarda o NOME da campanha (texto, não FK) — mesma convenção
+      // usada em todo o resto do sistema pra ligar lead à campanha de origem.
+      client.query(
+        `SELECT campanha,
+                COUNT(*) FILTER (WHERE criado_em >= NOW() - INTERVAL '7 days') AS leads_atual,
+                COUNT(*) FILTER (WHERE criado_em >= NOW() - INTERVAL '14 days' AND criado_em < NOW() - INTERVAL '7 days') AS leads_anterior
+         FROM leads
+         WHERE usuario_id = $1 AND campanha IS NOT NULL AND campanha <> ''
+         GROUP BY campanha`,
+        [usuarioId]
+      ),
+    ]);
 
   const [gastoMeta, gastoGoogle, gastoTikTok] = await Promise.all([
     obterGastoSemanalMeta(usuarioId),
@@ -27368,17 +27386,50 @@ async function montarResumoSemanalCorretor(usuarioId: number) {
     .filter((v): v is number => v !== null)
     .reduce((a, b) => a + b, 0);
 
+  const ehAtiva = (status: any) => ["ACTIVE", "ENABLED"].includes(String(status || "").toUpperCase());
+  const campanhasAtivasNomes = campanhasRows.rows.filter(c => ehAtiva(c.status)).map(c => c.nome);
+  const campanhasPausadasNomes = campanhasRows.rows.filter(c => !ehAtiva(c.status)).map(c => c.nome);
+
+  // "Destaque da semana" = mais leads gerados na semana atual, entre as campanhas que
+  // geraram pelo menos 1 lead agora (evita eleger uma campanha parada há meses).
+  const destaque = leadsPorCampanha.rows
+    .map(r => ({
+      nome: r.campanha as string,
+      leads_atual: Number(r.leads_atual || 0),
+      leads_anterior: Number(r.leads_anterior || 0),
+    }))
+    .filter(r => r.leads_atual > 0)
+    .sort((a, b) => b.leads_atual - a.leads_atual)[0] || null;
+
   return {
-    campanhas_ativas: Number(campanhasAtivas.rows[0]?.total || 0),
+    campanhas_ativas_nomes: campanhasAtivasNomes,
+    campanhas_pausadas_nomes: campanhasPausadasNomes,
     leads_semana: Number(leadsSemana.rows[0]?.total || 0),
+    leads_semana_anterior: Number(leadsSemanaAnterior.rows[0]?.total || 0),
     leads_quentes: Number(leadsQuentes.rows[0]?.total || 0),
     leads_fechados: Number(leadsFechados.rows[0]?.total || 0),
     gasto_total: gastoTotal,
+    destaque,
   };
 }
 
 function formatarMoedaBRLTexto(valor: number) {
   return valor.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+// Lista até `limite` nomes por extenso e resume o resto em "e mais N" — uma campanha
+// desativada há tempos ou um corretor com muitas campanhas não pode virar uma mensagem
+// de WhatsApp gigante.
+function listarNomesCampanha(nomes: string[], limite = 6): string {
+  if (!nomes.length) return "nenhuma";
+  const visiveis = nomes.slice(0, limite).join(", ");
+  const resto = nomes.length - limite;
+  return resto > 0 ? `${visiveis} e mais ${resto}` : visiveis;
+}
+
+function formatarTendenciaSemanal(atual: number, anterior: number): string {
+  if (atual === anterior) return anterior > 0 ? " (igual à semana passada)" : "";
+  return atual > anterior ? ` (↑ era ${anterior})` : ` (↓ era ${anterior})`;
 }
 
 async function enviarResumoSemanalCorretor(usuarioId: number, numeroBot: string) {
@@ -27387,12 +27438,19 @@ async function enviarResumoSemanalCorretor(usuarioId: number, numeroBot: string)
 
   const msg =
     `📊 *Resumo da sua semana*\n\n` +
-    `📢 Campanhas ativas: *${resumo.campanhas_ativas}*\n` +
-    `🧲 Leads na semana: *${resumo.leads_semana}*\n` +
-    `🔥 Leads quentes: *${resumo.leads_quentes}*\n` +
-    `✅ Leads fechados: *${resumo.leads_fechados}*\n` +
-    `💰 Valor investido: *${formatarMoedaBRLTexto(resumo.gasto_total)}*\n` +
-    (cpl !== null ? `📈 Custo por lead: *${formatarMoedaBRLTexto(cpl)}*\n` : "") +
+    `📢 *Campanhas*\n` +
+    `✅ Ativas (${resumo.campanhas_ativas_nomes.length}): ${listarNomesCampanha(resumo.campanhas_ativas_nomes)}\n` +
+    `⏸️ Pausadas/desativadas (${resumo.campanhas_pausadas_nomes.length}): ${listarNomesCampanha(resumo.campanhas_pausadas_nomes)}\n\n` +
+    `🧲 *Leads*\n` +
+    `Total: *${resumo.leads_semana}*${formatarTendenciaSemanal(resumo.leads_semana, resumo.leads_semana_anterior)}\n` +
+    `🔥 Quentes: *${resumo.leads_quentes}*\n` +
+    `✅ Fechados: *${resumo.leads_fechados}*\n\n` +
+    `💰 *Investimento*\n` +
+    `Total: *${formatarMoedaBRLTexto(resumo.gasto_total)}*\n` +
+    (cpl !== null ? `Custo por lead: *${formatarMoedaBRLTexto(cpl)}*\n` : "") +
+    (resumo.destaque
+      ? `\n🏆 *Campanha destaque da semana*\n"${resumo.destaque.nome}" gerou *${resumo.destaque.leads_atual} lead(s)*${formatarTendenciaSemanal(resumo.destaque.leads_atual, resumo.destaque.leads_anterior)}.\n_(Critério: mais leads gerados na semana entre as suas campanhas.)_\n`
+      : "") +
     `\nAcesse a plataforma para ver todos os detalhes.`;
 
   await enviarLembreteWhatsApp(numeroBot, msg);
@@ -27411,14 +27469,15 @@ function diaEHoraBrasilAgora() {
 }
 
 // Roda a cada hora (mesmo padrão de verificarAlertasRailway abaixo); só dispara de fato às
-// segundas-feiras, na janela das 8h (horário de Brasília). resumo_semanal_enviado_em em
+// sextas-feiras, na janela das 16h (horário de Brasília) — antes era segunda de manhã,
+// mudado a pedido pra fechar a semana já com o resumo em mãos. resumo_semanal_enviado_em em
 // "usuarios" garante que nunca manda duas vezes na mesma semana mesmo que o processo
 // reinicie/redeploy no meio da janela — um setInterval sozinho reseta a cada deploy, então
 // não dá pra confiar só nele pra um intervalo de 7 dias num projeto com deploy frequente.
 async function verificarResumosSemanaisWhatsApp() {
   try {
     const { diaSemana, hora } = diaEHoraBrasilAgora();
-    if (diaSemana !== "Mon" || hora !== 8) return;
+    if (diaSemana !== "Fri" || hora !== 16) return;
 
     const usuarios = await client.query(`
       SELECT u.id, pc.dados_conta->>'numero' AS numero_bot
