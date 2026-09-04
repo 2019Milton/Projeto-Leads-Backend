@@ -12889,6 +12889,44 @@ app.get(
       [usuario_id, adAccountId]
     );
 
+    // Quebra por rede (Facebook/Instagram) pro card "Status Meta" do Dashboard —
+    // campanhas separadas (ver montarContextoPublicacaoMeta no front) guardam
+    // configuracoes_avancadas.plataformas com um único elemento; campanhas
+    // legadas combinadas (ou sem essa info) caem no balde "meta" genérico, sem
+    // quebra — não dá pra saber qual rede sem essa marcação.
+    const campanhasParaQuebraRede = await client.query(
+      `
+      SELECT status, configuracoes_avancadas
+      FROM campanhas
+      WHERE usuario_id = $1
+      AND conta_anuncios_id = $2
+      `,
+      [usuario_id, adAccountId]
+    );
+
+    const campanhasPorRede: Record<string, { campanhas: number; campanhas_ativas: number }> = {
+      facebook: { campanhas: 0, campanhas_ativas: 0 },
+      instagram: { campanhas: 0, campanhas_ativas: 0 }
+    };
+
+    for (const linha of campanhasParaQuebraRede.rows) {
+      let cfg = linha.configuracoes_avancadas;
+      if (typeof cfg === "string") {
+        try { cfg = JSON.parse(cfg); } catch { cfg = null; }
+      }
+      const plataformasLinha = Array.isArray(cfg?.plataformas) ? cfg.plataformas : [];
+      const rede =
+        plataformasLinha.length === 1 && ["facebook", "instagram"].includes(plataformasLinha[0])
+          ? plataformasLinha[0]
+          : null;
+      if (!rede) continue;
+
+      campanhasPorRede[rede].campanhas += 1;
+      if (["ACTIVE", "ENABLED"].includes(String(linha.status || "").toUpperCase())) {
+        campanhasPorRede[rede].campanhas_ativas += 1;
+      }
+    }
+
     // criado_em é timestamp sem timezone armazenado em UTC — comparar direto com
     // CURRENT_DATE (também UTC) faz "hoje" virar "ontem" assim que passa das 21h em
     // Brasília (UTC-3), horário em que o dia UTC já virou mas o dia local não.
@@ -12906,10 +12944,39 @@ app.get(
       [usuario_id, adAccountId]
     );
 
+    // Mesmos leads de hoje acima, mas só os de origem Meta, quebrados por rede via
+    // a campanha de cada lead (campanha_id) — mesma resolução de
+    // plataformaCampanhaExibicao() do front, em SQL: só resolve facebook/instagram
+    // quando configuracoes_avancadas.plataformas tem exatamente uma dessas redes;
+    // o resto (campanha legada combinada, sem essa marcação, ou sem campanha
+    // vinculada) fica de fora da quebra, não é possível saber a rede real.
+    const leadsHojePorRedeRes = await client.query(
+      `
+      SELECT
+        CASE
+          WHEN c.configuracoes_avancadas->'plataformas' = '["facebook"]'::jsonb THEN 'facebook'
+          WHEN c.configuracoes_avancadas->'plataformas' = '["instagram"]'::jsonb THEN 'instagram'
+        END AS rede,
+        COUNT(*)::int AS total
+      FROM leads l
+      LEFT JOIN campanhas c ON c.id = l.campanha_id
+      WHERE l.usuario_id = $1
+      AND COALESCE(l.origem, 'manual') = 'meta'
+      AND l.conta_anuncios_id = $2
+      AND (l.criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
+      GROUP BY 1
+      `,
+      [usuario_id, adAccountId]
+    );
+
     let gastoHoje = 0;
     let leadsHojeMeta = 0;
     let campanhasMetaTotal: number | null = null;
     let campanhasMetaAtivas: number | null = null;
+    const gastoLeadsHojePorRede: Record<string, { gasto_hoje: number; leads_hoje: number }> = {
+      facebook: { gasto_hoje: 0, leads_hoje: 0 },
+      instagram: { gasto_hoje: 0, leads_hoje: 0 }
+    };
 
     try {
 
@@ -12931,6 +12998,46 @@ app.get(
         err
       );
     }
+
+    // Mesmo gasto de hoje acima, mas quebrado por rede — a Meta suporta isso
+    // nativamente via breakdowns=publisher_platform (uma linha por rede em vez
+    // de uma linha só agregada). Chamada separada (em vez de reusar a de cima)
+    // porque breakdowns muda o formato da resposta e não convém arriscar
+    // quebrar o gasto "hoje" já em produção se esta falhar. Leads por rede
+    // vem do banco (leadsHojePorRedeRes acima), não daqui — mesma fonte que
+    // leads_hoje agregado já usa (leadsHojeBanco), pra não misturar duas
+    // contagens de leads diferentes (banco vs. actions da Meta) no mesmo card.
+    try {
+
+      const insightsPorRede = await fetch(
+        `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=spend&breakdowns=publisher_platform&date_preset=today&access_token=${token}`
+      ).then(r => r.json());
+
+      for (const linha of insightsPorRede.data || []) {
+        const rede = String(linha.publisher_platform || "").toLowerCase();
+        if (!gastoLeadsHojePorRede[rede]) continue;
+
+        gastoLeadsHojePorRede[rede].gasto_hoje = Number(linha.spend || 0);
+      }
+
+    } catch (err) {
+
+      console.error(
+        "ERRO GASTO HOJE POR REDE:",
+        err
+      );
+    }
+
+    for (const linha of leadsHojePorRedeRes.rows) {
+      if (linha.rede && gastoLeadsHojePorRede[linha.rede]) {
+        gastoLeadsHojePorRede[linha.rede].leads_hoje = Number(linha.total || 0);
+      }
+    }
+
+    const metricasPorRede = {
+      facebook: { ...campanhasPorRede.facebook, ...gastoLeadsHojePorRede.facebook },
+      instagram: { ...campanhasPorRede.instagram, ...gastoLeadsHojePorRede.instagram }
+    };
 
     try {
 
@@ -13227,6 +13334,7 @@ app.get(
         leads_hoje_plataforma: leadsHojePlataforma,
         gasto_hoje: gastoHoje,
         gasto_hoje_formatado: gastoHojeFormatado,
+        por_rede: metricasPorRede,
         ultimo_sync:
           conn.rows[0].ultimo_sync || null
       },
@@ -22555,13 +22663,29 @@ app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
     // quais linhas são desse tipo pra poder rotular como "Meta Ads · WhatsApp" em vez de só
     // "Meta Ads" (perderia a info de que veio de conversa, não formulário) ou só "whatsapp"
     // (perderia de qual plataforma veio o anúncio).
+    // Dentro do balde 'meta', refina pra facebook/instagram quando a campanha
+    // do lead (campanha_id) tiver essa marcação — mesma resolução usada em
+    // /meta/status-completo e no front (plataformaCampanhaExibicao). Campanha
+    // legada combinada, sem campanha vinculada, ou sem essa marcação continua
+    // caindo em 'meta' genérico.
     const result = await client.query(
       `SELECT
-         COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') AS plataforma,
-         (plataforma = 'whatsapp') AS canal_whatsapp,
+         CASE
+           WHEN COALESCE(NULLIF(l.plataforma, 'whatsapp'), l.origem, 'formulario') = 'meta'
+           THEN COALESCE(
+             CASE
+               WHEN c.configuracoes_avancadas->'plataformas' = '["facebook"]'::jsonb THEN 'facebook'
+               WHEN c.configuracoes_avancadas->'plataformas' = '["instagram"]'::jsonb THEN 'instagram'
+             END,
+             'meta'
+           )
+           ELSE COALESCE(NULLIF(l.plataforma, 'whatsapp'), l.origem, 'formulario')
+         END AS plataforma,
+         (l.plataforma = 'whatsapp') AS canal_whatsapp,
          COUNT(*)::int AS total
-       FROM leads
-       WHERE usuario_id = $1
+       FROM leads l
+       LEFT JOIN campanhas c ON c.id = l.campanha_id
+       WHERE l.usuario_id = $1
        GROUP BY 1, 2
        ORDER BY total DESC`,
       [user.id]
