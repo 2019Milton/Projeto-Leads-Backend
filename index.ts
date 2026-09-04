@@ -1936,31 +1936,27 @@ function montarTargetingMeta(avancadas: any) {
   const plataformas =
     listaOpcional(avancadas?.plataformas);
 
+  // Posicionamentos granulares (facebook_positions/instagram_positions) só valem
+  // quando a rede correspondente ainda está marcada em "plataformas" — antes,
+  // um facebook_positions/instagram_positions que sobrava de uma edição anterior
+  // (os checkboxes de posicionamento não se limpam sozinhos ao desmarcar a rede)
+  // reincluía a rede em publisher_platforms mesmo com o usuário tendo acabado de
+  // desmarcá-la, então remover o Instagram numa edição nunca "pegava" de verdade
+  // no conjunto de anúncios — e um sync posterior lia esse publisher_platforms
+  // (ainda com Instagram) direto da Meta e sobrescrevia o "plataformas" local.
   const FACEBOOK_POSITIONS_DEPRECATED = ["video_feeds"];
-  const facebookPositions =
-    listaOpcional(avancadas?.facebook_positions)
-      .filter((p: string) => !FACEBOOK_POSITIONS_DEPRECATED.includes(p));
-
-  if (
-    facebookPositions.length &&
-    !plataformas.includes("facebook")
-  ) {
-    plataformas.push("facebook");
-  }
+  const facebookPositions = plataformas.includes("facebook")
+    ? listaOpcional(avancadas?.facebook_positions)
+        .filter((p: string) => !FACEBOOK_POSITIONS_DEPRECATED.includes(p))
+    : [];
 
   if (facebookPositions.length) {
     targeting.facebook_positions = facebookPositions;
   }
 
-  const instagramPositions =
-    listaOpcional(avancadas?.instagram_positions);
-
-  if (
-    instagramPositions.length &&
-    !plataformas.includes("instagram")
-  ) {
-    plataformas.push("instagram");
-  }
+  const instagramPositions = plataformas.includes("instagram")
+    ? listaOpcional(avancadas?.instagram_positions)
+    : [];
 
   if (instagramPositions.length) {
     targeting.instagram_positions = instagramPositions;
