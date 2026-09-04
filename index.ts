@@ -6861,10 +6861,12 @@ function googleAdsExtrairExencoesPolitica(
 app.post("/google/campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const { usuario_id, nome, orcamento, publicacao_grupo_id } = await c.req.json();
+    const { usuario_id, nome, orcamento, publicacao_grupo_id, tipo_campanha } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
+
+    const tipoCampanhaGoogle = String(tipo_campanha || "").toLowerCase() === "display" ? "display" : "search";
 
     if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
       return c.json({ error: "Developer token do Google Ads não configurado" }, 500);
@@ -6925,21 +6927,27 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       {
         create: {
           name: nomeCampanhaGoogle,
-          // Campanhas Display com Lead Form exigem a conta ja ter gasto historico
-          // (>US$1.000, confirmado via CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE em
-          // producao e na documentacao oficial do Google) — bloqueia toda conta nova.
-          // Pesquisa nao tem essa exigencia e e o tipo recomendado pela propria Google
-          // pra Lead Forms, entao a plataforma usa Pesquisa em vez de Display.
-          advertisingChannelType: "SEARCH",
+          // Campanha pode ser de Pesquisa (texto) ou Display (imagem) — controlado pelo
+          // campo tipo_campanha vindo do frontend. Display com Lead Form exige a conta
+          // ja ter gasto historico (>US$1.000, confirmado via
+          // CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE em producao e na documentacao
+          // oficial do Google) e verificacao de identidade do anunciante — por isso, em
+          // Display, o Lead Form e sempre uma tentativa opcional e best-effort feita em
+          // /google/anuncio (degrada graciosamente se a conta nao for elegivel), nunca
+          // bloqueante como em Pesquisa. A URL de destino sempre funciona em Display,
+          // sem gate nenhum.
+          advertisingChannelType: tipoCampanhaGoogle === "display" ? "DISPLAY" : "SEARCH",
           status: "PAUSED",
           campaignBudget: budgetResourceName,
           manualCpc: {},
-          networkSettings: {
-            targetGoogleSearch: true,
-            targetSearchNetwork: true,
-            targetContentNetwork: false,
-            targetPartnerSearchNetwork: false,
-          },
+          ...(tipoCampanhaGoogle === "search" ? {
+            networkSettings: {
+              targetGoogleSearch: true,
+              targetSearchNetwork: true,
+              targetContentNetwork: false,
+              targetPartnerSearchNetwork: false,
+            },
+          } : {}),
           // Autodeclaração exigida pela Google Ads API em toda criação de campanha
           // (EU Political Advertising Regulation) — sem isso a API rejeita com
           // FieldError.REQUIRED. Plataforma é de leads no Brasil, sem qualquer
@@ -6976,7 +6984,7 @@ app.post("/google/campanha", authMiddleware, async (c) => {
         campaignId,
         conexao.customerId,
         nomeCampanha,
-        JSON.stringify({ campaign_budget_resource_name: budgetResourceName }),
+        JSON.stringify({ campaign_budget_resource_name: budgetResourceName, tipo_campanha: tipoCampanhaGoogle }),
         textoOpcional(publicacao_grupo_id) || null,
       ]
     );
@@ -6988,11 +6996,12 @@ app.post("/google/campanha", authMiddleware, async (c) => {
   }
 });
 
-// Cria o Grupo de Anuncios de Pesquisa (equivalente ao /meta/adset e /tiktok/adgroup)
+// Cria o Grupo de Anuncios, de Pesquisa ou Display conforme tipo_campanha (equivalente
+// ao /meta/adset e /tiktok/adgroup)
 app.post("/google/adgroup", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const { usuario_id, campaign_id, orcamento } = await c.req.json();
+    const { usuario_id, campaign_id, orcamento, tipo_campanha } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
@@ -7000,6 +7009,8 @@ app.post("/google/adgroup", authMiddleware, async (c) => {
     if (!campaign_id) {
       return c.json({ error: "campaign_id não enviado" }, 400);
     }
+
+    const tipoCampanhaGoogle = String(tipo_campanha || "").toLowerCase() === "display" ? "display" : "search";
 
     const conexao = await resolverConexaoGoogleAds(usuarioId);
     if ("erro" in conexao) {
@@ -7017,7 +7028,7 @@ app.post("/google/adgroup", authMiddleware, async (c) => {
         create: {
           name: `AdGroup Leads ${Date.now()}`,
           campaign: campaignResourceName,
-          type: "SEARCH_STANDARD",
+          type: tipoCampanhaGoogle === "display" ? "DISPLAY_STANDARD" : "SEARCH_STANDARD",
           status: "ENABLED",
           cpcBidMicros: String(cpcBidMicros),
         },
@@ -7263,25 +7274,48 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const {
       usuario_id, campaign_id, adgroup_id, form_id,
       titulos, descricoes, nome_anunciante, url_destino,
-      daily_budget, configuracoes_avancadas
+      daily_budget, configuracoes_avancadas,
+      tipo_campanha, titulo_longo,
+      imagem_paisagem_asset, imagem_quadrada_asset
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
 
+    const tipoCampanha = String(tipo_campanha || "").toLowerCase() === "display" ? "display" : "search";
+
     if (!campaign_id) return c.json({ error: "campaign_id não enviado" }, 400);
     if (!adgroup_id) return c.json({ error: "adgroup_id não enviado" }, 400);
-    if (!form_id) return c.json({ error: "Selecione um Lead Form antes de publicar" }, 400);
+    // Lead Form so e obrigatorio em Pesquisa — em Display e opcional/best-effort
+    // (ver bloco de vinculo do formulario mais abaixo).
+    if (tipoCampanha === "search" && !form_id) {
+      return c.json({ error: "Selecione um Lead Form antes de publicar" }, 400);
+    }
 
     const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
     const listaDescricoes = (Array.isArray(descricoes) ? descricoes : []).map(textoOpcional).filter(Boolean);
     const nomeAnunciante = textoOpcional(nome_anunciante);
     const url = textoOpcional(url_destino) || "https://plataformadeleads.com.br";
+    const tituloLongo = textoOpcional(titulo_longo);
+    const imagemPaisagem = textoOpcional(imagem_paisagem_asset);
+    const imagemQuadrada = textoOpcional(imagem_quadrada_asset);
 
-    // O Responsive Search Ad exige no minimo 3 titulos e 2 descricoes (regra fixa da
-    // Google Ads API) — sem esse minimo a criacao do anuncio e rejeitada.
-    if (listaTitulos.length < 3) return c.json({ error: "Informe ao menos 3 títulos para o anúncio Google" }, 400);
-    if (listaDescricoes.length < 2) return c.json({ error: "Informe ao menos 2 descrições para o anúncio Google" }, 400);
+    if (tipoCampanha === "search") {
+      // O Responsive Search Ad exige no minimo 3 titulos e 2 descricoes (regra fixa da
+      // Google Ads API) — sem esse minimo a criacao do anuncio e rejeitada.
+      if (listaTitulos.length < 3) return c.json({ error: "Informe ao menos 3 títulos para o anúncio Google" }, 400);
+      if (listaDescricoes.length < 2) return c.json({ error: "Informe ao menos 2 descrições para o anúncio Google" }, 400);
+    } else {
+      // Responsive Display Ad exige no minimo 1 titulo, 1 titulo longo, 1 descricao,
+      // e as duas imagens (paisagem 1.91:1 e quadrada 1:1) ja enviadas via
+      // /google/upload-imagem (ver responsiveDisplayAd abaixo).
+      if (listaTitulos.length < 1) return c.json({ error: "Informe ao menos 1 título para o anúncio de Display" }, 400);
+      if (!tituloLongo) return c.json({ error: "Informe o título longo para o anúncio de Display" }, 400);
+      if (listaDescricoes.length < 1) return c.json({ error: "Informe ao menos 1 descrição para o anúncio de Display" }, 400);
+      if (!imagemPaisagem || !imagemQuadrada) {
+        return c.json({ error: "Envie a imagem do anúncio de Display antes de publicar" }, 400);
+      }
+    }
 
     const conexao = await resolverConexaoGoogleAds(usuarioId);
     if ("erro" in conexao) {
@@ -7291,24 +7325,32 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
     const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
 
-    const adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
-      {
-        create: {
-          adGroup: adGroupResourceName,
-          status: "PAUSED",
-          ad: {
-            finalUrls: [url],
-            responsiveSearchAd: {
-              // Trunca no limite real da Google (30/90 chars) antes de enviar —
-              // reforço de segurança independente da validação do frontend
-              // (se ela for contornada, a Google rejeitaria com TOO_LONG em
-              // vez de simplesmente aceitar um texto cortado sem querer).
-              headlines: listaTitulos.slice(0, 15).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
-              descriptions: listaDescricoes.slice(0, 4).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
-            },
+    const adCreate: any = tipoCampanha === "search"
+      ? {
+          finalUrls: [url],
+          responsiveSearchAd: {
+            // Trunca no limite real da Google (30/90 chars) antes de enviar —
+            // reforço de segurança independente da validação do frontend
+            // (se ela for contornada, a Google rejeitaria com TOO_LONG em
+            // vez de simplesmente aceitar um texto cortado sem querer).
+            headlines: listaTitulos.slice(0, 15).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
+            descriptions: listaDescricoes.slice(0, 4).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
           },
-        },
-      },
+        }
+      : {
+          finalUrls: [url],
+          responsiveDisplayAd: {
+            marketingImages: [{ asset: imagemPaisagem }],
+            squareMarketingImages: [{ asset: imagemQuadrada }],
+            headlines: listaTitulos.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
+            longHeadline: { text: truncarSemCortarPalavra(tituloLongo, 90) },
+            descriptions: listaDescricoes.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
+            ...(nomeAnunciante ? { businessName: truncarSemCortarPalavra(nomeAnunciante, 25) } : {}),
+          },
+        };
+
+    const adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+      { create: { adGroup: adGroupResourceName, status: "PAUSED", ad: adCreate } },
     ]);
 
     const adResourceName = adResults[0]?.resourceName;
@@ -7320,64 +7362,93 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       ? adResourceName.split("~")[1]
       : adResourceName.split("/").pop();
 
-    // Campanha de Pesquisa exige palavras-chave pra veicular (sem elas o anuncio nunca
-    // aparece) — reaproveita os proprios titulos do anuncio como palavras-chave em
-    // correspondencia ampla, ja que sao textos curtos e relevantes ao nicho gerados
-    // pela IA/usuario, sem precisar de um campo novo so pra isso. Sanitiza pontuacao
-    // de chamada (!, ?, etc — valida num titulo de anuncio, invalida numa keyword).
-    const keywordOps: any[] = listaTitulos
-      .map(sanitizarPalavraChaveGoogle)
-      .filter(Boolean)
-      .slice(0, 10)
-      .map(texto => ({
-        create: {
-          adGroup: adGroupResourceName,
-          status: "ENABLED",
-          keyword: { text: texto, matchType: "BROAD" },
-        },
-      }));
+    if (tipoCampanha === "search") {
+      // Campanha de Pesquisa exige palavras-chave pra veicular (sem elas o anuncio nunca
+      // aparece) — reaproveita os proprios titulos do anuncio como palavras-chave em
+      // correspondencia ampla, ja que sao textos curtos e relevantes ao nicho gerados
+      // pela IA/usuario, sem precisar de um campo novo so pra isso. Sanitiza pontuacao
+      // de chamada (!, ?, etc — valida num titulo de anuncio, invalida numa keyword).
+      // Display nao usa palavras-chave (segmentacao e por audiencia/publico, nao existe
+      // esse conceito no formulario atual, entao esta etapa e pulada inteira).
+      const keywordOps: any[] = listaTitulos
+        .map(sanitizarPalavraChaveGoogle)
+        .filter(Boolean)
+        .slice(0, 10)
+        .map(texto => ({
+          create: {
+            adGroup: adGroupResourceName,
+            status: "ENABLED",
+            keyword: { text: texto, matchType: "BROAD" },
+          },
+        }));
 
-    try {
-      await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria", keywordOps);
-    } catch (err: any) {
-      // Nichos sensiveis (saude, financas etc.) fazem o texto do titulo/palavra-chave
-      // esbarrar em politicas de "publicidade personalizada" mesmo sem intencao de
-      // segmentar por essa categoria — quando a Google marca a violacao como
-      // "isExemptible", da pra pedir isencao reenviando a mesma policyViolationKey.
-      const exencoes = googleAdsExtrairExencoesPolitica(err);
-      if (!exencoes.length) throw err;
+      try {
+        await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria", keywordOps);
+      } catch (err: any) {
+        // Nichos sensiveis (saude, financas etc.) fazem o texto do titulo/palavra-chave
+        // esbarrar em politicas de "publicidade personalizada" mesmo sem intencao de
+        // segmentar por essa categoria — quando a Google marca a violacao como
+        // "isExemptible", da pra pedir isencao reenviando a mesma policyViolationKey.
+        const exencoes = googleAdsExtrairExencoesPolitica(err);
+        if (!exencoes.length) throw err;
 
-      for (const { operationIndex, key } of exencoes) {
-        const operacao = keywordOps[operationIndex];
-        if (!operacao) continue;
-        operacao.exemptPolicyViolationKeys = [
-          ...(operacao.exemptPolicyViolationKeys || []),
-          key,
-        ];
+        for (const { operationIndex, key } of exencoes) {
+          const operacao = keywordOps[operationIndex];
+          if (!operacao) continue;
+          operacao.exemptPolicyViolationKeys = [
+            ...(operacao.exemptPolicyViolationKeys || []),
+            key,
+          ];
+        }
+
+        await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria", keywordOps);
       }
-
-      await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupCriteria", keywordOps);
     }
 
-    // ASSUMPTION: vincular o Lead Form como CampaignAsset com fieldType LEAD_FORM
-    // (nao usa AssetSet/CampaignAssetSet) — conferido contra o sample oficial
-    // "Add lead form asset" da Google Ads API.
-    await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
-      {
-        create: {
-          campaign: campaignResourceName,
-          asset: form_id,
-          fieldType: "LEAD_FORM",
-        },
-      },
-    ]);
+    let formIdFinal = textoOpcional(form_id);
+    let avisoFormulario: string | undefined;
+
+    if (tipoCampanha === "search") {
+      // ASSUMPTION: vincular o Lead Form como CampaignAsset com fieldType LEAD_FORM
+      // (nao usa AssetSet/CampaignAssetSet) — conferido contra o sample oficial
+      // "Add lead form asset" da Google Ads API.
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
+        { create: { campaign: campaignResourceName, asset: formIdFinal, fieldType: "LEAD_FORM" } },
+      ]);
+    } else if (formIdFinal) {
+      // Mesmo mecanismo de vinculo do Search, mas best-effort: contas sem gasto
+      // historico (>US$1.000) e/ou verificacao de identidade de anunciante concluida
+      // nao podem usar Lead Form em Display (gate documentado acima em
+      // /google/campanha). Em vez de derrubar a criacao inteira do anuncio, so
+      // desiste do formulario e deixa o anuncio no ar levando pra URL de destino.
+      try {
+        await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
+          { create: { campaign: campaignResourceName, asset: formIdFinal, fieldType: "LEAD_FORM" } },
+        ]);
+      } catch (err: any) {
+        if (
+          googleAdsTemErroCode(err, "CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE") ||
+          googleAdsTemErroCode(err, "CUSTOMER_NOT_VERIFIED") ||
+          googleAdsTemErroCode(err, "INCOMPATIBLE_ADVERTISING_CHANNEL_TYPE")
+        ) {
+          console.warn("AVISO /google/anuncio: Lead Form não anexado à campanha Display (conta não elegível):", err.message);
+          avisoFormulario =
+            "O anúncio de Display foi criado e está no ar levando ao seu site (URL de destino), mas não foi possível anexar o formulário de leads: a conta do Google Ads ainda não tem o histórico de gasto (mínimo de US$ 1.000) e/ou a verificação de identidade de anunciante exigidos pela Google para usar formulários de leads em campanhas de Display. Isso é uma exigência da própria Google, não um erro da plataforma — a campanha funciona normalmente do mesmo jeito.";
+          formIdFinal = "";
+        } else {
+          throw err;
+        }
+      }
+    }
 
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
+      tipo_campanha: tipoCampanha,
       titulos: listaTitulos,
       descricoes: listaDescricoes,
       nome_anunciante: nomeAnunciante,
       url_destino: url,
+      ...(tipoCampanha === "display" ? { titulo_longo: tituloLongo } : {}),
     };
 
     await client.query(
@@ -7392,7 +7463,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       [
         String(adgroup_id),
         String(adId),
-        String(form_id),
+        formIdFinal || null,
         numeroOpcional(daily_budget),
         JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
@@ -7400,7 +7471,11 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       ]
     );
 
-    return c.json({ id: String(adId), ad_id: String(adId) });
+    return c.json({
+      id: String(adId),
+      ad_id: String(adId),
+      ...(avisoFormulario ? { aviso: avisoFormulario } : {})
+    });
   } catch (err: any) {
     console.error("ERRO /google/anuncio:", err);
     return c.json({ error: err.message || "Erro ao criar anúncio Google Ads" }, 500);
