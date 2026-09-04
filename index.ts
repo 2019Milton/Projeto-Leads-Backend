@@ -21899,37 +21899,81 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         ...(Array.isArray(cfg.image_urls) ? cfg.image_urls : [])
       ].filter(Boolean))];
 
+    const instagramSelecionado =
+      Array.isArray(cfg.plataformas) && cfg.plataformas.includes("instagram");
+    const escolhaMidiaInstagram =
+      textoOpcional(cfg.escolha_midia_instagram);
+    const videoIdSalvo =
+      textoOpcional(cfg.video_id) ||
+      textoOpcional(cfg.videoId) ||
+      null;
+    const videoEscolhidoExplicitamente =
+      instagramSelecionado && escolhaMidiaInstagram === "video";
+
+    if (videoEscolhidoExplicitamente && !videoIdSalvo) {
+      return await falhar(
+        "O vídeo escolhido para o Instagram não está mais disponível nesta campanha. Edite a campanha, envie o vídeo novamente e tente publicar."
+      );
+    }
+
+    let videoMetaId: string | null = null;
+    let videoThumbnailUrl: string | null = null;
+    const deveUsarVideo =
+      Boolean(videoIdSalvo) &&
+      (!instagramSelecionado || escolhaMidiaInstagram !== "imagens");
+
+    if (deveUsarVideo && videoIdSalvo) {
+      const videoMeta =
+        await aguardarVideoMetaReady(token, videoIdSalvo, 1, 0);
+
+      if (!videoMeta.ready) {
+        return await falhar(
+          "O vídeo escolhido não está disponível na conta de anúncios Meta atual. Edite esta campanha, envie o vídeo novamente e tente publicar."
+        );
+      }
+
+      videoMetaId = videoIdSalvo;
+      videoThumbnailUrl = videoMeta.picture;
+    }
+
+    const publicarSomenteVideo =
+      instagramSelecionado &&
+      Boolean(videoMetaId) &&
+      escolhaMidiaInstagram !== "imagens";
+
     const hashes: string[] = [];
 
-    for (const urlImagem of imageUrls) {
-      const uploadImagem =
-        await enviarImagemMetaPorUrl(token, adAccountId, String(urlImagem));
+    if (!publicarSomenteVideo) {
+      for (const urlImagem of imageUrls) {
+        const uploadImagem =
+          await enviarImagemMetaPorUrl(token, adAccountId, String(urlImagem));
 
-      if (uploadImagem.hash) {
-        // A Meta hasheia por conteúdo — URLs distintas da mesma imagem (ex.:
-        // espelhos de CDN diferentes) voltam com o hash igual; sem este
-        // dedupe, o card de carrossel se repete mesmo com URLs únicas.
-        if (!hashes.includes(uploadImagem.hash)) {
-          hashes.push(uploadImagem.hash);
+        if (uploadImagem.hash) {
+          // A Meta hasheia por conteúdo — URLs distintas da mesma imagem (ex.:
+          // espelhos de CDN diferentes) voltam com o hash igual; sem este
+          // dedupe, o card de carrossel se repete mesmo com URLs únicas.
+          if (!hashes.includes(uploadImagem.hash)) {
+            hashes.push(uploadImagem.hash);
+          }
+        } else {
+          // Não existe fallback seguro para reaproveitar cfg.imageHash aqui: hashes de
+          // imagem na Meta são específicos por conta de anúncios, e o hash salvo em
+          // configuracoes_avancadas pertence à conta de quem encaminhou a campanha, não
+          // à de quem está publicando agora. Reaproveitá-lo cria um anúncio que a Meta
+          // aceita na criação mas rejeita na revisão ("Imagem não encontrada"). O link
+          // de imagem da Meta usado no reenvio por URL também expira com o tempo, então
+          // essa falha é esperada em campanhas encaminhadas há mais tempo.
+          console.error(
+            "PUBLICAR_RECEBIDA: falha ao reenviar imagem por URL (provável link expirado):",
+            urlImagem, JSON.stringify(uploadImagem.resposta)
+          );
         }
-      } else {
-        // Não existe fallback seguro para reaproveitar cfg.imageHash aqui: hashes de
-        // imagem na Meta são específicos por conta de anúncios, e o hash salvo em
-        // configuracoes_avancadas pertence à conta de quem encaminhou a campanha, não
-        // à de quem está publicando agora. Reaproveitá-lo cria um anúncio que a Meta
-        // aceita na criação mas rejeita na revisão ("Imagem não encontrada"). O link
-        // de imagem da Meta usado no reenvio por URL também expira com o tempo, então
-        // essa falha é esperada em campanhas encaminhadas há mais tempo.
-        console.error(
-          "PUBLICAR_RECEBIDA: falha ao reenviar imagem por URL (provável link expirado):",
-          urlImagem, JSON.stringify(uploadImagem.resposta)
-        );
       }
     }
 
-    if (!hashes.length) {
+    if (!hashes.length && !videoMetaId) {
       return await falhar(
-        "Não foi possível reenviar a imagem original desta campanha para sua conta de anúncios (o link pode ter expirado). Peça para quem encaminhou reenviar a campanha novamente, ou edite esta campanha e adicione uma nova imagem antes de publicar."
+        "Não foi possível preparar a mídia original desta campanha para sua conta de anúncios. Edite a campanha, envie uma imagem ou vídeo novamente e tente publicar."
       );
     }
 
@@ -21951,40 +21995,27 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       textoOpcional(cfg.cta) ||
       "LEARN_MORE";
 
-    const isCarrossel =
-      hashes.length > 1;
-
-    const linkDataBase: Record<string, any> = {
-      message:
+    const conteudoCriativo = montarConteudoCriativoMeta({
+      hashes,
+      videoId: videoMetaId,
+      videoThumbnailUrl,
+      instagramSelecionado,
+      escolhaMidiaInstagram,
+      videoPosicaoCarrossel: numeroOpcional(cfg.video_posicao_carrossel),
+      tituloAnuncio,
+      descricaoAnuncio,
+      texto:
         textoOpcional(cfg.texto) ||
         textoOpcional(campanha.texto) ||
-        "Entre em contato agora"
-    };
-
-    if (isCarrossel) {
-      linkDataBase.child_attachments = hashes.map((hash, index) => ({
-        link: linkDestino,
-        image_hash: hash,
-        name: index === 0 ? tituloAnuncio : `Slide ${index + 1}`,
-        description: descricaoAnuncio,
-        call_to_action: montarCallToActionMeta(destino, ctaType, formMeta.id)
-      }));
-      linkDataBase.multi_share_end_card = false;
-    } else {
-      linkDataBase.link = linkDestino;
-      linkDataBase.image_hash = hashes[0];
-      linkDataBase.name = tituloAnuncio;
-      linkDataBase.description = descricaoAnuncio;
-      linkDataBase.call_to_action = montarCallToActionMeta(destino, ctaType, formMeta.id);
-    }
+        "Entre em contato agora",
+      linkDestino,
+      ctaPayload: montarCallToActionMeta(destino, ctaType, formMeta.id)
+    });
 
     const objectStorySpec: Record<string, any> = {
       page_id: pageId,
-      link_data: linkDataBase
+      ...conteudoCriativo
     };
-
-    const instagramSelecionado =
-      Array.isArray(cfg.plataformas) && cfg.plataformas.includes("instagram");
 
     if (instagramSelecionado) {
       const instagramPaginaId =
