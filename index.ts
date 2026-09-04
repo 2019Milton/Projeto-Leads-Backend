@@ -1710,7 +1710,7 @@ function construirAssetFeedSpecMisto(params: {
     bodies: [{ text: params.texto, adlabels: [{ name: ROTULO_CORPO }] }],
     link_urls: [{ website_url: params.linkDestino, adlabels: [{ name: ROTULO_LINK }] }],
     call_to_action_types: [params.ctaType],
-    ad_formats: ["CAROUSEL_FORMAT"],
+    ad_formats: ["CAROUSEL"],
     carousels: [
       {
         adlabels: [{ name: ROTULO_CARROSSEL_FACEBOOK }],
