@@ -16498,6 +16498,9 @@ await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lembrete_1dia_env
 await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lembrete_dia_enviado BOOLEAN DEFAULT FALSE;`);
 await client.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS observacao_agendamento TEXT;`);
 
+await client.query(`ALTER TABLE campanhas ADD COLUMN IF NOT EXISTS fim_lembrete_1dia_enviado BOOLEAN DEFAULT FALSE;`);
+await client.query(`ALTER TABLE campanhas ADD COLUMN IF NOT EXISTS fim_lembrete_dia_enviado BOOLEAN DEFAULT FALSE;`);
+
 await client.query(`
   CREATE TABLE IF NOT EXISTS notificacoes (
     id           SERIAL PRIMARY KEY,
@@ -27610,6 +27613,97 @@ async function processarLembretesContato() {
   }
 }
 
+// "fim" em configuracoes_avancadas vem do input datetime-local do front (formatarDataHoraLabel),
+// string local ingênua "YYYY-MM-DDTHH:mm" sem timezone — não usar `new Date()` aqui, que
+// interpretaria como horário do servidor (Railway roda em UTC) e mostraria a hora errada.
+function formatarDataHoraFimCampanha(isoLocal: string): string {
+  const m = String(isoLocal || "").match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return isoLocal || "";
+  const [, ano, mes, dia, h, min] = m;
+  return `${dia}/${mes}/${ano} ${h}:${min}`;
+}
+
+// Mesmo padrão de processarLembretesContato (antecipado 1 dia antes + no dia), só que pra
+// "Data de término" da campanha (configuracoes_avancadas.fim) em vez de data_contato do lead.
+async function processarLembretesFimCampanha() {
+  try {
+    const hoje   = new Date().toISOString().slice(0, 10);
+    const amanha = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+
+    // ── 1. Campanhas que terminam AMANHÃ (aviso antecipado) ──
+    const antecipadas = await client.query(
+      `SELECT c.id, c.nome, c.configuracoes_avancadas, c.usuario_id,
+              u.nome AS usuario_nome, u.whatsapp AS usuario_whatsapp
+       FROM campanhas c
+       INNER JOIN usuarios u ON u.id = c.usuario_id
+       WHERE c.status != 'DELETED'
+         AND c.configuracoes_avancadas->>'fim' LIKE $1
+         AND c.fim_lembrete_1dia_enviado = FALSE`,
+      [`${amanha}%`]
+    );
+
+    for (const campanha of antecipadas.rows) {
+      const dataFormatada = formatarDataHoraFimCampanha(campanha.configuracoes_avancadas?.fim);
+      const titulo = `Campanha "${campanha.nome}" termina amanhã`;
+      const mensagem = `Olá ${campanha.usuario_nome}! ⏰ Lembrete: a campanha *${campanha.nome}* está programada pra terminar amanhã (${dataFormatada}). Se quiser continuar rodando, ajuste ou remova a data de término antes disso.`;
+
+      await client.query(
+        `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+         VALUES ($1, 'campanha_fim_antecipado', $2, $3)`,
+        [campanha.usuario_id, titulo, mensagem]
+      );
+
+      if (campanha.usuario_whatsapp) {
+        await enviarLembreteWhatsApp(campanha.usuario_whatsapp, mensagem);
+      }
+
+      await client.query(
+        `UPDATE campanhas SET fim_lembrete_1dia_enviado = TRUE WHERE id = $1`,
+        [campanha.id]
+      );
+    }
+
+    // ── 2. Campanhas que terminam HOJE ──
+    const hojeCampanhas = await client.query(
+      `SELECT c.id, c.nome, c.configuracoes_avancadas, c.usuario_id,
+              u.nome AS usuario_nome, u.whatsapp AS usuario_whatsapp
+       FROM campanhas c
+       INNER JOIN usuarios u ON u.id = c.usuario_id
+       WHERE c.status != 'DELETED'
+         AND c.configuracoes_avancadas->>'fim' LIKE $1
+         AND c.fim_lembrete_dia_enviado = FALSE`,
+      [`${hoje}%`]
+    );
+
+    for (const campanha of hojeCampanhas.rows) {
+      const dataFormatada = formatarDataHoraFimCampanha(campanha.configuracoes_avancadas?.fim);
+      const titulo = `Campanha "${campanha.nome}" termina hoje`;
+      const mensagem = `Olá ${campanha.usuario_nome}! 🔔 Hoje (${dataFormatada}) é a data de término da campanha *${campanha.nome}*. Ela será pausada automaticamente pela plataforma de anúncios.`;
+
+      await client.query(
+        `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+         VALUES ($1, 'campanha_fim_dia', $2, $3)`,
+        [campanha.usuario_id, titulo, mensagem]
+      );
+
+      if (campanha.usuario_whatsapp) {
+        await enviarLembreteWhatsApp(campanha.usuario_whatsapp, mensagem);
+      }
+
+      await client.query(
+        `UPDATE campanhas SET fim_lembrete_dia_enviado = TRUE WHERE id = $1`,
+        [campanha.id]
+      );
+    }
+
+    if (antecipadas.rows.length + hojeCampanhas.rows.length > 0) {
+      console.log(`LEMBRETES FIM CAMPANHA: ${antecipadas.rows.length} antecipados, ${hojeCampanhas.rows.length} no dia`);
+    }
+  } catch (e) {
+    console.error("ERRO CRON LEMBRETES FIM CAMPANHA:", e);
+  }
+}
+
 /* =========================
    👷 CRIADOR DE CAMPANHA
 ========================= */
@@ -28268,6 +28362,7 @@ function agendarLembretes() {
     const horaBRT = (agora.getUTCHours() - 3 + 24) % 24;
     if (horaBRT === HORA_ENVIO) {
       processarLembretesContato();
+      processarLembretesFimCampanha();
     }
   };
   // Verifica a cada 30 minutos
