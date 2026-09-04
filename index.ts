@@ -27976,7 +27976,13 @@ async function processarLembretesContato() {
     );
 
     for (const lead of antecipados.rows) {
-      const dataFormatada = new Date(lead.data_contato + "T12:00:00").toLocaleDateString("pt-BR");
+      // lead.data_contato já vem como objeto Date (coluna DATE, pg converte
+      // automaticamente) — concatenar string nele chamava Date.toString()
+      // implicitamente e gerava um texto que new Date() não conseguia parsear,
+      // resultando em "Invalid Date" na mensagem. Formata direto do objeto,
+      // fixando timeZone:"UTC" porque DATE não tem hora/fuso — sem isso o
+      // resultado dependeria do fuso do servidor e podia mostrar o dia errado.
+      const dataFormatada = lead.data_contato.toLocaleDateString("pt-BR", { timeZone: "UTC" });
       const titulo = `Lembrete: contatar ${lead.nome} amanhã`;
       const mensagem = `Olá ${lead.corretor_nome}! Lembrete: amanhã (${dataFormatada}) é o dia combinado para entrar em contato com o lead *${lead.nome}*. Não esqueça! 📅`;
 
@@ -28010,7 +28016,8 @@ async function processarLembretesContato() {
     );
 
     for (const lead of hoje_leads.rows) {
-      const dataFormatada = new Date(lead.data_contato + "T12:00:00").toLocaleDateString("pt-BR");
+      // Mesmo motivo do bloco de amanhã acima: data_contato já é Date, não string.
+      const dataFormatada = lead.data_contato.toLocaleDateString("pt-BR", { timeZone: "UTC" });
       const titulo = `Hoje é o dia: ligue para ${lead.nome}`;
       const mensagem = `Bom dia, ${lead.corretor_nome}! 🔔 Hoje (${dataFormatada}) é o dia combinado para entrar em contato com o lead *${lead.nome}*. Boa venda! 💪`;
 
