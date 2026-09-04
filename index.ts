@@ -21984,14 +21984,26 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     };
 
     if (Array.isArray(cfg.plataformas) && cfg.plataformas.includes("instagram")) {
+      // Prioriza a conta de Instagram vinculada à conta de anúncios ATUAL (a que vai
+      // criar o anúncio de verdade) em vez do cfg.instagram_actor_id salvo — esse valor
+      // pode ter sido gravado quando a campanha (ou a que ela foi duplicada) usava outra
+      // conta de anúncios conectada, e a Meta rejeita a criação inteira do criativo com
+      // "(#100) Param instagram_actor_id must be a valid Instagram account id" quando o
+      // id não pertence à conta de anúncios em uso.
+      const contasInstagramAnuncio =
+        await listarContasInstagramAnuncio(token, adAccountId);
       const instagramActorId =
+        contasInstagramAnuncio[0]?.id ||
         textoOpcional(cfg.instagram_actor_id) ||
-        (await listarContasInstagramAnuncio(token, adAccountId))[0]?.id ||
         null;
 
-      if (instagramActorId) {
-        objectStorySpec.instagram_actor_id = instagramActorId;
+      if (!instagramActorId) {
+        return await falhar(
+          "Nenhuma conta do Instagram está vinculada à sua conta de anúncios da Meta conectada. Vincule uma conta do Instagram a essa conta de anúncios no Gerenciador de Negócios antes de publicar para o Instagram."
+        );
       }
+
+      objectStorySpec.instagram_actor_id = instagramActorId;
     }
 
     const creativeMeta = await fetch(
