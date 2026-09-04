@@ -21381,10 +21381,21 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           formId || null
         );
 
+        // Carrossel misto (imagens + vídeo) exige uma miniatura (picture) no card do
+        // vídeo — sem ela a Meta rejeita o object_story_spec inteiro com "picture or
+        // image_hash é obrigatório". Na criação isso já vem de aguardarVideoMetaReady
+        // (chamado logo após o upload do vídeo); na edição o vídeo já existe e nunca
+        // era buscado, então essa miniatura ficava sempre null.
+        let videoThumbnailUrl: string | null = null;
+        if (videoId && imageHashes.length > 0) {
+          const { picture } = await aguardarVideoMetaReady(token, videoId, 1, 0);
+          videoThumbnailUrl = picture;
+        }
+
         const conteudoCriativo = montarConteudoCriativoMeta({
           hashes: imageHashes,
           videoId: videoId || null,
-          videoThumbnailUrl: null,
+          videoThumbnailUrl,
           instagramSelecionado: Array.isArray(avancadas?.plataformas) && avancadas.plataformas.includes("instagram"),
           escolhaMidiaInstagram: textoOpcional(avancadas.escolha_midia_instagram),
           videoPosicaoCarrossel: numeroOpcional(avancadas.video_posicao_carrossel),
