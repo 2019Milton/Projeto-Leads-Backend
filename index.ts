@@ -7472,6 +7472,191 @@ app.post("/google/excluir-campanha", authMiddleware, async (c) => {
   }
 });
 
+// Consulta o que já existe no Google Ads para uma campanha (grupo de anúncios, anúncio,
+// palavras-chave, orçamento e formulário de lead vinculado) — usado antes de completar a
+// publicação de campanhas que chegaram por sincronização externa (ex: "AgenteSmart"), que
+// não têm nenhuma configuração salva localmente (configuracoes_avancadas é NULL). Só
+// consulta, nunca cria nem altera nada no Google Ads.
+// ASSUMPTION: assume no máximo 1 grupo de anúncios não removido por campanha — é o que o
+// próprio /google/adgroup sempre produz e o que se espera de campanhas simples de Pesquisa.
+app.get("/google/campanha-status/:campaign_id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campaignIdParam = c.req.param("campaign_id");
+    const campaignId = Number(campaignIdParam);
+
+    if (!Number.isFinite(campaignId) || campaignId <= 0) {
+      return c.json({ error: "campaign_id inválido" }, 400);
+    }
+
+    const campanhaBanco = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+       LIMIT 1`,
+      [String(campaignId), user.id]
+    );
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+    }
+
+    const conexao = await resolverConexaoGoogleAds(user.id);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    let campanhaGoogleResults: any[];
+    try {
+      campanhaGoogleResults = await googleAdsQuery(
+        conexao.customerId, conexao.accessToken,
+        `SELECT campaign.id, campaign.status, campaign_budget.amount_micros
+         FROM campaign
+         WHERE campaign.id = ${campaignId}`,
+        conexao.loginCustomerId
+      );
+    } catch (errCampanha: any) {
+      console.error("ERRO /google/campanha-status (campanha):", errCampanha.message);
+      return c.json({ error: "Não foi possível consultar esta campanha no Google Ads" }, 502);
+    }
+
+    if (!campanhaGoogleResults.length) {
+      return c.json({
+        error: "Esta campanha não existe mais nesta conta do Google Ads conectada. Sincronize novamente para atualizar sua lista de campanhas."
+      }, 404);
+    }
+
+    const campanhaGoogle = (campanhaGoogleResults[0] as any).campaign;
+    if (String(campanhaGoogle?.status).toUpperCase() === "REMOVED") {
+      return c.json({
+        error: "Esta campanha foi removida no Google Ads. Sincronize novamente para atualizar sua lista de campanhas."
+      }, 404);
+    }
+    const orcamentoMicros = Number((campanhaGoogleResults[0] as any).campaignBudget?.amountMicros ?? 0) || null;
+
+    // Grupo de anúncios já existente (se houver, é sempre reaproveitado — nunca criamos
+    // um segundo grupo na mesma campanha).
+    let adGroup: any = null;
+    try {
+      const adGroupResults = await googleAdsQuery(
+        conexao.customerId, conexao.accessToken,
+        `SELECT ad_group.id, ad_group.name, ad_group.status
+         FROM ad_group
+         WHERE campaign.id = ${campaignId} AND ad_group.status != 'REMOVED'
+         LIMIT 1`,
+        conexao.loginCustomerId
+      );
+      adGroup = (adGroupResults[0] as any)?.adGroup ?? null;
+    } catch (errAdGroup: any) {
+      console.warn("AVISO /google/campanha-status (ad_group):", errAdGroup.message);
+    }
+
+    let temAnuncio = false;
+    let temPalavrasChave = false;
+    if (adGroup?.id) {
+      try {
+        const adResults = await googleAdsQuery(
+          conexao.customerId, conexao.accessToken,
+          `SELECT ad_group_ad.ad.id, ad_group_ad.status
+           FROM ad_group_ad
+           WHERE ad_group.id = ${adGroup.id} AND ad_group_ad.status != 'REMOVED'
+           LIMIT 1`,
+          conexao.loginCustomerId
+        );
+        temAnuncio = adResults.length > 0;
+      } catch (errAd: any) {
+        console.warn("AVISO /google/campanha-status (ad_group_ad):", errAd.message);
+      }
+
+      try {
+        const keywordResults = await googleAdsQuery(
+          conexao.customerId, conexao.accessToken,
+          `SELECT ad_group_criterion.criterion_id
+           FROM ad_group_criterion
+           WHERE ad_group.id = ${adGroup.id}
+             AND ad_group_criterion.type = 'KEYWORD'
+             AND ad_group_criterion.status != 'REMOVED'
+           LIMIT 1`,
+          conexao.loginCustomerId
+        );
+        temPalavrasChave = keywordResults.length > 0;
+      } catch (errKeyword: any) {
+        console.warn("AVISO /google/campanha-status (ad_group_criterion):", errKeyword.message);
+      }
+    }
+
+    let formResourceName: string | null = null;
+    try {
+      const formResults = await googleAdsQuery(
+        conexao.customerId, conexao.accessToken,
+        `SELECT campaign_asset.asset
+         FROM campaign_asset
+         WHERE campaign.id = ${campaignId}
+           AND campaign_asset.field_type = 'LEAD_FORM'
+           AND campaign_asset.status != 'REMOVED'
+         LIMIT 1`,
+        conexao.loginCustomerId
+      );
+      formResourceName = (formResults[0] as any)?.campaignAsset?.asset ?? null;
+    } catch (errForm: any) {
+      console.warn("AVISO /google/campanha-status (campaign_asset):", errForm.message);
+    }
+
+    return c.json({
+      tem_grupo_anuncios: Boolean(adGroup?.id),
+      adgroup_id: adGroup?.id ? String(adGroup.id) : null,
+      adgroup_nome: adGroup?.name ?? null,
+      tem_anuncio: temAnuncio,
+      tem_palavras_chave: temPalavrasChave,
+      orcamento_diario_atual: orcamentoMicros ? orcamentoMicros / 1_000_000 : null,
+      tem_formulario_vinculado: Boolean(formResourceName),
+      form_resource_name: formResourceName,
+    });
+  } catch (err: any) {
+    console.error("ERRO /google/campanha-status:", err);
+    return c.json({ error: err.message || "Erro ao consultar status da campanha no Google Ads" }, 500);
+  }
+});
+
+// Remove um Grupo de Anúncios específico (limpeza pontual quando um passo posterior desta
+// mesma tentativa de completar uma campanha existente falha) — não usar para excluir toda
+// uma campanha, isso é o /google/excluir-campanha.
+app.post("/google/excluir-adgroup", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { campaign_id, adgroup_id } = await c.req.json();
+    if (!campaign_id || !adgroup_id) {
+      return c.json({ error: "campaign_id e adgroup_id obrigatórios" }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google' LIMIT 1`,
+      [campaign_id, user.id]
+    );
+    if (!campanha.rows.length) {
+      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+    }
+
+    const conexao = await resolverConexaoGoogleAds(user.id);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
+    try {
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroups", [
+        { remove: adGroupResourceName },
+      ]);
+    } catch (err: any) {
+      const msg = String(err?.message || "").toLowerCase();
+      if (!msg.includes("not found") && !msg.includes("does not exist") && !msg.includes("invalid resource")) {
+        return c.json({ error: err.message || "Erro ao remover grupo de anúncios" }, 400);
+      }
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /google/excluir-adgroup:", err);
+    return c.json({ error: "Erro ao remover grupo de anúncios" }, 500);
+  }
+});
+
 // Ativa/pausa uma campanha Google Ads (equivalente ao /meta/toggle-campanha e
 // /tiktok/toggle-campanha) — campanhas de Pesquisa sao sempre criadas PAUSED pela
 // API (nao ha como criar ja ENABLED), entao esta e a unica forma de comecar a
