@@ -15750,16 +15750,16 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
   }
 
   const sourceId = conversa.referral?.source_id ? String(conversa.referral.source_id) : null;
-  const redeOrigem = detectarRedeOrigemReferral(conversa.referral);
 
   let nichoId: number | null = null;
   let nomeCampanha = "Campanha WhatsApp";
   let campanhaId: number | null = null;
   let contaAnunciosId: string | null = null;
+  let redeOrigemCampanha: string | null = null;
 
   if (sourceId) {
     const campRow = await client.query(
-      `SELECT id, nome, nicho_id, conta_anuncios_id FROM campanhas WHERE ad_id = $1 AND usuario_id = $2 LIMIT 1`,
+      `SELECT id, nome, nicho_id, conta_anuncios_id, configuracoes_avancadas FROM campanhas WHERE ad_id = $1 AND usuario_id = $2 LIMIT 1`,
       [sourceId, usuarioId]
     ).catch(() => ({ rows: [] as any[] }));
 
@@ -15768,8 +15768,23 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
       nomeCampanha = campRow.rows[0].nome || nomeCampanha;
       nichoId = campRow.rows[0].nicho_id ?? null;
       contaAnunciosId = campRow.rows[0].conta_anuncios_id ?? null;
+
+      // Campanha publicada separadamente por rede (ver montarContextoPublicacaoMeta
+      // no front) já diz com certeza de onde é o lead — mais confiável que o
+      // referral abaixo, que é um chute por palavra-chave na URL. Só campanhas
+      // legadas combinadas (ou sem essa marcação) precisam do chute.
+      let cfgCampanha = campRow.rows[0].configuracoes_avancadas;
+      if (typeof cfgCampanha === "string") {
+        try { cfgCampanha = JSON.parse(cfgCampanha); } catch { cfgCampanha = null; }
+      }
+      const plataformasCampanha = Array.isArray(cfgCampanha?.plataformas) ? cfgCampanha.plataformas : [];
+      if (plataformasCampanha.length === 1 && ["facebook", "instagram"].includes(plataformasCampanha[0])) {
+        redeOrigemCampanha = plataformasCampanha[0];
+      }
     }
   }
+
+  const redeOrigem = redeOrigemCampanha || detectarRedeOrigemReferral(conversa.referral);
 
   // conta_anuncios_id precisa vir preenchido: /meta/metricas-campanhas conta os
   // leads de cada campanha filtrando por ele (junto com o nome) — sem isso o
