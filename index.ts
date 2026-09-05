@@ -6917,6 +6917,26 @@ function googleAdsCodigosErro(err: any): string[] {
   return [...codigos];
 }
 
+function googleAdsErroConfirmaRecursoAusente(err: any): boolean {
+  const codigos = googleAdsCodigosErro(err);
+  if (codigos.some(codigo => codigo.includes("NOT_FOUND") || codigo.includes("REMOVED"))) {
+    return true;
+  }
+
+  const mensagem = [
+    err?.message,
+    googleAdsPrimeiraMensagemDetalhada(err)
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  return (
+    mensagem.includes("resource was not found") ||
+    mensagem.includes("resource not found") ||
+    mensagem.includes("does not exist") ||
+    mensagem.includes("already removed") ||
+    mensagem.includes("has been removed")
+  );
+}
+
 function googleAdsPrimeiraMensagemDetalhada(err: any): string {
   const detalhes = err?.googleAdsError?.error?.details;
   if (!Array.isArray(detalhes)) return "";
@@ -7846,31 +7866,29 @@ app.post("/google/excluir-campanha", authMiddleware, async (c) => {
 
     const conexao = await resolverConexaoGoogleAds(user.id);
 
-    if (!("erro" in conexao)) {
-      const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
-      try {
-        // A API do Google Ads nao aceita mais setar status:"REMOVED" via update
-        // ("Enum value 'REMOVED' cannot be used", confirmado em producao) — o jeito
-        // correto de excluir um recurso via mutate e a operacao "remove", que leva
-        // so o resourceName (sem updateMask).
-        await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
-          { remove: campaignResourceName },
-        ]);
-      } catch (err: any) {
-        // Tolera campanha ja removida/inexistente no Google Ads — mesmo espirito do Meta/TikTok:
-        // nao trava o usuario por causa de um objeto que ja sumiu do lado de la.
-        const msg = String(err?.message || "").toLowerCase();
-        const naoPertenceMaisGoogle =
-          msg.includes("not found") ||
-          msg.includes("does not exist") ||
-          msg.includes("invalid resource") ||
-          msg.includes("resource was not found");
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
 
-        if (!naoPertenceMaisGoogle) {
-          return c.json({ error: err.message || "Erro ao excluir no Google Ads" }, 400);
-        }
-        console.log("EXCLUIR GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campaign_id);
+    const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
+    try {
+      // A API do Google Ads nao aceita mais setar status:"REMOVED" via update
+      // ("Enum value 'REMOVED' cannot be used", confirmado em producao) — o jeito
+      // correto de excluir um recurso via mutate e a operacao "remove", que leva
+      // so o resourceName (sem updateMask).
+      await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+        { remove: campaignResourceName },
+      ]);
+    } catch (err: any) {
+      // Tolera campanha ja removida/inexistente no Google Ads — mesmo espirito do Meta/TikTok:
+      // nao trava o usuario por causa de um objeto que ja sumiu do lado de la.
+      const naoPertenceMaisGoogle =
+        googleAdsErroConfirmaRecursoAusente(err);
+
+      if (!naoPertenceMaisGoogle) {
+        return c.json({ error: err.message || "Erro ao excluir no Google Ads" }, 400);
       }
+      console.log("EXCLUIR GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campaign_id);
     }
 
     await client.query(
@@ -8671,11 +8689,9 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
       return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
     }
 
-    // ASSUMPTION: enum operation_status "ENABLE"/"DISABLE" e endpoints separados
-    // por tipo de objeto — confirmar contra o SDK oficial na Fase 2B.
     const operationStatus = status === "ACTIVE" ? "ENABLE" : "DISABLE";
 
-    const campanhaRes = await tiktokFetch("/campaign/update/status/", conexao.token, {
+    const campanhaRes = await tiktokFetch("/campaign/status/update/", conexao.token, {
       method: "POST",
       body: {
         advertiser_id: conexao.advertiserId,
@@ -8689,7 +8705,7 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
     }
 
     if (adset_id) {
-      const adgroupRes = await tiktokFetch("/adgroup/update/status/", conexao.token, {
+      const adgroupRes = await tiktokFetch("/adgroup/status/update/", conexao.token, {
         method: "POST",
         body: {
           advertiser_id: conexao.advertiserId,
@@ -8701,7 +8717,7 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
     }
 
     if (ad_id) {
-      const adRes = await tiktokFetch("/ad/update/status/", conexao.token, {
+      const adRes = await tiktokFetch("/ad/status/update/", conexao.token, {
         method: "POST",
         body: {
           advertiser_id: conexao.advertiserId,
@@ -8747,31 +8763,37 @@ app.post("/tiktok/excluir-campanha", authMiddleware, async (c) => {
 
     const conexao = await obterConexaoTikTok(user.id);
 
-    if (conexao?.advertiserId) {
-      const del = await tiktokFetch("/campaign/update/status/", conexao.token, {
-        method: "POST",
-        body: {
-          advertiser_id: conexao.advertiserId,
-          campaign_ids: [String(campaign_id)],
-          operation_status: "DELETE"
-        }
-      });
+    if (!conexao) {
+      return c.json({ error: "TikTok não conectada" }, 400);
+    }
+    if (!conexao.advertiserId) {
+      return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
+    }
 
-      if (!del.ok) {
-        // Tolera campanha já removida/inexistente na TikTok — mesmo espírito do
-        // Meta: não trava o usuário por causa de um objeto que já sumiu do lado de lá.
-        const msg = (del.error || "").toLowerCase();
-        const naoPertenceMaisTikTok =
-          msg.includes("not exist") ||
-          msg.includes("not found") ||
-          msg.includes("invalid campaign") ||
-          msg.includes("does not exist");
-
-        if (!naoPertenceMaisTikTok) {
-          return c.json({ error: del.error || "Erro ao excluir no TikTok" }, 400);
-        }
-        console.log("EXCLUIR TIKTOK: campanha não encontrada na TikTok, removendo localmente:", campaign_id);
+    const del = await tiktokFetch("/campaign/status/update/", conexao.token, {
+      method: "POST",
+      body: {
+        advertiser_id: conexao.advertiserId,
+        campaign_ids: [String(campaign_id)],
+        operation_status: "DELETE"
       }
+    });
+
+    if (!del.ok) {
+      // Tolera campanha já removida/inexistente na TikTok — mesmo espírito do
+      // Meta: não trava o usuário por causa de um objeto que já sumiu do lado de lá.
+      const msg = (del.error || "").toLowerCase();
+      const naoPertenceMaisTikTok =
+        msg.includes("not exist") ||
+        msg.includes("not found") ||
+        msg.includes("does not exist") ||
+        msg.includes("already deleted") ||
+        msg.includes("has been deleted");
+
+      if (!naoPertenceMaisTikTok) {
+        return c.json({ error: del.error || "Erro ao excluir no TikTok" }, 400);
+      }
+      console.log("EXCLUIR TIKTOK: campanha não encontrada na TikTok, removendo localmente:", campaign_id);
     }
 
     await client.query(
@@ -8786,67 +8808,12 @@ app.post("/tiktok/excluir-campanha", authMiddleware, async (c) => {
   }
 });
 
-// Restaura (volta pra PAUSED) uma campanha TikTok excluída no histórico local
+// O TikTok trata DELETE como exclusão permanente. Mantemos a rota para clientes
+// antigos, mas nunca recriamos um card local sem o objeto remoto correspondente.
 app.post("/tiktok/restaurar-campanha", authMiddleware, async (c) => {
-  try {
-    const user: any = c.get("user");
-    const { campaign_id } = await c.req.json();
-
-    if (!campaign_id) {
-      return c.json({ error: "campaign_id obrigatorio" }, 400);
-    }
-
-    const campanha = await client.query(
-      `SELECT id, adset_id, ad_id FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok' AND UPPER(status) = 'DELETED'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanha.rows.length) {
-      return c.json({ error: "Campanha excluída não encontrada para este usuário" }, 404);
-    }
-
-    const conexao = await obterConexaoTikTok(user.id);
-    let aviso: string | null = null;
-
-    if (conexao?.advertiserId) {
-      // Reaplica status "pausado" (nunca ativo direto) em campanha + adgroup + anúncio,
-      // mesma cautela que o restaurar do Meta.
-      const alvos: Array<{ endpoint: string; campo: string; id: string | null }> = [
-        { endpoint: "/campaign/update/status/", campo: "campaign_ids", id: String(campaign_id) },
-        { endpoint: "/adgroup/update/status/", campo: "adgroup_ids", id: campanha.rows[0].adset_id },
-        { endpoint: "/ad/update/status/", campo: "ad_ids", id: campanha.rows[0].ad_id }
-      ];
-
-      for (const alvo of alvos) {
-        if (!alvo.id) continue;
-        const res = await tiktokFetch(alvo.endpoint, conexao.token, {
-          method: "POST",
-          body: {
-            advertiser_id: conexao.advertiserId,
-            [alvo.campo]: [alvo.id],
-            operation_status: "DISABLE"
-          }
-        });
-        if (!res.ok && !aviso) {
-          aviso = "O TikTok não permitiu recuperar a campanha original. Ela ficou restaurada apenas na plataforma.";
-        }
-      }
-    } else {
-      aviso = "TikTok não conectada. A campanha foi restaurada apenas no histórico local.";
-    }
-
-    await client.query(
-      `UPDATE campanhas SET status = 'PAUSED', atualizado_em = NOW() WHERE id = $1`,
-      [campanha.rows[0].id]
-    );
-
-    return c.json({ sucesso: true, aviso });
-  } catch (err: any) {
-    console.error("ERRO /tiktok/restaurar-campanha:", err);
-    return c.json({ error: "Erro ao restaurar campanha" }, 500);
-  }
+  return c.json({
+    error: "Campanhas excluídas no TikTok não podem ser restauradas. Duplique ou recrie a campanha para publicá-la novamente."
+  }, 409);
 });
 
 // Upload de imagem de criativo para a TikTok Ads (equivalente ao /meta/upload-imagem)
@@ -9769,125 +9736,19 @@ app.post("/kwai/sincronizar-campanhas", authMiddleware, async (c) => {
   }
 });
 
-// Pausa/ativa uma campanha Kwai (equivalente ao /tiktok/toggle-campanha).
-// 🚧 STUB: a busca/atualização local em `campanhas` é real; a chamada real
-// pra pausar/ativar na Kuaishou ainda não existe — por ora só refletimos o
-// status localmente, mesmo espírito de tolerância que o TikTok usa quando a
-// conexão não está disponível (ver /tiktok/restaurar-campanha). Na prática
-// nenhuma linha com plataforma = 'kwai' existe em `campanhas` hoje, porque
-// POST /kwai/campanha não grava nada (ver comentário lá) — esta rota fica
-// inerte, mas estruturalmente pronta.
+// A integração Kwai ainda não possui operações remotas de status/exclusão.
+// As rotas permanecem para compatibilidade, mas não alteram o histórico local:
+// isso evita que a tela indique uma mudança que nunca ocorreu na Kuaishou.
 app.post("/kwai/toggle-campanha", authMiddleware, async (c) => {
-  try {
-    const user: any = c.get("user");
-    const { campaign_id, status } = await c.req.json();
-
-    if (!campaign_id || !["ACTIVE", "PAUSED"].includes(status)) {
-      return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
-    }
-
-    const campanhaBanco = await client.query(
-      `SELECT id
-       FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'kwai'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanhaBanco.rows.length) {
-      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
-    }
-
-    await client.query(
-      `UPDATE campanhas SET status = $1, atualizado_em = NOW() WHERE id = $2`,
-      [status, campanhaBanco.rows[0].id]
-    );
-
-    return c.json({
-      sucesso: true,
-      aviso: `${KWAI_AVISO_INDISPONIVEL} O status foi alterado apenas na plataforma, não na Kuaishou.`
-    });
-  } catch (err: any) {
-    console.error("ERRO /kwai/toggle-campanha:", err);
-    return c.json({ error: "Erro ao alterar campanha" }, 500);
-  }
+  return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 501);
 });
 
-// Exclui (marca como DELETED) uma campanha Kwai — equivalente ao
-// /tiktok/excluir-campanha. 🚧 STUB: mesma lógica do toggle acima — exclusão
-// real na Kuaishou ainda não existe, marca como excluída só localmente.
 app.post("/kwai/excluir-campanha", authMiddleware, async (c) => {
-  try {
-    const user: any = c.get("user");
-    const { campaign_id } = await c.req.json();
-
-    if (!campaign_id) {
-      return c.json({ error: "campaign_id obrigatorio" }, 400);
-    }
-
-    const campanha = await client.query(
-      `SELECT id
-       FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'kwai'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanha.rows.length) {
-      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
-    }
-
-    await client.query(
-      `UPDATE campanhas SET status = 'DELETED', atualizado_em = NOW() WHERE id = $1`,
-      [campanha.rows[0].id]
-    );
-
-    return c.json({
-      sucesso: true,
-      aviso: `${KWAI_AVISO_INDISPONIVEL} A campanha foi excluída apenas na plataforma.`
-    });
-  } catch (err: any) {
-    console.error("ERRO /kwai/excluir-campanha:", err);
-    return c.json({ error: "Erro ao excluir campanha" }, 500);
-  }
+  return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 501);
 });
 
-// Restaura (volta pra PAUSED) uma campanha Kwai excluída no histórico local —
-// equivalente ao /tiktok/restaurar-campanha. 🚧 STUB: mesmo espírito de
-// tolerância que o TikTok usa quando a conexão não está disponível.
 app.post("/kwai/restaurar-campanha", authMiddleware, async (c) => {
-  try {
-    const user: any = c.get("user");
-    const { campaign_id } = await c.req.json();
-
-    if (!campaign_id) {
-      return c.json({ error: "campaign_id obrigatorio" }, 400);
-    }
-
-    const campanha = await client.query(
-      `SELECT id FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'kwai' AND UPPER(status) = 'DELETED'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanha.rows.length) {
-      return c.json({ error: "Campanha excluída não encontrada para este usuário" }, 404);
-    }
-
-    await client.query(
-      `UPDATE campanhas SET status = 'PAUSED', atualizado_em = NOW() WHERE id = $1`,
-      [campanha.rows[0].id]
-    );
-
-    return c.json({
-      sucesso: true,
-      aviso: `${KWAI_AVISO_INDISPONIVEL} A campanha foi restaurada apenas no histórico local.`
-    });
-  } catch (err: any) {
-    console.error("ERRO /kwai/restaurar-campanha:", err);
-    return c.json({ error: "Erro ao restaurar campanha" }, 500);
-  }
+  return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 501);
 });
 
 // Upload de imagem de criativo para o Kwai Ads (equivalente ao
@@ -10922,10 +10783,32 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
     }
 
     const conexao = await resolverConexaoLinkedIn(user.id);
-    if (!("erro" in conexao)) {
-      await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`, conexao.accessToken, {
-        method: "DELETE"
-      }).catch(err => console.warn("AVISO exclusao campaign group LinkedIn (nao bloqueante):", err));
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const del = await linkedinFetch(
+      `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`,
+      conexao.accessToken,
+      { method: "DELETE" }
+    );
+
+    if (!del.ok) {
+      const msg = String(del.error || "").toLowerCase();
+      const naoPertenceMaisLinkedIn =
+        del.status === 404 ||
+        del.status === 410 ||
+        msg.includes("not found") ||
+        msg.includes("does not exist") ||
+        msg.includes("already deleted");
+
+      if (!naoPertenceMaisLinkedIn) {
+        return c.json({
+          error: del.error || "O LinkedIn não permitiu excluir a campanha"
+        }, 400);
+      }
+
+      console.log("EXCLUIR LINKEDIN: campanha não encontrada, removendo localmente:", campaign_id);
     }
 
     await client.query(
@@ -18759,6 +18642,13 @@ app.post("/campanhas/:id/encaminhar", authMiddleware, async (c) => {
     }
 
     const orig = campanha.rows[0];
+    const plataformaOrigem = String(orig.plataforma || "meta").toLowerCase();
+
+    if (!["meta", "facebook", "instagram"].includes(plataformaOrigem)) {
+      return c.json({
+        error: `Encaminhamento ainda não está disponível para ${plataformaOrigem}. Crie a campanha diretamente nessa plataforma para evitar uma cópia que não possa ser publicada.`
+      }, 409);
+    }
 
     if (corretorIds.length) {
 
@@ -21262,16 +21152,21 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
     if (metaRes.error) {
       const errCode = Number(metaRes.error?.code) || 0;
       const errMsg = (metaRes.error?.message || "").toLowerCase();
+      const erroDeAcessoMeta =
+        errMsg.includes("permission") ||
+        errMsg.includes("access token") ||
+        errMsg.includes("not authorized") ||
+        errMsg.includes("cannot be loaded");
 
       // Campanha não existe mais no Meta (inválida, já excluída lá ou nunca criada):
       // marca como deletada localmente sem bloquear o usuário
       const naoPertenceMaisMeta =
-        errCode === 803 ||   // no such object
-        errCode === 100 ||   // invalid parameter (inclui IDs inexistentes)
-        errMsg.includes("invalid parameter") ||
-        errMsg.includes("no such") ||
-        errMsg.includes("does not exist") ||
-        errMsg.includes("deleted");
+        !erroDeAcessoMeta && (
+          errCode === 803 ||
+          errMsg.includes("no such") ||
+          errMsg.includes("does not exist") ||
+          errMsg.includes("already deleted")
+        );
 
       if (!naoPertenceMaisMeta) {
         return c.json({
@@ -21348,41 +21243,47 @@ app.post("/meta/restaurar-campanha", authMiddleware, async (c) => {
       [user.id]
     );
 
-    const token =
-      conn.rows[0]?.access_token || null;
+    const token = conn.rows[0]?.access_token;
 
+    if (!token) {
+      return c.json({ error: "Meta não conectada" }, 400);
+    }
+
+    const idsMeta = [
+      campaign_id,
+      campanha.rows[0].adset_id,
+      campanha.rows[0].ad_id
+    ].filter(Boolean);
     let aviso: string | null = null;
 
-    if (token) {
-      const idsMeta = [
-        campaign_id,
-        campanha.rows[0].adset_id,
-        campanha.rows[0].ad_id
-      ].filter(Boolean);
-
-      for (const idMeta of idsMeta) {
-        const metaRes = await fetch(
-          `https://graph.facebook.com/v19.0/${idMeta}`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              status: "PAUSED",
-              access_token: token
-            })
-          }
-        ).then(r => r.json());
-
-        if (metaRes.error && !aviso) {
-          aviso =
-            "A Meta não permitiu recuperar a campanha original. Ela ficou restaurada apenas na plataforma.";
+    for (let indice = 0; indice < idsMeta.length; indice += 1) {
+      const idMeta = idsMeta[indice];
+      const metaRes = await fetch(
+        `https://graph.facebook.com/v19.0/${idMeta}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            status: "PAUSED",
+            access_token: token
+          })
         }
+      ).then(r => r.json());
+
+      if (metaRes.error && indice === 0) {
+        return c.json({
+          error:
+            metaRes.error?.error_user_msg ||
+            metaRes.error?.message ||
+            "A Meta não permitiu restaurar a campanha"
+        }, 400);
       }
-    } else {
-      aviso =
-        "Meta não conectada. A campanha foi restaurada apenas no histórico local.";
+
+      if (metaRes.error && !aviso) {
+        aviso = "A campanha foi restaurada na Meta, mas um item interno do anúncio não pôde ser reativado. Revise o conjunto e o anúncio antes de publicar.";
+      }
     }
 
     await client.query(
@@ -21428,7 +21329,7 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
 
     const campanha = await client.query(
       `
-      SELECT id, campaign_id, status, plataforma
+      SELECT id, campaign_id, plataforma
       FROM campanhas
       WHERE id = $1
       AND usuario_id = $2
@@ -21446,9 +21347,6 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
     const campanhaLocal =
       campanha.rows[0];
 
-    const statusAtual =
-      String(campanhaLocal.status || "").toUpperCase();
-
     const plataformaRegistrada =
       String(campanhaLocal.plataforma || "meta").toLowerCase();
     const plataformaLocal = ["facebook", "instagram"].includes(plataformaRegistrada)
@@ -21461,94 +21359,96 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
       }, 400);
     }
 
-    // Antes so tentava excluir via Meta, ignorando a plataforma real da campanha —
-    // pra uma campanha Google/TikTok isso chamava a API errada com um campaign_id
-    // que nao existe la, e o botao "excluir definitivamente" nunca funcionava.
-    if (
-      campanhaLocal.campaign_id &&
-      !["DELETED", "REMOVED"].includes(statusAtual)
-    ) {
+    // Um campaign_id indica que existe (ou existiu) um objeto remoto. Mesmo que
+    // o histórico local já esteja DELETED/REMOVED, confirmamos a exclusão na rede
+    // antes de apagar o registro — versões antigas podiam ter alterado só o banco.
+    if (campanhaLocal.campaign_id) {
       if (plataformaLocal === "google") {
         const conexao = await resolverConexaoGoogleAds(user.id);
 
-        if (!("erro" in conexao)) {
-          try {
-            await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
-              { remove: `customers/${conexao.customerId}/campaigns/${campanhaLocal.campaign_id}` },
-            ]);
-          } catch (err: any) {
-            const msg = String(err?.message || "").toLowerCase();
-            const naoPertenceMaisGoogle =
-              msg.includes("not found") ||
-              msg.includes("does not exist") ||
-              msg.includes("invalid resource") ||
-              msg.includes("resource was not found");
+        if ("erro" in conexao) {
+          return c.json({ error: conexao.erro }, 400);
+        }
 
-            if (!naoPertenceMaisGoogle) {
-              return c.json({
-                error: err?.message || "O Google Ads não permitiu excluir a campanha"
-              }, 400);
-            }
-            console.log("EXCLUIR DEFINITIVO GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campanhaLocal.campaign_id);
+        try {
+          await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+            { remove: `customers/${conexao.customerId}/campaigns/${campanhaLocal.campaign_id}` },
+          ]);
+        } catch (err: any) {
+          const naoPertenceMaisGoogle =
+            googleAdsErroConfirmaRecursoAusente(err);
+
+          if (!naoPertenceMaisGoogle) {
+            return c.json({
+              error: err?.message || "O Google Ads não permitiu excluir a campanha"
+            }, 400);
           }
+          console.log("EXCLUIR DEFINITIVO GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campanhaLocal.campaign_id);
         }
       } else if (plataformaLocal === "tiktok") {
         const conexao = await obterConexaoTikTok(user.id);
 
-        if (conexao?.advertiserId) {
-          const del = await tiktokFetch("/campaign/update/status/", conexao.token, {
-            method: "POST",
-            body: {
-              advertiser_id: conexao.advertiserId,
-              campaign_ids: [String(campanhaLocal.campaign_id)],
-              operation_status: "DELETE"
-            }
-          });
+        if (!conexao) {
+          return c.json({ error: "TikTok não conectada" }, 400);
+        }
+        if (!conexao.advertiserId) {
+          return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
+        }
 
-          if (!del.ok) {
-            const msg = (del.error || "").toLowerCase();
-            const naoPertenceMaisTikTok =
-              msg.includes("not exist") ||
-              msg.includes("not found") ||
-              msg.includes("invalid campaign") ||
-              msg.includes("does not exist");
-
-            if (!naoPertenceMaisTikTok) {
-              return c.json({ error: del.error || "O TikTok não permitiu excluir a campanha" }, 400);
-            }
-            console.log("EXCLUIR DEFINITIVO TIKTOK: campanha não encontrada na TikTok, removendo localmente:", campanhaLocal.campaign_id);
+        const del = await tiktokFetch("/campaign/status/update/", conexao.token, {
+          method: "POST",
+          body: {
+            advertiser_id: conexao.advertiserId,
+            campaign_ids: [String(campanhaLocal.campaign_id)],
+            operation_status: "DELETE"
           }
+        });
+
+        if (!del.ok) {
+          const msg = (del.error || "").toLowerCase();
+          const naoPertenceMaisTikTok =
+            msg.includes("not exist") ||
+            msg.includes("not found") ||
+            msg.includes("does not exist") ||
+            msg.includes("already deleted") ||
+            msg.includes("has been deleted");
+
+          if (!naoPertenceMaisTikTok) {
+            return c.json({ error: del.error || "O TikTok não permitiu excluir a campanha" }, 400);
+          }
+          console.log("EXCLUIR DEFINITIVO TIKTOK: campanha não encontrada na TikTok, removendo localmente:", campanhaLocal.campaign_id);
         }
       } else if (plataformaLocal === "linkedin") {
         const conexao = await resolverConexaoLinkedIn(user.id);
 
-        if (!("erro" in conexao)) {
-          const del = await linkedinFetch(
-            `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campanhaLocal.campaign_id}`,
-            conexao.accessToken,
-            { method: "DELETE" }
-          );
+        if ("erro" in conexao) {
+          return c.json({ error: conexao.erro }, 400);
+        }
 
-          if (!del.ok) {
-            const msg = String(del.error || "").toLowerCase();
-            const naoPertenceMaisLinkedIn =
-              msg.includes("not found") ||
-              msg.includes("does not exist") ||
-              msg.includes("invalid") ||
-              msg.includes("deleted");
+        const del = await linkedinFetch(
+          `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campanhaLocal.campaign_id}`,
+          conexao.accessToken,
+          { method: "DELETE" }
+        );
 
-            if (!naoPertenceMaisLinkedIn) {
-              return c.json({
-                error: del.error || "O LinkedIn não permitiu excluir a campanha"
-              }, 400);
-            }
-            console.log("EXCLUIR DEFINITIVO LINKEDIN: campanha não encontrada, removendo localmente:", campanhaLocal.campaign_id);
+        if (!del.ok) {
+          const msg = String(del.error || "").toLowerCase();
+          const naoPertenceMaisLinkedIn =
+            del.status === 404 ||
+            del.status === 410 ||
+            msg.includes("not found") ||
+            msg.includes("does not exist") ||
+            msg.includes("already deleted");
+
+          if (!naoPertenceMaisLinkedIn) {
+            return c.json({
+              error: del.error || "O LinkedIn não permitiu excluir a campanha"
+            }, 400);
           }
+          console.log("EXCLUIR DEFINITIVO LINKEDIN: campanha não encontrada, removendo localmente:", campanhaLocal.campaign_id);
         }
       } else if (plataformaLocal === "kwai") {
-        // A integração Kwai ainda não possui remoção remota. Mantemos a
-        // operação estritamente local em vez de enviar o ID para outra rede.
-        console.log("EXCLUIR DEFINITIVO KWAI: removendo somente o registro local:", campanhaLocal.campaign_id);
+        return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 501);
       } else if (plataformaLocal === "meta") {
         const conn = await client.query(
           `
@@ -21561,33 +21461,54 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
           [user.id]
         );
 
-        const token =
-          conn.rows[0]?.access_token || null;
+        const token = conn.rows[0]?.access_token;
 
-        if (token) {
-          const metaRes = await fetch(
-            `https://graph.facebook.com/v19.0/${campanhaLocal.campaign_id}`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                status: "DELETED",
-                access_token: token
-              })
-            }
-          ).then(r => r.json());
+        if (!token) {
+          return c.json({ error: "Meta não conectada" }, 400);
+        }
 
-          console.log("DELETE DEFINITIVO META:", metaRes);
+        const metaRes = await fetch(
+          `https://graph.facebook.com/v19.0/${campanhaLocal.campaign_id}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              status: "DELETED",
+              access_token: token
+            })
+          }
+        ).then(r => r.json());
 
-          if (metaRes.error) {
+        console.log("DELETE DEFINITIVO META:", metaRes);
+
+        if (metaRes.error) {
+          const errCode = Number(metaRes.error?.code) || 0;
+          const errMsg = String(metaRes.error?.message || "").toLowerCase();
+          const erroDeAcessoMeta =
+            errMsg.includes("permission") ||
+            errMsg.includes("access token") ||
+            errMsg.includes("not authorized") ||
+            errMsg.includes("cannot be loaded");
+          const naoPertenceMaisMeta =
+            !erroDeAcessoMeta && (
+              errCode === 803 ||
+              errMsg.includes("no such") ||
+              errMsg.includes("does not exist") ||
+              errMsg.includes("already deleted")
+            );
+
+          if (!naoPertenceMaisMeta) {
             return c.json({
               error:
-                metaRes.error.message ||
+                metaRes.error?.error_user_msg ||
+                metaRes.error?.message ||
                 "A Meta não permitiu excluir a campanha"
             }, 400);
           }
+
+          console.log("EXCLUIR DEFINITIVO META: campanha não encontrada, removendo localmente:", campanhaLocal.campaign_id);
         }
       }
     }
@@ -28087,6 +28008,14 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
     }
 
     const orig = origRes.rows[0];
+    const plataformaOrigem = String(orig.plataforma || "meta").toLowerCase();
+
+    if (!["meta", "facebook", "instagram"].includes(plataformaOrigem)) {
+      return c.json({
+        error: `Duplicação ainda não está disponível para ${plataformaOrigem}. Crie uma nova campanha nessa plataforma para garantir que todos os campos necessários sejam preenchidos.`
+      }, 409);
+    }
+
     const novoNome = body.nome?.trim() || `Cópia de ${orig.nome}`;
 
     // Destino (Lead Ads vs WhatsApp) pode ser trocado no duplicar — é o único
