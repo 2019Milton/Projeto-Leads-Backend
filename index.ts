@@ -11564,7 +11564,8 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
       configuracoes_avancadas,
       nicho_id,
       cbo,
-      daily_budget: dailyBudgetCampanha
+      daily_budget: dailyBudgetCampanha,
+      publicacao_grupo_id
     } = await c.req.json();
 
     const usuarioId =
@@ -11677,9 +11678,10 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
         status,
         origem,
         configuracoes_avancadas,
-        nicho_id
+        nicho_id,
+        publicacao_grupo_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       `,
       [
         usuarioId,
@@ -11693,7 +11695,8 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
           cbo: Boolean(cbo),
           destino
         }),
-        nicho_id ?? null
+        nicho_id ?? null,
+        textoOpcional(publicacao_grupo_id) || null
       ]
     );
 
@@ -28387,6 +28390,47 @@ app.patch("/campanhas/:id/nicho", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO PATCH /campanhas/:id/nicho:", err);
     return c.json({ error: "Erro ao vincular nicho" }, 500);
+  }
+});
+
+// Atribui um publicacao_grupo_id a uma campanha que ainda não tem um — usado
+// quando o usuário adiciona uma nova plataforma a uma campanha já publicada
+// sozinha, pra juntar as duas no mesmo grupo visual da listagem. Genérico
+// (não depende da plataforma da linha) e idempotente: se a linha já tiver um
+// grupo, devolve o grupo existente em vez de sobrescrever.
+app.patch("/campanhas/:id/grupo", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    const { publicacao_grupo_id } = await c.req.json();
+
+    const grupoProposto = textoOpcional(publicacao_grupo_id);
+    if (!grupoProposto) {
+      return c.json({ error: "publicacao_grupo_id obrigatório" }, 400);
+    }
+
+    const campRes = await client.query(
+      `SELECT id, publicacao_grupo_id FROM campanhas WHERE id = $1 AND usuario_id = $2`,
+      [campanhaId, user.id]
+    );
+    if (campRes.rows.length === 0) {
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const grupoAtual = campRes.rows[0].publicacao_grupo_id;
+    if (grupoAtual) {
+      return c.json({ publicacao_grupo_id: grupoAtual });
+    }
+
+    await client.query(
+      `UPDATE campanhas SET publicacao_grupo_id = $1 WHERE id = $2`,
+      [grupoProposto, campanhaId]
+    );
+
+    return c.json({ publicacao_grupo_id: grupoProposto });
+  } catch (err) {
+    console.error("ERRO PATCH /campanhas/:id/grupo:", err);
+    return c.json({ error: "Erro ao vincular campanha a um grupo de publicação" }, 500);
   }
 });
 
