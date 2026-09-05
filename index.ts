@@ -1547,6 +1547,24 @@ function resolverDestinoCampanha(valor: unknown): DestinoCampanhaMeta {
   return valor === "whatsapp" ? "whatsapp" : "lead_ads";
 }
 
+type DestinoCampanhaTikTok = "lead_ads" | "site" | "whatsapp";
+
+function resolverDestinoCampanhaTikTok(valor: unknown): DestinoCampanhaTikTok {
+  const destino = String(valor || "").trim().toLowerCase();
+  return destino === "site" || destino === "whatsapp" ? destino : "lead_ads";
+}
+
+// A integração de WhatsApp da plataforma já normaliza todos os números brasileiros
+// em E.164 (55 + DDD + número). A TikTok recebe país, código de chamada e número em
+// campos separados; por isso o phone_number precisa ir sem o prefixo 55.
+function prepararNumeroWhatsappBrasilTikTok(valor: unknown) {
+  const e164 = normalizarTelefoneWhatsApp(valor);
+  const numeroNacional = e164.startsWith("55") ? e164.slice(2) : "";
+  return numeroNacional.length === 10 || numeroNacional.length === 11
+    ? numeroNacional
+    : "";
+}
+
 async function obterNumeroWhatsappConectadoUsuario(usuarioId: number) {
   const conexao = await client.query(
     `SELECT dados_conta->>'numero' AS numero
@@ -9032,7 +9050,8 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
       configuracoes_avancadas,
       nicho_id,
       daily_budget,
-      publicacao_grupo_id
+      publicacao_grupo_id,
+      destino
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -9079,6 +9098,13 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     }
 
     const campaignId = String(resposta.data.data.campaign_id);
+    const destinoResolvido = resolverDestinoCampanhaTikTok(
+      destino ?? configuracoes_avancadas?.destino
+    );
+    const configuracoesPersistidas = {
+      ...(configuracoes_avancadas || {}),
+      destino: destinoResolvido
+    };
 
     await client.query(
       `INSERT INTO campanhas (
@@ -9093,7 +9119,7 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
         nome || "Campanha Plataforma",
         "PAUSED",
         "plataforma",
-        JSON.stringify(configuracoes_avancadas || {}),
+        JSON.stringify(configuracoesPersistidas),
         nicho_id ?? null,
         textoOpcional(publicacao_grupo_id) || null
       ]
@@ -9114,7 +9140,8 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
       usuario_id,
       campaign_id,
       daily_budget,
-      configuracoes_avancadas
+      configuracoes_avancadas,
+      destino
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -9136,6 +9163,7 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
 
     const avancadas = configuracoes_avancadas || {};
     const targeting = montarTargetingTikTok(avancadas);
+    const destinoResolvido = resolverDestinoCampanhaTikTok(destino ?? avancadas.destino);
 
     if (!targeting.location_ids?.length) {
       return c.json({ error: "Selecione ao menos uma localização para segmentar a campanha TikTok" }, 400);
@@ -9155,19 +9183,51 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
     const inicio = textoOpcional(avancadas.inicio);
     const fim = textoOpcional(avancadas.fim);
 
-    // ASSUMPTION: nomes de campo (placement_type/billing_event/schedule_type) e enums
-    // conforme documentação pública do adgroup/create — confirmar na Fase 2B.
+    let numeroWhatsappTikTok = "";
+    if (destinoResolvido === "whatsapp") {
+      const numeroConectado = await obterNumeroWhatsappConectadoUsuario(usuarioId);
+      if (!numeroConectado) {
+        return c.json({
+          error: "Conecte o WhatsApp da plataforma (aba WhatsApp Bot) antes de publicar uma campanha TikTok com destino WhatsApp."
+        }, 400);
+      }
+      numeroWhatsappTikTok = prepararNumeroWhatsappBrasilTikTok(numeroConectado);
+      if (!numeroWhatsappTikTok) {
+        return c.json({
+          error: "O número conectado ao WhatsApp precisa ser brasileiro e conter DDD para ser usado no TikTok Ads."
+        }, 400);
+      }
+    }
+
+    // Mapeamento oficial da TikTok Business API v1.3:
+    // - Instant Form: LEAD_GENERATION + INSTANT_PAGE, otimizado para Lead Generation;
+    // - site: LEAD_GENERATION + EXTERNAL_WEBSITE, otimizado para clique sem exigir Pixel;
+    // - WhatsApp: LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE + WHATSAPP.
+    // Click/CPC no WhatsApp funciona sem parceiro de mensagens nem event set.
+    const ehFormulario = destinoResolvido === "lead_ads";
     const payloadAdgroup: any = {
       advertiser_id: conexao.advertiserId,
       campaign_id: String(campaign_id),
       adgroup_name: `AdGroup Leads ${Date.now()}`,
-      promotion_type: "LEAD_GENERATION",
+      promotion_type: destinoResolvido === "whatsapp"
+        ? "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE"
+        : "LEAD_GENERATION",
+      ...(destinoResolvido === "lead_ads" ? { promotion_target_type: "INSTANT_PAGE" } : {}),
+      ...(destinoResolvido === "site" ? { promotion_target_type: "EXTERNAL_WEBSITE" } : {}),
+      ...(destinoResolvido === "whatsapp" ? {
+        messaging_app_type: "WHATSAPP",
+        phone_region_code: "BR",
+        phone_region_calling_code: "+55",
+        phone_number: numeroWhatsappTikTok
+      } : {}),
       placement_type: "PLACEMENT_TYPE_AUTOMATIC",
-      targeting,
-      budget_mode: "BUDGET_MODE_DAY",
+      ...targeting,
+      budget_mode: "BUDGET_MODE_DYNAMIC_DAILY_BUDGET",
       budget: orcamento,
-      billing_event: "CPM",
-      optimization_goal: "LEAD_GENERATION",
+      billing_event: ehFormulario ? "OCPM" : "CPC",
+      optimization_goal: ehFormulario ? "LEAD_GENERATION" : "CLICK",
+      bid_type: "BID_TYPE_NO_BID",
+      pacing: "PACING_MODE_SMOOTH",
       schedule_start_time: formatarDataHoraTikTok(
         inicio ? new Date(inicio) : new Date(Date.now() + 60000)
       ),
@@ -9263,7 +9323,9 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       daily_budget,
       image_ids,
       image_id,
-      video_id
+      video_id,
+      destino,
+      url_destino
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -9271,8 +9333,15 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       return negarAcessoConta(c);
     }
 
-    if (!form_id) {
+    const avancadas = configuracoes_avancadas || {};
+    const destinoResolvido = resolverDestinoCampanhaTikTok(destino ?? avancadas.destino);
+    const urlDestino = destinoResolvido === "site" ? urlOpcional(url_destino, "") : "";
+
+    if (destinoResolvido === "lead_ads" && !form_id) {
       return c.json({ error: "form_id (Instant Form) não enviado" }, 400);
+    }
+    if (destinoResolvido === "site" && !urlDestino) {
+      return c.json({ error: "Informe um endereço completo e válido para o anúncio TikTok" }, 400);
     }
     if (!adgroup_id) {
       return c.json({ error: "adgroup_id não enviado" }, 400);
@@ -9293,7 +9362,6 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       return c.json({ error: "Selecione a identidade (perfil TikTok) antes de publicar o anúncio" }, 400);
     }
 
-    const avancadas = configuracoes_avancadas || {};
     const tituloAnuncio = textoOpcional(avancadas.titulo) || "Saiba mais";
 
     const imagens: string[] =
@@ -9307,19 +9375,17 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       return c.json({ error: "Envie ao menos uma imagem ou vídeo para o anúncio TikTok" }, 400);
     }
 
-    // ASSUMPTION MAIS ARRISCADA: como a TikTok amarra o Instant Form ao criativo do
-    // anúncio. Aqui assumimos um campo "page_id" no objeto de criativo (a TikTok chama
-    // o Instant Form internamente de "page" nos endpoints de lead gen) — confirmar o
-    // campo exato contra o SDK oficial na Fase 2B; sem isso o anúncio pode não vincular
-    // ao formulário certo mesmo sendo aceito pela API.
+    // page_id só é válido para Instant Form. No site a URL vai no criativo; no
+    // WhatsApp o destino já foi definido no ad group e a própria TikTok o preenche.
     const criativo: any = {
       ad_name: `Anuncio Leads ${Date.now()}`,
       ad_format: video_id ? "SINGLE_VIDEO" : imagens.length > 1 ? "CAROUSEL_ADS" : "SINGLE_IMAGE",
       identity_id: identidadeId,
       identity_type: identidadeTipo,
       ad_text: texto || "Quer mais clientes? 🚀",
-      call_to_action: cta || "LEARN_MORE",
-      page_id: String(form_id)
+      call_to_action: destinoResolvido === "whatsapp" ? "CONTACT_US" : (cta || "LEARN_MORE"),
+      ...(destinoResolvido === "lead_ads" ? { page_id: String(form_id) } : {}),
+      ...(destinoResolvido === "site" ? { landing_page_url: urlDestino } : {})
     };
 
     if (video_id) {
@@ -9356,7 +9422,9 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       ...avancadas,
       texto,
       cta,
-      form_id: String(form_id),
+      destino: destinoResolvido,
+      url_destino: urlDestino || null,
+      form_id: destinoResolvido === "lead_ads" ? String(form_id) : null,
       identity_id: identidadeId,
       identity_type: identidadeTipo,
       image_ids: imagens,
@@ -9382,7 +9450,7 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       [
         String(adgroup_id),
         String(adId),
-        String(form_id),
+        destinoResolvido === "lead_ads" ? String(form_id) : null,
         numeroOpcional(daily_budget),
         JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
