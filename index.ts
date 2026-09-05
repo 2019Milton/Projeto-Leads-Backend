@@ -5002,6 +5002,7 @@ async function listarCampaignIdsMetaDoUsuario(
     FROM campanhas
     WHERE usuario_id = $1
       AND conta_anuncios_id = $2
+      AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       AND campaign_id IS NOT NULL
       AND COALESCE(status, '') <> 'DELETED'
       AND (
@@ -5088,7 +5089,9 @@ async function sincronizarCampanhasUsuario(
       campanha.status || campanha.effective_status || "UNKNOWN";
 
     const existe = await client.query(
-      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2
+         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')`,
       [campanha.id, usuarioId]
     );
 
@@ -5096,7 +5099,8 @@ async function sincronizarCampanhasUsuario(
       await client.query(
         `UPDATE campanhas
          SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
-         WHERE campaign_id = $4 AND usuario_id = $5`,
+         WHERE campaign_id = $4 AND usuario_id = $5
+           AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')`,
         [campanha.name, statusFinal, contaAnunciosId, campanha.id, usuarioId]
       );
     } else {
@@ -5165,6 +5169,7 @@ async function sincronizarLeadsMetaUsuario(
         WHERE form_id = $1
         AND conta_anuncios_id = $2
         AND usuario_id = $3
+        AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
         LIMIT 1
         `,
         [form.id, adAccountId, usuarioId]
@@ -6480,14 +6485,14 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       const campaignId = String(campanha.id);
 
       const existe = await client.query(
-        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'`,
         [campaignId, usuarioId]
       );
 
       if (existe.rows.length > 0) {
         await client.query(
           `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
-           WHERE campaign_id = $3 AND usuario_id = $4`,
+           WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'google'`,
           [campanha.name, campanha.status, campaignId, usuarioId]
         );
       } else {
@@ -6535,7 +6540,9 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       const campaignIdLead = String(dadosLead.campaign || "").split("/").pop() || "";
       if (campaignIdLead) {
         const campRow = await client.query(
-          `SELECT nome, nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 LIMIT 1`,
+          `SELECT nome, nicho_id FROM campanhas
+           WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+           LIMIT 1`,
           [campaignIdLead, usuarioId]
         );
         if (campRow.rows.length) {
@@ -8486,14 +8493,14 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
 
     for (const campanha of campanhas) {
       const existe = await client.query(
-        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'`,
         [String(campanha.campaign_id), usuarioId]
       );
 
       if (existe.rows.length > 0) {
         await client.query(
           `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
-           WHERE campaign_id = $3 AND usuario_id = $4`,
+           WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'tiktok'`,
           [campanha.campaign_name, campanha.status, String(campanha.campaign_id), usuarioId]
         );
       } else {
@@ -8545,7 +8552,9 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
         let nichoId: number | null = null;
         if (formId) {
           const campRow = await client.query(
-            `SELECT nome, nicho_id FROM campanhas WHERE form_id = $1 AND usuario_id = $2 LIMIT 1`,
+            `SELECT nome, nicho_id FROM campanhas
+             WHERE form_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+             LIMIT 1`,
             [formId, usuarioId]
           );
           if (campRow.rows.length) {
@@ -10963,14 +10972,14 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
     const statusCampanha = String(campanha.status || "PAUSED").toUpperCase();
 
     const existe = await client.query(
-      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2`,
+      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'`,
       [campaignGroupId, usuarioId]
     );
 
     if (existe.rows.length > 0) {
       await client.query(
         `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
-         WHERE campaign_id = $3 AND usuario_id = $4`,
+         WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'linkedin'`,
         [nomeCampanha, statusCampanha, campaignGroupId, usuarioId]
       );
     } else {
@@ -15593,7 +15602,9 @@ app.post("/webhook/tiktok", async (c) => {
       let nichoId: number | null = null;
       if (formId) {
         const campRow = await client.query(
-          `SELECT nome, nicho_id FROM campanhas WHERE form_id = $1 AND usuario_id = $2 LIMIT 1`,
+          `SELECT nome, nicho_id FROM campanhas
+           WHERE form_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+           LIMIT 1`,
           [formId, usuarioId]
         );
         if (campRow.rows.length) {
@@ -16013,6 +16024,7 @@ app.post("/webhook/meta", async (c) => {
                 SELECT usuario_id, nome, conta_anuncios_id, nicho_id, configuracoes_avancadas
                 FROM campanhas
                 WHERE form_id = $1
+                AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
                 LIMIT 1
                 `,
                 [form_id]
@@ -16033,6 +16045,7 @@ app.post("/webhook/meta", async (c) => {
                 SELECT usuario_id, nome, conta_anuncios_id, nicho_id, configuracoes_avancadas
                 FROM campanhas
                 WHERE page_id = $1
+                AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
                 ORDER BY id DESC
                 LIMIT 1
                 `,
@@ -16465,7 +16478,11 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
 
   if (sourceId) {
     const campRow = await client.query(
-      `SELECT id, nome, nicho_id, conta_anuncios_id, configuracoes_avancadas FROM campanhas WHERE ad_id = $1 AND usuario_id = $2 LIMIT 1`,
+      `SELECT id, nome, nicho_id, conta_anuncios_id, configuracoes_avancadas
+       FROM campanhas
+       WHERE ad_id = $1 AND usuario_id = $2
+         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+       LIMIT 1`,
       [sourceId, usuarioId]
     ).catch(() => ({ rows: [] as any[] }));
 
@@ -19475,7 +19492,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         )
         AND (
           c.origem = 'manual'
-          OR (COALESCE(c.plataforma, 'meta') = 'meta' AND ($2::text IS NULL OR c.conta_anuncios_id = $2))
+          OR (LOWER(COALESCE(c.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') AND ($2::text IS NULL OR c.conta_anuncios_id = $2))
           OR (c.plataforma = 'google' AND c.conta_anuncios_id = $3)
           OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $4)
           OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $5)
@@ -19696,7 +19713,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       if (
         token &&
         campanha.campaign_id &&
-        plataformaCampanha === "meta" &&
+        ["meta", "facebook", "instagram"].includes(plataformaCampanha) &&
         String(campanha.status || "").toUpperCase() !== "DELETED"
       ) {
         try {
@@ -19853,7 +19870,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       // herdava o aviso de faturamento da conta Meta do usuario, mesmo sem nenhuma
       // relacao com ela.
       const campanhaEhMeta =
-        (campanha.plataforma || "meta") === "meta";
+        ["meta", "facebook", "instagram"].includes(plataformaCampanha);
 
       const mensagemErroPagamento =
         campanhaEhMeta
@@ -19864,7 +19881,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
       // 🔥 VEICULAÇÃO (status detalhado igual ao Gerenciador de Anúncios)
       const veiculacaoStatus =
-        veiculacaoPorCampanha[campanha.campaign_id] || null;
+        campanhaEhMeta
+          ? (veiculacaoPorCampanha[campanha.campaign_id] || null)
+          : null;
 
       // Corrige divergência de status entre banco e Meta automaticamente.
       // Ex.: usuário pausou direto na Meta → banco ainda mostra ACTIVE.
@@ -19884,13 +19903,14 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         campanha.status = statusMetaCampanha;
       }
 
-      const diagnosticoVeiculacao =
-        diagnosticarVeiculacaoMeta(
-          veiculacaoStatus,
-          issuesCampanha,
-          mensagemErroPagamento || (campanhaEhMeta ? erroPagamentoConta : null),
-          campanha.status
-        );
+      const diagnosticoVeiculacao = campanhaEhMeta
+        ? diagnosticarVeiculacaoMeta(
+            veiculacaoStatus,
+            issuesCampanha,
+            mensagemErroPagamento || erroPagamentoConta,
+            campanha.status
+          )
+        : null;
 
       // Persiste nicho detectado pelas tabelas de detalhe ou leads
       if (!campanha.nicho_id && campanha.nicho_slug) {
@@ -20001,18 +20021,20 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           campanha.configuracoes_avancadas?.ultimo_erro_publicacao || null,
         erro_pagamento: mensagemErroPagamento || null,
         veiculacao: veiculacaoStatus,
-        veiculacao_label: traduzirVeiculacaoMeta(veiculacaoStatus),
-        veiculacao_tipo: diagnosticoVeiculacao.tipo,
-        veiculacao_subcategoria: diagnosticoVeiculacao.subcategoria,
-        veiculacao_motivo: diagnosticoVeiculacao.motivo,
-        veiculacao_acao: diagnosticoVeiculacao.acao,
-        veiculacao_acao_passos: diagnosticoVeiculacao.acao_passos,
-        veiculacao_acao_url: urlAcaoVeiculacaoMeta(
-          diagnosticoVeiculacao.subcategoria,
-          campanha.campaign_id || null,
-          campanha.conta_anuncios_id || null
-        ),
-        veiculacao_detalhes: diagnosticoVeiculacao.detalhes,
+        veiculacao_label: campanhaEhMeta ? traduzirVeiculacaoMeta(veiculacaoStatus) : null,
+        veiculacao_tipo: diagnosticoVeiculacao?.tipo || null,
+        veiculacao_subcategoria: diagnosticoVeiculacao?.subcategoria || null,
+        veiculacao_motivo: diagnosticoVeiculacao?.motivo || null,
+        veiculacao_acao: diagnosticoVeiculacao?.acao || null,
+        veiculacao_acao_passos: diagnosticoVeiculacao?.acao_passos || [],
+        veiculacao_acao_url: diagnosticoVeiculacao
+          ? urlAcaoVeiculacaoMeta(
+              diagnosticoVeiculacao.subcategoria,
+              campanha.campaign_id || null,
+              campanha.conta_anuncios_id || null
+            )
+          : null,
+        veiculacao_detalhes: diagnosticoVeiculacao?.detalhes || null,
         conta_anuncios_id: campanha.conta_anuncios_id || null,
         nicho_id: campanha.nicho_id || null,
         nicho_slug: campanha.nicho_slug || null,
@@ -20897,6 +20919,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
         FROM campanhas
         WHERE campaign_id = $1
         AND usuario_id = $2
+        AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
         `,
         [campanha.id, user.id]
       );
@@ -20913,6 +20936,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             atualizado_em = NOW()
           WHERE campaign_id = $4
           AND usuario_id = $5
+          AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
           `,
           [
             campanha.name,
@@ -20939,9 +20963,10 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             nome,
             status,
             origem,
+            plataforma,
             atualizado_em
           )
-          VALUES ($1,$2,$3,$4,$5,$6,NOW())
+          VALUES ($1,$2,$3,$4,$5,$6,'meta',NOW())
           `,
           [
             user.id,
@@ -21011,6 +21036,7 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       FROM campanhas
       WHERE campaign_id = $1
       AND usuario_id = $2
+      AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
       [campaign_id, user.id]
@@ -21181,6 +21207,7 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
       WHERE campaign_id = $1
       AND usuario_id = $2
       AND (conta_anuncios_id = $3 OR conta_anuncios_id IS NULL)
+      AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
       [campaign_id, user.id, contaAnunciosId]
@@ -21298,6 +21325,7 @@ app.post("/meta/restaurar-campanha", authMiddleware, async (c) => {
       WHERE campaign_id = $1
       AND usuario_id = $2
       AND UPPER(status) = 'DELETED'
+      AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
       [campaign_id, user.id]
@@ -21421,15 +21449,24 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
     const statusAtual =
       String(campanhaLocal.status || "").toUpperCase();
 
-    const plataformaLocal =
-      campanhaLocal.plataforma || "meta";
+    const plataformaRegistrada =
+      String(campanhaLocal.plataforma || "meta").toLowerCase();
+    const plataformaLocal = ["facebook", "instagram"].includes(plataformaRegistrada)
+      ? "meta"
+      : plataformaRegistrada;
+
+    if (!["meta", "google", "tiktok", "linkedin", "kwai"].includes(plataformaLocal)) {
+      return c.json({
+        error: `Exclusão definitiva não suportada para a plataforma ${plataformaLocal}`
+      }, 400);
+    }
 
     // Antes so tentava excluir via Meta, ignorando a plataforma real da campanha —
     // pra uma campanha Google/TikTok isso chamava a API errada com um campaign_id
     // que nao existe la, e o botao "excluir definitivamente" nunca funcionava.
     if (
       campanhaLocal.campaign_id &&
-      statusAtual !== "DELETED"
+      !["DELETED", "REMOVED"].includes(statusAtual)
     ) {
       if (plataformaLocal === "google") {
         const conexao = await resolverConexaoGoogleAds(user.id);
@@ -21482,7 +21519,37 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
             console.log("EXCLUIR DEFINITIVO TIKTOK: campanha não encontrada na TikTok, removendo localmente:", campanhaLocal.campaign_id);
           }
         }
-      } else {
+      } else if (plataformaLocal === "linkedin") {
+        const conexao = await resolverConexaoLinkedIn(user.id);
+
+        if (!("erro" in conexao)) {
+          const del = await linkedinFetch(
+            `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campanhaLocal.campaign_id}`,
+            conexao.accessToken,
+            { method: "DELETE" }
+          );
+
+          if (!del.ok) {
+            const msg = String(del.error || "").toLowerCase();
+            const naoPertenceMaisLinkedIn =
+              msg.includes("not found") ||
+              msg.includes("does not exist") ||
+              msg.includes("invalid") ||
+              msg.includes("deleted");
+
+            if (!naoPertenceMaisLinkedIn) {
+              return c.json({
+                error: del.error || "O LinkedIn não permitiu excluir a campanha"
+              }, 400);
+            }
+            console.log("EXCLUIR DEFINITIVO LINKEDIN: campanha não encontrada, removendo localmente:", campanhaLocal.campaign_id);
+          }
+        }
+      } else if (plataformaLocal === "kwai") {
+        // A integração Kwai ainda não possui remoção remota. Mantemos a
+        // operação estritamente local em vez de enviar o ID para outra rede.
+        console.log("EXCLUIR DEFINITIVO KWAI: removendo somente o registro local:", campanhaLocal.campaign_id);
+      } else if (plataformaLocal === "meta") {
         const conn = await client.query(
           `
           SELECT access_token
@@ -21562,12 +21629,16 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
     }
 
     const campanhaRes = await client.query(
-      `SELECT * FROM campanhas WHERE id = $1 AND usuario_id = $2 LIMIT 1`,
+      `SELECT * FROM campanhas
+       WHERE id = $1
+         AND usuario_id = $2
+         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+       LIMIT 1`,
       [campanhaId, user.id]
     );
 
     if (!campanhaRes.rows.length) {
-      return c.json({ error: "Campanha não encontrada" }, 404);
+      return c.json({ error: "Campanha Meta não encontrada" }, 404);
     }
 
     const campanha = campanhaRes.rows[0];
@@ -22077,7 +22148,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     // isso não usamos apenas o valor enviado pela tela para decidir se é rascunho.
     const campanhaLocalRes = campanha_local_id
       ? await client.query(
-          `SELECT id, campaign_id, adset_id, ad_id, origem, origem_campanha_id
+          `SELECT id, campaign_id, adset_id, ad_id, origem, origem_campanha_id, plataforma
            FROM campanhas
            WHERE id = $1 AND usuario_id = $2
            LIMIT 1`,
@@ -22085,6 +22156,16 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         )
       : { rows: [] as any[] };
     const campanhaLocal = campanhaLocalRes.rows[0] || null;
+    if (
+      campanhaLocal &&
+      !["meta", "facebook", "instagram"].includes(
+        String(campanhaLocal.plataforma || "meta").toLowerCase()
+      )
+    ) {
+      return c.json({
+        error: "Esta edição pertence a outra plataforma e não pode ser processada pela Meta"
+      }, 409);
+    }
     const ehRascunhoLocal = Boolean(
       campanhaLocal && (
         !campanhaLocal.campaign_id ||
@@ -22142,6 +22223,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         OR encaminhada_para_usuario_id = $2
       )
       AND conta_anuncios_id = $3
+      AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
       [campaign_id, usuarioId, contaAnunciosId]
@@ -22733,6 +22815,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       FROM campanhas c
       WHERE c.id = $1
       AND c.usuario_id = $2
+      AND LOWER(COALESCE(c.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
       [campanhaId, user.id]
@@ -28121,7 +28204,8 @@ app.get("/campanhas/:id/preview-anuncio", authMiddleware, async (c) => {
       `SELECT c.id, c.usuario_id, c.ad_id, c.adset_id, c.campaign_id, c.status, c.conta_anuncios_id
        FROM campanhas c
        WHERE c.id = $1
-         AND c.usuario_id = $2`,
+         AND c.usuario_id = $2
+         AND LOWER(COALESCE(c.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')`,
       [campanhaId, user.id]
     );
 
