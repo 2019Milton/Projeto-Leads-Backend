@@ -2964,7 +2964,7 @@ function detectarSinaisIA(lead: any, ml: any) {
 // extrairFeaturesMLLead) — único lugar que decide "qual nicho é esse lead".
 type ChaveNicho =
   | "imoveis" | "saude" | "suplementos" | "saas" | "higienizacao" | "telecom"
-  | "educacao" | "auto" | "consorcio";
+  | "cursos_online" | "educacao" | "auto" | "consorcio";
 
 function detectarChaveNicho(lead: any): ChaveNicho | null {
   const slug = String(lead?.nicho_slug || "").toLowerCase();
@@ -2976,6 +2976,7 @@ function detectarChaveNicho(lead: any): ChaveNicho | null {
   if (slug.includes("saas") || slug.includes("plataforma") || nome.includes("saas") || nome.includes("plataforma")) return "saas";
   if (slug.includes("higien") || nome.includes("higien")) return "higienizacao";
   if (slug.includes("telecom") || nome.includes("telecom")) return "telecom";
+  if (slug.includes("curso_online") || slug.includes("cursos_online") || nome.includes("curso online") || nome.includes("cursos online")) return "cursos_online";
   if (slug.includes("educa") || nome.includes("educa") || nome.includes("curso") || nome.includes("ensino")) return "educacao";
   if (slug.includes("auto") || nome.includes("auto") || nome.includes("veículo") || nome.includes("veiculo") || nome.includes("carro")) return "auto";
   if (slug.includes("consorcio") || slug.includes("consórcio") || nome.includes("consórcio") || nome.includes("consorcio")) return "consorcio";
@@ -2994,6 +2995,7 @@ const VOCABULARIO_NICHO: Record<ChaveNicho, string[]> = {
   saas: ["implantacao", "implantação", "licenca", "licença", "usuarios", "usuários", "integracao", "integração", "trial", "onboarding"],
   higienizacao: ["estofado", "colchao", "colchão", "carpete", "tapete", "sofa", "sofá", "acaro", "ácaro", "mofo", "pos obra", "pós obra", "agendamento", "orcamento", "orçamento"],
   telecom: ["internet dedicada", "link dedicado", "firewall", "pabx", "ramal", "hotspot", "wifi corporativo", "uptime", "sla", "provedor", "fornecedor"],
+  cursos_online: ["curso online", "aula gravada", "aula ao vivo", "certificado", "acesso vitalicio", "acesso vitalício", "plataforma de ensino", "parcelamento", "nova profissao", "nova profissão", "renda extra", "inscricao", "inscrição", "modulo", "módulo"],
   educacao: ["matricula", "matrícula", "turma", "bolsa", "certificado", "presencial", "carga horaria", "carga horária", "professor", "aula"],
   auto: ["seminovo", "revisao", "revisão", "test drive", "quilometragem", "troca", "financiamento", "entrada", "placa", "laudo"],
   consorcio: ["carta de credito", "carta de crédito", "contemplacao", "contemplação", "lance", "grupo", "cota", "assembleia"]
@@ -3008,6 +3010,7 @@ function contextoNicho(lead: any) {
   const isSaas       = chave === "saas";
   const isHigienizacao = chave === "higienizacao";
   const isTelecom    = chave === "telecom";
+  const isCursosOnline = chave === "cursos_online";
   const isEducacao   = chave === "educacao";
   const isAuto       = chave === "auto";
   const isConsorcio  = chave === "consorcio";
@@ -3142,6 +3145,28 @@ function contextoNicho(lead: any) {
     msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse em melhorar a telecom da empresa. Posso retomar com uma proposta atualizada.`,
     msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos contato para futuras oportunidades em telecom empresarial?`,
     system: "Você é uma IA comercial especializada em soluções de telecom e TI empresarial (internet dedicada, firewall, PABX, hotspot, chatbot). Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em porte da empresa, situação atual (troca ou primeira contratação) e ROI/economia."
+  };
+
+  if (isCursosOnline) return {
+    nicho: "Cursos Online",
+    produto: "curso online",
+    produto_pl: "cursos online",
+    verbo_interesse: "se inscrever no curso",
+    qualificadores: ["área de interesse", "objetivo com o curso", "disponibilidade para estudar", "orçamento"],
+    perguntas: [
+      "Qual área você quer aprender ou se especializar?",
+      "Qual seu objetivo: nova profissão, renda extra, hobby ou certificação?",
+      "Quanto tempo por semana você teria para estudar?",
+      "Já fez algum curso online antes?",
+      "Tem orçamento definido para investir na sua formação?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse no curso. Qual é o seu principal objetivo com essa formação? Assim já te mostro as condições certas!`,
+    msg_morno:  (nome: string) => `Oi ${nome}! Para te indicar a melhor turma, me conta: qual área você quer aprender e qual seu objetivo com o curso?`,
+    msg_frio:   (nome: string) => `Oi ${nome}! Você ainda tem interesse em começar o curso? Posso te enviar as condições sem compromisso.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Temos uma condição especial essa semana para o curso. Ainda faz sentido pra você começar agora?`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse no curso. Posso retomar com as opções atualizadas.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras turmas do curso?`,
+    system: "Você é uma IA comercial especializada em cursos online e infoprodutos educacionais. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em transformação pessoal/profissional, objetivo do aluno (nova profissão, renda extra, hobby) e condições de pagamento."
   };
 
   if (isEducacao) return {
@@ -4252,7 +4277,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
 
   const systemMsg =
     `IDIOMA OBRIGATORIO: escreva TODA a resposta em portugues do Brasil (pt-BR) — todo texto de todo campo do JSON, sem excecao. Nunca responda em ingles ou em qualquer outro idioma. Siglas do mercado de midia paga (${siglasPermitidas}) podem ser mantidas como estao, mas todas as frases ao redor delas devem ser em portugues. ` +
-    `Voce e um gestor de trafego pago senior, especialista em ${nomePlataformaAnalise} para geracao de leads no mercado brasileiro, com anos de experiencia otimizando campanhas para corretores (seguros, imoveis, planos de saude, suplementos, SaaS, higienizacao, telecom empresarial). ` +
+    `Voce e um gestor de trafego pago senior, especialista em ${nomePlataformaAnalise} para geracao de leads no mercado brasileiro, com anos de experiencia otimizando campanhas para corretores (seguros, imoveis, planos de saude, suplementos, SaaS, higienizacao, telecom empresarial, cursos online). ` +
     `Analise a campanha como faria uma auditoria profissional real: avalie CPL, CTR, CPC e frequencia contra o que e tipico para ${nomePlataformaAnalise} de geracao de leads no Brasil (sem inventar numeros de terceiros, apenas usando seu conhecimento geral de mercado como referencia qualitativa); avalie o pacing do orcamento (gasto real vs. orcamento projetado para os dias ativos); avalie se a segmentacao (idade, genero, interesses, localidades, publicos customizados${segmentacaoAdvantage}) esta ampla ou estreita demais para o volume de dados que ja existe; avalie o criativo (tipo, copy, CTA) e sinais de possivel fadiga (frequencia alta com CTR caindo); ${clausulaLanceOrcamento}avalie a fricção do formulario de leads (quantidade de perguntas, formulario de qualidade). ` +
     "Considere tambem quantos dias a campanha esta ativa e quantos leads/impressoes ja existem: com poucos dias ou poucos dados, deixe claro que e cedo para conclusoes fortes e recomende continuar coletando dados antes de mudancas bruscas, em vez de sugerir uma acao agressiva baseada em amostra pequena. " +
     `De recomendacoes concretas e priorizadas (o que fazer primeiro, o que testar, o que NAO mexer ainda) pensando sempre em gerar mais leads pelo menor custo possivel, considerando tanto as configuracoes atuais quanto os ajustes que poderiam ser feitos e ainda nao foram (ex: reduzir perguntas do formulario, ${clausulaAjusteCbo}testar novo criativo, ampliar ou restringir publico, ajustar orcamento). Use somente os dados reais recebidos, nunca invente metricas, nomes ou configuracoes que nao foram informadas. ` +
@@ -7566,6 +7591,19 @@ async function salvarEstruturaNichoCampanhaGoogle(
        textoOpcional(dados.porte_empresa) || null,
        textoOpcional(dados.situacao_atual) || null,
        textoOpcional(dados.area_atendida) || null]
+    );
+  } else if (nichoSlug === "cursos_online") {
+    await client.query(
+      `INSERT INTO campanhas_cursos_online
+         (campanha_id, area_curso, objetivo_aluno, publico_alvo)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (campanha_id) DO UPDATE SET
+         area_curso = EXCLUDED.area_curso,
+         objetivo_aluno = EXCLUDED.objetivo_aluno,
+         publico_alvo = EXCLUDED.publico_alvo`,
+      [campanhaId, textoOpcional(dados.area_curso) || null,
+       textoOpcional(dados.objetivo_aluno) || null,
+       textoOpcional(dados.publico_alvo) || null]
     );
   }
 }
@@ -17233,7 +17271,8 @@ await client.query(`
     ('suplementos', 'Suplementos',      '#EA580C'),
     ('saas',        'Plataforma / SaaS','#7C3AED'),
     ('higienizacao','Higienização',     '#16A34A'),
-    ('telecom',     'Telecom Empresarial','#DC2626')
+    ('telecom',     'Telecom Empresarial','#DC2626'),
+    ('cursos_online','Cursos Online',     '#DB2777')
   ON CONFLICT (slug) DO UPDATE SET cor = EXCLUDED.cor, nome = EXCLUDED.nome;
 `);
 
@@ -17298,6 +17337,15 @@ await client.query(`
     porte_empresa   TEXT,
     situacao_atual  TEXT,
     area_atendida   TEXT
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas_cursos_online (
+    campanha_id     INTEGER PRIMARY KEY REFERENCES campanhas(id) ON DELETE CASCADE,
+    area_curso      TEXT,
+    objetivo_aluno  TEXT,
+    publico_alvo    TEXT
   );
 `);
 
@@ -17403,6 +17451,21 @@ async function copiarDadosNichoCampanha(
            (campanha_id, tipo_servico, porte_empresa, situacao_atual, area_atendida)
          VALUES ($1, $2, $3, $4, $5)`,
         [novaCampanhaId, d.tipo_servico, d.porte_empresa, d.situacao_atual, d.area_atendida]
+      );
+    }
+  } else if (nichoSlug === "cursos_online") {
+    const r = await dbClient.query(
+      `SELECT area_curso, objetivo_aluno, publico_alvo
+       FROM campanhas_cursos_online WHERE campanha_id = $1`,
+      [origCampanhaId]
+    );
+    if (r.rows.length > 0) {
+      const d = r.rows[0];
+      await dbClient.query(
+        `INSERT INTO campanhas_cursos_online
+           (campanha_id, area_curso, objetivo_aluno, publico_alvo)
+         VALUES ($1, $2, $3, $4)`,
+        [novaCampanhaId, d.area_curso, d.objetivo_aluno, d.publico_alvo]
       );
     }
   }
@@ -18481,6 +18544,8 @@ app.get("/campanhas", authMiddleware, async (c) => {
           OR
           EXISTS (SELECT 1 FROM campanhas_telecom ctc WHERE ctc.campanha_id = c.id) AND ni.slug = 'telecom'
           OR
+          EXISTS (SELECT 1 FROM campanhas_cursos_online cco WHERE cco.campanha_id = c.id) AND ni.slug = 'cursos_online'
+          OR
           EXISTS (SELECT 1 FROM leads l WHERE l.campanha = c.nome AND l.nicho_id = ni.id AND l.usuario_id = c.usuario_id LIMIT 1)
         )
         LIMIT 1
@@ -19320,6 +19385,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         ctc.porte_empresa,
         ctc.situacao_atual,
         ctc.area_atendida AS area_atendida_telecom,
+        cco.area_curso,
+        cco.objetivo_aluno,
+        cco.publico_alvo AS publico_alvo_cursos_online,
         COALESCE(dono_origem.email,     dono.email)     AS criado_por_email,
         COALESCE(dono_origem.nome,      dono.nome)      AS criado_por_nome,
         COALESCE(dono_origem.sobrenome, dono.sobrenome) AS criado_por_sobrenome,
@@ -19372,6 +19440,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         ON chg.campanha_id = c.id
       LEFT JOIN campanhas_telecom ctc
         ON ctc.campanha_id = c.id
+      LEFT JOIN campanhas_cursos_online cco
+        ON cco.campanha_id = c.id
       WHERE
         c.usuario_id = $1
         AND NOT (
@@ -19835,12 +19905,14 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         produto: campanha.produto ?? campanha.configuracoes_avancadas?.produto,
         objetivo: campanha.objetivo_nicho ?? campanha.configuracoes_avancadas?.objetivo,
         marca: campanha.marca ?? campanha.configuracoes_avancadas?.marca,
-        publico_alvo: campanha.publico_alvo ?? campanha.publico_alvo_higienizacao ?? campanha.configuracoes_avancadas?.publico_alvo,
+        publico_alvo: campanha.publico_alvo ?? campanha.publico_alvo_higienizacao ?? campanha.publico_alvo_cursos_online ?? campanha.configuracoes_avancadas?.publico_alvo,
         tipo_servico: campanha.tipo_servico ?? campanha.tipo_servico_telecom ?? campanha.configuracoes_avancadas?.tipo_servico,
         frequencia: campanha.frequencia ?? campanha.configuracoes_avancadas?.frequencia,
         area_atendida: campanha.area_atendida ?? campanha.area_atendida_telecom ?? campanha.configuracoes_avancadas?.area_atendida,
         porte_empresa: campanha.porte_empresa ?? campanha.configuracoes_avancadas?.porte_empresa,
-        situacao_atual: campanha.situacao_atual ?? campanha.configuracoes_avancadas?.situacao_atual
+        situacao_atual: campanha.situacao_atual ?? campanha.configuracoes_avancadas?.situacao_atual,
+        area_curso: campanha.area_curso ?? campanha.configuracoes_avancadas?.area_curso,
+        objetivo_aluno: campanha.objetivo_aluno ?? campanha.configuracoes_avancadas?.objetivo_aluno
       };
 
       metricas.push({
@@ -25862,6 +25934,32 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       interesses: "telecomunicacoes empresariais, seguranca da informacao, PABX em nuvem, TI para empresas, transformacao digital, infraestrutura de TI",
       idadeMin: "28", idadeMax: "60",
       obrigadoTextoSufixo: "nossa equipe vai entrar em contato para entender sua necessidade e apresentar a melhor solucao"
+    },
+    cursos_online: {
+      topicoDefault: "curso online",
+      especialidade: "cursos online e infoprodutos educacionais no Brasil, com foco em publico feminino buscando nova profissao, renda extra ou qualificacao",
+      v1exemplos: [
+        "Vagas com condicao especial fecham em breve",
+        "Ultimas vagas com preco promocional",
+        "Garanta sua vaga antes do preco subir"
+      ],
+      v1texto: "crie urgencia em torno do preco promocional por tempo limitado ou vagas restantes na turma",
+      v2exemplos: [
+        "Sua nova profissao pode comecar hoje",
+        "Autonomia financeira comecando do zero",
+        "Transforme seu tempo livre em uma nova fonte de renda"
+      ],
+      v2texto: "evoque transformacao pessoal e profissional, autonomia e a sensacao de conquista ao aprender algo novo",
+      v3exemplos: [
+        "Certificado incluso e acesso vitalicio ao curso",
+        "Aulas gravadas, estude no seu tempo, onde estiver",
+        "Metodo pratico com suporte direto para tirar duvidas"
+      ],
+      v3texto: "destaque beneficios concretos: certificado, acesso vitalicio, flexibilidade de horario, suporte e parcelamento",
+      perguntas: "Qual area voce quer aprender ou se especializar?\nQual seu objetivo: nova profissao, renda extra, hobby ou certificacao?\nQuanto tempo por semana voce teria para estudar?",
+      interesses: "cursos online, empreendedorismo feminino, renda extra, qualificacao profissional, desenvolvimento pessoal, trabalhar de casa",
+      idadeMin: "22", idadeMax: "55",
+      obrigadoTextoSufixo: "nossa equipe vai entrar em contato para te passar todos os detalhes da turma e formas de pagamento"
     }
   };
 
@@ -26051,7 +26149,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Para saude: nicho_operadora, nicho_tipo_plano (individual|familiar|empresarial), nicho_cobertura (basica|intermediaria|premium), nicho_acomodacao (enfermaria|apartamento).\n` +
       `Para suplementos: nicho_produto (whey|creatina|pre_workout|bcaa|multivitaminico|colageno|outro), nicho_objetivo (ganho_massa|emagrecimento|performance|saude), nicho_marca, nicho_publico_alvo (iniciantes|intermediario|avancado).\n` +
       `Para higienizacao: nicho_tipo_servico (estofados|colchoes|carpetes_tapetes|pos_obra|ar_condicionado|caixa_dagua|geral), nicho_frequencia (avulso|recorrente), nicho_publico_alvo (residencial|comercial|industrial).\n` +
-      `Para telecom: nicho_tipo_servico (link_dedicado|firewall|hotspot|pabx|smartchat|consultoria), nicho_porte_empresa (pequena|media|grande), nicho_situacao_atual (primeira_contratacao|trocando_fornecedor|ampliando_estrutura).\n\n` +
+      `Para telecom: nicho_tipo_servico (link_dedicado|firewall|hotspot|pabx|smartchat|consultoria), nicho_porte_empresa (pequena|media|grande), nicho_situacao_atual (primeira_contratacao|trocando_fornecedor|ampliando_estrutura).\n` +
+      `Para cursos_online: nicho_area_curso (beleza_estetica|tecnologia|gestao_negocios|saude_bemestar|idiomas|culinaria|outro), nicho_objetivo_aluno (nova_profissao|renda_extra|hobby_interesse|certificacao), nicho_publico_alvo (texto livre descrevendo o publico-alvo).\n\n` +
       (incluirGoogle
         ? `Campos extras OBRIGATORIOS por causa do Google Ads (anuncio Display, respeite os limites de caracteres a risca):\n` +
           `google_titulo_1, google_titulo_2, google_titulo_3 (3 titulos curtos e DIFERENTES entre si, cada um com no maximo 30 caracteres),\n` +
@@ -26229,6 +26328,8 @@ const DIRECAO_VISUAL_NICHO: Record<string, string> = {
     "Cleaning / sanitization service advertising creative. Emphasize visible cleanliness and freshness: crisp whites, bright light-filled spaces, satisfying before/after contrast when relevant, professional equipment or spotless results. Convey hygiene and reliability.",
   telecom:
     "B2B telecom / IT infrastructure advertising creative. Corporate, confident, professional: deep blues or dark tones with sharp accent highlights, abstract network/connectivity motifs (subtle signal or circuit graphics), clean modern office or data-center imagery. Convey reliability and technical competence — never childish or overly playful.",
+  cursos_online:
+    "Online course / infoproduct advertising creative, aimed primarily at women pursuing a new career, extra income, or personal growth. Warm, welcoming, aspirational palette (soft pinks/magentas or warm neutrals), genuine and diverse depictions of women studying or working confidently on a laptop or phone, subtle visual cues of achievement (certificate, graduation, celebrating a milestone). Convey approachability and transformation — avoid cold corporate stock-photo clichés or overly childish/school-like imagery.",
   educacao:
     "Education / online course advertising creative. Bright, optimistic, aspirational imagery of growth, achievement, or focused learning. Clean modern layout with clear visual hierarchy.",
   auto:
@@ -27758,10 +27859,10 @@ app.put("/usuario/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 6
+      nicho_ids.length > 7
     ) {
       return c.json(
-        { error: "Informe entre 1 e 6 nichos" },
+        { error: "Informe entre 1 e 7 nichos" },
         400
       );
     }
@@ -27831,10 +27932,10 @@ app.put("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 6
+      nicho_ids.length > 7
     ) {
       return c.json(
-        { error: "Informe entre 1 e 6 nichos" },
+        { error: "Informe entre 1 e 7 nichos" },
         400
       );
     }
@@ -27897,7 +27998,10 @@ app.post("/campanhas/manual", authMiddleware, async (c) => {
       area_atendida,
       // campos de telecom
       porte_empresa,
-      situacao_atual
+      situacao_atual,
+      // campos de cursos online
+      area_curso,
+      objetivo_aluno
     } = body;
 
     if (!nome) {
@@ -27978,6 +28082,13 @@ app.post("/campanhas/manual", authMiddleware, async (c) => {
          VALUES ($1, $2, $3, $4, $5)`,
         [campanhaId, tipo_servico ?? null, porte_empresa ?? null,
          situacao_atual ?? null, area_atendida ?? null]
+      );
+    } else if (slug === "cursos_online") {
+      await client.query(
+        `INSERT INTO campanhas_cursos_online
+           (campanha_id, area_curso, objetivo_aluno, publico_alvo)
+         VALUES ($1, $2, $3, $4)`,
+        [campanhaId, area_curso ?? null, objetivo_aluno ?? null, publico_alvo ?? null]
       );
     }
 
@@ -28103,6 +28214,12 @@ app.get("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
     } else if (camp.slug === "telecom") {
       const r = await client.query(
         `SELECT * FROM campanhas_telecom WHERE campanha_id = $1`,
+        [campanhaId]
+      );
+      dados = r.rows[0] ?? null;
+    } else if (camp.slug === "cursos_online") {
+      const r = await client.query(
+        `SELECT * FROM campanhas_cursos_online WHERE campanha_id = $1`,
         [campanhaId]
       );
       dados = r.rows[0] ?? null;
@@ -28355,6 +28472,18 @@ app.put("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
         [campanhaId,
          body.tipo_servico ?? null, body.porte_empresa ?? null,
          body.situacao_atual ?? null, body.area_atendida ?? null]
+      );
+    } else if (slug === "cursos_online") {
+      await client.query(
+        `INSERT INTO campanhas_cursos_online
+           (campanha_id, area_curso, objetivo_aluno, publico_alvo)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (campanha_id) DO UPDATE SET
+           area_curso     = EXCLUDED.area_curso,
+           objetivo_aluno = EXCLUDED.objetivo_aluno,
+           publico_alvo   = EXCLUDED.publico_alvo`,
+        [campanhaId,
+         body.area_curso ?? null, body.objetivo_aluno ?? null, body.publico_alvo ?? null]
       );
     } else {
       return c.json({ error: "Campanha sem nicho definido" }, 400);
