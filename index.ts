@@ -6601,11 +6601,10 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
 });
 
 /* =========================
-   🔴 GOOGLE ADS — PUBLICACAO (Display + Lead Form existente)
-   Segue o mesmo padrao de /tiktok/*: o Lead Form nao e criado pela API,
-   o usuario escolhe um ja existente no Google Ads Manager (GET /google/formularios).
-   Payloads conferidos contra a documentacao oficial da Google Ads API v24 em
-   16/07/2026 — ver plano de implementacao para as fontes.
+   🔴 GOOGLE ADS — PUBLICACAO
+   Pesquisa e Display com destino em Lead Form ou site; Pesquisa tambem pode
+   receber Business Message Asset nativo do WhatsApp. O numero vem da conexao
+   do WhatsApp Bot do proprio usuario, sem ser aceito livremente no payload.
 ========================= */
 
 async function resolverConexaoGoogleAds(
@@ -6632,6 +6631,57 @@ async function resolverConexaoGoogleAds(
     setTimeout(() => googleLoginCustomerIdPorToken.delete(accessToken), 60 * 60 * 1000);
   }
   return { accessToken, customerId: String(customerId), loginCustomerId: loginCustomerId ? String(loginCustomerId) : null };
+}
+
+type NumeroWhatsappGoogle = {
+  countryCode: "BR";
+  phoneNumber: string;
+  comparavel: string;
+};
+
+// O numero usado pelo Google deve ser exatamente o mesmo conectado ao bot da
+// plataforma. Isso evita que um usuario injete no payload um WhatsApp de terceiros
+// e garante que as conversas novas cheguem ao fluxo de atendimento ja configurado.
+async function resolverNumeroWhatsappGoogle(
+  usuarioId: number
+): Promise<{ erro: string } | NumeroWhatsappGoogle> {
+  const conexao = await client.query(
+    `SELECT dados_conta
+     FROM plataforma_conexoes
+     WHERE usuario_id = $1
+       AND plataforma = 'whatsapp'
+       AND status = 'conectado'
+     LIMIT 1`,
+    [usuarioId]
+  );
+
+  const dadosBrutos = conexao.rows[0]?.dados_conta;
+  let dadosConta: any = dadosBrutos || {};
+  if (typeof dadosBrutos === "string") {
+    try { dadosConta = JSON.parse(dadosBrutos); } catch { dadosConta = {}; }
+  }
+
+  if (!dadosConta?.waba_id || !dadosConta?.phone_number_id) {
+    return { erro: "Conecte e conclua a configuração do WhatsApp na aba WhatsApp Bot antes de publicar esta campanha." };
+  }
+
+  const digitosOriginais = String(dadosConta?.numero || "").replace(/\D/g, "");
+  const numeroNacional =
+    digitosOriginais.startsWith("55") && (digitosOriginais.length === 12 || digitosOriginais.length === 13)
+      ? digitosOriginais.slice(2)
+      : digitosOriginais;
+
+  if (!/^\d{10,11}$/.test(numeroNacional)) {
+    return {
+      erro: "O WhatsApp Bot está conectado, mas o número salvo não está em um formato brasileiro válido. Reconecte o WhatsApp antes de publicar."
+    };
+  }
+
+  return {
+    countryCode: "BR",
+    phoneNumber: numeroNacional,
+    comparavel: `55${numeroNacional}`,
+  };
 }
 
 // Cria (ou reaproveita) a Conversion Action do Google Ads usada como alvo do
@@ -6826,6 +6876,132 @@ function googleAdsTemErroCode(err: any, codigo: string): boolean {
     }
   }
   return false;
+}
+
+function googleAdsCodigosErro(err: any): string[] {
+  const detalhes = err?.googleAdsError?.error?.details;
+  if (!Array.isArray(detalhes)) return [];
+  const codigos = new Set<string>();
+  for (const detalhe of detalhes) {
+    for (const erroItem of detalhe?.errors ?? []) {
+      for (const valor of Object.values(erroItem?.errorCode ?? {})) {
+        if (typeof valor === "string" && valor) codigos.add(valor);
+      }
+    }
+  }
+  return [...codigos];
+}
+
+function googleAdsPrimeiraMensagemDetalhada(err: any): string {
+  const detalhes = err?.googleAdsError?.error?.details;
+  if (!Array.isArray(detalhes)) return "";
+  for (const detalhe of detalhes) {
+    for (const erroItem of detalhe?.errors ?? []) {
+      const mensagem = textoOpcional(erroItem?.message);
+      if (mensagem) return mensagem;
+    }
+  }
+  return "";
+}
+
+function mensagemErroBusinessMessageGoogle(err: any): string {
+  if (googleAdsTemErroCode(err, "CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE")) {
+    return "Esta conta do Google Ads ainda não foi liberada pelo Google para usar o botão nativo de WhatsApp. O recurso está em acesso restrito (allowlist); solicite a liberação ao gerente da conta Google Ads e tente novamente.";
+  }
+  if (googleAdsTemErroCode(err, "CUSTOMER_NOT_VERIFIED")) {
+    return "O Google Ads exige que a verificação do anunciante esteja concluída antes de usar o botão de WhatsApp. Conclua a verificação da conta e tente novamente.";
+  }
+
+  const codigos = googleAdsCodigosErro(err);
+  if (codigos.some(codigo => /PHONE|WHATSAPP|MESSAGE_PROVIDER/i.test(codigo))) {
+    return "O Google Ads não aceitou o número do WhatsApp conectado. Confirme se esse número está ativo no WhatsApp Business e se os dados da conta estão verificados.";
+  }
+
+  const detalhe = googleAdsPrimeiraMensagemDetalhada(err);
+  return detalhe
+    ? `O Google Ads não conseguiu configurar o botão de WhatsApp: ${detalhe}`
+    : "O Google Ads não conseguiu configurar o botão de WhatsApp nesta conta. Revise a elegibilidade da conta e tente novamente.";
+}
+
+function numeroWhatsappGoogleComparavel(countryCode: string, phoneNumber: string): string {
+  const digitos = String(phoneNumber || "").replace(/\D/g, "");
+  if (String(countryCode || "").toUpperCase() === "BR" && !digitos.startsWith("55")) {
+    return `55${digitos}`;
+  }
+  return digitos;
+}
+
+async function obterOuCriarBusinessMessageWhatsappGoogle(
+  customerId: string,
+  accessToken: string,
+  loginCustomerId: string | null,
+  numero: NumeroWhatsappGoogle,
+  mensagemInicial: string
+): Promise<string> {
+  const mensagem = truncarSemCortarPalavra(mensagemInicial, 200);
+
+  // Assets sao imutaveis no Google Ads. Reutiliza o mesmo recurso quando numero e
+  // mensagem coincidem, evitando acumular uma copia a cada tentativa de publicacao.
+  try {
+    const existentes = await googleAdsQuery(
+      customerId,
+      accessToken,
+      `SELECT asset.resource_name,
+              asset.business_message_asset.message_provider,
+              asset.business_message_asset.starter_message,
+              asset.business_message_asset.whatsapp_info.country_code,
+              asset.business_message_asset.whatsapp_info.phone_number
+       FROM asset
+       WHERE asset.type = 'BUSINESS_MESSAGE'`,
+      loginCustomerId
+    );
+
+    for (const row of existentes as any[]) {
+      const asset = row?.asset ?? {};
+      const info = asset?.businessMessageAsset ?? asset?.business_message_asset ?? {};
+      const whatsapp = info?.whatsappInfo ?? info?.whatsapp_info ?? {};
+      const mesmoNumero = numeroWhatsappGoogleComparavel(
+        whatsapp?.countryCode ?? whatsapp?.country_code,
+        whatsapp?.phoneNumber ?? whatsapp?.phone_number
+      ) === numero.comparavel;
+      const mesmaMensagem = String(info?.starterMessage ?? info?.starter_message ?? "").trim() === mensagem;
+      if (asset?.resourceName && mesmoNumero && mesmaMensagem) return asset.resourceName;
+      if (asset?.resource_name && mesmoNumero && mesmaMensagem) return asset.resource_name;
+    }
+  } catch (err: any) {
+    // Consultar assets antigos e apenas uma otimizacao. A criacao abaixo ainda
+    // devolve o erro completo e elegivel para traducao caso a conta nao tenha acesso.
+    console.warn("AVISO GOOGLE BUSINESS MESSAGE: não foi possível consultar assets existentes:", err?.message);
+  }
+
+  const resultados = await googleAdsMutate(
+    customerId,
+    accessToken,
+    "assets",
+    [{
+      create: {
+        name: `WhatsApp Plataforma de Leads - ${Date.now()}`,
+        type: "BUSINESS_MESSAGE",
+        businessMessageAsset: {
+          messageProvider: "WHATSAPP",
+          starterMessage: mensagem,
+          callToAction: {
+            callToActionSelection: "CONTACT_US",
+            callToActionDescription: "Converse com nossa equipe",
+          },
+          whatsappInfo: {
+            countryCode: numero.countryCode,
+            phoneNumber: numero.phoneNumber,
+          },
+        },
+      },
+    }],
+    loginCustomerId
+  );
+
+  const resourceName = resultados[0]?.resourceName;
+  if (!resourceName) throw new Error("O Google Ads não retornou o identificador do botão de WhatsApp criado.");
+  return resourceName;
 }
 
 // Varre error.details[].errors[] procurando violacoes de politica marcadas como
@@ -7275,7 +7451,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       usuario_id, campaign_id, adgroup_id, form_id,
       titulos, descricoes, nome_anunciante, url_destino,
       daily_budget, configuracoes_avancadas,
-      tipo_campanha, titulo_longo,
+      tipo_campanha, titulo_longo, destino, mensagem_whatsapp,
       imagem_paisagem_asset, imagem_quadrada_asset
     } = await c.req.json();
 
@@ -7283,13 +7459,22 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     if (!usuarioId) return negarAcessoConta(c);
 
     const tipoCampanha = String(tipo_campanha || "").toLowerCase() === "display" ? "display" : "search";
+    const destinoInformado = String(destino || "").toLowerCase();
+    const destinoGoogle = ["lead_ads", "site", "whatsapp"].includes(destinoInformado)
+      ? destinoInformado
+      : (form_id ? "lead_ads" : "site");
+    const mensagemWhatsapp = textoOpcional(mensagem_whatsapp);
 
     if (!campaign_id) return c.json({ error: "campaign_id não enviado" }, 400);
     if (!adgroup_id) return c.json({ error: "adgroup_id não enviado" }, 400);
-    // Lead Form so e obrigatorio em Pesquisa — em Display e opcional/best-effort
-    // (ver bloco de vinculo do formulario mais abaixo).
-    if (tipoCampanha === "search" && !form_id) {
+    if (destinoGoogle === "lead_ads" && !form_id) {
       return c.json({ error: "Selecione um Lead Form antes de publicar" }, 400);
+    }
+    if (destinoGoogle === "whatsapp" && tipoCampanha !== "search") {
+      return c.json({ error: "O destino WhatsApp está disponível somente em campanhas de Pesquisa do Google Ads" }, 400);
+    }
+    if (destinoGoogle === "whatsapp" && !mensagemWhatsapp) {
+      return c.json({ error: "Informe a mensagem inicial do WhatsApp" }, 400);
     }
 
     const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
@@ -7324,6 +7509,26 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
     const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
+    let businessMessageAssetResourceName: string | null = null;
+
+    if (destinoGoogle === "whatsapp") {
+      const numeroWhatsapp = await resolverNumeroWhatsappGoogle(usuarioId);
+      if ("erro" in numeroWhatsapp) {
+        return c.json({ error: numeroWhatsapp.erro }, 400);
+      }
+      try {
+        businessMessageAssetResourceName = await obterOuCriarBusinessMessageWhatsappGoogle(
+          conexao.customerId,
+          conexao.accessToken,
+          conexao.loginCustomerId,
+          numeroWhatsapp,
+          mensagemWhatsapp
+        );
+      } catch (errBusinessMessage: any) {
+        console.error("ERRO /google/anuncio (Business Message WhatsApp):", errBusinessMessage);
+        return c.json({ error: mensagemErroBusinessMessageGoogle(errBusinessMessage) }, 400);
+      }
+    }
 
     const adCreate: any = tipoCampanha === "search"
       ? {
@@ -7405,39 +7610,29 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       }
     }
 
-    let formIdFinal = textoOpcional(form_id);
-    let avisoFormulario: string | undefined;
+    const formIdFinal = destinoGoogle === "lead_ads" ? textoOpcional(form_id) : "";
 
-    if (tipoCampanha === "search") {
-      // ASSUMPTION: vincular o Lead Form como CampaignAsset com fieldType LEAD_FORM
-      // (nao usa AssetSet/CampaignAssetSet) — conferido contra o sample oficial
-      // "Add lead form asset" da Google Ads API.
+    if (destinoGoogle === "lead_ads") {
       await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
         { create: { campaign: campaignResourceName, asset: formIdFinal, fieldType: "LEAD_FORM" } },
-      ]);
-    } else if (formIdFinal) {
-      // Mesmo mecanismo de vinculo do Search, mas best-effort: contas sem gasto
-      // historico (>US$1.000) e/ou verificacao de identidade de anunciante concluida
-      // nao podem usar Lead Form em Display (gate documentado acima em
-      // /google/campanha). Em vez de derrubar a criacao inteira do anuncio, so
-      // desiste do formulario e deixa o anuncio no ar levando pra URL de destino.
+      ], conexao.loginCustomerId);
+    }
+
+    if (destinoGoogle === "whatsapp" && businessMessageAssetResourceName) {
       try {
         await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
-          { create: { campaign: campaignResourceName, asset: formIdFinal, fieldType: "LEAD_FORM" } },
-        ]);
-      } catch (err: any) {
-        if (
-          googleAdsTemErroCode(err, "CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE") ||
-          googleAdsTemErroCode(err, "CUSTOMER_NOT_VERIFIED") ||
-          googleAdsTemErroCode(err, "INCOMPATIBLE_ADVERTISING_CHANNEL_TYPE")
-        ) {
-          console.warn("AVISO /google/anuncio: Lead Form não anexado à campanha Display (conta não elegível):", err.message);
-          avisoFormulario =
-            "O anúncio de Display foi criado e está no ar levando ao seu site (URL de destino), mas não foi possível anexar o formulário de leads: a conta do Google Ads ainda não tem o histórico de gasto (mínimo de US$ 1.000) e/ou a verificação de identidade de anunciante exigidos pela Google para usar formulários de leads em campanhas de Display. Isso é uma exigência da própria Google, não um erro da plataforma — a campanha funciona normalmente do mesmo jeito.";
-          formIdFinal = "";
-        } else {
-          throw err;
-        }
+          {
+            create: {
+              campaign: campaignResourceName,
+              asset: businessMessageAssetResourceName,
+              fieldType: "BUSINESS_MESSAGE",
+              status: "ENABLED",
+            },
+          },
+        ], conexao.loginCustomerId);
+      } catch (errBusinessMessage: any) {
+        console.error("ERRO /google/anuncio (vínculo Business Message WhatsApp):", errBusinessMessage);
+        return c.json({ error: mensagemErroBusinessMessageGoogle(errBusinessMessage) }, 400);
       }
     }
 
@@ -7448,6 +7643,11 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       descricoes: listaDescricoes,
       nome_anunciante: nomeAnunciante,
       url_destino: url,
+      destino: destinoGoogle,
+      ...(destinoGoogle === "whatsapp" ? {
+        mensagem_whatsapp: mensagemWhatsapp,
+        business_message_asset: businessMessageAssetResourceName,
+      } : {}),
       ...(tipoCampanha === "display" ? { titulo_longo: tituloLongo } : {}),
     };
 
@@ -7474,7 +7674,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     return c.json({
       id: String(adId),
       ad_id: String(adId),
-      ...(avisoFormulario ? { aviso: avisoFormulario } : {})
+      ...(businessMessageAssetResourceName ? { business_message_asset: businessMessageAssetResourceName } : {})
     });
   } catch (err: any) {
     console.error("ERRO /google/anuncio:", err);
