@@ -7459,6 +7459,90 @@ app.post("/google/upload-imagem", authMiddleware, async (c) => {
   }
 });
 
+async function salvarEstruturaNichoCampanhaGoogle(
+  campanhaId: number,
+  nichoSlug: string,
+  dados: Record<string, any>
+) {
+  if (nichoSlug === "imoveis") {
+    await client.query(
+      `INSERT INTO campanhas_imoveis
+         (campanha_id, tipo_imovel, finalidade, valor_min, valor_max, regiao)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (campanha_id) DO UPDATE SET
+         tipo_imovel = EXCLUDED.tipo_imovel,
+         finalidade = EXCLUDED.finalidade,
+         valor_min = EXCLUDED.valor_min,
+         valor_max = EXCLUDED.valor_max,
+         regiao = EXCLUDED.regiao`,
+      [campanhaId, dados.tipo_imovel ?? null, dados.finalidade ?? null,
+       numeroOpcional(dados.valor_min), numeroOpcional(dados.valor_max),
+       textoOpcional(dados.regiao) || null]
+    );
+  } else if (nichoSlug === "saude") {
+    await client.query(
+      `INSERT INTO campanhas_saude
+         (campanha_id, operadora, tipo_plano, faixa_etaria_min,
+          faixa_etaria_max, cobertura, acomodacao)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (campanha_id) DO UPDATE SET
+         operadora = EXCLUDED.operadora,
+         tipo_plano = EXCLUDED.tipo_plano,
+         faixa_etaria_min = EXCLUDED.faixa_etaria_min,
+         faixa_etaria_max = EXCLUDED.faixa_etaria_max,
+         cobertura = EXCLUDED.cobertura,
+         acomodacao = EXCLUDED.acomodacao`,
+      [campanhaId, textoOpcional(dados.operadora) || null,
+       textoOpcional(dados.tipo_plano) || null,
+       numeroOpcional(dados.faixa_etaria_min), numeroOpcional(dados.faixa_etaria_max),
+       textoOpcional(dados.cobertura) || null, textoOpcional(dados.acomodacao) || null]
+    );
+  } else if (nichoSlug === "suplementos") {
+    await client.query(
+      `INSERT INTO campanhas_suplementos
+         (campanha_id, produto, objetivo, marca, publico_alvo)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (campanha_id) DO UPDATE SET
+         produto = EXCLUDED.produto,
+         objetivo = EXCLUDED.objetivo,
+         marca = EXCLUDED.marca,
+         publico_alvo = EXCLUDED.publico_alvo`,
+      [campanhaId, textoOpcional(dados.produto) || null,
+       textoOpcional(dados.objetivo) || null, textoOpcional(dados.marca) || null,
+       textoOpcional(dados.publico_alvo) || null]
+    );
+  } else if (nichoSlug === "higienizacao") {
+    await client.query(
+      `INSERT INTO campanhas_higienizacao
+         (campanha_id, tipo_servico, frequencia, area_atendida, publico_alvo)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (campanha_id) DO UPDATE SET
+         tipo_servico = EXCLUDED.tipo_servico,
+         frequencia = EXCLUDED.frequencia,
+         area_atendida = EXCLUDED.area_atendida,
+         publico_alvo = EXCLUDED.publico_alvo`,
+      [campanhaId, textoOpcional(dados.tipo_servico) || null,
+       textoOpcional(dados.frequencia) || null, textoOpcional(dados.area_atendida) || null,
+       textoOpcional(dados.publico_alvo) || null]
+    );
+  } else if (nichoSlug === "telecom") {
+    await client.query(
+      `INSERT INTO campanhas_telecom
+         (campanha_id, tipo_servico, porte_empresa, situacao_atual, area_atendida)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (campanha_id) DO UPDATE SET
+         tipo_servico = EXCLUDED.tipo_servico,
+         porte_empresa = EXCLUDED.porte_empresa,
+         situacao_atual = EXCLUDED.situacao_atual,
+         area_atendida = EXCLUDED.area_atendida`,
+      [campanhaId, textoOpcional(dados.tipo_servico) || null,
+       textoOpcional(dados.porte_empresa) || null,
+       textoOpcional(dados.situacao_atual) || null,
+       textoOpcional(dados.area_atendida) || null]
+    );
+  }
+}
+
 // Cria o Responsive Search Ad (texto, sem imagem) + palavras-chave e vincula o Lead
 // Form escolhido a campanha (equivalente ao /meta/anuncio e /tiktok/anuncio) — aqui a
 // linha de campanhas recebe adset_id/ad_id/form_id, mesmo padrao das outras plataformas.
@@ -7475,6 +7559,23 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
+
+    const nichoIdInformado = Number(configuracoes_avancadas?.nicho_id);
+    let nichoCampanhaGoogle: { id: number; slug: string } | null = null;
+    if (Number.isInteger(nichoIdInformado) && nichoIdInformado > 0) {
+      const nichoPermitido = await client.query(
+        `SELECT n.id, n.slug
+         FROM usuario_nichos un
+         INNER JOIN nichos n ON n.id = un.nicho_id
+         WHERE un.usuario_id = $1 AND n.id = $2
+         LIMIT 1`,
+        [usuarioId, nichoIdInformado]
+      );
+      if (!nichoPermitido.rows.length) {
+        return c.json({ error: "O nicho selecionado não está habilitado para este usuário" }, 403);
+      }
+      nichoCampanhaGoogle = nichoPermitido.rows[0];
+    }
 
     const tipoCampanha = String(tipo_campanha || "").toLowerCase() === "display" ? "display" : "search";
     const destinoInformado = String(destino || "").toLowerCase();
@@ -7656,6 +7757,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
+      plataformas: ["google"],
       tipo_campanha: tipoCampanha,
       titulos: listaTitulos,
       descricoes: listaDescricoes,
@@ -7669,25 +7771,36 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       ...(tipoCampanha === "display" ? { titulo_longo: tituloLongo } : {}),
     };
 
-    await client.query(
+    const campanhaAtualizada = await client.query(
       `UPDATE campanhas
        SET adset_id = $1,
            ad_id = $2,
            form_id = $3,
            daily_budget = $4,
-           configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $5::jsonb,
+           nicho_id = COALESCE($5, nicho_id),
+           configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $6::jsonb,
            atualizado_em = NOW()
-       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'google'`,
+       WHERE campaign_id = $7 AND usuario_id = $8 AND plataforma = 'google'
+       RETURNING id`,
       [
         String(adgroup_id),
         String(adId),
         formIdFinal || null,
         numeroOpcional(daily_budget),
+        nichoCampanhaGoogle?.id ?? null,
         JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
         usuarioId
       ]
     );
+
+    if (campanhaAtualizada.rows[0]?.id && nichoCampanhaGoogle) {
+      await salvarEstruturaNichoCampanhaGoogle(
+        Number(campanhaAtualizada.rows[0].id),
+        nichoCampanhaGoogle.slug,
+        configuracoesPersistidas
+      );
+    }
 
     return c.json({
       id: String(adId),
@@ -18471,6 +18584,12 @@ app.get("/campanhas", authMiddleware, async (c) => {
       ) nd ON true
       WHERE
         c.usuario_id = $1
+        AND NOT (
+          c.plataforma = 'google'
+          AND c.origem = 'plataforma'
+          AND UPPER(COALESCE(c.status, '')) IN ('REMOVED', 'DELETED')
+          AND c.ad_id IS NULL
+        )
         AND (
           c.origem = 'manual'
           OR (COALESCE(c.plataforma, 'meta') = 'meta' AND c.conta_anuncios_id = $2)
@@ -19345,6 +19464,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         ON ctc.campanha_id = c.id
       WHERE
         c.usuario_id = $1
+        AND NOT (
+          c.plataforma = 'google'
+          AND c.origem = 'plataforma'
+          AND UPPER(COALESCE(c.status, '')) IN ('REMOVED', 'DELETED')
+          AND c.ad_id IS NULL
+        )
         AND (
           c.origem = 'manual'
           OR (COALESCE(c.plataforma, 'meta') = 'meta' AND ($2::text IS NULL OR c.conta_anuncios_id = $2))
