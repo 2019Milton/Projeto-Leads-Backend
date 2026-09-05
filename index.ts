@@ -7878,6 +7878,287 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
   }
 });
 
+// Edita uma campanha Google Ads ja publicada — nome e orcamento sao atualizados
+// de verdade (update+updateMask, mesmo mecanismo ja usado em /google/toggle-campanha
+// pra status), mas a Google nao permite editar o texto de um Responsive
+// Search/Display Ad ja criado: quando o texto muda, cria um adGroupAd novo com
+// o texto atualizado, ativa, e so entao pausa o antigo (nessa ordem, pra nunca
+// ter uma janela sem nenhum anuncio ativo). Espelha /meta/editar-campanha:
+// rascunho local so grava no banco; publicada bloqueia troca de tipo/destino;
+// falha no texto do anuncio nao derruba nome/orcamento (aviso, nao erro).
+app.post("/google/editar-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id, campanha_local_id, campaign_id,
+      nome, daily_budget,
+      titulos, descricoes, titulo_longo, nome_anunciante, url_destino,
+      imagem_paisagem_asset, imagem_quadrada_asset,
+      configuracoes_avancadas
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const campanhaLocalRes = campanha_local_id
+      ? await client.query(
+          `SELECT id, campaign_id, adset_id, ad_id, origem, plataforma
+           FROM campanhas WHERE id = $1 AND usuario_id = $2 LIMIT 1`,
+          [campanha_local_id, usuarioId]
+        )
+      : { rows: [] as any[] };
+    const campanhaLocal = campanhaLocalRes.rows[0] || null;
+
+    if (campanhaLocal && String(campanhaLocal.plataforma || "").toLowerCase() !== "google") {
+      return c.json({
+        error: "Esta edição pertence a outra plataforma e não pode ser processada pelo Google Ads"
+      }, 409);
+    }
+
+    const ehRascunhoLocal = Boolean(
+      campanhaLocal && (
+        !campanhaLocal.campaign_id ||
+        (!campanhaLocal.adset_id && !campanhaLocal.ad_id) ||
+        String(campanhaLocal.origem || "").toLowerCase() === "manual"
+      )
+    );
+
+    // Campanha ainda nao publicada no Google Ads (duplicada ou rascunho): so
+    // salva localmente, sem nenhuma chamada externa — mesma logica do Meta.
+    if (ehRascunhoLocal) {
+      const avancadas = configuracoes_avancadas || {};
+      if (Array.isArray(titulos)) avancadas.titulos = titulos.map(textoOpcional).filter(Boolean);
+      if (Array.isArray(descricoes)) avancadas.descricoes = descricoes.map(textoOpcional).filter(Boolean);
+      if (titulo_longo !== undefined) avancadas.titulo_longo = textoOpcional(titulo_longo);
+      if (nome_anunciante !== undefined) avancadas.nome_anunciante = textoOpcional(nome_anunciante);
+      if (url_destino !== undefined) avancadas.url_destino = textoOpcional(url_destino);
+
+      await client.query(
+        `UPDATE campanhas
+         SET configuracoes_avancadas = $1,
+             daily_budget = COALESCE($2, daily_budget),
+             nome = COALESCE($3, nome),
+             campaign_id = NULL,
+             adset_id = NULL,
+             ad_id = NULL,
+             form_id = NULL,
+             atualizado_em = NOW()
+         WHERE id = $4 AND usuario_id = $5`,
+        [JSON.stringify(avancadas), numeroOpcional(daily_budget), textoOpcional(nome), campanha_local_id, usuarioId]
+      );
+      return c.json({ sucesso: true });
+    }
+
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ error: "Developer token do Google Ads não configurado" }, 500);
+    }
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({ error: conexao.erro }, 400);
+    }
+
+    const campanhaBanco = await client.query(
+      `SELECT id, adset_id, ad_id, configuracoes_avancadas
+       FROM campanhas
+       WHERE campaign_id = $1
+         AND (usuario_id = $2 OR encaminhada_para_usuario_id = $2)
+         AND conta_anuncios_id = $3
+         AND plataforma = 'google'
+       LIMIT 1`,
+      [campaign_id, usuarioId, conexao.customerId]
+    );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+    }
+
+    const linha = campanhaBanco.rows[0];
+    const cfgBanco = linha.configuracoes_avancadas || {};
+
+    // Trocar Pesquisa<->Display ou o destino depois de publicada exigiria refazer
+    // a estrutura do grupo de anuncios (keywords, formato do anuncio) — fora do
+    // escopo desta edicao, mesma trava que o Meta ja aplica pro destino.
+    const tipoCampanhaBanco = String(cfgBanco.tipo_campanha || "search").toLowerCase();
+    const tipoCampanhaSolicitado = String(configuracoes_avancadas?.tipo_campanha || tipoCampanhaBanco).toLowerCase();
+    if (tipoCampanhaSolicitado !== tipoCampanhaBanco) {
+      return c.json({
+        error: "O tipo de campanha (Pesquisa/Display) não pode ser alterado depois de publicada. Duplique a campanha para trocar o tipo."
+      }, 409);
+    }
+    const destinoBanco = String(cfgBanco.destino || "lead_ads").toLowerCase();
+    const destinoSolicitado = String(configuracoes_avancadas?.destino || destinoBanco).toLowerCase();
+    if (destinoSolicitado !== destinoBanco) {
+      return c.json({
+        error: "O destino de uma campanha já publicada não pode ser alterado. Duplique a campanha e escolha o novo destino na cópia."
+      }, 409);
+    }
+
+    const nomeNovo = textoOpcional(nome);
+    const dailyBudget = numeroOpcional(daily_budget);
+    const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
+
+    // Nome e orcamento precisam ter sucesso — sao a parte "obrigatoria" da edicao.
+    try {
+      if (nomeNovo) {
+        // Mesmo sufixo anti-duplicidade usado na criacao (/google/campanha) —
+        // sem ele, renomear pra um nome ja usado em outra campanha da conta
+        // esbarra intermitentemente em DUPLICATE_CAMPAIGN_NAME.
+        const nomeGoogle = `${nomeNovo} - ${Date.now()}`;
+        await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+          { update: { resourceName: campaignResourceName, name: nomeGoogle }, updateMask: "name" },
+        ]);
+      }
+
+      if (dailyBudget !== null && dailyBudget > 0) {
+        const budgetResourceName = cfgBanco.campaign_budget_resource_name;
+        if (budgetResourceName) {
+          await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignBudgets", [
+            {
+              update: {
+                resourceName: budgetResourceName,
+                amountMicros: String(Math.round(dailyBudget * 1_000_000)),
+              },
+              updateMask: "amount_micros",
+            },
+          ]);
+        } else {
+          console.warn("EDITAR CAMPANHA GOOGLE: sem campaign_budget_resource_name salvo, orçamento não atualizado — campanha", campaign_id);
+        }
+      }
+    } catch (err: any) {
+      console.error("ERRO /google/editar-campanha (nome/orcamento):", err);
+      return c.json({ error: err.message || "Erro ao salvar as alterações no Google Ads" }, 400);
+    }
+
+    // Texto do anuncio: melhor esforco. A Google nao permite editar headlines/
+    // descriptions de um Ad ja criado — a unica forma e criar um adGroupAd novo
+    // e desativar o antigo. So faz esse trabalho todo se o texto realmente mudou,
+    // pra nao gerar anuncio novo (e historico de performance zerado) numa edicao
+    // que so mexeu no orcamento.
+    const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
+    const listaDescricoes = (Array.isArray(descricoes) ? descricoes : []).map(textoOpcional).filter(Boolean);
+    const tituloLongoNovo = textoOpcional(titulo_longo);
+    const nomeAnuncianteNovo = textoOpcional(nome_anunciante);
+    const urlNova = textoOpcional(url_destino);
+
+    const textoMudou =
+      JSON.stringify(listaTitulos) !== JSON.stringify(cfgBanco.titulos || []) ||
+      JSON.stringify(listaDescricoes) !== JSON.stringify(cfgBanco.descricoes || []) ||
+      tituloLongoNovo !== (cfgBanco.titulo_longo || "") ||
+      nomeAnuncianteNovo !== (cfgBanco.nome_anunciante || "") ||
+      urlNova !== (cfgBanco.url_destino || "");
+
+    let anuncioAtualizadoComErro: string | null = null;
+    let novoAdId: string | null = null;
+
+    if (textoMudou && listaTitulos.length) {
+      try {
+        if (tipoCampanhaBanco === "search") {
+          if (listaTitulos.length < 3) throw new Error("Informe ao menos 3 títulos para o anúncio de Pesquisa");
+          if (listaDescricoes.length < 2) throw new Error("Informe ao menos 2 descrições para o anúncio de Pesquisa");
+        } else {
+          if (!tituloLongoNovo) throw new Error("Informe o título longo para o anúncio de Display");
+          if (!listaDescricoes.length) throw new Error("Informe ao menos 1 descrição para o anúncio de Display");
+        }
+
+        const imagemPaisagem = textoOpcional(imagem_paisagem_asset) || textoOpcional(cfgBanco.imagem_paisagem_asset);
+        const imagemQuadrada = textoOpcional(imagem_quadrada_asset) || textoOpcional(cfgBanco.imagem_quadrada_asset);
+        if (tipoCampanhaBanco === "display" && (!imagemPaisagem || !imagemQuadrada)) {
+          throw new Error("Imagem do anúncio de Display não encontrada — reenvie a imagem para trocar o texto");
+        }
+
+        const urlFinal = urlNova || cfgBanco.url_destino || "https://plataformadeleads.com.br";
+        const adCreate: any = tipoCampanhaBanco === "search"
+          ? {
+              finalUrls: [urlFinal],
+              responsiveSearchAd: {
+                headlines: listaTitulos.slice(0, 15).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
+                descriptions: listaDescricoes.slice(0, 4).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
+              },
+            }
+          : {
+              finalUrls: [urlFinal],
+              responsiveDisplayAd: {
+                marketingImages: [{ asset: imagemPaisagem }],
+                squareMarketingImages: [{ asset: imagemQuadrada }],
+                headlines: listaTitulos.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
+                longHeadline: { text: truncarSemCortarPalavra(tituloLongoNovo, 90) },
+                descriptions: listaDescricoes.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
+                ...(nomeAnuncianteNovo ? { businessName: truncarSemCortarPalavra(nomeAnuncianteNovo, 25) } : {}),
+              },
+            };
+
+        const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${linha.adset_id}`;
+        const adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+          { create: { adGroup: adGroupResourceName, status: "PAUSED", ad: adCreate } },
+        ]);
+        const novoAdResourceName = adResults[0]?.resourceName;
+        if (!novoAdResourceName) throw new Error("Erro ao criar o novo anúncio no Google Ads");
+        novoAdId = novoAdResourceName.includes("~")
+          ? novoAdResourceName.split("~")[1]
+          : novoAdResourceName.split("/").pop();
+
+        // Ativa o novo antes de mexer no antigo — nunca fica uma janela sem
+        // nenhum anuncio ativo no grupo.
+        await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+          { update: { resourceName: novoAdResourceName, status: "ENABLED" }, updateMask: "status" },
+        ]);
+
+        if (linha.ad_id) {
+          const adAntigoResourceName = `customers/${conexao.customerId}/adGroupAds/${linha.adset_id}~${linha.ad_id}`;
+          try {
+            await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
+              { update: { resourceName: adAntigoResourceName, status: "PAUSED" }, updateMask: "status" },
+            ]);
+          } catch (errPausarAntigo: any) {
+            console.warn("EDITAR CAMPANHA GOOGLE: novo anúncio criado, mas falha ao pausar o antigo:", errPausarAntigo);
+            anuncioAtualizadoComErro =
+              "O novo texto foi publicado, mas não foi possível pausar o anúncio anterior — verifique manualmente no Google Ads se ele continua rodando em duplicidade.";
+          }
+        }
+      } catch (errAnuncio: any) {
+        console.warn("EDITAR CAMPANHA GOOGLE: falha ao atualizar texto do anúncio (ignorado):", errAnuncio);
+        anuncioAtualizadoComErro =
+          "As demais alterações foram salvas, mas não foi possível atualizar o texto do anúncio no Google Ads: " +
+          (errAnuncio.message || "erro desconhecido") +
+          ". O anúncio publicado continua com o texto anterior.";
+      }
+    }
+
+    const avancadasFinal = {
+      ...cfgBanco,
+      ...(configuracoes_avancadas || {}),
+      titulos: listaTitulos.length ? listaTitulos : cfgBanco.titulos,
+      descricoes: listaDescricoes.length ? listaDescricoes : cfgBanco.descricoes,
+      titulo_longo: tituloLongoNovo || cfgBanco.titulo_longo,
+      nome_anunciante: nomeAnuncianteNovo || cfgBanco.nome_anunciante,
+      url_destino: urlNova || cfgBanco.url_destino,
+      imagem_paisagem_asset: textoOpcional(imagem_paisagem_asset) || cfgBanco.imagem_paisagem_asset,
+      imagem_quadrada_asset: textoOpcional(imagem_quadrada_asset) || cfgBanco.imagem_quadrada_asset,
+      campaign_budget_resource_name: cfgBanco.campaign_budget_resource_name,
+      tipo_campanha: tipoCampanhaBanco,
+      destino: destinoBanco,
+    };
+
+    await client.query(
+      `UPDATE campanhas
+       SET configuracoes_avancadas = $1,
+           daily_budget = COALESCE($2, daily_budget),
+           nome = COALESCE($3, nome),
+           ad_id = COALESCE($4, ad_id),
+           atualizado_em = NOW()
+       WHERE id = $5`,
+      [JSON.stringify(avancadasFinal), dailyBudget, nomeNovo, novoAdId, linha.id]
+    );
+
+    return c.json({ sucesso: true, aviso: anuncioAtualizadoComErro });
+  } catch (err: any) {
+    console.error("ERRO /google/editar-campanha:", err);
+    return c.json({ error: err.message || "Erro ao editar campanha Google Ads" }, 500);
+  }
+});
+
 // Exclui (soft-delete) uma campanha Google Ads criada pela plataforma via operacao
 // "remove" no mutate — a Google Ads API resulta no mesmo status=REMOVED internamente,
 // mas nao aceita mais chegar la via update de status (mesma ideia do /tiktok/excluir-campanha,
