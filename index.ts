@@ -5096,6 +5096,51 @@ async function obterContaAnunciosSelecionadaIdUsuario(
   return conn.rows[0]?.conta_anuncios_id || null;
 }
 
+function normalizarIdContaAnuncios(valor: unknown): string {
+  return String(valor ?? "")
+    .trim()
+    .replace(/^act_/i, "")
+    .replace(/-/g, "");
+}
+
+function campanhaPertenceContaAnuncios(
+  contaCampanha: unknown,
+  contaSelecionada: unknown
+): boolean {
+  const campanha = normalizarIdContaAnuncios(contaCampanha);
+  const selecionada = normalizarIdContaAnuncios(contaSelecionada);
+  return Boolean(campanha && selecionada && campanha === selecionada);
+}
+
+function erroCampanhaOutraConta(plataforma: string): string {
+  return `Esta campanha não pertence à conta de anúncios ${plataforma} selecionada. Sincronize a conta correta e tente novamente.`;
+}
+
+async function campanhaExisteNaContaSelecionada(
+  usuarioId: number,
+  campaignId: unknown,
+  plataforma: "meta" | "google" | "tiktok" | "linkedin",
+  contaAnunciosId: unknown
+): Promise<boolean> {
+  if (!campaignId || !contaAnunciosId) return false;
+
+  const resultado = await client.query(
+    `SELECT id
+     FROM campanhas
+     WHERE campaign_id = $1
+       AND usuario_id = $2
+       AND conta_anuncios_id = $3
+       AND (
+         ($4 = 'meta' AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram'))
+         OR ($4 <> 'meta' AND LOWER(COALESCE(plataforma, '')) = $4)
+       )
+     LIMIT 1`,
+    [String(campaignId), usuarioId, String(contaAnunciosId), plataforma]
+  );
+
+  return resultado.rows.length > 0;
+}
+
 
 
 async function sincronizarCampanhasUsuario(
@@ -5116,17 +5161,19 @@ async function sincronizarCampanhasUsuario(
     const existe = await client.query(
       `SELECT id FROM campanhas
        WHERE campaign_id = $1 AND usuario_id = $2
-         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')`,
-      [campanha.id, usuarioId]
+         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+         AND (conta_anuncios_id = $3 OR conta_anuncios_id IS NULL)
+       ORDER BY CASE WHEN conta_anuncios_id = $3 THEN 0 ELSE 1 END
+       LIMIT 1`,
+      [campanha.id, usuarioId, contaAnunciosId]
     );
 
     if (existe.rows.length > 0) {
       await client.query(
         `UPDATE campanhas
          SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
-         WHERE campaign_id = $4 AND usuario_id = $5
-           AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')`,
-        [campanha.name, statusFinal, contaAnunciosId, campanha.id, usuarioId]
+         WHERE id = $4`,
+        [campanha.name, statusFinal, contaAnunciosId, existe.rows[0].id]
       );
     } else {
       await client.query(
@@ -6510,15 +6557,19 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       const campaignId = String(campanha.id);
 
       const existe = await client.query(
-        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'`,
-        [campaignId, usuarioId]
+        `SELECT id FROM campanhas
+         WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+           AND conta_anuncios_id = $3
+         LIMIT 1`,
+        [campaignId, usuarioId, String(customerId)]
       );
 
       if (existe.rows.length > 0) {
         await client.query(
-          `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
-           WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'google'`,
-          [campanha.name, campanha.status, campaignId, usuarioId]
+          `UPDATE campanhas
+           SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
+           WHERE id = $4`,
+          [campanha.name, campanha.status, String(customerId), existe.rows[0].id]
         );
       } else {
         await client.query(
@@ -6567,8 +6618,9 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
         const campRow = await client.query(
           `SELECT nome, nicho_id FROM campanhas
            WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+             AND conta_anuncios_id = $3
            LIMIT 1`,
-          [campaignIdLead, usuarioId]
+          [campaignIdLead, usuarioId, String(customerId)]
         );
         if (campRow.rows.length) {
           nomeCampanha = campRow.rows[0].nome;
@@ -7263,6 +7315,10 @@ app.post("/google/adgroup", authMiddleware, async (c) => {
       return c.json({ error: conexao.erro }, 400);
     }
 
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "google", conexao.customerId)) {
+      return c.json({ error: erroCampanhaOutraConta("Google Ads") }, 409);
+    }
+
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
     const cpcBidMicros = Math.max(
       1_000_000,
@@ -7691,6 +7747,10 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       return c.json({ error: conexao.erro }, 400);
     }
 
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "google", conexao.customerId)) {
+      return c.json({ error: erroCampanhaOutraConta("Google Ads") }, 409);
+    }
+
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
     const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
     let businessMessageAssetResourceName: string | null = null;
@@ -7846,6 +7906,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
            configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $6::jsonb,
            atualizado_em = NOW()
        WHERE campaign_id = $7 AND usuario_id = $8 AND plataforma = 'google'
+         AND conta_anuncios_id = $9
        RETURNING id`,
       [
         String(adgroup_id),
@@ -7855,7 +7916,8 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
         nichoCampanhaGoogle?.id ?? null,
         JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
-        usuarioId
+        usuarioId,
+        conexao.customerId
       ]
     );
 
@@ -8172,21 +8234,22 @@ app.post("/google/excluir-campanha", authMiddleware, async (c) => {
       return c.json({ error: "campaign_id obrigatorio" }, 400);
     }
 
-    const campanha = await client.query(
-      `SELECT id FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanha.rows.length) {
-      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
-    }
-
     const conexao = await resolverConexaoGoogleAds(user.id);
 
     if ("erro" in conexao) {
       return c.json({ error: conexao.erro }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [campaign_id, user.id, conexao.customerId]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({ error: erroCampanhaOutraConta("Google Ads") }, 409);
     }
 
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
@@ -8239,19 +8302,20 @@ app.get("/google/campanha-status/:campaign_id", authMiddleware, async (c) => {
       return c.json({ error: "campaign_id inválido" }, 400);
     }
 
-    const campanhaBanco = await client.query(
-      `SELECT id FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
-       LIMIT 1`,
-      [String(campaignId), user.id]
-    );
-    if (!campanhaBanco.rows.length) {
-      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
-    }
-
     const conexao = await resolverConexaoGoogleAds(user.id);
     if ("erro" in conexao) {
       return c.json({ error: conexao.erro }, 400);
+    }
+
+    const campanhaBanco = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [String(campaignId), user.id, conexao.customerId]
+    );
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: erroCampanhaOutraConta("Google Ads") }, 409);
     }
 
     let campanhaGoogleResults: any[];
@@ -8377,16 +8441,19 @@ app.post("/google/excluir-adgroup", authMiddleware, async (c) => {
       return c.json({ error: "campaign_id e adgroup_id obrigatórios" }, 400);
     }
 
-    const campanha = await client.query(
-      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google' LIMIT 1`,
-      [campaign_id, user.id]
-    );
-    if (!campanha.rows.length) {
-      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
-    }
-
     const conexao = await resolverConexaoGoogleAds(user.id);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [campaign_id, user.id, conexao.customerId]
+    );
+    if (!campanha.rows.length) {
+      return c.json({ error: erroCampanhaOutraConta("Google Ads") }, 409);
+    }
 
     const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
     try {
@@ -8421,24 +8488,25 @@ app.post("/google/toggle-campanha", authMiddleware, async (c) => {
       return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
     }
 
-    const campanhaBanco = await client.query(
-      `SELECT id, adset_id, ad_id
-       FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanhaBanco.rows.length) {
-      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
-    }
-
-    const { adset_id, ad_id } = campanhaBanco.rows[0];
-
     const conexao = await resolverConexaoGoogleAds(user.id);
     if ("erro" in conexao) {
       return c.json({ error: conexao.erro }, 400);
     }
+
+    const campanhaBanco = await client.query(
+      `SELECT id, adset_id, ad_id
+       FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [campaign_id, user.id, conexao.customerId]
+    );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: erroCampanhaOutraConta("Google Ads") }, 409);
+    }
+
+    const { adset_id, ad_id } = campanhaBanco.rows[0];
 
     const googleStatus = status === "ACTIVE" ? "ENABLED" : "PAUSED";
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
@@ -8830,15 +8898,19 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
 
     for (const campanha of campanhas) {
       const existe = await client.query(
-        `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'`,
-        [String(campanha.campaign_id), usuarioId]
+        `SELECT id FROM campanhas
+         WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+           AND conta_anuncios_id = $3
+         LIMIT 1`,
+        [String(campanha.campaign_id), usuarioId, String(advertiserId)]
       );
 
       if (existe.rows.length > 0) {
         await client.query(
-          `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
-           WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'tiktok'`,
-          [campanha.campaign_name, campanha.status, String(campanha.campaign_id), usuarioId]
+          `UPDATE campanhas
+           SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
+           WHERE id = $4`,
+          [campanha.campaign_name, campanha.status, String(advertiserId), existe.rows[0].id]
         );
       } else {
         await client.query(
@@ -8891,8 +8963,9 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
           const campRow = await client.query(
             `SELECT nome, nicho_id FROM campanhas
              WHERE form_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+               AND conta_anuncios_id = $3
              LIMIT 1`,
-            [formId, usuarioId]
+            [formId, usuarioId, String(advertiserId)]
           );
           if (campRow.rows.length) {
             nomeCampanha = campRow.rows[0].nome;
@@ -8986,20 +9059,6 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
       return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
     }
 
-    const campanhaBanco = await client.query(
-      `SELECT id, adset_id, ad_id
-       FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanhaBanco.rows.length) {
-      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
-    }
-
-    const { adset_id, ad_id } = campanhaBanco.rows[0];
-
     const conexao = await obterConexaoTikTok(user.id);
     if (!conexao) {
       return c.json({ error: "TikTok não conectada" }, 400);
@@ -9007,6 +9066,21 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
     if (!conexao.advertiserId) {
       return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
     }
+
+    const campanhaBanco = await client.query(
+      `SELECT id, adset_id, ad_id
+       FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [campaign_id, user.id, conexao.advertiserId]
+    );
+
+    if (!campanhaBanco.rows.length) {
+      return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
+    }
+
+    const { adset_id, ad_id } = campanhaBanco.rows[0];
 
     const operationStatus = status === "ACTIVE" ? "ENABLE" : "DISABLE";
 
@@ -9069,17 +9143,6 @@ app.post("/tiktok/excluir-campanha", authMiddleware, async (c) => {
       return c.json({ error: "campaign_id obrigatorio" }, 400);
     }
 
-    const campanha = await client.query(
-      `SELECT id FROM campanhas
-       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
-       LIMIT 1`,
-      [campaign_id, user.id]
-    );
-
-    if (!campanha.rows.length) {
-      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
-    }
-
     const conexao = await obterConexaoTikTok(user.id);
 
     if (!conexao) {
@@ -9087,6 +9150,18 @@ app.post("/tiktok/excluir-campanha", authMiddleware, async (c) => {
     }
     if (!conexao.advertiserId) {
       return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [campaign_id, user.id, conexao.advertiserId]
+    );
+
+    if (!campanha.rows.length) {
+      return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
     }
 
     const del = await tiktokFetch("/campaign/status/update/", conexao.token, {
@@ -9569,6 +9644,10 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
       return c.json({ error: "Selecione a conta de anúncios TikTok antes de criar o grupo de anúncios" }, 400);
     }
 
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "tiktok", conexao.advertiserId)) {
+      return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
+    }
+
     const avancadas = configuracoes_avancadas || {};
     const targeting = montarTargetingTikTok(avancadas);
     const destinoResolvido = resolverDestinoCampanhaTikTok(destino ?? avancadas.destino);
@@ -9763,6 +9842,10 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       return c.json({ error: "Selecione a conta de anúncios TikTok antes de publicar o anúncio" }, 400);
     }
 
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "tiktok", conexao.advertiserId)) {
+      return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
+    }
+
     const identidadeId = textoOpcional(identity_id) || conexao.identityId;
     const identidadeTipo = textoOpcional(identity_type) || conexao.identityType;
 
@@ -9854,7 +9937,8 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
            daily_budget = $4,
            configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $5::jsonb,
            atualizado_em = NOW()
-       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'tiktok'`,
+       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'tiktok'
+         AND conta_anuncios_id = $8`,
       [
         String(adgroup_id),
         String(adId),
@@ -9862,7 +9946,8 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
         numeroOpcional(daily_budget),
         JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
-        usuarioId
+        usuarioId,
+        conexao.advertiserId
       ]
     );
 
@@ -10651,6 +10736,10 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
 
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "linkedin", conexao.adAccountId)) {
+      return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
+    }
+
     const orcamento = numeroOpcional(daily_budget);
     if (!orcamento || orcamento <= 0) {
       return c.json({ error: "Orçamento diário é obrigatório para a campanha LinkedIn" }, 400);
@@ -10888,6 +10977,10 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
       return c.json({ error: "Nenhuma organização (Página do LinkedIn) vinculada à conta de anúncios selecionada" }, 400);
     }
 
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "linkedin", conexao.adAccountId)) {
+      return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
+    }
+
     const avancadas = configuracoes_avancadas || {};
 
     let waLink: string | null = null;
@@ -11000,7 +11093,8 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
            daily_budget = $4,
            configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $5::jsonb,
            atualizado_em = NOW()
-       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'linkedin'`,
+       WHERE campaign_id = $6 AND usuario_id = $7 AND plataforma = 'linkedin'
+         AND conta_anuncios_id = $8`,
       [
         String(adgroup_id),
         String(creativeId),
@@ -11008,7 +11102,8 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
         numeroOpcional(daily_budget),
         JSON.stringify(configuracoesPersistidas),
         String(campaign_id),
-        usuarioId
+        usuarioId,
+        conexao.adAccountId
       ]
     );
 
@@ -11030,19 +11125,20 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
       return c.json({ error: "campaign_id e status (ACTIVE/PAUSED) obrigatorios" }, 400);
     }
 
+    const conexao = await resolverConexaoLinkedIn(user.id);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
     const campanhaBanco = await client.query(
       `SELECT id, adset_id FROM campanhas
        WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'
+         AND conta_anuncios_id = $3
        LIMIT 1`,
-      [campaign_id, user.id]
+      [campaign_id, user.id, conexao.adAccountId]
     );
     if (!campanhaBanco.rows.length) {
-      return c.json({ error: "Campanha não disponível para este usuário" }, 404);
+      return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
     }
     const { adset_id } = campanhaBanco.rows[0];
-
-    const conexao = await resolverConexaoLinkedIn(user.id);
-    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
 
     const statusLinkedIn = status === "ACTIVE" ? "ACTIVE" : "PAUSED";
 
@@ -11093,17 +11189,20 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
     const { campaign_id } = await c.req.json();
     if (!campaign_id) return c.json({ error: "campaign_id obrigatorio" }, 400);
 
-    const campanha = await client.query(
-      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
-      [campaign_id, user.id]
-    );
-    if (!campanha.rows.length) {
-      return c.json({ error: "Apenas o dono da campanha pode excluí-la" }, 403);
-    }
-
     const conexao = await resolverConexaoLinkedIn(user.id);
     if ("erro" in conexao) {
       return c.json({ error: conexao.erro }, 400);
+    }
+
+    const campanha = await client.query(
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [campaign_id, user.id, conexao.adAccountId]
+    );
+    if (!campanha.rows.length) {
+      return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
     }
 
     const del = await linkedinFetch(
@@ -11174,15 +11273,19 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
     const statusCampanha = String(campanha.status || "PAUSED").toUpperCase();
 
     const existe = await client.query(
-      `SELECT id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'`,
-      [campaignGroupId, usuarioId]
+      `SELECT id FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'
+         AND conta_anuncios_id = $3
+       LIMIT 1`,
+      [campaignGroupId, usuarioId, String(adAccountId)]
     );
 
     if (existe.rows.length > 0) {
       await client.query(
-        `UPDATE campanhas SET nome = $1, status = $2, atualizado_em = NOW()
-         WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'linkedin'`,
-        [nomeCampanha, statusCampanha, campaignGroupId, usuarioId]
+        `UPDATE campanhas
+         SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
+         WHERE id = $4`,
+        [nomeCampanha, statusCampanha, String(adAccountId), existe.rows[0].id]
       );
     } else {
       await client.query(
@@ -11207,8 +11310,10 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
   let totalLeads = 0;
 
   const formulariosDaConta = await client.query(
-    `SELECT form_id, nome, nicho_id FROM campanhas WHERE usuario_id = $1 AND plataforma = 'linkedin' AND form_id IS NOT NULL`,
-    [usuarioId]
+    `SELECT form_id, nome, nicho_id FROM campanhas
+     WHERE usuario_id = $1 AND plataforma = 'linkedin'
+       AND conta_anuncios_id = $2 AND form_id IS NOT NULL`,
+    [usuarioId, String(adAccountId)]
   );
   const campanhaPorFormId = new Map<string, { nome: string; nicho_id: number | null }>();
   for (const row of formulariosDaConta.rows) {
@@ -11966,6 +12071,10 @@ app.post("/meta/adset", authMiddleware, async (c) => {
     }
     
     const adAccountId = contaAds.id;
+
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "meta", adAccountId)) {
+      return c.json({ error: erroCampanhaOutraConta("Meta Ads") }, 409);
+    }
 
     const avancadas =
       configuracoes_avancadas || {};
@@ -12862,6 +12971,10 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
     }
 
     const adAccountId = contaAds.id;
+
+    if (!await campanhaExisteNaContaSelecionada(usuarioId, campaign_id, "meta", adAccountId)) {
+      return c.json({ error: erroCampanhaOutraConta("Meta Ads") }, 409);
+    }
 
     const avancadas =
       configuracoes_avancadas || {};
@@ -18840,8 +18953,8 @@ app.get("/campanhas", authMiddleware, async (c) => {
           AND c.ad_id IS NULL
         )
         AND (
-          c.origem = 'manual'
-          OR (COALESCE(c.plataforma, 'meta') = 'meta' AND c.conta_anuncios_id = $2)
+          (c.origem = 'manual' AND c.campaign_id IS NULL)
+          OR (LOWER(COALESCE(c.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') AND c.conta_anuncios_id = $2)
           OR (c.plataforma = 'google' AND c.conta_anuncios_id = $4)
           OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $5)
           OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $6)
@@ -19732,8 +19845,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           AND c.ad_id IS NULL
         )
         AND (
-          c.origem = 'manual'
-          OR (LOWER(COALESCE(c.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') AND ($2::text IS NULL OR c.conta_anuncios_id = $2))
+          (c.origem = 'manual' AND c.campaign_id IS NULL)
+          OR (LOWER(COALESCE(c.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') AND c.conta_anuncios_id = $2)
           OR (c.plataforma = 'google' AND c.conta_anuncios_id = $3)
           OR (c.plataforma = 'tiktok' AND c.conta_anuncios_id = $4)
           OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $5)
@@ -21162,9 +21275,12 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
         FROM campanhas
         WHERE campaign_id = $1
         AND usuario_id = $2
+        AND (conta_anuncios_id = $3 OR conta_anuncios_id IS NULL)
         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+        ORDER BY CASE WHEN conta_anuncios_id = $3 THEN 0 ELSE 1 END
+        LIMIT 1
         `,
-        [campanha.id, user.id]
+        [campanha.id, user.id, adAccountId]
       );
 
       if (existe.rows.length > 0) {
@@ -21177,16 +21293,13 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             status = $2,
             conta_anuncios_id = $3,
             atualizado_em = NOW()
-          WHERE campaign_id = $4
-          AND usuario_id = $5
-          AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+          WHERE id = $4
           `,
           [
             campanha.name,
             statusFinal,
             adAccountId,
-            campanha.id,
-            user.id
+            existe.rows[0].id
           ]
         );
 
@@ -21273,22 +21386,30 @@ app.post("/meta/toggle-campanha", authMiddleware, async (c) => {
       status
     } = await c.req.json();
 
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(user.id);
+
+    if (!contaAnunciosId) {
+      return c.json({ error: "Conta de anúncios Meta não selecionada" }, 400);
+    }
+
     const campanhaBanco = await client.query(
       `
       SELECT id, adset_id, ad_id, usuario_id, conta_anuncios_id
       FROM campanhas
       WHERE campaign_id = $1
       AND usuario_id = $2
+      AND conta_anuncios_id = $3
       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
-      [campaign_id, user.id]
+      [campaign_id, user.id, contaAnunciosId]
     );
 
     if (!campanhaBanco.rows.length) {
       return c.json({
-        error: "Campanha não disponível para este usuário"
-      }, 404);
+        error: erroCampanhaOutraConta("Meta Ads")
+      }, 409);
     }
 
     const adset_id =
@@ -21443,13 +21564,17 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
         user.id
       );
 
+    if (!contaAnunciosId) {
+      return c.json({ error: "Conta de anúncios Meta não selecionada" }, 400);
+    }
+
     const campanha = await client.query(
       `
       SELECT id
       FROM campanhas
       WHERE campaign_id = $1
       AND usuario_id = $2
-      AND (conta_anuncios_id = $3 OR conta_anuncios_id IS NULL)
+      AND conta_anuncios_id = $3
       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
@@ -21458,8 +21583,8 @@ app.post("/meta/excluir-campanha", authMiddleware, async (c) => {
 
     if (!campanha.rows.length) {
       return c.json({
-        error: "Apenas o dono da campanha pode excluí-la"
-      }, 403);
+        error: erroCampanhaOutraConta("Meta Ads")
+      }, 409);
     }
 
     // 🔐 TOKEN
@@ -21566,23 +21691,31 @@ app.post("/meta/restaurar-campanha", authMiddleware, async (c) => {
       campaign_id
     } = await c.req.json();
 
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(user.id);
+
+    if (!contaAnunciosId) {
+      return c.json({ error: "Conta de anúncios Meta não selecionada" }, 400);
+    }
+
     const campanha = await client.query(
       `
       SELECT id, adset_id, ad_id
       FROM campanhas
       WHERE campaign_id = $1
       AND usuario_id = $2
+      AND conta_anuncios_id = $3
       AND UPPER(status) = 'DELETED'
       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
       LIMIT 1
       `,
-      [campaign_id, user.id]
+      [campaign_id, user.id, contaAnunciosId]
     );
 
     if (!campanha.rows.length) {
       return c.json({
-        error: "Campanha excluída não encontrada para este usuário"
-      }, 404);
+        error: erroCampanhaOutraConta("Meta Ads")
+      }, 409);
     }
 
     const conn = await client.query(
@@ -21682,7 +21815,7 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
 
     const campanha = await client.query(
       `
-      SELECT id, campaign_id, plataforma
+      SELECT id, campaign_id, plataforma, conta_anuncios_id
       FROM campanhas
       WHERE id = $1
       AND usuario_id = $2
@@ -21723,6 +21856,10 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
           return c.json({ error: conexao.erro }, 400);
         }
 
+        if (!campanhaPertenceContaAnuncios(campanhaLocal.conta_anuncios_id, conexao.customerId)) {
+          return c.json({ error: erroCampanhaOutraConta("Google Ads") }, 409);
+        }
+
         try {
           await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
             { remove: `customers/${conexao.customerId}/campaigns/${campanhaLocal.campaign_id}` },
@@ -21746,6 +21883,10 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
         }
         if (!conexao.advertiserId) {
           return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
+        }
+
+        if (!campanhaPertenceContaAnuncios(campanhaLocal.conta_anuncios_id, conexao.advertiserId)) {
+          return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
         }
 
         const del = await tiktokFetch("/campaign/status/update/", conexao.token, {
@@ -21778,6 +21919,10 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
           return c.json({ error: conexao.erro }, 400);
         }
 
+        if (!campanhaPertenceContaAnuncios(campanhaLocal.conta_anuncios_id, conexao.adAccountId)) {
+          return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
+        }
+
         const del = await linkedinFetch(
           `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campanhaLocal.campaign_id}`,
           conexao.accessToken,
@@ -21803,6 +21948,13 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
       } else if (plataformaLocal === "kwai") {
         return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 501);
       } else if (plataformaLocal === "meta") {
+        const contaAnunciosId =
+          await obterContaAnunciosSelecionadaIdUsuario(user.id);
+
+        if (!campanhaPertenceContaAnuncios(campanhaLocal.conta_anuncios_id, contaAnunciosId)) {
+          return c.json({ error: erroCampanhaOutraConta("Meta Ads") }, 409);
+        }
+
         const conn = await client.query(
           `
           SELECT access_token
@@ -21902,17 +22054,21 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
       return c.json({ error: "Campanha inválida" }, 400);
     }
 
+    const contaAnunciosId =
+      await obterContaAnunciosSelecionadaIdUsuario(user.id);
+
     const campanhaRes = await client.query(
       `SELECT * FROM campanhas
        WHERE id = $1
          AND usuario_id = $2
+         AND (campaign_id IS NULL OR conta_anuncios_id = $3)
          AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
        LIMIT 1`,
-      [campanhaId, user.id]
+      [campanhaId, user.id, contaAnunciosId]
     );
 
     if (!campanhaRes.rows.length) {
-      return c.json({ error: "Campanha Meta não encontrada" }, 404);
+      return c.json({ error: erroCampanhaOutraConta("Meta Ads") }, 409);
     }
 
     const campanha = campanhaRes.rows[0];
@@ -22422,7 +22578,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     // isso não usamos apenas o valor enviado pela tela para decidir se é rascunho.
     const campanhaLocalRes = campanha_local_id
       ? await client.query(
-          `SELECT id, campaign_id, adset_id, ad_id, origem, origem_campanha_id, plataforma
+          `SELECT id, campaign_id, adset_id, ad_id, origem, origem_campanha_id, plataforma, conta_anuncios_id
            FROM campanhas
            WHERE id = $1 AND usuario_id = $2
            LIMIT 1`,
@@ -22439,6 +22595,15 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       return c.json({
         error: "Esta edição pertence a outra plataforma e não pode ser processada pela Meta"
       }, 409);
+    }
+
+    if (campanhaLocal?.campaign_id) {
+      const contaAnunciosId =
+        await obterContaAnunciosSelecionadaIdUsuario(usuarioId);
+
+      if (!campanhaPertenceContaAnuncios(campanhaLocal.conta_anuncios_id, contaAnunciosId)) {
+        return c.json({ error: erroCampanhaOutraConta("Meta Ads") }, 409);
+      }
     }
     const ehRascunhoLocal = Boolean(
       campanhaLocal && (
