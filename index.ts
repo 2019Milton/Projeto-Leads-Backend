@@ -26454,6 +26454,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_frequencia: "",
       nicho_porte_empresa: "",
       nicho_situacao_atual: "",
+      nicho_area_curso: "",
+      nicho_objetivo_aluno: "",
       cbo: true,
       attribution_spec: "7d_click_1d_view",
       google_titulo_1: incluirGoogle ? truncarSemCortarPalavra(titulo, 30) : "",
@@ -26512,6 +26514,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_frequencia: v?.nicho_frequencia || v?.frequencia || "",
       nicho_porte_empresa: v?.nicho_porte_empresa || v?.porte_empresa || "",
       nicho_situacao_atual: v?.nicho_situacao_atual || v?.situacao_atual || "",
+      nicho_area_curso: v?.nicho_area_curso || v?.area_curso || "",
+      nicho_objetivo_aluno: v?.nicho_objetivo_aluno || v?.objetivo_aluno || "",
       cbo: v?.cbo ?? true,
       attribution_spec: v?.attribution_spec || "7d_click_1d_view",
       // Limites defensivos (30/90/90/25 chars) mesmo que a IA ignore o pedido no prompt —
