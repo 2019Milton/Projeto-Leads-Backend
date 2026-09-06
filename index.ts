@@ -12620,7 +12620,8 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
 
     console.log("BODY RECEBIDO");
 
-    const imagem = body.get("imagem") as File;
+    const imagem = body.get("imagem") as File | null;
+    const imagemUrl = textoOpcional(body.get("imagem_url"));
 
     console.log(
       "IMAGEM:",
@@ -12642,7 +12643,7 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
       usuario_id
     );
 
-    if (!imagem) {
+    if (!imagem && !imagemUrl) {
 
       return c.json({
         error: "Imagem não enviada"
@@ -12696,6 +12697,22 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
       "AD ACCOUNT:",
       adAccountId
     );
+
+    // Sem arquivo novo, mas com URL de uma imagem já publicada (fallback usado
+    // ao adicionar Meta como plataforma nova numa campanha existente sem
+    // trocar a imagem): reaproveita enviarImagemMetaPorUrl, que já sabe que o
+    // CDN da própria Meta rejeita o parâmetro "url" do /adimages e por isso
+    // baixa os bytes e reenvia via "bytes" — não duplicar essa lógica aqui.
+    if (!imagem && imagemUrl) {
+      const resultado = await enviarImagemMetaPorUrl(token, adAccountId, imagemUrl);
+      if (!resultado.hash) {
+        return c.json({
+          error: resultado.resposta?.error?.message || "Erro upload imagem",
+          detalhe: resultado.resposta
+        }, 400);
+      }
+      return c.json({ sucesso: true, hash: resultado.hash, url: null });
+    }
 
     // 🔥 FORMDATA PARA META
     const metaForm = new FormData();
