@@ -7523,25 +7523,47 @@ async function cortarImagemGoogleDisplay(bytes: ArrayBuffer, tipo: string) {
   return buffer;
 }
 
+// Baixa uma imagem já hospedada (ex: URL salva em configuracoes_avancadas de
+// uma publicação anterior) pra reenviar como upload numa rede diferente —
+// usado quando o usuário adiciona uma plataforma nova a uma campanha
+// existente sem selecionar uma imagem nova (ver imagem_url nos endpoints de
+// upload-imagem abaixo). Servidor-servidor não tem restrição de CORS,
+// diferente de tentar isso no navegador contra o CDN de outra rede.
+async function baixarImagemDeUrl(url: string): Promise<{ bytes: ArrayBuffer } | { erro: string }> {
+  const res = await fetch(url);
+  if (!res.ok) {
+    return { erro: `Falha ao baixar a imagem original (HTTP ${res.status})` };
+  }
+  return { bytes: await res.arrayBuffer() };
+}
+
 app.post("/google/upload-imagem", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const body = await c.req.formData();
 
-    const imagem = body.get("imagem") as File;
+    const imagem = body.get("imagem") as File | null;
+    const imagemUrl = textoOpcional(body.get("imagem_url"));
     const usuario_id = body.get("usuario_id");
     const tipo = String(body.get("tipo") || "paisagem");
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
-    if (!imagem) return c.json({ error: "Imagem não enviada" }, 400);
+    if (!imagem && !imagemUrl) return c.json({ error: "Imagem não enviada" }, 400);
 
     const conexao = await resolverConexaoGoogleAds(usuarioId);
     if ("erro" in conexao) {
       return c.json({ error: conexao.erro }, 400);
     }
 
-    const bytesOriginais = await imagem.arrayBuffer();
+    let bytesOriginais: ArrayBuffer;
+    if (imagem) {
+      bytesOriginais = await imagem.arrayBuffer();
+    } else {
+      const baixada = await baixarImagemDeUrl(imagemUrl!);
+      if ("erro" in baixada) return c.json({ error: baixada.erro }, 502);
+      bytesOriginais = baixada.bytes;
+    }
     const bytesCortados = await cortarImagemGoogleDisplay(bytesOriginais, tipo);
     const base64 = bytesCortados.toString("base64");
     const mimeType = "IMAGE_JPEG";
@@ -9216,14 +9238,15 @@ app.post("/tiktok/upload-imagem", authMiddleware, async (c) => {
     const user: any = c.get("user");
     const body = await c.req.formData();
 
-    const imagem = body.get("imagem") as File;
+    const imagem = body.get("imagem") as File | null;
+    const imagemUrl = textoOpcional(body.get("imagem_url"));
     const usuario_id = body.get("usuario_id");
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
 
     if (!usuarioId) {
       return negarAcessoConta(c);
     }
-    if (!imagem) {
+    if (!imagem && !imagemUrl) {
       return c.json({ error: "Imagem não enviada" }, 400);
     }
 
@@ -9235,12 +9258,24 @@ app.post("/tiktok/upload-imagem", authMiddleware, async (c) => {
       return c.json({ error: "Conta de anúncios TikTok não selecionada" }, 400);
     }
 
+    let arquivoImagem: Blob;
+    let nomeArquivoImagem: string;
+    if (imagem) {
+      arquivoImagem = imagem;
+      nomeArquivoImagem = imagem.name;
+    } else {
+      const baixada = await baixarImagemDeUrl(imagemUrl!);
+      if ("erro" in baixada) return c.json({ error: baixada.erro }, 502);
+      arquivoImagem = new Blob([baixada.bytes]);
+      nomeArquivoImagem = `imagem-${Date.now()}.jpg`;
+    }
+
     // ASSUMPTION: endpoint/campos de multipart conforme documentação pública —
     // confirmar contra o SDK oficial (github.com/tiktok/tiktok-business-api-sdk) na Fase 2B.
     const tiktokForm = new FormData();
     tiktokForm.append("advertiser_id", conexao.advertiserId);
     tiktokForm.append("upload_type", "UPLOAD_BY_FILE");
-    tiktokForm.append("image_file", imagem, imagem.name);
+    tiktokForm.append("image_file", arquivoImagem, nomeArquivoImagem);
 
     const response = await fetch(`${TIKTOK_API}/file/image/ad/upload/`, {
       method: "POST",
@@ -10829,12 +10864,13 @@ app.post("/linkedin/upload-imagem", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const body = await c.req.formData();
-    const imagem = body.get("imagem") as File;
+    const imagem = body.get("imagem") as File | null;
+    const imagemUrl = textoOpcional(body.get("imagem_url"));
     const usuario_id = body.get("usuario_id");
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
-    if (!imagem) return c.json({ error: "Imagem não enviada" }, 400);
+    if (!imagem && !imagemUrl) return c.json({ error: "Imagem não enviada" }, 400);
 
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
@@ -10852,7 +10888,15 @@ app.post("/linkedin/upload-imagem", authMiddleware, async (c) => {
       return c.json({ error: init.error || "Erro ao iniciar upload de imagem no LinkedIn", detalhe: init.data }, 400);
     }
 
-    const bytesCortados = await cortarImagemLinkedIn(await imagem.arrayBuffer());
+    let bytesOriginaisLinkedIn: ArrayBuffer;
+    if (imagem) {
+      bytesOriginaisLinkedIn = await imagem.arrayBuffer();
+    } else {
+      const baixada = await baixarImagemDeUrl(imagemUrl!);
+      if ("erro" in baixada) return c.json({ error: baixada.erro }, 502);
+      bytesOriginaisLinkedIn = baixada.bytes;
+    }
+    const bytesCortados = await cortarImagemLinkedIn(bytesOriginaisLinkedIn);
 
     const uploadRes = await fetch(uploadUrl, {
       method: "PUT",
