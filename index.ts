@@ -20716,6 +20716,19 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         objetivo_aluno: campanha.objetivo_aluno ?? campanha.configuracoes_avancadas?.objetivo_aluno
       };
 
+      // Uma campanha sincronizada da rede ja existe remotamente mesmo quando
+      // o sync trouxe apenas o campaign_id. adset_id/ad_id vazios significam
+      // "criacao ainda incompleta" somente para campanhas iniciadas dentro da
+      // Plataforma de Leads. Manter os dois conceitos separados evita tratar
+      // importadas como rascunho e executar nelas a acao local errada.
+      const campanhaImportada =
+        !campanhaTemOrigemNativa(campanha.origem);
+      const publicadaRemotamente = Boolean(campanha.campaign_id) && (
+        campanhaImportada ||
+        Boolean(campanha.adset_id) ||
+        Boolean(campanha.ad_id)
+      );
+
       metricas.push({
         id: campanha.id,
         nome: campanha.nome,
@@ -20726,8 +20739,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         adset_id: campanha.adset_id,
         ad_id: campanha.ad_id,
         form_id: campanha.form_id,
-        destino_editavel:
-          !campanha.adset_id && !campanha.ad_id,
+        publicada_remotamente: publicadaRemotamente,
+        destino_editavel: !publicadaRemotamente,
         criada_por_usuario_id: campanha.usuario_id,
         criada_por_email: campanha.criado_por_email,
         criada_por_nome:
