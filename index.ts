@@ -18353,19 +18353,20 @@ await client.query(`
     criado_em
   )
   SELECT
-    usuario_id,
+    c.usuario_id,
     CASE
-      WHEN LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') THEN 'meta'
-      ELSE LOWER(plataforma)
+      WHEN LOWER(COALESCE(c.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') THEN 'meta'
+      ELSE LOWER(c.plataforma)
     END,
-    REPLACE(REGEXP_REPLACE(TRIM(conta_anuncios_id), '^act_', '', 'i'), '-', ''),
-    TRIM(campaign_id),
-    COALESCE(criado_em, CURRENT_TIMESTAMP)
-  FROM campanhas
-  WHERE usuario_id IS NOT NULL
-    AND NULLIF(TRIM(campaign_id), '') IS NOT NULL
-    AND NULLIF(TRIM(conta_anuncios_id), '') IS NOT NULL
-    AND LOWER(COALESCE(origem, '')) NOT IN (
+    REPLACE(REGEXP_REPLACE(TRIM(c.conta_anuncios_id), '^act_', '', 'i'), '-', ''),
+    TRIM(c.campaign_id),
+    COALESCE(c.criado_em, CURRENT_TIMESTAMP)
+  FROM campanhas c
+  INNER JOIN usuarios u
+    ON u.id = c.usuario_id
+  WHERE NULLIF(TRIM(c.campaign_id), '') IS NOT NULL
+    AND NULLIF(TRIM(c.conta_anuncios_id), '') IS NOT NULL
+    AND LOWER(COALESCE(c.origem, '')) NOT IN (
       'meta', 'facebook', 'instagram', 'google', 'tiktok', 'linkedin', 'kwai'
     )
   ON CONFLICT (usuario_id, plataforma, conta_anuncios_id, campaign_id)
@@ -18380,6 +18381,7 @@ await client.query(`
     IF NEW.usuario_id IS NULL
        OR NULLIF(TRIM(NEW.campaign_id), '') IS NULL
        OR NULLIF(TRIM(NEW.conta_anuncios_id), '') IS NULL
+       OR NOT EXISTS (SELECT 1 FROM usuarios WHERE id = NEW.usuario_id)
        OR LOWER(COALESCE(NEW.origem, '')) IN (
          'meta', 'facebook', 'instagram', 'google', 'tiktok', 'linkedin', 'kwai'
        ) THEN
