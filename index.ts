@@ -1541,10 +1541,11 @@ async function criarAdSetMetaComOtimizacaoInteligente(
    confirmados contra tráfego real, verificar na primeira publicação de teste.
 ========================= */
 
-type DestinoCampanhaMeta = "lead_ads" | "whatsapp";
+type DestinoCampanhaMeta = "lead_ads" | "site" | "whatsapp";
 
 function resolverDestinoCampanha(valor: unknown): DestinoCampanhaMeta {
-  return valor === "whatsapp" ? "whatsapp" : "lead_ads";
+  const destino = String(valor || "").trim().toLowerCase();
+  return destino === "site" || destino === "whatsapp" ? destino : "lead_ads";
 }
 
 type DestinoCampanhaTikTok = "lead_ads" | "site" | "whatsapp";
@@ -1606,6 +1607,18 @@ function montarDestinoAdsetMeta(
       }
     };
   }
+  // "site": objetivo continua OUTCOME_LEADS (WEBSITE só é destination_type
+  // valido pra esse objetivo — e pra OUTCOME_AWARENESS/OUTCOME_SALES, que a
+  // plataforma nao usa — confirmado no field reference oficial de destination_type
+  // da Marketing API). LANDING_PAGE_VIEWS é a otimizacao recomendada pela Meta
+  // pra trafego de site (prioriza quem realmente carrega a pagina, nao só clica).
+  if (destino === "site") {
+    return {
+      destination_type: "WEBSITE",
+      optimization_goal: "LANDING_PAGE_VIEWS",
+      promoted_object: { page_id: pageId }
+    };
+  }
   return {
     destination_type: "ON_AD",
     optimization_goal: "LEAD_GENERATION",
@@ -1627,16 +1640,26 @@ async function criarAdSetMetaParaDestino(
   if (destino === "whatsapp") {
     return enviarPayloadMetaComFallbackBid(url, payloadBase, `${contexto}_WHATSAPP`);
   }
+  // "site" usa LANDING_PAGE_VIEWS (já definido em payloadBase por
+  // montarDestinoAdsetMeta) — a otimização inteligente de Quality Lead é
+  // específica de LEAD_GENERATION e sobrescreveria esse optimization_goal.
+  if (destino === "site") {
+    return enviarPayloadMetaComFallbackBid(url, payloadBase, `${contexto}_SITE`);
+  }
   return criarAdSetMetaComOtimizacaoInteligente(url, payloadBase, contexto, usuarioId);
 }
 
 // call_to_action do criativo: Lead Ads abre o Instant Form, CTWA abre uma
 // conversa de WhatsApp. Mesmo shape usado no anúncio único, no carrossel e no
 // video_data.
-function montarCallToActionMeta(destino: DestinoCampanhaMeta, ctaType: string, formId: string | null) {
-  return destino === "whatsapp"
-    ? { type: "WHATSAPP_MESSAGE", value: { app_destination: "WHATSAPP" } }
-    : { type: ctaType, value: { lead_gen_form_id: formId } };
+function montarCallToActionMeta(destino: DestinoCampanhaMeta, ctaType: string, formId: string | null, linkDestino?: string) {
+  if (destino === "whatsapp") {
+    return { type: "WHATSAPP_MESSAGE", value: { app_destination: "WHATSAPP" } };
+  }
+  if (destino === "site") {
+    return { type: ctaType, value: { link: linkDestino || "" } };
+  }
+  return { type: ctaType, value: { lead_gen_form_id: formId } };
 }
 
 // Monta o conteúdo do criativo (link_data OU video_data, pra usar dentro de
@@ -13139,7 +13162,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
 
     const destino = resolverDestinoCampanha(configuracoes_avancadas?.destino);
 
-    if (!form_id && destino !== "whatsapp") {
+    if (!form_id && destino === "lead_ads") {
 
       return c.json({
         error: "form_id não enviado"
@@ -13268,7 +13291,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       descricaoAnuncio,
       texto,
       linkDestino,
-      ctaPayload: montarCallToActionMeta(destino, ctaType, form_id)
+      ctaPayload: montarCallToActionMeta(destino, ctaType, form_id, linkDestino)
     });
 
     const objectStorySpec: Record<string, any> = {
@@ -23456,12 +23479,13 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       if (
         adId &&
         pageId &&
-        (destinoOriginal === "whatsapp" || formId)
+        (destinoOriginal !== "lead_ads" || formId)
       ) {
         const ctaPayload = montarCallToActionMeta(
           destinoOriginal,
           ctaType,
-          formId || null
+          formId || null,
+          linkDestino
         );
 
         // Carrossel misto (imagens + vídeo) exige uma miniatura (picture) no card do
@@ -23850,7 +23874,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     let formMeta: { id: string | null } = { id: null };
 
-    if (destino !== "whatsapp") {
+    if (destino === "lead_ads") {
       const payloadFormulario: any = {
         name: `Form ${campanha.nome || "Leads"} ${Date.now()}`,
         locale: "pt_BR",
@@ -24104,7 +24128,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         textoOpcional(campanha.texto) ||
         "Entre em contato agora",
       linkDestino,
-      ctaPayload: montarCallToActionMeta(destino, ctaType, formMeta.id)
+      ctaPayload: montarCallToActionMeta(destino, ctaType, formMeta.id, linkDestino)
     });
 
     const objectStorySpec: Record<string, any> = {
@@ -31059,7 +31083,7 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     const pagina = pagesDetalhes.data?.find((p: any) => p.id === pageId);
     let formId: string | null = null;
 
-    if (pagina?.access_token && destino !== "whatsapp") {
+    if (pagina?.access_token && destino === "lead_ads") {
       const perguntasExtras = Array.isArray(cfgFormulario.perguntas_customizadas)
         ? cfgFormulario.perguntas_customizadas.slice(0, 4).map((q: string, i: number) => ({
             type: "CUSTOM", key: `qualificacao_${i + 1}`, label: q
