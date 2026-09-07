@@ -15700,9 +15700,11 @@ app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
       return c.json({ error: "Informe um valor válido" }, 400);
     }
 
-    // Normaliza sempre pro dia 1 do mês — evita duas linhas pro mesmo mês por
-    // causa de um dia diferente vindo do front.
-    const mesNormalizado = `${String(mes_referencia).slice(0, 7)}-01`;
+    // Aceita mês (YYYY-MM) por compatibilidade, mas cai no dia 1 só nesse caso —
+    // quando vem dia explícito (YYYY-MM-DD) do front, é ele que é gravado.
+    const dataReferencia = String(mes_referencia).length > 7
+      ? String(mes_referencia)
+      : `${String(mes_referencia)}-01`;
 
     const result = await client.query(
       `INSERT INTO financeiro_lancamentos (usuario_id, mes_referencia, valor, observacao)
@@ -15712,7 +15714,7 @@ app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
        RETURNING id, usuario_id, mes_referencia, valor, status,
                  comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
                  observacao, criado_em`,
-      [usuarioId, mesNormalizado, valorNumero, textoOpcional(observacao) || null]
+      [usuarioId, dataReferencia, valorNumero, textoOpcional(observacao) || null]
     );
 
     return c.json(linhaFinanceiroParaJson(result.rows[0]));
