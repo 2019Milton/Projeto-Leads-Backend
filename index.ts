@@ -15648,6 +15648,40 @@ async function lerArquivoFinanceiro(c: any): Promise<
   return { erro: null, mimeType, bytes: Buffer.from(bytesArrayBuffer) };
 }
 
+const CHAVE_PIX_TIPO_LABEL: Record<string, string> = {
+  cpf: "CPF",
+  cnpj: "CNPJ",
+  email: "E-mail",
+  telefone: "Telefone",
+  aleatoria: "Chave aleatória",
+};
+
+// Identifica o formato de uma chave PIX (CPF, CNPJ, e-mail, telefone ou
+// aleatória/EVP) só pra saber que rótulo mostrar pro usuário que vai pagar —
+// não confere dígito verificador, não é uma validação bancária.
+function identificarChavePix(valorBruto: unknown): { tipo: string; valor: string } | null {
+  const valor = String(valorBruto || "").trim();
+  if (!valor) return null;
+
+  if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(valor)) {
+    return { tipo: "aleatoria", valor: valor.toLowerCase() };
+  }
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(valor)) {
+    return { tipo: "email", valor: valor.toLowerCase() };
+  }
+  if (valor.startsWith("+") || /[()]/.test(valor)) {
+    const digitos = valor.replace(/\D/g, "");
+    if (digitos.length < 10 || digitos.length > 13) return null;
+    return { tipo: "telefone", valor: `+${digitos.startsWith("55") ? digitos : "55" + digitos}` };
+  }
+
+  const somenteDigitos = valor.replace(/\D/g, "");
+  if (somenteDigitos.length === 11) return { tipo: "cpf", valor: somenteDigitos };
+  if (somenteDigitos.length === 14) return { tipo: "cnpj", valor: somenteDigitos };
+
+  return null;
+}
+
 function linhaFinanceiroParaJson(linha: any) {
   return {
     id: linha.id,
@@ -15660,6 +15694,9 @@ function linhaFinanceiroParaJson(linha: any) {
     tem_nf: linha.nf_dados !== null && linha.nf_dados !== undefined,
     nf_enviada_em: linha.nf_enviada_em,
     observacao: linha.observacao,
+    pix_chave: linha.pix_chave,
+    pix_tipo: linha.pix_tipo,
+    pix_tipo_label: linha.pix_tipo ? (CHAVE_PIX_TIPO_LABEL[linha.pix_tipo] || linha.pix_tipo) : null,
     criado_em: linha.criado_em
   };
 }
@@ -15672,7 +15709,7 @@ app.get("/financeiro/meus-lancamentos", authMiddleware, async (c) => {
     const result = await client.query(
       `SELECT id, usuario_id, mes_referencia, valor, status,
               comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
-              observacao, criado_em
+              observacao, pix_chave, pix_tipo, criado_em
        FROM financeiro_lancamentos
        WHERE usuario_id = $1
        ORDER BY mes_referencia DESC`,
@@ -15812,7 +15849,7 @@ app.get("/admin/financeiro/usuarios/:usuarioId/lancamentos", authMiddleware, asy
     const result = await client.query(
       `SELECT id, usuario_id, mes_referencia, valor, status,
               comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
-              observacao, criado_em
+              observacao, pix_chave, pix_tipo, criado_em
        FROM financeiro_lancamentos
        WHERE usuario_id = $1
        ORDER BY mes_referencia DESC`,
@@ -15834,7 +15871,7 @@ app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
       return c.json({ error: "Acesso negado" }, 403);
     }
 
-    const { usuario_id, mes_referencia, valor, observacao } = await c.req.json();
+    const { usuario_id, mes_referencia, valor, observacao, pix_chave } = await c.req.json();
 
     const usuarioId = Number(usuario_id);
     const valorNumero = Number(valor);
@@ -15849,6 +15886,12 @@ app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
       return c.json({ error: "Informe um valor válido" }, 400);
     }
 
+    const chavePixTexto = textoOpcional(pix_chave);
+    const chavePix = chavePixTexto ? identificarChavePix(chavePixTexto) : null;
+    if (chavePixTexto && !chavePix) {
+      return c.json({ error: "Chave PIX em formato inválido (use CPF, CNPJ, e-mail, telefone ou chave aleatória)" }, 400);
+    }
+
     // Aceita mês (YYYY-MM) por compatibilidade, mas cai no dia 1 só nesse caso —
     // quando vem dia explícito (YYYY-MM-DD) do front, é ele que é gravado.
     const dataReferencia = String(mes_referencia).length > 7
@@ -15856,14 +15899,16 @@ app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
       : `${String(mes_referencia)}-01`;
 
     const result = await client.query(
-      `INSERT INTO financeiro_lancamentos (usuario_id, mes_referencia, valor, observacao)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO financeiro_lancamentos (usuario_id, mes_referencia, valor, observacao, pix_chave, pix_tipo)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (usuario_id, mes_referencia)
-       DO UPDATE SET valor = EXCLUDED.valor, observacao = EXCLUDED.observacao
+       DO UPDATE SET valor = EXCLUDED.valor, observacao = EXCLUDED.observacao,
+                     pix_chave = EXCLUDED.pix_chave, pix_tipo = EXCLUDED.pix_tipo
        RETURNING id, usuario_id, mes_referencia, valor, status,
                  comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
-                 observacao, criado_em`,
-      [usuarioId, dataReferencia, valorNumero, textoOpcional(observacao) || null]
+                 observacao, pix_chave, pix_tipo, criado_em`,
+      [usuarioId, dataReferencia, valorNumero, textoOpcional(observacao) || null,
+       chavePix?.valor || null, chavePix?.tipo || null]
     );
 
     return c.json(linhaFinanceiroParaJson(result.rows[0]));
@@ -15873,7 +15918,7 @@ app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
   }
 });
 
-// 🔹 Admin — edita valor/observação de um lançamento existente.
+// 🔹 Admin — edita data/valor/observação/chave PIX de um lançamento existente.
 app.put("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -15884,21 +15929,43 @@ app.put("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
     const id = Number(c.req.param("id"));
     if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
 
-    const { valor, observacao } = await c.req.json();
+    const { mes_referencia, valor, observacao, pix_chave } = await c.req.json();
     const valorNumero = Number(valor);
     if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
       return c.json({ error: "Informe um valor válido" }, 400);
     }
+    if (!mes_referencia || !/^\d{4}-\d{2}(-\d{2})?$/.test(String(mes_referencia))) {
+      return c.json({ error: "Data de referência inválida" }, 400);
+    }
 
-    const result = await client.query(
-      `UPDATE financeiro_lancamentos
-       SET valor = $1, observacao = $2
-       WHERE id = $3
-       RETURNING id, usuario_id, mes_referencia, valor, status,
-                 comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
-                 observacao, criado_em`,
-      [valorNumero, textoOpcional(observacao) || null, id]
-    );
+    const chavePixTexto = textoOpcional(pix_chave);
+    const chavePix = chavePixTexto ? identificarChavePix(chavePixTexto) : null;
+    if (chavePixTexto && !chavePix) {
+      return c.json({ error: "Chave PIX em formato inválido (use CPF, CNPJ, e-mail, telefone ou chave aleatória)" }, 400);
+    }
+
+    const dataReferencia = String(mes_referencia).length > 7
+      ? String(mes_referencia)
+      : `${String(mes_referencia)}-01`;
+
+    let result;
+    try {
+      result = await client.query(
+        `UPDATE financeiro_lancamentos
+         SET mes_referencia = $1, valor = $2, observacao = $3, pix_chave = $4, pix_tipo = $5
+         WHERE id = $6
+         RETURNING id, usuario_id, mes_referencia, valor, status,
+                   comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+                   observacao, pix_chave, pix_tipo, criado_em`,
+        [dataReferencia, valorNumero, textoOpcional(observacao) || null,
+         chavePix?.valor || null, chavePix?.tipo || null, id]
+      );
+    } catch (erroQuery: any) {
+      if (erroQuery?.code === "23505") {
+        return c.json({ error: "Já existe um lançamento desse usuário nessa data de referência" }, 409);
+      }
+      throw erroQuery;
+    }
 
     if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
 
@@ -15906,6 +15973,31 @@ app.put("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO PUT /admin/financeiro/lancamentos/:id:", err);
     return c.json({ error: "Erro ao atualizar lançamento" }, 500);
+  }
+});
+
+// 🔹 Admin — exclui um lançamento existente.
+app.delete("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const result = await client.query(
+      `DELETE FROM financeiro_lancamentos WHERE id = $1 RETURNING id`,
+      [id]
+    );
+
+    if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO DELETE /admin/financeiro/lancamentos/:id:", err);
+    return c.json({ error: "Erro ao excluir lançamento" }, 500);
   }
 });
 
@@ -18258,9 +18350,14 @@ await client.query(`
     nf_mime                TEXT,
     nf_enviada_em          TIMESTAMP,
     observacao             TEXT,
+    pix_chave              TEXT,
+    pix_tipo               TEXT,
     criado_em              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(usuario_id, mes_referencia)
   );
+
+  ALTER TABLE financeiro_lancamentos ADD COLUMN IF NOT EXISTS pix_chave TEXT;
+  ALTER TABLE financeiro_lancamentos ADD COLUMN IF NOT EXISTS pix_tipo TEXT;
 
   CREATE TABLE IF NOT EXISTS whatsapp_conversas (
     id                  SERIAL PRIMARY KEY,
