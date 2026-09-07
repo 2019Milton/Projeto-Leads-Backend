@@ -7362,6 +7362,13 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     }
     const campaignId = campaignResourceName.split("/").pop();
 
+    await registrarIdCampanhaNativa(
+      usuarioId,
+      "google",
+      conexao.customerId,
+      campaignId
+    );
+
     // ASSUMPTION: geoTargetConstants/2076 (Brasil) e languageConstants/1014 (portugues)
     // fixos no MVP, sem UI de segmentacao — nao bloqueia a criacao da campanha se falhar.
     try {
@@ -9727,6 +9734,14 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     }
 
     const campaignId = String(resposta.data.data.campaign_id);
+
+    await registrarIdCampanhaNativa(
+      usuarioId,
+      "tiktok",
+      conexao.advertiserId,
+      campaignId
+    );
+
     const destinoResolvido = resolverDestinoCampanhaTikTok(
       destino ?? configuracoes_avancadas?.destino
     );
@@ -10841,6 +10856,13 @@ app.post("/linkedin/campanha", authMiddleware, async (c) => {
     }
 
     const campaignGroupId = resposta.id;
+
+    await registrarIdCampanhaNativa(
+      usuarioId,
+      "linkedin",
+      conexao.adAccountId,
+      campaignGroupId
+    );
 
     await client.query(
       `INSERT INTO campanhas (
@@ -12147,6 +12169,13 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
         detalhe: campanha
       }, 400);
     }
+
+    await registrarIdCampanhaNativa(
+      usuarioId,
+      "meta",
+      adAccountId,
+      campanha.id
+    );
     
     await client.query(
       `
@@ -21591,6 +21620,17 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
       } else {
 
+        if (statusCampanhaRemotaExcluida(statusFinal)) {
+          continue;
+        }
+
+        const origem = await origemAoSincronizarCampanha(
+          user.id,
+          "meta",
+          adAccountId,
+          campanha.id
+        );
+
         await client.query(
           `
           INSERT INTO campanhas (
@@ -21611,7 +21651,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             adAccountId,
             campanha.name,
             statusFinal,
-            "meta"
+            origem
           ]
         );
 
@@ -23682,6 +23722,13 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     }
 
     campaignMetaId = campanhaMeta.id;
+
+    await registrarIdCampanhaNativa(
+      user.id,
+      "meta",
+      adAccountId,
+      campaignMetaId
+    );
 
     const perguntasExtras =
       Array.isArray(cfg.perguntas)
@@ -30413,6 +30460,13 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     }
 
     campanhaMetaIdCriada = campanhaMeta.id;
+
+    await registrarIdCampanhaNativa(
+      rascunho.corretor_id,
+      "meta",
+      adAccountId,
+      campanhaMetaIdCriada
+    );
 
     // 2. Busca page_id disponível do corretor
     let pageId = textoOpcional(cfgCriativo.page_id);
