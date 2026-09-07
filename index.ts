@@ -5116,6 +5116,90 @@ function erroCampanhaOutraConta(plataforma: string): string {
   return `Esta campanha não pertence à conta de anúncios ${plataforma} selecionada. Sincronize a conta correta e tente novamente.`;
 }
 
+const ORIGENS_IMPORTADAS_CAMPANHA = new Set([
+  "meta",
+  "facebook",
+  "instagram",
+  "google",
+  "tiktok",
+  "linkedin",
+  "kwai",
+]);
+
+function normalizarPlataformaRegistroCampanha(valor: unknown): string {
+  const plataforma = String(valor || "meta").trim().toLowerCase();
+  return ["facebook", "instagram"].includes(plataforma) ? "meta" : plataforma;
+}
+
+function campanhaTemOrigemNativa(origem: unknown): boolean {
+  return !ORIGENS_IMPORTADAS_CAMPANHA.has(
+    String(origem || "").trim().toLowerCase()
+  );
+}
+
+function statusCampanhaRemotaExcluida(status: unknown): boolean {
+  const normalizado = String(status || "").trim().toUpperCase();
+  return [
+    "DELETED",
+    "REMOVED",
+    "ARCHIVED",
+    "DELETE",
+    "CAMPAIGN_STATUS_DELETE",
+  ].includes(normalizado);
+}
+
+async function registrarIdCampanhaNativa(
+  usuarioId: number,
+  plataforma: unknown,
+  contaAnunciosId: unknown,
+  campaignId: unknown
+) {
+  const plataformaNormalizada = normalizarPlataformaRegistroCampanha(plataforma);
+  const contaNormalizada = normalizarIdContaAnuncios(contaAnunciosId);
+  const campaignIdNormalizado = String(campaignId || "").trim();
+
+  if (!usuarioId || !plataformaNormalizada || !contaNormalizada || !campaignIdNormalizado) {
+    return;
+  }
+
+  await client.query(
+    `INSERT INTO campanhas_origens_nativas
+       (usuario_id, plataforma, conta_anuncios_id, campaign_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (usuario_id, plataforma, conta_anuncios_id, campaign_id)
+     DO NOTHING`,
+    [usuarioId, plataformaNormalizada, contaNormalizada, campaignIdNormalizado]
+  );
+}
+
+async function origemAoSincronizarCampanha(
+  usuarioId: number,
+  plataforma: unknown,
+  contaAnunciosId: unknown,
+  campaignId: unknown
+): Promise<string> {
+  const plataformaNormalizada = normalizarPlataformaRegistroCampanha(plataforma);
+  const contaNormalizada = normalizarIdContaAnuncios(contaAnunciosId);
+  const campaignIdNormalizado = String(campaignId || "").trim();
+
+  if (!contaNormalizada || !campaignIdNormalizado) {
+    return plataformaNormalizada;
+  }
+
+  const registro = await client.query(
+    `SELECT 1
+     FROM campanhas_origens_nativas
+     WHERE usuario_id = $1
+       AND plataforma = $2
+       AND conta_anuncios_id = $3
+       AND campaign_id = $4
+     LIMIT 1`,
+    [usuarioId, plataformaNormalizada, contaNormalizada, campaignIdNormalizado]
+  );
+
+  return registro.rows.length > 0 ? "plataforma" : plataformaNormalizada;
+}
+
 async function campanhaExisteNaContaSelecionada(
   usuarioId: number,
   campaignId: unknown,
@@ -5176,10 +5260,19 @@ async function sincronizarCampanhasUsuario(
         [campanha.name, statusFinal, contaAnunciosId, existe.rows[0].id]
       );
     } else {
+      if (statusCampanhaRemotaExcluida(statusFinal)) {
+        continue;
+      }
+      const origem = await origemAoSincronizarCampanha(
+        usuarioId,
+        "meta",
+        contaAnunciosId,
+        campanha.id
+      );
       await client.query(
         `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
-         VALUES ($1,$2,$3,$4,$5,'meta','meta',NOW())`,
-        [usuarioId, campanha.id, contaAnunciosId, campanha.name, statusFinal]
+         VALUES ($1,$2,$3,$4,$5,$6,'meta',NOW())`,
+        [usuarioId, campanha.id, contaAnunciosId, campanha.name, statusFinal, origem]
       );
     }
   }
@@ -6572,10 +6665,19 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
           [campanha.name, campanha.status, String(customerId), existe.rows[0].id]
         );
       } else {
+        if (statusCampanhaRemotaExcluida(campanha.status)) {
+          continue;
+        }
+        const origem = await origemAoSincronizarCampanha(
+          usuarioId,
+          "google",
+          customerId,
+          campaignId
+        );
         await client.query(
           `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
-           VALUES ($1, $2, $3, $4, $5, 'google', 'google', NOW())`,
-          [usuarioId, campaignId, String(customerId), campanha.name, campanha.status]
+           VALUES ($1, $2, $3, $4, $5, $6, 'google', NOW())`,
+          [usuarioId, campaignId, String(customerId), campanha.name, campanha.status, origem]
         );
       }
     }
@@ -8935,10 +9037,19 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
           [campanha.campaign_name, campanha.status, String(advertiserId), existe.rows[0].id]
         );
       } else {
+        if (statusCampanhaRemotaExcluida(campanha.status)) {
+          continue;
+        }
+        const origem = await origemAoSincronizarCampanha(
+          usuarioId,
+          "tiktok",
+          advertiserId,
+          campanha.campaign_id
+        );
         await client.query(
           `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
-           VALUES ($1, $2, $3, $4, $5, 'tiktok', 'tiktok', NOW())`,
-          [usuarioId, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.status]
+           VALUES ($1, $2, $3, $4, $5, $6, 'tiktok', NOW())`,
+          [usuarioId, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.status, origem]
         );
       }
     }
@@ -11332,10 +11443,19 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
         [nomeCampanha, statusCampanha, String(adAccountId), existe.rows[0].id]
       );
     } else {
+      if (statusCampanhaRemotaExcluida(statusCampanha)) {
+        continue;
+      }
+      const origem = await origemAoSincronizarCampanha(
+        usuarioId,
+        "linkedin",
+        adAccountId,
+        campaignGroupId
+      );
       await client.query(
         `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
-         VALUES ($1, $2, $3, $4, $5, 'linkedin', 'linkedin', NOW())`,
-        [usuarioId, campaignGroupId, String(adAccountId), nomeCampanha, statusCampanha]
+         VALUES ($1, $2, $3, $4, $5, $6, 'linkedin', NOW())`,
+        [usuarioId, campaignGroupId, String(adAccountId), nomeCampanha, statusCampanha, origem]
       );
     }
   }
@@ -18211,6 +18331,102 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS publicacao_grupo_id TEXT;
 `);
 
+// A origem nativa pertence ao ID remoto, não à existência momentânea da linha
+// em campanhas. Redes de anúncios normalmente "excluem" mudando o objeto para
+// DELETED/REMOVED; se esse objeto reaparecer numa consulta depois de uma exclusão
+// definitiva local, este registro impede que ele seja reclassificado como importado.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas_origens_nativas (
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    plataforma TEXT NOT NULL,
+    conta_anuncios_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (usuario_id, plataforma, conta_anuncios_id, campaign_id)
+  );
+
+  INSERT INTO campanhas_origens_nativas (
+    usuario_id,
+    plataforma,
+    conta_anuncios_id,
+    campaign_id,
+    criado_em
+  )
+  SELECT
+    usuario_id,
+    CASE
+      WHEN LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') THEN 'meta'
+      ELSE LOWER(plataforma)
+    END,
+    REPLACE(REGEXP_REPLACE(TRIM(conta_anuncios_id), '^act_', '', 'i'), '-', ''),
+    TRIM(campaign_id),
+    COALESCE(criado_em, CURRENT_TIMESTAMP)
+  FROM campanhas
+  WHERE usuario_id IS NOT NULL
+    AND NULLIF(TRIM(campaign_id), '') IS NOT NULL
+    AND NULLIF(TRIM(conta_anuncios_id), '') IS NOT NULL
+    AND LOWER(COALESCE(origem, '')) NOT IN (
+      'meta', 'facebook', 'instagram', 'google', 'tiktok', 'linkedin', 'kwai'
+    )
+  ON CONFLICT (usuario_id, plataforma, conta_anuncios_id, campaign_id)
+  DO NOTHING;
+
+  CREATE OR REPLACE FUNCTION registrar_origem_nativa_campanha()
+  RETURNS TRIGGER AS $$
+  DECLARE
+    plataforma_normalizada TEXT;
+    conta_normalizada TEXT;
+  BEGIN
+    IF NEW.usuario_id IS NULL
+       OR NULLIF(TRIM(NEW.campaign_id), '') IS NULL
+       OR NULLIF(TRIM(NEW.conta_anuncios_id), '') IS NULL
+       OR LOWER(COALESCE(NEW.origem, '')) IN (
+         'meta', 'facebook', 'instagram', 'google', 'tiktok', 'linkedin', 'kwai'
+       ) THEN
+      RETURN NEW;
+    END IF;
+
+    plataforma_normalizada := CASE
+      WHEN LOWER(COALESCE(NEW.plataforma, 'meta')) IN ('meta', 'facebook', 'instagram') THEN 'meta'
+      ELSE LOWER(NEW.plataforma)
+    END;
+    conta_normalizada := REPLACE(
+      REGEXP_REPLACE(TRIM(NEW.conta_anuncios_id), '^act_', '', 'i'),
+      '-',
+      ''
+    );
+
+    INSERT INTO campanhas_origens_nativas (
+      usuario_id, plataforma, conta_anuncios_id, campaign_id
+    )
+    VALUES (
+      NEW.usuario_id, plataforma_normalizada, conta_normalizada, TRIM(NEW.campaign_id)
+    )
+    ON CONFLICT (usuario_id, plataforma, conta_anuncios_id, campaign_id)
+    DO NOTHING;
+
+    RETURN NEW;
+  END;
+  $$ LANGUAGE plpgsql;
+
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_trigger
+      WHERE tgname = 'trg_registrar_origem_nativa_campanha'
+        AND tgrelid = 'campanhas'::regclass
+    ) THEN
+      CREATE TRIGGER trg_registrar_origem_nativa_campanha
+      AFTER INSERT OR UPDATE OF usuario_id, campaign_id, conta_anuncios_id, origem, plataforma
+      ON campanhas
+      FOR EACH ROW
+      EXECUTE FUNCTION registrar_origem_nativa_campanha();
+    END IF;
+  END;
+  $$;
+`);
+
 // Rastreio de envio dos eventos de Conversion Leads (Meta Conversions API) —
 // evita mandar o mesmo evento de novo se o lead oscilar de score depois.
 await client.query(`
@@ -21878,7 +22094,7 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
 
     const campanha = await client.query(
       `
-      SELECT id, campaign_id, plataforma, conta_anuncios_id
+      SELECT id, campaign_id, plataforma, conta_anuncios_id, origem
       FROM campanhas
       WHERE id = $1
       AND usuario_id = $2
@@ -22079,6 +22295,18 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
           console.log("EXCLUIR DEFINITIVO META: campanha não encontrada, removendo localmente:", campanhaLocal.campaign_id);
         }
       }
+    }
+
+    if (
+      campanhaLocal.campaign_id &&
+      campanhaTemOrigemNativa(campanhaLocal.origem)
+    ) {
+      await registrarIdCampanhaNativa(
+        user.id,
+        plataformaLocal,
+        campanhaLocal.conta_anuncios_id,
+        campanhaLocal.campaign_id
+      );
     }
 
     await client.query(
