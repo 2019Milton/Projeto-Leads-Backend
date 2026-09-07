@@ -2871,6 +2871,7 @@ type TipoUsoIA =
   | "motivo_perda"
   | "reativacao_lote"
   | "criador_campanha"
+  | "gerar_banner"
   | "resumo_diario"
   | "relatorio"
   | "roteiro_whatsapp"
@@ -27241,35 +27242,407 @@ const DIRECAO_VISUAL_NICHO: Record<string, string> = {
 const DIRECAO_VISUAL_GENERICA =
   "Professional advertising creative with a single clear focal point and a mood appropriate to the product or service described below.";
 
-// Monta o prompt real enviado ao gpt-image-1: contexto de nicho (quando conhecido)
-// + diretrizes de qualidade sempre aplicadas + o pedido do usuário como prioridade
-// máxima. Sem isso o modelo recebia só o texto cru do usuário, sem nenhuma direção
-// sobre o que funciona bem nesse mercado nem sobre legibilidade/composição.
-function construirPromptCriativoIA(promptUsuario: string, nichoSlug: string | null, modoEditar: boolean): string {
-  const direcaoNicho = (nichoSlug && DIRECAO_VISUAL_NICHO[nichoSlug]) || DIRECAO_VISUAL_GENERICA;
+type BriefingCriativoIA = {
+  nicho: string | null;
+  formato: string;
+  objetivo: string;
+  estilo: string;
+  publico: string;
+  oferta: string;
+  texto_arte: string;
+  marca: string;
+};
 
-  const diretrizesQualidade =
-    "- Single clear focal point — avoid busy or cluttered compositions.\n" +
-    "- Professional photography/rendering quality: sharp, well-lit, high production value — like a real paid ad from a strong brand in this industry, not an amateur stock photo or generic AI render.\n" +
-    "- If the request includes any text to display on the image, render it in large, bold, highly legible typography with strong contrast against the background, positioned with safe margins (never cropped at the edges), and keep the wording short and punchy.\n" +
-    "- No distorted hands/faces/anatomy, no nonsensical or garbled text, no unwanted watermarks or logos.\n" +
-    "- Should feel native to a real social media ad feed (Meta/Instagram) — not an obviously staged or generic stock photo.";
+type FontePesquisaCriativo = { titulo: string; url: string };
+
+type PesquisaCriativoIA = {
+  realizada: boolean;
+  nicho_identificado: string;
+  resumo_mercado: string;
+  padroes_visuais: string[];
+  angulos: string[];
+  elementos_evitar: string[];
+  direcao_recomendada: string;
+  fontes: FontePesquisaCriativo[];
+  aviso: string | null;
+  usage?: any;
+};
+
+const FORMATOS_CRIATIVO_IA: Record<string, { tamanho: string; rotulo: string; direcao: string }> = {
+  instagram_feed: {
+    tamanho: "1024x1024",
+    rotulo: "Instagram/Facebook Feed (quadrado)",
+    direcao: "Design for a square mobile feed. Keep the focal point and all essential text inside generous safe margins."
+  },
+  stories_reels: {
+    tamanho: "1024x1536",
+    rotulo: "Stories/Reels (vertical)",
+    direcao: "Design vertically for Stories/Reels. Keep critical elements away from the top and bottom interface zones; use a strong central visual flow."
+  },
+  tiktok_vertical: {
+    tamanho: "1024x1536",
+    rotulo: "TikTok (vertical)",
+    direcao: "Design for a vertical, mobile-first TikTok placement. Make it feel immediate and native while preserving professional brand quality and right-side/bottom UI safe zones."
+  },
+  google_display: {
+    tamanho: "1536x1024",
+    rotulo: "Google Display (horizontal)",
+    direcao: "Design a horizontal display-ad master with a simple composition that remains understandable at small sizes and leaves breathing room for responsive crops."
+  },
+  linkedin_feed: {
+    tamanho: "1536x1024",
+    rotulo: "LinkedIn Feed (horizontal)",
+    direcao: "Design a horizontal B2B feed creative with an authoritative, credible visual language and a clear business benefit."
+  },
+  quadrado_generico: {
+    tamanho: "1024x1024",
+    rotulo: "Quadrado multiplataforma",
+    direcao: "Design a versatile square creative with central safe areas so it can be adapted to multiple advertising platforms."
+  }
+};
+
+const OBJETIVOS_CRIATIVO_IA: Record<string, string> = {
+  leads: "Lead generation: make the value proposition immediately clear and reduce perceived friction.",
+  whatsapp: "WhatsApp conversations: convey approachability, urgency without pressure, and a clear reason to start a conversation.",
+  site: "Website traffic or conversion: create curiosity and a clear visual path toward the offer.",
+  remarketing: "Remarketing: assume some prior awareness, reinforce the strongest differentiator, and overcome hesitation.",
+  reconhecimento: "Brand awareness: prioritize memorability, distinctive visual assets, and instant category recognition."
+};
+
+const ESTILOS_CRIATIVO_IA: Record<string, string> = {
+  auto: "Choose the style best supported by the current niche research and the advertiser's briefing.",
+  resposta_direta: "Direct-response advertising: bold hierarchy, immediate benefit, focused persuasive composition.",
+  premium: "Premium brand campaign: refined art direction, controlled palette, sophisticated lighting and generous negative space.",
+  ugc: "Authentic UGC-inspired aesthetic: believable real-world setting and human warmth, while remaining polished and advertisement-ready.",
+  minimalista: "Minimalist: one focal point, restrained palette, ample negative space and concise communication.",
+  corporativo: "Modern corporate: credible, clean and confident, avoiding generic handshakes and obvious stock-photo clichés.",
+  ousado: "Bold and energetic: distinctive color contrast and dynamic composition without visual clutter."
+};
+
+function limitarTextoCriativo(value: unknown, limite: number) {
+  return textoOpcional(value).slice(0, limite);
+}
+
+function normalizarBriefingCriativo(body: any, nichoSlug: string | null): BriefingCriativoIA {
+  const briefing = body?.briefing && typeof body.briefing === "object" ? body.briefing : {};
+  const formatoPedido = limitarTextoCriativo(briefing.formato, 40);
+  const objetivoPedido = limitarTextoCriativo(briefing.objetivo, 40);
+  const estiloPedido = limitarTextoCriativo(briefing.estilo, 40);
+
+  return {
+    nicho: nichoSlug || limitarTextoCriativo(briefing.nicho, 80) || null,
+    formato: FORMATOS_CRIATIVO_IA[formatoPedido] ? formatoPedido : "instagram_feed",
+    objetivo: OBJETIVOS_CRIATIVO_IA[objetivoPedido] ? objetivoPedido : "leads",
+    estilo: ESTILOS_CRIATIVO_IA[estiloPedido] ? estiloPedido : "auto",
+    publico: limitarTextoCriativo(briefing.publico, 500),
+    oferta: limitarTextoCriativo(briefing.oferta, 700),
+    texto_arte: limitarTextoCriativo(briefing.texto_arte, 180),
+    marca: limitarTextoCriativo(briefing.marca, 700)
+  };
+}
+
+function modeloResponsesCriativo() {
+  const configurado = textoOpcional(Bun.env.OPENAI_RESEARCH_MODEL);
+  if (configurado) return configurado;
+  const modeloPadrao = textoOpcional(Bun.env.OPENAI_MODEL);
+  return /^(gpt-5|gpt-4\.1|o1|o3|o4)/i.test(modeloPadrao) ? modeloPadrao : "gpt-5-mini";
+}
+
+function extrairFontesPesquisaCriativo(data: any): FontePesquisaCriativo[] {
+  const fontes: FontePesquisaCriativo[] = [];
+  const vistas = new Set<string>();
+
+  const adicionar = (urlValue: unknown, tituloValue: unknown) => {
+    const url = textoOpcional(urlValue);
+    if (!/^https?:\/\//i.test(url) || vistas.has(url) || fontes.length >= 6) return;
+    vistas.add(url);
+    let titulo = textoOpcional(tituloValue);
+    if (!titulo) {
+      try { titulo = new URL(url).hostname.replace(/^www\./, ""); } catch (_) { titulo = "Referência pesquisada"; }
+    }
+    fontes.push({ titulo: titulo.slice(0, 160), url });
+  };
+
+  for (const item of data?.output || []) {
+    if (item?.type === "web_search_call") {
+      for (const fonte of item?.action?.sources || []) adicionar(fonte?.url, fonte?.title || fonte?.name);
+    }
+    for (const conteudo of item?.content || []) {
+      for (const anotacao of conteudo?.annotations || []) {
+        if (anotacao?.type === "url_citation") adicionar(anotacao?.url, anotacao?.title);
+      }
+    }
+  }
+  return fontes;
+}
+
+async function pesquisarReferenciasCriativoIA(
+  openaiKey: string,
+  promptUsuario: string,
+  briefing: BriefingCriativoIA
+): Promise<PesquisaCriativoIA> {
+  const nichoInformado = briefing.nicho || "detectar a partir da oferta e da descrição";
+  const fallbackDirecao = (briefing.nicho && DIRECAO_VISUAL_NICHO[briefing.nicho]) || DIRECAO_VISUAL_GENERICA;
+
+  try {
+    const response = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modeloResponsesCriativo(),
+        instructions:
+          "Você é um diretor de arte e estrategista de mídia paga no Brasil. Pesquise na web referências atuais, padrões e abordagens visuais relevantes para o nicho, objetivo e canal pedidos. " +
+          "Use as referências somente para síntese estratégica: nunca copie literalmente uma campanha, composição, personagem, slogan, identidade visual ou marca de terceiros. " +
+          "Priorize fontes confiáveis e exemplos recentes. Diferencie tendências úteis de modismos e evite alegações proibidas ou sem comprovação.",
+        input: [{
+          role: "user",
+          content: [{
+            type: "input_text",
+            text:
+              `Nicho: ${nichoInformado}\n` +
+              `Formato/canal: ${FORMATOS_CRIATIVO_IA[briefing.formato].rotulo}\n` +
+              `Objetivo: ${briefing.objetivo}\n` +
+              `Público: ${briefing.publico || "não informado"}\n` +
+              `Oferta: ${briefing.oferta || "não informada"}\n` +
+              `Descrição do anunciante: ${promptUsuario.slice(0, 3000)}\n\n` +
+              "Pesquise referências e entregue uma direção original, específica, prática e visualmente detalhada."
+          }]
+        }],
+        tools: [{
+          type: "web_search",
+          search_context_size: "medium",
+          user_location: { type: "approximate", country: "BR", timezone: "America/Sao_Paulo" }
+        }],
+        tool_choice: "required",
+        include: ["web_search_call.action.sources"],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "pesquisa_criativo_publicitario",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["nicho_identificado", "resumo_mercado", "padroes_visuais", "angulos", "elementos_evitar", "direcao_recomendada"],
+              properties: {
+                nicho_identificado: { type: "string" },
+                resumo_mercado: { type: "string" },
+                padroes_visuais: { type: "array", items: { type: "string" } },
+                angulos: { type: "array", items: { type: "string" } },
+                elementos_evitar: { type: "array", items: { type: "string" } },
+                direcao_recomendada: { type: "string" }
+              }
+            }
+          }
+        },
+        max_output_tokens: 1400,
+        store: false
+      })
+    });
+    const data: any = await response.json();
+    if (!response.ok) throw new Error(data?.error?.message || "Pesquisa web indisponível");
+
+    const texto = extrairTextoRespostaOpenAI(data);
+    const resultado = JSON.parse(texto || "{}");
+    return {
+      realizada: true,
+      nicho_identificado: limitarTextoCriativo(resultado.nicho_identificado, 140) || briefing.nicho || "geral",
+      resumo_mercado: limitarTextoCriativo(resultado.resumo_mercado, 1000),
+      padroes_visuais: Array.isArray(resultado.padroes_visuais) ? resultado.padroes_visuais.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
+      angulos: Array.isArray(resultado.angulos) ? resultado.angulos.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
+      elementos_evitar: Array.isArray(resultado.elementos_evitar) ? resultado.elementos_evitar.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
+      direcao_recomendada: limitarTextoCriativo(resultado.direcao_recomendada, 1200) || fallbackDirecao,
+      fontes: extrairFontesPesquisaCriativo(data),
+      aviso: null,
+      usage: data?.usage
+    };
+  } catch (err) {
+    console.error("PESQUISA CRIATIVO IA:", err);
+    return {
+      realizada: false,
+      nicho_identificado: briefing.nicho || "geral",
+      resumo_mercado: "",
+      padroes_visuais: [],
+      angulos: [],
+      elementos_evitar: [],
+      direcao_recomendada: fallbackDirecao,
+      fontes: [],
+      aviso: "A pesquisa web não respondeu; o criativo foi produzido com a direção especializada já configurada para o nicho."
+    };
+  }
+}
+
+function construirPromptCriativoIA(
+  promptUsuario: string,
+  briefing: BriefingCriativoIA,
+  pesquisa: PesquisaCriativoIA,
+  modoEditar: boolean
+) {
+  const formato = FORMATOS_CRIATIVO_IA[briefing.formato];
+  const direcaoNicho = (briefing.nicho && DIRECAO_VISUAL_NICHO[briefing.nicho]) || pesquisa.direcao_recomendada || DIRECAO_VISUAL_GENERICA;
+  const textoArte = briefing.texto_arte
+    ? `ARTWORK TEXT — render exactly this wording, with correct spelling and no extra promotional copy: "${briefing.texto_arte}".`
+    : "ARTWORK TEXT — do not invent promotional copy or random words. Only include text when the advertiser explicitly requested it in the description or it already exists in the base image.";
+  const lista = (itens: string[]) => itens.length ? itens.map(item => `- ${item}`).join("\n") : "- No additional item.";
+
+  const contexto =
+    `DELIVERABLE: ${formato.rotulo}, generated at ${formato.tamanho}. ${formato.direcao}\n` +
+    `CAMPAIGN OBJECTIVE: ${OBJETIVOS_CRIATIVO_IA[briefing.objetivo]}\n` +
+    `TARGET AUDIENCE: ${briefing.publico || "Infer carefully from the advertiser's description and niche."}\n` +
+    `OFFER/VALUE PROPOSITION: ${briefing.oferta || "Infer only what is explicitly supported by the advertiser's description."}\n` +
+    `STYLE: ${ESTILOS_CRIATIVO_IA[briefing.estilo]}\n` +
+    `BRAND RULES/RESTRICTIONS: ${briefing.marca || "No specific brand rules supplied; use a coherent original palette and no third-party logos."}\n` +
+    `${textoArte}\n\n` +
+    `INDUSTRY ART DIRECTION: ${direcaoNicho}\n` +
+    `CURRENT WEB RESEARCH SYNTHESIS: ${pesquisa.resumo_mercado || "Use the specialized industry direction above."}\n` +
+    `RECOMMENDED ORIGINAL DIRECTION: ${pesquisa.direcao_recomendada}\n` +
+    `USEFUL VISUAL PATTERNS:\n${lista(pesquisa.padroes_visuais)}\n` +
+    `CREATIVE ANGLES:\n${lista(pesquisa.angulos)}\n` +
+    `AVOID:\n${lista(pesquisa.elementos_evitar)}\n\n` +
+    "Synthesize these findings into a new, original concept. Do not copy any researched advertisement, layout, slogan, logo, identifiable person or protected brand asset.";
+
+  const qualidade =
+    "QUALITY CONTROL:\n" +
+    "- Create a polished paid-media creative with one unmistakable focal point and a deliberate visual hierarchy.\n" +
+    "- It must be understandable within two seconds on a phone, with strong contrast and generous safe margins.\n" +
+    "- Use realistic, intentional lighting, materials and anatomy; no malformed hands, faces, objects or interface fragments.\n" +
+    "- Avoid generic AI aesthetics, clutter, tiny text, fake logos, watermarks, unsupported claims and irrelevant decoration.\n" +
+    "- Keep the product/service, audience, offer and campaign objective visibly aligned.\n" +
+    "- If text is required, prioritize exact spelling, short lines and excellent legibility; never crop letters.\n" +
+    "- The final image must look finished and ready for a professional Brazilian advertising account.";
 
   if (modoEditar) {
     return (
-      `Editing task on the provided image, for a ${nichoSlug || "general"} advertising creative: ${promptUsuario}\n\n` +
-      "IMPORTANT: Use the provided reference image as the exact visual base. Keep ALL original elements, colors, composition, and style. Only add, modify, or remove exactly what is described above. Do NOT recreate the image from scratch. The result must look like a natural modification of the original image.\n\n" +
-      `INDUSTRY CONTEXT for any new/modified elements: ${direcaoNicho}\n\n` +
-      `QUALITY GUIDELINES for any new/modified elements:\n${diretrizesQualidade}`
+      "EDITING TASK: use the first supplied image as the visual base. Preserve every element that the advertiser did not ask to change, including identity, composition and recognizable subjects. Do not redesign from scratch.\n\n" +
+      `${contexto}\n\nADVERTISER'S EXACT EDIT REQUEST (highest priority):\n${promptUsuario}\n\n${qualidade}`
     );
   }
 
   return (
-    "You are creating a high-converting advertising creative image for a social media ad feed (Meta/Instagram/Facebook).\n\n" +
-    `INDUSTRY CONTEXT: ${direcaoNicho}\n\n` +
-    `CREATIVE QUALITY GUIDELINES (always apply):\n${diretrizesQualidade}\n\n` +
-    `SPECIFIC REQUEST FROM THE ADVERTISER (top priority — follow this exactly; use the guidance above only to fill in gaps or elevate quality where the request didn't specify):\n"${promptUsuario}"`
+    "Create an original, high-performing advertising image from the strategic brief below.\n\n" +
+    `${contexto}\n\nADVERTISER'S EXACT CREATIVE REQUEST (highest priority):\n${promptUsuario}\n\n${qualidade}`
   );
+}
+
+async function gerarImagemCriativoOpenAI(args: {
+  openaiKey: string;
+  prompt: string;
+  tamanho: string;
+  imagens: Array<{ data: string; tipo: string }>;
+}) {
+  if (args.imagens.length > 0) {
+    const formData = new FormData();
+    formData.append("model", "gpt-image-1");
+    formData.append("prompt", args.prompt);
+    formData.append("n", "1");
+    formData.append("size", args.tamanho);
+    formData.append("quality", "high");
+    formData.append("input_fidelity", "high");
+    formData.append("output_format", "png");
+
+    const campoImagem = args.imagens.length > 1 ? "image[]" : "image";
+    for (let i = 0; i < args.imagens.length; i++) {
+      const { data, tipo } = args.imagens[i];
+      const buffer = Buffer.from(data, "base64");
+      const blob = new Blob([buffer], { type: tipo || "image/png" });
+      formData.append(campoImagem, blob, `referencia_${i + 1}.png`);
+    }
+
+    const response = await fetch("https://api.openai.com/v1/images/edits", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${args.openaiKey}` },
+      body: formData
+    });
+    const data: any = await response.json();
+    if (!response.ok) throw new Error(data?.error?.message || "Erro ao gerar o criativo com as referências selecionadas.");
+    return { imagemBase64: data?.data?.[0]?.b64_json || "", usage: data?.usage };
+  }
+
+  const response = await fetch("https://api.openai.com/v1/images/generations", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${args.openaiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-image-1",
+      prompt: args.prompt,
+      n: 1,
+      size: args.tamanho,
+      quality: "high",
+      output_format: "png"
+    })
+  });
+  const data: any = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || "Erro ao gerar o criativo.");
+  return { imagemBase64: data?.data?.[0]?.b64_json || "", usage: data?.usage };
+}
+
+async function avaliarCriativoIA(
+  openaiKey: string,
+  imagemBase64: string,
+  promptUsuario: string,
+  briefing: BriefingCriativoIA
+) {
+  try {
+    const response = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modeloResponsesCriativo(),
+        instructions:
+          "Você é um diretor de criação sênior fazendo controle de qualidade rigoroso de uma peça publicitária. Avalie apenas o que está visível e compare com o briefing. " +
+          "Considere aderência ao nicho e oferta, impacto inicial, hierarquia, composição, legibilidade mobile, margens seguras, exatidão de texto, credibilidade, adequação ao canal e ausência de artefatos de IA. Seja exigente e prático.",
+        input: [{
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                `Pedido: ${promptUsuario.slice(0, 2200)}\n` +
+                `Nicho: ${briefing.nicho || "detectado pela descrição"}\n` +
+                `Formato: ${FORMATOS_CRIATIVO_IA[briefing.formato].rotulo}\n` +
+                `Objetivo: ${briefing.objetivo}\nPúblico: ${briefing.publico || "não informado"}\n` +
+                `Oferta: ${briefing.oferta || "não informada"}\nTexto obrigatório: ${briefing.texto_arte || "nenhum"}`
+            },
+            { type: "input_image", image_url: `data:image/png;base64,${imagemBase64}`, detail: "high" }
+          ]
+        }],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "controle_qualidade_criativo",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["nota", "aprovado", "pontos_fortes", "problemas", "instrucao_refinamento"],
+              properties: {
+                nota: { type: "number", minimum: 0, maximum: 10 },
+                aprovado: { type: "boolean" },
+                pontos_fortes: { type: "array", items: { type: "string" } },
+                problemas: { type: "array", items: { type: "string" } },
+                instrucao_refinamento: { type: "string" }
+              }
+            }
+          }
+        },
+        max_output_tokens: 900,
+        store: false
+      })
+    });
+    const data: any = await response.json();
+    if (!response.ok) throw new Error(data?.error?.message || "Revisão visual indisponível");
+    const resultado = JSON.parse(extrairTextoRespostaOpenAI(data) || "{}");
+    return {
+      nota: Math.max(0, Math.min(10, Number(resultado.nota) || 0)),
+      aprovado: Boolean(resultado.aprovado),
+      pontos_fortes: Array.isArray(resultado.pontos_fortes) ? resultado.pontos_fortes.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
+      problemas: Array.isArray(resultado.problemas) ? resultado.problemas.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
+      instrucao_refinamento: limitarTextoCriativo(resultado.instrucao_refinamento, 1200),
+      usage: data?.usage
+    };
+  } catch (err) {
+    console.error("REVISAO CRIATIVO IA:", err);
+    return null;
+  }
 }
 
 app.post("/ia/gerar-banner", authMiddleware, async (c) => {
@@ -27282,17 +27655,19 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
     if (bloqueio) return c.json({ error: bloqueio }, 403);
 
     const body = await c.req.json().catch(() => ({}));
-    const prompt = textoOpcional(body.prompt);
+    const prompt = limitarTextoCriativo(body.prompt, 4000);
     if (!prompt) return c.json({ error: "Descreva o criativo antes de gerar." }, 400);
 
-    const nichoSlug = textoOpcional(body.nicho);
-    const promptFinal = construirPromptCriativoIA(prompt, nichoSlug, body.modo === "editar");
-
     const modoEditar: boolean = body.modo === "editar";
+    const nichoSlug = limitarTextoCriativo(body.nicho, 80) || null;
+    const briefing = normalizarBriefingCriativo(body, nichoSlug);
 
     const imagensBase64: Array<{ data: string; tipo: string }> = Array.isArray(body.imagens_base64)
       ? body.imagens_base64.slice(0, modoEditar ? 1 : 4)
       : [];
+    if (modoEditar && imagensBase64.length === 0) {
+      return c.json({ error: "Selecione uma imagem base para editar." }, 400);
+    }
 
     // Respeita o provider do usuário — geração de imagem só é suportada pela OpenAI,
     // então Anthropic faz fallback silencioso para OpenAI.
@@ -27303,76 +27678,94 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
 
     if (!openaiKey) return c.json({ error: "Geração de imagem não configurada. Configure a chave OpenAI." }, 400);
 
-    let imagemBase64 = "";
+    const pesquisa = await pesquisarReferenciasCriativoIA(openaiKey, prompt, briefing);
+    const promptFinal = construirPromptCriativoIA(prompt, briefing, pesquisa, modoEditar);
+    const tamanho = FORMATOS_CRIATIVO_IA[briefing.formato].tamanho;
 
-    if (imagensBase64.length > 0) {
-      const formData = new FormData();
-      formData.append("model", "gpt-image-1");
-      formData.append("n", "1");
-      formData.append("size", "1024x1024");
-      formData.append("output_format", "png");
-
-      if (modoEditar && imagensBase64.length === 1) {
-        // Modo editar: promptFinal já inclui a instrução de manter a imagem base
-        formData.append("prompt", promptFinal);
-
-        const { data, tipo } = imagensBase64[0];
-        const buffer = Buffer.from(data, "base64");
-        const blob = new Blob([buffer], { type: tipo || "image/png" });
-        formData.append("image", blob, "base.png");
-      } else {
-        // Modo gerar com referências visuais
-        formData.append("prompt", promptFinal);
-        for (let i = 0; i < imagensBase64.length; i++) {
-          const { data, tipo } = imagensBase64[i];
-          const buffer = Buffer.from(data, "base64");
-          const blob = new Blob([buffer], { type: tipo || "image/png" });
-          formData.append("image", blob, `ref_${i + 1}.png`);
-        }
-      }
-
-      const resp = await fetch("https://api.openai.com/v1/images/edits", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${openaiKey}` },
-        body: formData
-      });
-
-      const result: any = await resp.json();
-      if (!resp.ok) {
-        console.error("GERAR BANNER GPT-IMAGE-1 ERROR:", result?.error?.message);
-        return c.json({ error: result?.error?.message || "Erro ao gerar criativo com as imagens selecionadas." }, 500);
-      }
-      imagemBase64 = result?.data?.[0]?.b64_json || "";
-    } else {
-      // Usa gpt-image-1 somente com texto
-      const resp = await fetch("https://api.openai.com/v1/images/generations", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${openaiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: "gpt-image-1",
-          prompt: promptFinal,
-          n: 1,
-          size: "1024x1024",
-          output_format: "png"
-        })
-      });
-
-      const result: any = await resp.json();
-      if (!resp.ok) {
-        console.error("GERAR BANNER GPT-IMAGE-1 TEXT ERROR:", result?.error?.message);
-        return c.json({ error: result?.error?.message || "Erro ao gerar criativo." }, 500);
-      }
-      imagemBase64 = result?.data?.[0]?.b64_json || "";
-    }
+    const geracaoInicial = await gerarImagemCriativoOpenAI({
+      openaiKey,
+      prompt: promptFinal,
+      tamanho,
+      imagens: imagensBase64
+    });
+    let imagemBase64 = geracaoInicial.imagemBase64;
+    const usagesIA: any[] = [pesquisa.usage, geracaoInicial.usage].filter(Boolean);
 
     if (!imagemBase64) return c.json({ error: "A IA não retornou uma imagem. Tente novamente." }, 500);
 
-    await registrarUsoIA(Number(user.id), "gerar_banner", "imagem", null, 0, 0, 0);
+    let avaliacao = await avaliarCriativoIA(openaiKey, imagemBase64, prompt, briefing);
+    if (avaliacao?.usage) usagesIA.push(avaliacao.usage);
+    let refinadoAutomaticamente = false;
+    let avisoRefinamento: string | null = null;
 
-    return c.json({ sucesso: true, imagem_base64: imagemBase64 });
+    if (
+      body.refinar_automaticamente !== false &&
+      avaliacao &&
+      (!avaliacao.aprovado || avaliacao.nota < 8)
+    ) {
+      const problemas = avaliacao.problemas.length
+        ? avaliacao.problemas.map((item: string) => `- ${item}`).join("\n")
+        : "- Improve clarity, visual hierarchy and fidelity to the brief.";
+      const promptRefinamento =
+        "Refine the supplied generated creative instead of replacing its core concept. Preserve everything that already works and correct every issue listed below.\n\n" +
+        `ISSUES FOUND BY THE CREATIVE DIRECTOR:\n${problemas}\n\n` +
+        `DIRECT REFINEMENT INSTRUCTION:\n${avaliacao.instrucao_refinamento || "Make the piece more polished, clear and advertising-ready."}\n\n` +
+        `ORIGINAL FULL BRIEF (still mandatory):\n${promptFinal}`;
+
+      try {
+        const refinamento = await gerarImagemCriativoOpenAI({
+          openaiKey,
+          prompt: promptRefinamento,
+          tamanho,
+          imagens: [{ data: imagemBase64, tipo: "image/png" }]
+        });
+        if (refinamento.imagemBase64) {
+          if (refinamento.usage) usagesIA.push(refinamento.usage);
+          imagemBase64 = refinamento.imagemBase64;
+          refinadoAutomaticamente = true;
+          const avaliacaoRefinada = await avaliarCriativoIA(openaiKey, imagemBase64, prompt, briefing);
+          if (avaliacaoRefinada) {
+            if (avaliacaoRefinada.usage) usagesIA.push(avaliacaoRefinada.usage);
+            avaliacao = avaliacaoRefinada;
+          }
+        }
+      } catch (err) {
+        console.error("REFINAMENTO CRIATIVO IA:", err);
+        avisoRefinamento = "A segunda geração não respondeu; foi mantido o primeiro criativo produzido.";
+      }
+    }
+
+    const tokensEntrada = usagesIA.reduce((total, usage) => total + Number(usage?.input_tokens || 0), 0);
+    const tokensSaida = usagesIA.reduce((total, usage) => total + Number(usage?.output_tokens || 0), 0);
+
+    await registrarUsoIA(Number(user.id), "gerar_banner", "imagem", null, 0, tokensEntrada, tokensSaida);
+
+    return c.json({
+      sucesso: true,
+      imagem_base64: imagemBase64,
+      pesquisa: {
+        realizada: pesquisa.realizada,
+        aviso: pesquisa.aviso,
+        fontes: pesquisa.fontes,
+        nicho_identificado: pesquisa.nicho_identificado,
+        direcao_recomendada: pesquisa.direcao_recomendada
+      },
+      planejamento: {
+        nicho: briefing.nicho || pesquisa.nicho_identificado,
+        formato: briefing.formato,
+        objetivo: briefing.objetivo,
+        estilo: briefing.estilo,
+        direcao_recomendada: pesquisa.direcao_recomendada
+      },
+      avaliacao: avaliacao ? {
+        nota: avaliacao.nota,
+        aprovado: avaliacao.aprovado,
+        pontos_fortes: avaliacao.pontos_fortes,
+        problemas: avaliacao.problemas
+      } : null,
+      refinado_automaticamente: refinadoAutomaticamente,
+      aviso_refinamento: avisoRefinamento
+    });
   } catch (err) {
     console.error("GERAR BANNER EXCEPTION:", err);
     return c.json({ error: "Erro interno ao gerar criativo." }, 500);
