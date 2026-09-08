@@ -8845,7 +8845,7 @@ async function buscarEstruturaCampanhaTikTok(
   const campanhaRes = await listarEntidadesTikTok(
     "/campaign/get/",
     conexao,
-    ["campaign_id", "campaign_name", "status", "objective_type"],
+    ["campaign_id", "campaign_name", "objective_type"],
     { campaign_ids: [campaignId] }
   );
   if (!campanhaRes.ok) avisos.push(campanhaRes.error || "Não foi possível consultar a campanha TikTok");
@@ -9661,7 +9661,7 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
 
     // 🔥 BUSCA CAMPANHAS
     const campanhasRes = await fetch(
-      `${TIKTOK_API}/campaign/get/?advertiser_id=${advertiserId}&fields=["campaign_id","campaign_name","status","objective_type"]&page_size=100`,
+      `${TIKTOK_API}/campaign/get/?advertiser_id=${advertiserId}&fields=["campaign_id","campaign_name","secondary_status","objective_type"]&page_size=100`,
       { headers: tiktokHeaders(token) }
     );
     const campanhasData = await campanhasRes.json() as any;
@@ -9688,10 +9688,10 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
           `UPDATE campanhas
            SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
            WHERE id = $4`,
-          [campanha.campaign_name, campanha.status, String(advertiserId), existe.rows[0].id]
+          [campanha.campaign_name, campanha.secondary_status, String(advertiserId), existe.rows[0].id]
         );
       } else {
-        if (statusCampanhaRemotaExcluida(campanha.status)) {
+        if (statusCampanhaRemotaExcluida(campanha.secondary_status)) {
           continue;
         }
         const origem = await origemAoSincronizarCampanha(
@@ -9703,7 +9703,7 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
         await client.query(
           `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
            VALUES ($1, $2, $3, $4, $5, $6, 'tiktok', NOW())`,
-          [usuarioId, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.status, origem]
+          [usuarioId, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.secondary_status, origem]
         );
       }
     }
