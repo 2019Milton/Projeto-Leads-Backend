@@ -17093,13 +17093,18 @@ function detectarRedeOrigemReferral(referral: any): string | null {
 
 // Cria um lead novo a partir de uma conversa de WhatsApp sem lead correspondente
 // — só quando a conversa carrega um referral genuíno de anúncio Click-to-WhatsApp
-// (ctwa_clid presente). Sem isso, retorna null e o comportamento de sempre
-// (mensagem só registrada, sem virar lead) continua intacto.
+// (source_type "ad"). ctwa_clid normalmente vem junto, mas a Meta às vezes entrega
+// o referral sem esse campo (visto num caso real) — nesse caso o lead ainda é
+// criado e atribuído à campanha certa via source_id, só fica sem ctwa_clid
+// (então sem reportar qualificação/fechamento pra Conversions API da Meta, que
+// exige esse campo). Sem referral de anúncio nenhum, retorna null e o
+// comportamento de sempre (mensagem só registrada, sem virar lead) continua intacto.
 async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeContato?: string | null): Promise<number | null> {
-  const ctwaClid = conversa?.referral?.ctwa_clid;
-  if (!ctwaClid) {
+  const referral = conversa?.referral;
+  if (!referral || referral.source_type !== "ad") {
     return null;
   }
+  const ctwaClid = referral.ctwa_clid || null;
 
   // Evita corrida: se outra chamada concorrente já vinculou entre o momento em
   // que vincularConversaAoLead rodou e agora, não duplica o lead.
