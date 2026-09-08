@@ -6120,14 +6120,27 @@ app.get("/auth/:plataforma/login", async (c) => {
       [stateHash, usuario.id, plataforma, META_OAUTH_STATE_TTL_MINUTES]
     );
 
-    const params = new URLSearchParams({
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      response_type: "code",
-      scope: cfg.scope,
-      state,
-      ...(cfg.extraAuthParams || {}),
-    });
+    // TikTok Business API usa um formato de URL de autorizacao proprio
+    // (app_id, sem response_type/scope na URL — as permissoes sao as
+    // configuradas no app dentro do TikTok for Business), diferente do
+    // padrao OAuth2 client_id/response_type/scope usado pelas outras
+    // plataformas. Ver tambem o branch tiktok no /callback abaixo (token
+    // exchange e nome do parametro de retorno tambem sao diferentes).
+    const params =
+      plataforma === "tiktok"
+        ? new URLSearchParams({
+            app_id: clientId,
+            redirect_uri: redirectUri,
+            state,
+          })
+        : new URLSearchParams({
+            client_id: clientId,
+            redirect_uri: redirectUri,
+            response_type: "code",
+            scope: cfg.scope,
+            state,
+            ...(cfg.extraAuthParams || {}),
+          });
 
     return c.redirect(`${cfg.authUrl}?${params.toString()}`);
   } catch (err) {
@@ -6142,7 +6155,9 @@ app.get("/auth/:plataforma/callback", async (c) => {
   if (!cfg) return c.text("Plataforma nao suporta conexao OAuth", 404);
 
   try {
-    const code  = c.req.query("code");
+    // TikTok devolve o codigo de autorizacao como "auth_code" no redirect,
+    // nao "code" (padrao OAuth2 usado pelas outras plataformas).
+    const code  = c.req.query(plataforma === "tiktok" ? "auth_code" : "code");
     const state = c.req.query("state");
     if (!state) return c.text("State nao recebido", 400);
     if (!code)  return c.text("Erro: code nao recebido", 400);
