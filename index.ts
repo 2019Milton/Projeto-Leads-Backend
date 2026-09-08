@@ -9602,9 +9602,10 @@ app.get("/tiktok/anunciantes", authMiddleware, async (c) => {
     const params = new URLSearchParams({
       app_id: clientId,
       secret: clientSecret,
-      access_token: token,
     });
-    const res = await fetch(`${TIKTOK_API}/oauth2/advertiser/get/?${params}`);
+    const res = await fetch(`${TIKTOK_API}/oauth2/advertiser/get/?${params}`, {
+      headers: tiktokHeaders(token),
+    });
     const data = await res.json() as any;
 
     if (data.code !== 0) {
