@@ -8757,6 +8757,580 @@ async function obterConexaoTikTok(
   };
 }
 
+type EstruturaCampanhaTikTok = {
+  campanha: any | null;
+  adgroup: any | null;
+  anuncio: any | null;
+  avisos: string[];
+};
+
+async function listarEntidadesTikTok(
+  endpoint: "/campaign/get/" | "/adgroup/get/" | "/ad/get/",
+  conexao: { token: string; advertiserId: string | null },
+  fields: string[],
+  filtering: Record<string, unknown>
+) {
+  if (!conexao.advertiserId) {
+    return { ok: false, data: null, error: "Conta de anúncios TikTok não selecionada" };
+  }
+  const params = new URLSearchParams({
+    advertiser_id: conexao.advertiserId,
+    filtering: JSON.stringify(filtering),
+    fields: JSON.stringify(fields),
+    page: "1",
+    page_size: "100"
+  });
+  return tiktokFetch(`${endpoint}?${params.toString()}`, conexao.token);
+}
+
+// Recupera a estrutura real (campanha -> ad group -> anúncio) antes de editar.
+// Isso também dá suporte às campanhas importadas, que historicamente eram
+// sincronizadas apenas com campaign_id e não possuíam adset_id/ad_id locais.
+async function buscarEstruturaCampanhaTikTok(
+  conexao: { token: string; advertiserId: string | null },
+  campaignId: string,
+  adgroupIdPreferido?: unknown,
+  adIdPreferido?: unknown
+): Promise<EstruturaCampanhaTikTok> {
+  const avisos: string[] = [];
+
+  const campanhaRes = await listarEntidadesTikTok(
+    "/campaign/get/",
+    conexao,
+    ["campaign_id", "campaign_name", "status", "objective_type"],
+    { campaign_ids: [campaignId] }
+  );
+  if (!campanhaRes.ok) avisos.push(campanhaRes.error || "Não foi possível consultar a campanha TikTok");
+  const campanhas = Array.isArray(campanhaRes.data?.data?.list)
+    ? campanhaRes.data.data.list
+    : [];
+  const campanha = campanhas.find((item: any) => String(item.campaign_id) === campaignId) || campanhas[0] || null;
+
+  const adgroupRes = await listarEntidadesTikTok(
+    "/adgroup/get/",
+    conexao,
+    [
+      "adgroup_id", "campaign_id", "adgroup_name", "budget",
+      "schedule_type", "schedule_start_time", "schedule_end_time",
+      "location_ids", "age_groups", "gender", "interest_category_ids",
+      "promotion_type", "optimization_goal", "billing_event"
+    ],
+    { campaign_ids: [campaignId] }
+  );
+  if (!adgroupRes.ok) avisos.push(adgroupRes.error || "Não foi possível consultar o grupo de anúncios TikTok");
+  const adgroups = Array.isArray(adgroupRes.data?.data?.list)
+    ? adgroupRes.data.data.list
+    : [];
+  const adgroupId = textoOpcional(adgroupIdPreferido);
+  const adgroup = adgroups.find((item: any) => adgroupId && String(item.adgroup_id) === adgroupId) || adgroups[0] || null;
+
+  let anuncio: any | null = null;
+  if (adgroup?.adgroup_id) {
+    const adRes = await listarEntidadesTikTok(
+      "/ad/get/",
+      conexao,
+      [
+        "ad_id", "adgroup_id", "ad_name", "ad_text", "call_to_action",
+        "page_id", "landing_page_url", "identity_id", "identity_type",
+        "image_ids", "video_id", "ad_format", "operation_status"
+      ],
+      { adgroup_ids: [String(adgroup.adgroup_id)] }
+    );
+    if (!adRes.ok) avisos.push(adRes.error || "Não foi possível consultar o anúncio TikTok");
+    const anuncios = Array.isArray(adRes.data?.data?.list)
+      ? adRes.data.data.list
+      : [];
+    const adId = textoOpcional(adIdPreferido);
+    anuncio = anuncios.find((item: any) => adId && String(item.ad_id) === adId) || anuncios[0] || null;
+  }
+
+  return { campanha, adgroup, anuncio, avisos };
+}
+
+function dataTikTokParaFormulario(valor: unknown): string {
+  const texto = textoOpcional(valor);
+  const correspondencia = texto.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/);
+  return correspondencia ? `${correspondencia[1]}T${correspondencia[2]}` : texto;
+}
+
+app.get("/tiktok/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaLocalId = Number(c.req.param("id"));
+    if (!Number.isFinite(campanhaLocalId) || campanhaLocalId <= 0) {
+      return c.json({ error: "Campanha inválida" }, 400);
+    }
+
+    const localRes = await client.query(
+      `SELECT id, campaign_id, adset_id, ad_id, form_id, conta_anuncios_id,
+              nome, status, nicho_id, daily_budget, configuracoes_avancadas
+       FROM campanhas
+       WHERE id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+       LIMIT 1`,
+      [campanhaLocalId, user.id]
+    );
+    if (!localRes.rows.length) {
+      return c.json({ error: "Campanha TikTok não encontrada" }, 404);
+    }
+
+    const linha = localRes.rows[0];
+    const configuracoesLocais = linha.configuracoes_avancadas || {};
+    const campaignId = textoOpcional(linha.campaign_id);
+    if (!campaignId) {
+      return c.json({ ...linha, configuracoes_avancadas: configuracoesLocais });
+    }
+
+    const conexao = await obterConexaoTikTok(user.id);
+    if (!conexao?.advertiserId) {
+      return c.json({ error: "Conecte e selecione a conta de anúncios TikTok antes de editar" }, 400);
+    }
+    if (!campanhaPertenceContaAnuncios(linha.conta_anuncios_id, conexao.advertiserId)) {
+      return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
+    }
+
+    const estrutura = await buscarEstruturaCampanhaTikTok(
+      conexao,
+      campaignId,
+      linha.adset_id,
+      linha.ad_id
+    );
+    const adgroup = estrutura.adgroup;
+    const anuncio = estrutura.anuncio;
+
+    const destinoInferido: DestinoCampanhaTikTok =
+      String(adgroup?.promotion_type || "").toUpperCase() === "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE"
+        ? "whatsapp"
+        : (anuncio?.landing_page_url || String(adgroup?.optimization_goal || "").toUpperCase() === "CLICK")
+        ? "site"
+        : "lead_ads";
+    const destino = configuracoesLocais.destino
+      ? resolverDestinoCampanhaTikTok(configuracoesLocais.destino)
+      : destinoInferido;
+
+    const idsLocalidades = Array.isArray(adgroup?.location_ids)
+      ? adgroup.location_ids.map(String).filter(Boolean)
+      : [];
+    const localidadesLocais = Array.isArray(configuracoesLocais.localidades)
+      ? configuracoesLocais.localidades
+      : [];
+    const nomesLocalidades = new Map<string, string>(
+      localidadesLocais.map((local: any): [string, string] => [
+        String(local?.key || ""),
+        String(local?.nome || local?.name || local?.key || "")
+      ])
+    );
+    const localidades = idsLocalidades.length
+      ? idsLocalidades.map((key: string) => ({
+          key,
+          nome: nomesLocalidades.get(key) || `Localização TikTok ${key}`,
+          tipo: "region"
+        }))
+      : localidadesLocais;
+
+    const ageGroups = Array.isArray(adgroup?.age_groups) ? adgroup.age_groups.map(String) : [];
+    const faixas = FAIXAS_ETARIAS_TIKTOK.filter(faixa => ageGroups.includes(faixa.valor));
+    const idadeMin = faixas.length ? Math.min(...faixas.map(faixa => faixa.min)) : configuracoesLocais.idade_min;
+    const idadeMax = faixas.length ? Math.max(...faixas.map(faixa => faixa.max)) : configuracoesLocais.idade_max;
+    const genero = adgroup?.gender === "GENDER_MALE"
+      ? 1
+      : adgroup?.gender === "GENDER_FEMALE"
+      ? 2
+      : "";
+    const formId = textoOpcional(anuncio?.page_id) || textoOpcional(linha.form_id) || textoOpcional(configuracoesLocais.form_id);
+    const imageIds = Array.isArray(anuncio?.image_ids)
+      ? anuncio.image_ids.map(String).filter(Boolean)
+      : (Array.isArray(configuracoesLocais.image_ids) ? configuracoesLocais.image_ids : []);
+    const videoId = textoOpcional(anuncio?.video_id) || textoOpcional(configuracoesLocais.video_id);
+    const orcamentoRemoto = numeroOpcional(adgroup?.budget);
+    const dailyBudget = orcamentoRemoto !== null
+      ? Math.round(orcamentoRemoto * 100)
+      : linha.daily_budget;
+
+    const configuracoes = {
+      ...configuracoesLocais,
+      destino,
+      localidades,
+      idade_min: idadeMin,
+      idade_max: idadeMax,
+      genero,
+      inicio: dataTikTokParaFormulario(adgroup?.schedule_start_time) || configuracoesLocais.inicio,
+      fim: dataTikTokParaFormulario(adgroup?.schedule_end_time) || configuracoesLocais.fim,
+      interesses_detalhados_tiktok: Array.isArray(adgroup?.interest_category_ids)
+        ? adgroup.interest_category_ids.map((id: unknown) => ({ id: String(id), nome: String(id) }))
+        : configuracoesLocais.interesses_detalhados_tiktok,
+      texto: textoOpcional(anuncio?.ad_text) || configuracoesLocais.texto,
+      cta: textoOpcional(anuncio?.call_to_action) || configuracoesLocais.cta,
+      form_id: destino === "lead_ads" ? formId || null : null,
+      url_destino: destino === "site"
+        ? textoOpcional(anuncio?.landing_page_url) || configuracoesLocais.url_destino || null
+        : null,
+      identity_id: textoOpcional(anuncio?.identity_id) || configuracoesLocais.identity_id || null,
+      identity_type: textoOpcional(anuncio?.identity_type) || configuracoesLocais.identity_type || null,
+      image_ids: imageIds,
+      video_id: videoId || null,
+      criativo: {
+        ...(configuracoesLocais.criativo || {}),
+        ad_id: textoOpcional(anuncio?.ad_id) || textoOpcional(linha.ad_id) || null,
+        tipo: videoId ? "video" : imageIds.length > 1 ? "carrossel" : "imagem",
+        image_ids: imageIds,
+        video_id: videoId || null
+      }
+    };
+
+    const adgroupId = textoOpcional(adgroup?.adgroup_id) || textoOpcional(linha.adset_id) || null;
+    const adId = textoOpcional(anuncio?.ad_id) || textoOpcional(linha.ad_id) || null;
+    const nome = textoOpcional(estrutura.campanha?.campaign_name) || linha.nome;
+
+    await client.query(
+      `UPDATE campanhas
+       SET adset_id = COALESCE($1, adset_id),
+           ad_id = COALESCE($2, ad_id),
+           form_id = $3,
+           nome = COALESCE($4, nome),
+           daily_budget = COALESCE($5, daily_budget),
+           configuracoes_avancadas = $6,
+           atualizado_em = NOW()
+       WHERE id = $7 AND usuario_id = $8 AND plataforma = 'tiktok'`,
+      [adgroupId, adId, destino === "lead_ads" ? formId || null : null, nome, dailyBudget, JSON.stringify(configuracoes), linha.id, user.id]
+    );
+
+    return c.json({
+      ...linha,
+      nome,
+      adset_id: adgroupId,
+      ad_id: adId,
+      form_id: destino === "lead_ads" ? formId || null : null,
+      daily_budget: dailyBudget,
+      configuracoes_avancadas: configuracoes,
+      aviso: estrutura.avisos.length ? estrutura.avisos.join(" ") : null
+    });
+  } catch (err: any) {
+    console.error("ERRO CONFIGURAÇÃO EDIÇÃO TIKTOK:", err);
+    return c.json({ error: err?.message || "Erro ao carregar configuração da campanha TikTok" }, 500);
+  }
+});
+
+app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const {
+      usuario_id,
+      campanha_local_id,
+      campaign_id,
+      nome,
+      texto,
+      cta,
+      daily_budget,
+      nicho_id,
+      destino,
+      form_id,
+      url_destino,
+      identity_id,
+      identity_type,
+      image_ids,
+      video_id,
+      midia_alterada,
+      configuracoes_avancadas
+    } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const campanhaLocalRes = campanha_local_id
+      ? await client.query(
+          `SELECT id, campaign_id, adset_id, ad_id, form_id, origem, plataforma,
+                  conta_anuncios_id, nome, nicho_id, daily_budget, configuracoes_avancadas
+           FROM campanhas
+           WHERE id = $1 AND usuario_id = $2
+           LIMIT 1`,
+          [campanha_local_id, usuarioId]
+        )
+      : await client.query(
+          `SELECT id, campaign_id, adset_id, ad_id, form_id, origem, plataforma,
+                  conta_anuncios_id, nome, nicho_id, daily_budget, configuracoes_avancadas
+           FROM campanhas
+           WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+           LIMIT 1`,
+          [textoOpcional(campaign_id), usuarioId]
+        );
+    const campanhaLocal = campanhaLocalRes.rows[0] || null;
+
+    if (!campanhaLocal) {
+      return c.json({ error: "Campanha TikTok não encontrada para este usuário" }, 404);
+    }
+    if (String(campanhaLocal.plataforma || "").toLowerCase() !== "tiktok") {
+      return c.json({
+        error: "Esta edição pertence a outra plataforma e não pode ser processada pelo TikTok"
+      }, 409);
+    }
+
+    const cfgBanco = campanhaLocal.configuracoes_avancadas || {};
+    const configuracoesSolicitadas = configuracoes_avancadas || {};
+    const configuracoesEdicao = {
+      ...cfgBanco,
+      ...configuracoesSolicitadas
+    };
+    const nomeSolicitado = textoOpcional(nome);
+    const dailyBudgetCentavos = numeroOpcional(daily_budget);
+
+    if (!nomeSolicitado) {
+      return c.json({ error: "Nome da campanha é obrigatório" }, 400);
+    }
+    if (dailyBudgetCentavos === null || dailyBudgetCentavos <= 0) {
+      return c.json({ error: "Orçamento diário é obrigatório" }, 400);
+    }
+
+    const campaignIdBanco = textoOpcional(campanhaLocal.campaign_id);
+    const campaignIdSolicitado = textoOpcional(campaign_id);
+    if (campaignIdBanco && campaignIdSolicitado && campaignIdBanco !== campaignIdSolicitado) {
+      return c.json({ error: "A campanha selecionada não corresponde ao ID TikTok informado" }, 409);
+    }
+
+    // Proteção equivalente às rotas Meta/Google: um rascunho local nunca pode
+    // usar IDs herdados para alterar uma campanha remota.
+    if (!campaignIdBanco) {
+      await client.query(
+        `UPDATE campanhas
+         SET nome = $1,
+             daily_budget = $2,
+             nicho_id = COALESCE($3, nicho_id),
+             configuracoes_avancadas = $4,
+             campaign_id = NULL,
+             adset_id = NULL,
+             ad_id = NULL,
+             form_id = NULL,
+             atualizado_em = NOW()
+         WHERE id = $5 AND usuario_id = $6 AND plataforma = 'tiktok'`,
+        [nomeSolicitado, dailyBudgetCentavos, numeroOpcional(nicho_id), JSON.stringify(configuracoesSolicitadas), campanhaLocal.id, usuarioId]
+      );
+      return c.json({ sucesso: true });
+    }
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao?.advertiserId) {
+      return c.json({ error: "Conecte e selecione a conta de anúncios TikTok antes de editar" }, 400);
+    }
+    if (!campanhaPertenceContaAnuncios(campanhaLocal.conta_anuncios_id, conexao.advertiserId)) {
+      return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
+    }
+
+    const estrutura = await buscarEstruturaCampanhaTikTok(
+      conexao,
+      campaignIdBanco,
+      campanhaLocal.adset_id,
+      campanhaLocal.ad_id
+    );
+    const adgroupId = textoOpcional(estrutura.adgroup?.adgroup_id) || textoOpcional(campanhaLocal.adset_id);
+    const adId = textoOpcional(estrutura.anuncio?.ad_id) || textoOpcional(campanhaLocal.ad_id);
+    if (!adgroupId) {
+      return c.json({
+        error: "O grupo de anúncios desta campanha não foi localizado no TikTok. Sincronize e tente novamente."
+      }, 409);
+    }
+
+    const destinoRemoto: DestinoCampanhaTikTok =
+      String(estrutura.adgroup?.promotion_type || "").toUpperCase() === "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE"
+        ? "whatsapp"
+        : (estrutura.anuncio?.landing_page_url || String(estrutura.adgroup?.optimization_goal || "").toUpperCase() === "CLICK")
+        ? "site"
+        : "lead_ads";
+    const destinoOriginal = cfgBanco.destino
+      ? resolverDestinoCampanhaTikTok(cfgBanco.destino)
+      : destinoRemoto;
+    const destinoSolicitado = resolverDestinoCampanhaTikTok(
+      destino ?? configuracoesEdicao.destino ?? destinoOriginal
+    );
+    if (destinoSolicitado !== destinoOriginal) {
+      return c.json({
+        error: "O destino de uma campanha já publicada não pode ser alterado. Publique uma nova campanha para usar outro destino."
+      }, 409);
+    }
+
+    // Valide todo o conteúdo antes da primeira mutação remota. Dessa forma,
+    // uma requisição inválida nunca altera apenas orçamento/público e falha
+    // mais tarde ao validar o anúncio.
+    const textoSolicitado = textoOpcional(texto) || textoOpcional(configuracoesEdicao.texto) || textoOpcional(estrutura.anuncio?.ad_text);
+    const ctaSolicitado = textoOpcional(cta) || textoOpcional(configuracoesEdicao.cta) || textoOpcional(estrutura.anuncio?.call_to_action) || "LEARN_MORE";
+    const identidadeId = textoOpcional(identity_id) || textoOpcional(configuracoesEdicao.identity_id) || textoOpcional(estrutura.anuncio?.identity_id);
+    const identidadeTipo = textoOpcional(identity_type) || textoOpcional(configuracoesEdicao.identity_type) || textoOpcional(estrutura.anuncio?.identity_type);
+    const formIdSolicitado = destinoSolicitado === "lead_ads"
+      ? textoOpcional(form_id) || textoOpcional(configuracoesEdicao.form_id) || textoOpcional(campanhaLocal.form_id) || textoOpcional(estrutura.anuncio?.page_id)
+      : "";
+    const urlSolicitada = destinoSolicitado === "site"
+      ? urlOpcional(url_destino ?? configuracoesEdicao.url_destino ?? estrutura.anuncio?.landing_page_url, "")
+      : "";
+    const imageIdsSolicitados = Array.isArray(image_ids) ? image_ids.map(String).filter(Boolean) : [];
+    const videoIdSolicitado = textoOpcional(video_id);
+    const midiaFoiAlterada = midia_alterada === true || midia_alterada === 1 || midia_alterada === "true";
+
+    if (!textoSolicitado) {
+      return c.json({ error: "Texto do anúncio TikTok é obrigatório" }, 400);
+    }
+    if (!identidadeId || !identidadeTipo) {
+      return c.json({ error: "A identidade do anúncio TikTok não foi localizada" }, 400);
+    }
+    if (destinoSolicitado === "lead_ads" && !formIdSolicitado) {
+      return c.json({ error: "Selecione o formulário instantâneo do TikTok" }, 400);
+    }
+    if (destinoSolicitado === "site" && !urlSolicitada) {
+      return c.json({ error: "Informe um endereço completo e válido para o anúncio TikTok" }, 400);
+    }
+    if (midiaFoiAlterada && !imageIdsSolicitados.length && !videoIdSolicitado) {
+      return c.json({ error: "A nova mídia do anúncio TikTok não foi enviada" }, 400);
+    }
+
+    const targeting = montarTargetingTikTok(configuracoesEdicao);
+    if (!targeting.location_ids?.length && Array.isArray(estrutura.adgroup?.location_ids)) {
+      targeting.location_ids = estrutura.adgroup.location_ids.map(String).filter(Boolean);
+    }
+    if (!targeting.location_ids?.length) {
+      return c.json({ error: "Selecione ao menos uma localização para a campanha TikTok" }, 400);
+    }
+
+    const inicio = textoOpcional(configuracoesEdicao.inicio);
+    const fim = textoOpcional(configuracoesEdicao.fim);
+    const payloadAdgroup: any = {
+      advertiser_id: conexao.advertiserId,
+      adgroup_id: adgroupId,
+      ...targeting,
+      budget: dailyBudgetCentavos / 100
+    };
+    if (inicio) {
+      const inicioData = new Date(inicio);
+      if (Number.isFinite(inicioData.getTime()) && inicioData.getTime() > Date.now()) {
+        payloadAdgroup.schedule_start_time = formatarDataHoraTikTok(inicioData);
+      }
+    }
+    if (fim) {
+      const fimData = new Date(fim);
+      if (!Number.isFinite(fimData.getTime()) || fimData.getTime() <= Date.now()) {
+        return c.json({ error: "A data final da campanha TikTok precisa estar no futuro" }, 400);
+      }
+      payloadAdgroup.schedule_type = "SCHEDULE_START_END";
+      payloadAdgroup.schedule_end_time = formatarDataHoraTikTok(fimData);
+    }
+
+    const adgroupRes = await tiktokFetch("/adgroup/update/", conexao.token, {
+      method: "POST",
+      body: payloadAdgroup
+    });
+    if (!adgroupRes.ok) {
+      return c.json({
+        error: adgroupRes.error || "Erro ao atualizar público, orçamento ou agenda no TikTok",
+        detalhe: adgroupRes.data
+      }, 400);
+    }
+
+    const avisos = [...estrutura.avisos];
+    let nomeFinal = campanhaLocal.nome;
+    if (nomeSolicitado !== campanhaLocal.nome) {
+      const campanhaRes = await tiktokFetch("/campaign/update/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          campaign_id: campaignIdBanco,
+          campaign_name: nomeSolicitado
+        }
+      });
+      if (campanhaRes.ok) {
+        nomeFinal = nomeSolicitado;
+      } else {
+        avisos.push(`O público e o orçamento foram atualizados, mas o nome não: ${campanhaRes.error || "erro do TikTok"}.`);
+      }
+    }
+
+    let criativoAtualizado = false;
+    if (adId) {
+      const criativo: any = {
+        ad_id: adId,
+        ad_text: textoSolicitado,
+        call_to_action: destinoSolicitado === "whatsapp" ? "CONTACT_US" : ctaSolicitado,
+        identity_id: identidadeId,
+        identity_type: identidadeTipo,
+        ...(destinoSolicitado === "lead_ads" ? { page_id: formIdSolicitado } : {}),
+        ...(destinoSolicitado === "site" ? { landing_page_url: urlSolicitada } : {})
+      };
+
+      if (midiaFoiAlterada) {
+        if (videoIdSolicitado) {
+          criativo.ad_format = "SINGLE_VIDEO";
+          criativo.video_id = videoIdSolicitado;
+        } else {
+          criativo.ad_format = imageIdsSolicitados.length > 1 ? "CAROUSEL_ADS" : "SINGLE_IMAGE";
+          criativo.image_ids = imageIdsSolicitados;
+        }
+      }
+
+      const anuncioRes = await tiktokFetch("/ad/update/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          adgroup_id: adgroupId,
+          creatives: [criativo],
+          patch_update: true
+        }
+      });
+      criativoAtualizado = anuncioRes.ok;
+      if (!anuncioRes.ok) {
+        avisos.push(`O público e o orçamento foram atualizados, mas o anúncio manteve o criativo anterior: ${anuncioRes.error || "erro do TikTok"}.`);
+      }
+    } else {
+      avisos.push("O público e o orçamento foram atualizados, mas nenhum anúncio foi encontrado para atualizar o texto ou a mídia.");
+    }
+
+    const configuracoesFinais = {
+      ...cfgBanco,
+      ...configuracoesSolicitadas,
+      destino: destinoOriginal,
+      texto: criativoAtualizado ? textoSolicitado : (cfgBanco.texto || textoOpcional(estrutura.anuncio?.ad_text)),
+      cta: criativoAtualizado ? ctaSolicitado : (cfgBanco.cta || textoOpcional(estrutura.anuncio?.call_to_action)),
+      identity_id: criativoAtualizado ? identidadeId : (cfgBanco.identity_id || textoOpcional(estrutura.anuncio?.identity_id) || null),
+      identity_type: criativoAtualizado ? identidadeTipo : (cfgBanco.identity_type || textoOpcional(estrutura.anuncio?.identity_type) || null),
+      form_id: destinoOriginal === "lead_ads"
+        ? (criativoAtualizado ? formIdSolicitado : (textoOpcional(campanhaLocal.form_id) || cfgBanco.form_id || null))
+        : null,
+      url_destino: destinoOriginal === "site"
+        ? (criativoAtualizado ? urlSolicitada : (cfgBanco.url_destino || textoOpcional(estrutura.anuncio?.landing_page_url) || null))
+        : null,
+      image_ids: criativoAtualizado && midiaFoiAlterada
+        ? imageIdsSolicitados
+        : (Array.isArray(cfgBanco.image_ids) ? cfgBanco.image_ids : (estrutura.anuncio?.image_ids || [])),
+      video_id: criativoAtualizado && midiaFoiAlterada
+        ? videoIdSolicitado || null
+        : (cfgBanco.video_id || textoOpcional(estrutura.anuncio?.video_id) || null)
+    };
+
+    await client.query(
+      `UPDATE campanhas
+       SET nome = $1,
+           adset_id = $2,
+           ad_id = COALESCE($3, ad_id),
+           form_id = $4,
+           daily_budget = $5,
+           nicho_id = COALESCE($6, nicho_id),
+           configuracoes_avancadas = $7,
+           atualizado_em = NOW()
+       WHERE id = $8 AND usuario_id = $9 AND plataforma = 'tiktok'`,
+      [
+        nomeFinal,
+        adgroupId,
+        adId || null,
+        destinoOriginal === "lead_ads" ? configuracoesFinais.form_id : null,
+        dailyBudgetCentavos,
+        numeroOpcional(nicho_id),
+        JSON.stringify(configuracoesFinais),
+        campanhaLocal.id,
+        usuarioId
+      ]
+    );
+
+    return c.json({ sucesso: true, aviso: avisos.length ? avisos.join(" ") : null });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/editar-campanha:", err);
+    return c.json({ error: err?.message || "Erro ao editar campanha TikTok" }, 500);
+  }
+});
+
 // Mesmo formato de /google/status-completo — usado pelo card "Status TikTok"
 // do Dashboard (campanhas, gasto e leads de hoje, com sincronizacao manual).
 app.get("/tiktok/status-completo", authMiddleware, async (c) => {
