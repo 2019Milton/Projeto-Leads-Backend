@@ -7294,14 +7294,19 @@ async function googleAdsMutate(
   accessToken: string,
   recurso: string,
   operations: any[],
-  loginCustomerId?: string | null
+  loginCustomerId?: string | null,
+  opcoes: { validateOnly?: boolean; partialFailure?: boolean } = {}
 ) {
   const res = await fetch(
     `${GOOGLE_ADS_API}/customers/${customerId}/${recurso}:mutate`,
     {
       method: "POST",
       headers: googleAdsHeaders(accessToken, loginCustomerId),
-      body: JSON.stringify({ operations }),
+      body: JSON.stringify({
+        operations,
+        ...(opcoes.validateOnly ? { validateOnly: true } : {}),
+        ...(opcoes.partialFailure ? { partialFailure: true } : {}),
+      }),
     }
   );
   const data = await res.json() as any;
@@ -7397,12 +7402,75 @@ function mensagemErroBusinessMessageGoogle(err: any): string {
     : "O Google Ads não conseguiu configurar o botão de WhatsApp nesta conta. Revise a elegibilidade da conta e tente novamente.";
 }
 
+function mensagemErroLeadFormGoogle(err: any): string {
+  if (googleAdsTemErroCode(err, "LEAD_FORM_MISSING_AGREEMENT")) {
+    return "A conta do Google Ads ainda não aceitou os Termos de Serviço de Lead Forms — isso só pode ser feito uma vez, manualmente, na interface do Google Ads. No Google Ads, vá em Campanhas → Ativos → clique em \"+\" → \"Formulário de lead\", preencha um formulário de exemplo e aceite os termos na última etapa antes de salvar. Depois, tente publicar novamente.";
+  }
+  if (googleAdsTemErroCode(err, "CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE")) {
+    return "Esta conta ainda não atende aos requisitos do Google Ads para usar formulário de leads neste formato. Verifique a situação da conta, a verificação do anunciante e, para Display ou formatos em que o título abre o formulário, o histórico mínimo de gastos exigido pelo Google.";
+  }
+  if (googleAdsTemErroCode(err, "CUSTOMER_NOT_VERIFIED")) {
+    return "Conclua a verificação do anunciante no Google Ads antes de publicar com formulário de leads.";
+  }
+
+  const detalhe = googleAdsPrimeiraMensagemDetalhada(err);
+  return detalhe
+    ? `O Google Ads não conseguiu criar o formulário de leads: ${detalhe}`
+    : (err?.message || "O Google Ads não conseguiu criar o formulário de leads nesta conta.");
+}
+
 function numeroWhatsappGoogleComparavel(countryCode: string, phoneNumber: string): string {
   const digitos = String(phoneNumber || "").replace(/\D/g, "");
   if (String(countryCode || "").toUpperCase() === "BR" && !digitos.startsWith("55")) {
     return `55${digitos}`;
   }
   return digitos;
+}
+
+function operacaoBusinessMessageWhatsappGoogle(
+  numero: NumeroWhatsappGoogle,
+  mensagemInicial: string,
+  nome: string
+) {
+  return {
+    create: {
+      name: nome,
+      type: "BUSINESS_MESSAGE",
+      businessMessageAsset: {
+        messageProvider: "WHATSAPP",
+        starterMessage: truncarSemCortarPalavra(mensagemInicial, 200),
+        callToAction: {
+          callToActionSelection: "CONTACT_US",
+          callToActionDescription: "Converse com nossa equipe",
+        },
+        whatsappInfo: {
+          countryCode: numero.countryCode,
+          phoneNumber: numero.phoneNumber,
+        },
+      },
+    },
+  };
+}
+
+async function validarBusinessMessageWhatsappGoogle(
+  customerId: string,
+  accessToken: string,
+  loginCustomerId: string | null,
+  numero: NumeroWhatsappGoogle,
+  mensagemInicial: string
+) {
+  await googleAdsMutate(
+    customerId,
+    accessToken,
+    "assets",
+    [operacaoBusinessMessageWhatsappGoogle(
+      numero,
+      mensagemInicial,
+      `Validacao WhatsApp Plataforma de Leads - ${Date.now()}`
+    )],
+    loginCustomerId,
+    { validateOnly: true }
+  );
 }
 
 async function obterOuCriarBusinessMessageWhatsappGoogle(
@@ -7452,24 +7520,11 @@ async function obterOuCriarBusinessMessageWhatsappGoogle(
     customerId,
     accessToken,
     "assets",
-    [{
-      create: {
-        name: `WhatsApp Plataforma de Leads - ${Date.now()}`,
-        type: "BUSINESS_MESSAGE",
-        businessMessageAsset: {
-          messageProvider: "WHATSAPP",
-          starterMessage: mensagem,
-          callToAction: {
-            callToActionSelection: "CONTACT_US",
-            callToActionDescription: "Converse com nossa equipe",
-          },
-          whatsappInfo: {
-            countryCode: numero.countryCode,
-            phoneNumber: numero.phoneNumber,
-          },
-        },
-      },
-    }],
+    [operacaoBusinessMessageWhatsappGoogle(
+      numero,
+      mensagem,
+      `WhatsApp Plataforma de Leads - ${Date.now()}`
+    )],
     loginCustomerId
   );
 
@@ -7477,6 +7532,52 @@ async function obterOuCriarBusinessMessageWhatsappGoogle(
   if (!resourceName) throw new Error("O Google Ads não retornou o identificador do botão de WhatsApp criado.");
   return resourceName;
 }
+
+app.get("/google/whatsapp-elegibilidade", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const usuarioId = resolverUsuarioIdOperacao(user, c.req.query("usuario_id"));
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({ elegivel: false, error: conexao.erro }, 400);
+    }
+
+    const numeroWhatsapp = await resolverNumeroWhatsappGoogle(usuarioId);
+    if ("erro" in numeroWhatsapp) {
+      return c.json({ elegivel: false, error: numeroWhatsapp.erro }, 400);
+    }
+
+    try {
+      await validarBusinessMessageWhatsappGoogle(
+        conexao.customerId,
+        conexao.accessToken,
+        conexao.loginCustomerId,
+        numeroWhatsapp,
+        "Olá! Gostaria de receber mais informações."
+      );
+    } catch (err: any) {
+      return c.json({
+        elegivel: false,
+        error: mensagemErroBusinessMessageGoogle(err),
+      });
+    }
+
+    const final = numeroWhatsapp.comparavel.slice(-4);
+    return c.json({
+      elegivel: true,
+      numero_mascarado: `WhatsApp final ${final}`,
+      mensagem: "Conta Google Ads e WhatsApp aptos para criar o recurso nativo de mensagem.",
+    });
+  } catch (err: any) {
+    console.error("ERRO /google/whatsapp-elegibilidade:", err);
+    return c.json({
+      elegivel: false,
+      error: err?.message || "Não foi possível validar o WhatsApp no Google Ads",
+    }, 500);
+  }
+});
 
 // Varre error.details[].errors[] procurando violacoes de politica marcadas como
 // "isExemptible" (ex: HEALTH_IN_PERSONALIZED_ADS — comum em nichos como planos de
@@ -7511,12 +7612,47 @@ function googleAdsExtrairExencoesPolitica(
 app.post("/google/campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const { usuario_id, nome, orcamento, publicacao_grupo_id, tipo_campanha } = await c.req.json();
+    const {
+      usuario_id, nome, orcamento, publicacao_grupo_id, tipo_campanha,
+      destino, mensagem_whatsapp, url_destino, privacidade_url, form_id, titulos
+    } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
 
     const tipoCampanhaGoogle = String(tipo_campanha || "").toLowerCase() === "display" ? "display" : "search";
+    const destinoInformado = String(destino || "").toLowerCase();
+    const destinoGoogle = ["lead_ads", "site", "whatsapp"].includes(destinoInformado)
+      ? destinoInformado
+      : "site";
+    const urlDestino = urlOpcional(url_destino, "");
+    const mensagemWhatsapp = textoOpcional(mensagem_whatsapp);
+    const formularioExistente = textoOpcional(form_id);
+
+    if (tipoCampanhaGoogle === "display" && destinoGoogle === "whatsapp") {
+      return c.json({
+        error: "O botão de WhatsApp está disponível somente em campanhas de Pesquisa. Em Display, escolha endereço do site ou formulário de leads."
+      }, 400);
+    }
+    if (!urlDestino) {
+      return c.json({
+        error: "Informe uma URL de destino completa e válida para o anúncio Google Ads."
+      }, 400);
+    }
+    if (destinoGoogle === "lead_ads" && !formularioExistente && !urlOpcional(privacidade_url, "")) {
+      return c.json({
+        error: "Informe a URL da política de privacidade do anunciante para criar o formulário do Google Ads."
+      }, 400);
+    }
+    if (destinoGoogle === "whatsapp" && !mensagemWhatsapp) {
+      return c.json({ error: "Informe a mensagem inicial do WhatsApp." }, 400);
+    }
+    const titulosGoogle = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
+    if (destinoGoogle === "whatsapp" && titulosGoogle.some(titulo => /whats[\s-]*app/i.test(titulo))) {
+      return c.json({
+        error: "Nos anúncios com botão de mensagem, o Google não permite mencionar WhatsApp nos títulos. Retire essa palavra dos títulos; o botão continuará identificando a conversa."
+      }, 400);
+    }
 
     if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
       return c.json({ error: "Developer token do Google Ads não configurado" }, 500);
@@ -7525,6 +7661,27 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     const conexao = await resolverConexaoGoogleAds(usuarioId);
     if ("erro" in conexao) {
       return c.json({ error: conexao.erro }, 400);
+    }
+
+    // O recurso nativo de WhatsApp da API e restrito por allowlist. Valida antes
+    // de criar orçamento/campanha para não deixar estruturas incompletas na conta
+    // quando o cliente ainda não foi liberado pelo Google.
+    if (destinoGoogle === "whatsapp") {
+      const numeroWhatsapp = await resolverNumeroWhatsappGoogle(usuarioId);
+      if ("erro" in numeroWhatsapp) {
+        return c.json({ error: numeroWhatsapp.erro }, 400);
+      }
+      try {
+        await validarBusinessMessageWhatsappGoogle(
+          conexao.customerId,
+          conexao.accessToken,
+          conexao.loginCustomerId,
+          numeroWhatsapp,
+          mensagemWhatsapp
+        );
+      } catch (errBusinessMessage: any) {
+        return c.json({ error: mensagemErroBusinessMessageGoogle(errBusinessMessage) }, 400);
+      }
     }
 
     // A Google Ads API não permite criar campanha diretamente numa conta gerenciadora
@@ -7577,19 +7734,16 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       {
         create: {
           name: nomeCampanhaGoogle,
-          // Campanha pode ser de Pesquisa (texto) ou Display (imagem) — controlado pelo
-          // campo tipo_campanha vindo do frontend. Display com Lead Form exige a conta
-          // ja ter gasto historico (>US$1.000, confirmado via
-          // CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE em producao e na documentacao
-          // oficial do Google) e verificacao de identidade do anunciante — por isso, em
-          // Display, o Lead Form e sempre uma tentativa opcional e best-effort feita em
-          // /google/anuncio (degrada graciosamente se a conta nao for elegivel), nunca
-          // bloqueante como em Pesquisa. A URL de destino sempre funciona em Display,
-          // sem gate nenhum.
+          // Pesquisa oferece site, Lead Form e WhatsApp. Display oferece site e
+          // Lead Form (sujeito aos requisitos de elegibilidade da conta); o recurso
+          // nativo de WhatsApp é exclusivo de Pesquisa.
           advertisingChannelType: tipoCampanhaGoogle === "display" ? "DISPLAY" : "SEARCH",
           status: "PAUSED",
           campaignBudget: budgetResourceName,
-          manualCpc: {},
+          // Formulários e mensagens são metas de conversão no Google. Site puro
+          // continua em CPC manual; os dois destinos de lead usam a estratégia
+          // recomendada pelo Google para otimizar conversões.
+          ...(destinoGoogle === "site" ? { manualCpc: {} } : { maximizeConversions: {} }),
           ...(tipoCampanhaGoogle === "search" ? {
             networkSettings: {
               targetGoogleSearch: true,
@@ -7641,7 +7795,13 @@ app.post("/google/campanha", authMiddleware, async (c) => {
         campaignId,
         conexao.customerId,
         nomeCampanha,
-        JSON.stringify({ campaign_budget_resource_name: budgetResourceName, tipo_campanha: tipoCampanhaGoogle }),
+        JSON.stringify({
+          campaign_budget_resource_name: budgetResourceName,
+          tipo_campanha: tipoCampanhaGoogle,
+          destino: destinoGoogle,
+          url_destino: urlDestino,
+          estrategia_lance: destinoGoogle === "site" ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS"
+        }),
         textoOpcional(publicacao_grupo_id) || null,
       ]
     );
@@ -7750,10 +7910,9 @@ app.get("/google/formularios", authMiddleware, async (c) => {
   }
 });
 
-// Cria um Lead Form asset novo (equivalente ao /meta/formulario) — diferente da Meta,
-// o schema do Google exige alguns campos fixos (política de privacidade, CTA, textos
-// pós-envio); usamos o mesmo padrão de placeholder já usado nas rotas Meta quando o
-// campo real não existe na UI (ex: privacidade_url cai em "https://google.com").
+// Cria um Lead Form asset novo (equivalente ao /meta/formulario). O Google exige
+// uma política de privacidade real do anunciante e uma URL final válida; nenhum
+// desses endereços pode ser inventado ou substituído silenciosamente.
 app.post("/google/formulario", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -7764,6 +7923,15 @@ app.post("/google/formulario", authMiddleware, async (c) => {
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
+
+    const urlDestino = urlOpcional(url_destino, "");
+    const urlPrivacidade = urlOpcional(privacidade_url, "");
+    if (!urlDestino) {
+      return c.json({ error: "Informe uma URL de destino completa e válida para o formulário do Google Ads." }, 400);
+    }
+    if (!urlPrivacidade) {
+      return c.json({ error: "Informe a URL da política de privacidade do anunciante para criar o formulário do Google Ads." }, 400);
+    }
 
     const conexao = await resolverConexaoGoogleAds(usuarioId);
     if ("erro" in conexao) {
@@ -7786,7 +7954,7 @@ app.post("/google/formulario", authMiddleware, async (c) => {
       callToActionDescription: "Fale com um especialista",
       headline: truncarSemCortarPalavra(textoOpcional(headline) || "Receba mais informações", 30),
       description: truncarSemCortarPalavra(textoOpcional(descricao) || "Deixe seus dados e entraremos em contato.", 200),
-      privacyPolicyUrl: urlOpcional(privacidade_url, "https://google.com"),
+      privacyPolicyUrl: urlPrivacidade,
       postSubmitHeadline: truncarSemCortarPalavra(textoOpcional(obrigado_titulo) || "Obrigado!", 30),
       postSubmitDescription: truncarSemCortarPalavra(textoOpcional(obrigado_texto) || "Recebemos seus dados. Em breve entraremos em contato.", 200),
       postSubmitCallToActionType: "VISIT_SITE",
@@ -7808,21 +7976,18 @@ app.post("/google/formulario", authMiddleware, async (c) => {
         {
           create: {
             name: `Lead Form ${Date.now()}`,
-            finalUrls: [urlOpcional(url_destino, "https://plataformadeleads.com.br")],
+            finalUrls: [urlDestino],
             leadFormAsset,
           },
         },
       ]);
-
-    const mensagemFaltaTermos =
-      "A conta do Google Ads ainda não aceitou os Termos de Serviço de Lead Forms — isso só pode ser feito uma vez, manualmente, na interface do Google Ads (não tem como aceitar pela API). No Google Ads, vá em Campanhas → Ativos → clique em \"+\" → \"Formulário de lead\", preencha um formulário de exemplo e aceite os Termos de Serviço na última etapa antes de salvar. Depois disso, tente publicar a campanha novamente.";
 
     let assetResults;
     try {
       assetResults = await criarAsset();
     } catch (err: any) {
       if (googleAdsTemErroCode(err, "LEAD_FORM_MISSING_AGREEMENT")) {
-        return c.json({ error: mensagemFaltaTermos }, 400);
+        return c.json({ error: mensagemErroLeadFormGoogle(err) }, 400);
       }
 
       // Perguntas customizadas via API são um recurso instável na Google Ads API (a
@@ -7835,13 +8000,10 @@ app.post("/google/formulario", authMiddleware, async (c) => {
         try {
           assetResults = await criarAsset();
         } catch (err2: any) {
-          if (googleAdsTemErroCode(err2, "LEAD_FORM_MISSING_AGREEMENT")) {
-            return c.json({ error: mensagemFaltaTermos }, 400);
-          }
-          throw err2;
+          return c.json({ error: mensagemErroLeadFormGoogle(err2) }, 400);
         }
       } else {
-        throw err;
+        return c.json({ error: mensagemErroLeadFormGoogle(err) }, 400);
       }
     }
 
@@ -8078,9 +8240,54 @@ async function salvarEstruturaNichoCampanhaGoogle(
   }
 }
 
-// Cria o Responsive Search Ad (texto, sem imagem) + palavras-chave e vincula o Lead
-// Form escolhido a campanha (equivalente ao /meta/anuncio e /tiktok/anuncio) — aqui a
-// linha de campanhas recebe adset_id/ad_id/form_id, mesmo padrao das outras plataformas.
+async function tentarHabilitarMetaFormularioGoogle(
+  customerId: string,
+  campaignId: string,
+  accessToken: string,
+  loginCustomerId: string | null
+): Promise<boolean> {
+  try {
+    const campaignIdSeguro = String(campaignId || "").replace(/\D/g, "");
+    if (!campaignIdSeguro) return false;
+    const resultados = await googleAdsQuery(
+      customerId,
+      accessToken,
+      `SELECT campaign_conversion_goal.resource_name,
+              campaign_conversion_goal.biddable
+       FROM campaign_conversion_goal
+       WHERE campaign.id = ${campaignIdSeguro}
+         AND campaign_conversion_goal.category = 'SUBMIT_LEAD_FORM'
+         AND campaign_conversion_goal.origin = 'GOOGLE_HOSTED'`,
+      loginCustomerId
+    );
+    const meta = (resultados[0] as any)?.campaignConversionGoal ??
+      (resultados[0] as any)?.campaign_conversion_goal;
+    const resourceName = meta?.resourceName ?? meta?.resource_name;
+    if (!resourceName) return false;
+    if (meta?.biddable === true) return true;
+
+    await googleAdsMutate(
+      customerId,
+      accessToken,
+      "campaignConversionGoals",
+      [{
+        update: { resourceName, biddable: true },
+        updateMask: "biddable",
+      }],
+      loginCustomerId
+    );
+    return true;
+  } catch (err: any) {
+    // A meta Google Hosted pode surgir apenas após a aprovação do asset. Nesse
+    // intervalo o anúncio continua válido e o Google cria a meta automaticamente.
+    console.warn("AVISO GOOGLE LEAD FORM: meta de conversão ainda indisponível:", err?.message);
+    return false;
+  }
+}
+
+// Cria o anúncio permitido para o tipo escolhido. Pesquisa aceita site, Lead Form
+// ou Business Message/WhatsApp; Display aceita site ou Lead Form, sujeito à
+// elegibilidade definida pelo Google. A linha local recebe adset_id/ad_id/form_id.
 app.post("/google/anuncio", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -8121,11 +8328,13 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     if (!campaign_id) return c.json({ error: "campaign_id não enviado" }, 400);
     if (!adgroup_id) return c.json({ error: "adgroup_id não enviado" }, 400);
+    if (tipoCampanha === "display" && destinoGoogle === "whatsapp") {
+      return c.json({
+        error: "O botão de WhatsApp está disponível somente em campanhas de Pesquisa. Em Display, escolha endereço do site ou formulário de leads."
+      }, 400);
+    }
     if (destinoGoogle === "lead_ads" && !form_id) {
       return c.json({ error: "Selecione um Lead Form antes de publicar" }, 400);
-    }
-    if (destinoGoogle === "whatsapp" && tipoCampanha !== "search") {
-      return c.json({ error: "O destino WhatsApp está disponível somente em campanhas de Pesquisa do Google Ads" }, 400);
     }
     if (destinoGoogle === "whatsapp" && !mensagemWhatsapp) {
       return c.json({ error: "Informe a mensagem inicial do WhatsApp" }, 400);
@@ -8134,10 +8343,19 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
     const listaDescricoes = (Array.isArray(descricoes) ? descricoes : []).map(textoOpcional).filter(Boolean);
     const nomeAnunciante = textoOpcional(nome_anunciante);
-    const url = textoOpcional(url_destino) || "https://plataformadeleads.com.br";
+    const url = urlOpcional(url_destino, "");
     const tituloLongo = textoOpcional(titulo_longo);
     const imagemPaisagem = textoOpcional(imagem_paisagem_asset);
     const imagemQuadrada = textoOpcional(imagem_quadrada_asset);
+
+    if (!url) {
+      return c.json({ error: "Informe uma URL de destino completa e válida para o anúncio Google Ads." }, 400);
+    }
+    if (destinoGoogle === "whatsapp" && listaTitulos.some(titulo => /whats[\s-]*app/i.test(titulo))) {
+      return c.json({
+        error: "Nos anúncios com botão de mensagem, o Google não permite mencionar WhatsApp nos títulos. Retire essa palavra dos títulos; o botão continuará identificando a conversa."
+      }, 400);
+    }
 
     if (tipoCampanha === "search") {
       // O Responsive Search Ad exige no minimo 3 titulos e 2 descricoes (regra fixa da
@@ -8269,11 +8487,18 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     }
 
     const formIdFinal = destinoGoogle === "lead_ads" ? textoOpcional(form_id) : "";
+    let metaFormularioOtimizada = false;
 
     if (destinoGoogle === "lead_ads") {
       await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
         { create: { campaign: campaignResourceName, asset: formIdFinal, fieldType: "LEAD_FORM" } },
       ], conexao.loginCustomerId);
+      metaFormularioOtimizada = await tentarHabilitarMetaFormularioGoogle(
+        conexao.customerId,
+        String(campaign_id),
+        conexao.accessToken,
+        conexao.loginCustomerId
+      );
     }
 
     if (destinoGoogle === "whatsapp" && businessMessageAssetResourceName) {
@@ -8303,6 +8528,9 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       nome_anunciante: nomeAnunciante,
       url_destino: url,
       destino: destinoGoogle,
+      ...(destinoGoogle === "lead_ads" ? {
+        lead_form_goal: metaFormularioOtimizada ? "BIDDABLE" : "AGUARDANDO_APROVACAO_GOOGLE",
+      } : {}),
       ...(destinoGoogle === "whatsapp" ? {
         mensagem_whatsapp: mensagemWhatsapp,
         business_message_asset: businessMessageAssetResourceName,
@@ -8346,6 +8574,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     return c.json({
       id: String(adId),
       ad_id: String(adId),
+      ...(destinoGoogle === "lead_ads" ? { lead_form_goal_configured: metaFormularioOtimizada } : {}),
       ...(businessMessageAssetResourceName ? { business_message_asset: businessMessageAssetResourceName } : {})
     });
   } catch (err: any) {
@@ -28514,11 +28743,12 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       ? `MODO COMPLETAR PLATAFORMAS: use todos os dados existentes como fonte de verdade. Gere conteudo somente para completar os campos vazios listados; os campos ja preenchidos serao preservados pela interface. A copy compartilhada precisa funcionar em TODAS as plataformas-alvo simultaneamente. Nao invente URLs, IDs de conta, paginas, perfis, formularios ou codigos de localizacao.\n\n`
       : `MODO CRIAR CAMPANHA: gere uma campanha completa e coerente para todas as plataformas-alvo selecionadas.\n\n`;
     const googleTipo = campanhaEntrada.google?.tipo === "display" ? "Display" : "Pesquisa";
+    const googleDestinoWhatsapp = campanhaEntrada.google?.destino === "whatsapp";
     const instrucaoPlataformas =
       (incluirFacebook ? `Facebook Ads: texto persuasivo, titulo, descricao, CTA, perguntas e tela de obrigado devem respeitar o nicho e os fatos existentes.\n` : "") +
       (incluirInstagram ? `Instagram Ads: a mesma base precisa soar natural em feed, stories e reels, sem depender de informacao inventada.\n` : "") +
       (incluirTikTok ? `TikTok Ads: produza mensagem direta, clara e adequada a video curto; use os campos compartilhados e nunca invente identidade, formulario, URL ou localizacao.\n` : "") +
-      (incluirGoogle ? `Google Ads (${googleTipo}): complete todos os campos google_* solicitados, com intencao de busca clara, variacoes diferentes e limites de caracteres rigorosos.\n` : "");
+      (incluirGoogle ? `Google Ads (${googleTipo}): complete todos os campos google_* solicitados, com intencao de busca clara, variacoes diferentes e limites de caracteres rigorosos.${googleDestinoWhatsapp ? " Nos titulos do Google, e proibido mencionar WhatsApp ou Whats App; o titulo abre o site e somente o botao abre a conversa." : ""}\n` : "");
 
     const prompt =
       `Produto/servico: "${topico}"\n` +
