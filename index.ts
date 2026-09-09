@@ -8781,6 +8781,134 @@ async function tiktokFetch(
   }
 }
 
+// Parser de CSV minimo (sem dependencia externa) — suporta valores entre aspas
+// com virgula/quebra de linha escapados, e "" como aspas literais dentro do
+// campo. Usado pelo download de leads da TikTok (ver baixarLeadsTikTokPorFormulario).
+function parsearCsvSimples(texto: string): Record<string, string>[] {
+  const linhas: string[][] = [];
+  let campo = "";
+  let linhaAtual: string[] = [];
+  let dentroAspas = false;
+
+  for (let i = 0; i < texto.length; i++) {
+    const c = texto[i];
+    if (dentroAspas) {
+      if (c === '"') {
+        if (texto[i + 1] === '"') { campo += '"'; i++; }
+        else dentroAspas = false;
+      } else {
+        campo += c;
+      }
+    } else if (c === '"') {
+      dentroAspas = true;
+    } else if (c === ",") {
+      linhaAtual.push(campo);
+      campo = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && texto[i + 1] === "\n") i++;
+      linhaAtual.push(campo);
+      campo = "";
+      if (linhaAtual.length > 1 || linhaAtual[0] !== "") linhas.push(linhaAtual);
+      linhaAtual = [];
+    } else {
+      campo += c;
+    }
+  }
+  if (campo || linhaAtual.length) {
+    linhaAtual.push(campo);
+    linhas.push(linhaAtual);
+  }
+
+  if (!linhas.length) return [];
+  const cabecalho = linhas[0].map(h => h.trim());
+  return linhas.slice(1).map(colunas => {
+    const linha: Record<string, string> = {};
+    cabecalho.forEach((h, idx) => { linha[h] = colunas[idx] ?? ""; });
+    return linha;
+  });
+}
+
+// Lê um valor de uma linha de CSV tentando varias chaves possiveis (a TikTok
+// nao documenta os nomes exatos das colunas do export — normaliza espaco/
+// underscore/maiusculas antes de comparar).
+function valorCsvPorChavesPossiveis(linha: Record<string, string>, chaves: string[]): string {
+  const normalizadas: Record<string, string> = {};
+  for (const chaveOriginal of Object.keys(linha)) {
+    const normalizada = chaveOriginal.trim().toLowerCase().replace(/[\s_]+/g, "_");
+    if (!(normalizada in normalizadas)) normalizadas[normalizada] = linha[chaveOriginal];
+  }
+  for (const chave of chaves) {
+    const valor = normalizadas[chave];
+    if (valor) return valor;
+  }
+  return "";
+}
+
+// Cria (ou faz polling de) uma "lead download task" da TikTok pra um Instant
+// Form especifico, baixa o CSV resultante quando pronta e devolve as linhas
+// como objetos {coluna: valor}. A TikTok nao oferece um /lead/get/ paginado
+// por data — esse fluxo assincrono (criar tarefa -> polling -> download) e
+// o mecanismo real de exportacao em massa, confirmado contra a documentacao
+// oficial em 2026-09-09 (mirror github.com/ckr2436/Tiktok-OPS/Leads).
+// ⚠️ Nomes de coluna do CSV e o caso file_type="zip" ainda NAO foram
+// confirmados contra trafego real — zip retorna null com aviso no log.
+async function baixarLeadsTikTokPorFormulario(
+  advertiserId: string,
+  pageId: string,
+  token: string
+): Promise<Record<string, string>[] | null> {
+  const criarOuConsultarTarefa = (taskId?: string) =>
+    tiktokFetch("/page/lead/task/", token, {
+      method: "POST",
+      body: {
+        advertiser_id: advertiserId,
+        page_id: pageId,
+        ...(taskId ? { task_id: taskId } : {}),
+      },
+    });
+
+  let tarefa = await criarOuConsultarTarefa();
+  if (!tarefa.ok) {
+    console.error("ERRO CRIAR TAREFA LEADS TIKTOK:", tarefa.error, tarefa.data);
+    return null;
+  }
+
+  const taskId = tarefa.data?.data?.task_id;
+  let tentativas = 0;
+  while (
+    (tarefa.data?.data?.status === "RUNNING" || tarefa.data?.data?.status === "CREATED") &&
+    taskId
+  ) {
+    if (tentativas >= 8) {
+      console.warn("TIKTOK LEAD TASK: nao concluiu a tempo (page_id", pageId, "task_id", taskId, ") — tenta na proxima sincronizacao");
+      return null;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    tarefa = await criarOuConsultarTarefa(taskId);
+    tentativas++;
+  }
+
+  if (!tarefa.ok || tarefa.data?.data?.status !== "SUCCEED") {
+    console.error("ERRO TAREFA LEADS TIKTOK (status final):", tarefa.error, tarefa.data);
+    return null;
+  }
+
+  if (tarefa.data?.data?.file_type === "zip") {
+    console.error("TIKTOK LEAD TASK: arquivo zip ainda nao suportado (page_id:", pageId, ")");
+    return null;
+  }
+
+  const downloadRes = await fetch(
+    `${TIKTOK_API}/page/lead/task/download/?advertiser_id=${advertiserId}&task_id=${taskId}`,
+    { headers: tiktokHeaders(token) }
+  );
+  if (!downloadRes.ok) {
+    console.error("ERRO DOWNLOAD LEADS TIKTOK:", downloadRes.status, await downloadRes.text());
+    return null;
+  }
+  return parsearCsvSimples(await downloadRes.text());
+}
+
 // Busca token + conta de anúncios (advertiser_id) + identidade já selecionadas pelo usuário
 async function obterConexaoTikTok(
   usuarioId: number
@@ -9708,58 +9836,30 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
       }
     }
 
-    // 🔥 BUSCA LEADS (últimos 30 dias)
-    // A TikTok passou a exigir page_id (o Instant Form) quando lead_source=INSTANT_FORM
-    // — nao existe uma chamada que traga leads de todos os formularios do anunciante
-    // de uma vez, entao busca a lista de formularios primeiro e itera lead/get por
-    // page_id (mesmo endpoint/formato assumido em /tiktok/formularios).
-    const trintaDiasAtras = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const startTime = Math.floor(trintaDiasAtras.getTime() / 1000);
+    // 🔥 BUSCA LEADS
+    // A TikTok nao oferece um /lead/get/ paginado por data (isso foi uma suposicao
+    // errada da versao anterior) — o export em massa e assincrono: criar uma "lead
+    // download task" por page_id (Instant Form), fazer polling do status e baixar
+    // um CSV quando pronto. Os page_id vem das nossas proprias campanhas ja
+    // sincronizadas (form_id), ja que nao existe um /page/get/ testado ainda para
+    // listar formularios direto na conta. Ver baixarLeadsTikTokPorFormulario.
+    const formsLocais = await client.query(
+      `SELECT DISTINCT form_id FROM campanhas
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' AND conta_anuncios_id = $2
+         AND form_id IS NOT NULL`,
+      [usuarioId, String(advertiserId)]
+    );
+    const pageIds: string[] = formsLocais.rows.map((r: any) => String(r.form_id)).filter(Boolean);
 
     let totalLeads = 0;
 
-    const paginasRes = await fetch(
-      `${TIKTOK_API}/page/lead_gen/get/?advertiser_id=${advertiserId}`,
-      { headers: tiktokHeaders(token) }
-    );
-    const paginasData = await paginasRes.json() as any;
-    if (paginasData.code !== 0) {
-      console.error("ERRO PAGINAS (INSTANT FORMS) TIKTOK:", paginasData);
-    }
-    const paginas = Array.isArray(paginasData.data?.pages)
-      ? paginasData.data.pages
-      : Array.isArray(paginasData.data?.list)
-      ? paginasData.data.list
-      : [];
-    const pageIds: string[] = paginas
-      .map((p: any) => p.page_id ?? p.id)
-      .filter(Boolean)
-      .map((id: any) => String(id));
-
     for (const pageId of pageIds) {
-    let page = 1;
-    let hasMore = true;
+      const linhasCsv = await baixarLeadsTikTokPorFormulario(String(advertiserId), pageId, token);
+      if (!linhasCsv) continue;
 
-    while (hasMore) {
-      const leadsRes = await fetch(
-        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&page_id=${pageId}&start_time=${startTime}&page=${page}&page_size=100`,
-        { headers: tiktokHeaders(token) }
-      );
-      const leadsData = await leadsRes.json() as any;
-
-      if (leadsData.code !== 0) {
-        console.error("ERRO LEADS TIKTOK:", leadsData);
-        break;
-      }
-
-      const leadsList = leadsData.data?.list ?? [];
-      const pageInfo = leadsData.data?.page_info ?? {};
-      hasMore = page < Math.ceil((pageInfo.total_number ?? 0) / 100);
-      page++;
-
-      for (const lead of leadsList) {
-        const leadId = String(lead.lead_id);
-        const formId = String(lead.form_id ?? "");
+      for (const linha of linhasCsv) {
+        const leadId = valorCsvPorChavesPossiveis(linha, ["lead_id"]);
+        if (!leadId) continue;
 
         const jaExiste = await client.query(
           `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
@@ -9767,39 +9867,39 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
         );
         if (jaExiste.rows.length > 0) continue;
 
-        // Identifica campanha pelo form_id, se disponível
-        let nomeCampanha = "Campanha TikTok";
+        // Identifica campanha pelo campaign_id do CSV (mais preciso) e, na falta
+        // dele, pelo form_id (mesmo comportamento anterior)
+        const campaignIdCsv = valorCsvPorChavesPossiveis(linha, ["campaign_id"]);
+        let nomeCampanha = valorCsvPorChavesPossiveis(linha, ["campaign_name"]) || "Campanha TikTok";
         let nichoId: number | null = null;
-        if (formId) {
-          const campRow = await client.query(
-            `SELECT nome, nicho_id FROM campanhas
-             WHERE form_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
-               AND conta_anuncios_id = $3
-             LIMIT 1`,
-            [formId, usuarioId, String(advertiserId)]
-          );
-          if (campRow.rows.length) {
-            nomeCampanha = campRow.rows[0].nome;
-            nichoId = campRow.rows[0].nicho_id ?? null;
-          }
+        const campRow = await client.query(
+          `SELECT nome, nicho_id FROM campanhas
+           WHERE usuario_id = $1 AND plataforma = 'tiktok' AND conta_anuncios_id = $2
+             AND (($3 <> '' AND campaign_id = $3) OR form_id = $4)
+           LIMIT 1`,
+          [usuarioId, String(advertiserId), campaignIdCsv, pageId]
+        );
+        if (campRow.rows.length) {
+          nomeCampanha = campRow.rows[0].nome;
+          nichoId = campRow.rows[0].nicho_id ?? null;
         }
 
-        let nome = "";
-        let email = "";
-        let telefone = "";
-        const respostasQualificacao: any[] = [];
+        const nome = valorCsvPorChavesPossiveis(linha, ["full_name", "name", "first_name"]) || "Lead TikTok";
+        const email = valorCsvPorChavesPossiveis(linha, ["email"]);
+        const telefone = valorCsvPorChavesPossiveis(linha, ["phone_number", "phone"]);
 
-        for (const field of lead.fields ?? []) {
-          const key = (field.name ?? "").toUpperCase();
-          if (key === "FULL_NAME" || key === "FIRST_NAME") nome = field.value ?? "";
-          else if (key === "EMAIL") email = field.value ?? "";
-          else if (key === "PHONE_NUMBER") telefone = field.value ?? "";
-          else respostasQualificacao.push({ pergunta: field.name, resposta: field.value ?? "" });
-        }
+        const camposConhecidos = new Set([
+          "lead_id", "campaign_id", "campaign_name", "full_name", "name", "first_name",
+          "last_name", "email", "phone_number", "phone", "create_time", "submit_time",
+          "page_id", "adgroup_id", "adgroup_name", "ad_id", "ad_name",
+        ]);
+        const respostasQualificacao = Object.keys(linha)
+          .filter(chave => !camposConhecidos.has(chave.trim().toLowerCase().replace(/[\s_]+/g, "_")))
+          .map(chave => ({ pergunta: chave, resposta: linha[chave] }));
 
-        const criadoEm = lead.submit_time
-          ? new Date(Number(lead.submit_time) * 1000).toISOString()
-          : null;
+        const criadoEmTexto = valorCsvPorChavesPossiveis(linha, ["create_time", "submit_time"]);
+        const criadoEm = criadoEmTexto ? new Date(criadoEmTexto).toISOString() : null;
+        const criadoEmValido = criadoEm && !Number.isNaN(new Date(criadoEm).getTime()) ? criadoEm : null;
 
         const leadInseridoTikTok = await client.query(
           `INSERT INTO leads
@@ -9808,9 +9908,9 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
            VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))
            RETURNING id`,
           [
-            usuarioId, leadId, nome || "Lead TikTok", email, telefone,
+            usuarioId, leadId, nome, email, telefone,
             nomeCampanha, String(advertiserId),
-            JSON.stringify(respostasQualificacao), nichoId, criadoEm
+            JSON.stringify(respostasQualificacao), nichoId, criadoEmValido
           ]
         );
 
@@ -9831,7 +9931,6 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
 
         totalLeads++;
       }
-    }
     }
 
     await client.query(
@@ -16889,51 +16988,50 @@ app.post("/webhook/tiktok", async (c) => {
       );
       if (jaExiste.rows.length > 0) continue;
 
-      // Busca os dados completos do lead
-      const leadRes = await fetch(
-        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&page_id=${formId}&lead_id=${leadId}`,
-        { headers: tiktokHeaders(token) }
-      );
-      const leadData = await leadRes.json() as any;
-
-      if (leadData.code !== 0 || !leadData.data?.list?.length) {
-        console.error("TIKTOK WEBHOOK: erro ao buscar lead:", leadData);
+      // Busca os dados completos do lead — nao existe um /lead/get/ por lead_id
+      // isolado (ver baixarLeadsTikTokPorFormulario); baixa o CSV do formulario
+      // inteiro (task assincrona) e filtra a linha pelo lead_id do evento.
+      if (!formId) {
+        console.error("TIKTOK WEBHOOK: evento sem form_id, nao e possivel buscar o lead:", leadId);
+        continue;
+      }
+      const linhasCsv = await baixarLeadsTikTokPorFormulario(advertiserId, formId, token);
+      const linha = linhasCsv?.find(l => valorCsvPorChavesPossiveis(l, ["lead_id"]) === leadId);
+      if (!linha) {
+        console.error("TIKTOK WEBHOOK: lead nao encontrado no export do formulario:", leadId, formId);
         continue;
       }
 
-      const lead = leadData.data.list[0];
-
-      let nomeCampanha = "Campanha TikTok";
+      const campaignIdCsv = valorCsvPorChavesPossiveis(linha, ["campaign_id"]);
+      let nomeCampanha = valorCsvPorChavesPossiveis(linha, ["campaign_name"]) || "Campanha TikTok";
       let nichoId: number | null = null;
-      if (formId) {
-        const campRow = await client.query(
-          `SELECT nome, nicho_id FROM campanhas
-           WHERE form_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
-           LIMIT 1`,
-          [formId, usuarioId]
-        );
-        if (campRow.rows.length) {
-          nomeCampanha = campRow.rows[0].nome;
-          nichoId = campRow.rows[0].nicho_id ?? null;
-        }
+      const campRow = await client.query(
+        `SELECT nome, nicho_id FROM campanhas
+         WHERE usuario_id = $1 AND plataforma = 'tiktok'
+           AND (($2 <> '' AND campaign_id = $2) OR form_id = $3)
+         LIMIT 1`,
+        [usuarioId, campaignIdCsv, formId]
+      );
+      if (campRow.rows.length) {
+        nomeCampanha = campRow.rows[0].nome;
+        nichoId = campRow.rows[0].nicho_id ?? null;
       }
 
-      let nome = "";
-      let email = "";
-      let telefone = "";
-      const respostasQualificacao: any[] = [];
+      const camposConhecidos = new Set([
+        "lead_id", "campaign_id", "campaign_name", "full_name", "name", "first_name",
+        "last_name", "email", "phone_number", "phone", "create_time", "submit_time",
+        "page_id", "adgroup_id", "adgroup_name", "ad_id", "ad_name",
+      ]);
+      const nome = valorCsvPorChavesPossiveis(linha, ["full_name", "name", "first_name"]) || "Lead TikTok";
+      const email = valorCsvPorChavesPossiveis(linha, ["email"]);
+      const telefone = valorCsvPorChavesPossiveis(linha, ["phone_number", "phone"]);
+      const respostasQualificacao = Object.keys(linha)
+        .filter(chave => !camposConhecidos.has(chave.trim().toLowerCase().replace(/[\s_]+/g, "_")))
+        .map(chave => ({ pergunta: chave, resposta: linha[chave] }));
 
-      for (const field of lead.fields ?? []) {
-        const key = (field.name ?? "").toUpperCase();
-        if (key === "FULL_NAME" || key === "FIRST_NAME") nome = field.value ?? "";
-        else if (key === "EMAIL") email = field.value ?? "";
-        else if (key === "PHONE_NUMBER") telefone = field.value ?? "";
-        else respostasQualificacao.push({ pergunta: field.name, resposta: field.value ?? "" });
-      }
-
-      const criadoEm = lead.submit_time
-        ? new Date(Number(lead.submit_time) * 1000).toISOString()
-        : null;
+      const criadoEmTexto = valorCsvPorChavesPossiveis(linha, ["create_time", "submit_time"]);
+      const criadoEmData = criadoEmTexto ? new Date(criadoEmTexto) : null;
+      const criadoEm = criadoEmData && !Number.isNaN(criadoEmData.getTime()) ? criadoEmData.toISOString() : null;
 
       await client.query(
         `INSERT INTO leads
