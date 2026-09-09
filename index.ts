@@ -9709,16 +9709,40 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
     }
 
     // 🔥 BUSCA LEADS (últimos 30 dias)
+    // A TikTok passou a exigir page_id (o Instant Form) quando lead_source=INSTANT_FORM
+    // — nao existe uma chamada que traga leads de todos os formularios do anunciante
+    // de uma vez, entao busca a lista de formularios primeiro e itera lead/get por
+    // page_id (mesmo endpoint/formato assumido em /tiktok/formularios).
     const trintaDiasAtras = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const startTime = Math.floor(trintaDiasAtras.getTime() / 1000);
 
-    let page = 1;
     let totalLeads = 0;
+
+    const paginasRes = await fetch(
+      `${TIKTOK_API}/page/lead_gen/get/?advertiser_id=${advertiserId}`,
+      { headers: tiktokHeaders(token) }
+    );
+    const paginasData = await paginasRes.json() as any;
+    if (paginasData.code !== 0) {
+      console.error("ERRO PAGINAS (INSTANT FORMS) TIKTOK:", paginasData);
+    }
+    const paginas = Array.isArray(paginasData.data?.pages)
+      ? paginasData.data.pages
+      : Array.isArray(paginasData.data?.list)
+      ? paginasData.data.list
+      : [];
+    const pageIds: string[] = paginas
+      .map((p: any) => p.page_id ?? p.id)
+      .filter(Boolean)
+      .map((id: any) => String(id));
+
+    for (const pageId of pageIds) {
+    let page = 1;
     let hasMore = true;
 
     while (hasMore) {
       const leadsRes = await fetch(
-        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&start_time=${startTime}&page=${page}&page_size=100`,
+        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&page_id=${pageId}&start_time=${startTime}&page=${page}&page_size=100`,
         { headers: tiktokHeaders(token) }
       );
       const leadsData = await leadsRes.json() as any;
@@ -9807,6 +9831,7 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
 
         totalLeads++;
       }
+    }
     }
 
     await client.query(
@@ -16866,7 +16891,7 @@ app.post("/webhook/tiktok", async (c) => {
 
       // Busca os dados completos do lead
       const leadRes = await fetch(
-        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&lead_id=${leadId}`,
+        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&page_id=${formId}&lead_id=${leadId}`,
         { headers: tiktokHeaders(token) }
       );
       const leadData = await leadRes.json() as any;
