@@ -18616,10 +18616,14 @@ await client.query(`
     ON usuarios(email);
   CREATE INDEX IF NOT EXISTS idx_leads_usuario_id
     ON leads(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_leads_usuario_criado_em
+    ON leads(usuario_id, criado_em DESC);
   CREATE INDEX IF NOT EXISTS idx_leads_lead_id
     ON leads(lead_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_usuario_id
     ON campanhas(usuario_id);
+  CREATE INDEX IF NOT EXISTS idx_campanhas_usuario_criado_em
+    ON campanhas(usuario_id, criado_em DESC);
   CREATE INDEX IF NOT EXISTS idx_campanhas_conta_anuncios_id
     ON campanhas(conta_anuncios_id);
   CREATE INDEX IF NOT EXISTS idx_campanhas_encaminhada_usuario_id
@@ -21518,6 +21522,134 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
     return c.json({
       error: "Erro ao buscar métricas"
+    }, 500);
+  }
+});
+
+// Base local do ranking exibido nos cards de integração. O gasto e as métricas
+// de entrega continuam vindo das rotas /<plataforma>/performance-diaria; aqui ficam
+// somente os sinais comparáveis da Central de Leads (volume, qualificação e
+// fechamento) e o nicho predominante do período. Assim o front não precisa baixar
+// todos os leads do usuário nem confundir o número autorreportado por cada rede com
+// o que realmente entrou no funil da Plataforma de Leads.
+app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const periodoSolicitado = Number(c.req.query("periodo_dias") || 30);
+    const periodoDias = Number.isFinite(periodoSolicitado)
+      ? Math.min(90, Math.max(7, Math.trunc(periodoSolicitado)))
+      : 30;
+    const inicio = new Date(Date.now() - periodoDias * 24 * 60 * 60 * 1000);
+
+    const metricasResult = await client.query(
+      `WITH leads_origem AS (
+         SELECT
+           LOWER(COALESCE(
+             NULLIF(NULLIF(LOWER(NULLIF(l.plataforma, '')), 'whatsapp'), ''),
+             NULLIF(LOWER(NULLIF(l.origem, '')), ''),
+             'formulario'
+           )) AS origem_normalizada,
+           LOWER(COALESCE(l.status, 'novo')) AS status,
+           l.nicho_id,
+           l.criado_em
+         FROM leads l
+         WHERE l.usuario_id = $1
+           AND l.criado_em >= $2
+       ), leads_normalizados AS (
+         SELECT
+           CASE
+             WHEN origem_normalizada IN ('meta', 'facebook', 'instagram') THEN 'meta'
+             WHEN origem_normalizada IN ('google', 'google_ads') THEN 'google'
+             WHEN origem_normalizada IN ('tiktok', 'tiktok_ads') THEN 'tiktok'
+             WHEN origem_normalizada IN ('linkedin', 'linkedin_ads') THEN 'linkedin'
+             WHEN origem_normalizada IN ('kwai', 'kwai_ads') THEN 'kwai'
+             WHEN origem_normalizada IN ('pinterest', 'pinterest_ads') THEN 'pinterest'
+             WHEN origem_normalizada IN ('snapchat', 'snapchat_ads') THEN 'snapchat'
+             WHEN origem_normalizada IN ('microsoft', 'microsoft_ads', 'bing') THEN 'microsoft'
+             ELSE NULL
+           END AS plataforma,
+           status,
+           nicho_id,
+           criado_em
+         FROM leads_origem
+       )
+       SELECT
+         plataforma,
+         COUNT(*)::int AS leads,
+         COUNT(*) FILTER (WHERE status IN ('em_conversa', 'fechado'))::int AS qualificados,
+         COUNT(*) FILTER (WHERE status = 'fechado')::int AS fechados,
+         COUNT(*) FILTER (WHERE status = 'perdido')::int AS perdidos,
+         MAX(criado_em) AS ultimo_lead_em
+       FROM leads_normalizados
+       WHERE plataforma IS NOT NULL
+       GROUP BY plataforma`,
+      [user.id, inicio]
+    );
+
+    // O nicho de referência é o que mais apareceu nos leads recentes. Quando a
+    // conta ainda não recebeu leads, usamos as campanhas recentes. Só adotamos o
+    // nicho habilitado como fallback quando ele é único; escolher um dos vários
+    // nichos por ordem alfabética produziria uma recomendação arbitrária.
+    const nichoResult = await client.query(
+      `WITH sinais_nicho AS (
+         SELECT l.nicho_id, 3::int AS peso
+         FROM leads l
+         WHERE l.usuario_id = $1 AND l.criado_em >= $2 AND l.nicho_id IS NOT NULL
+         UNION ALL
+         SELECT c.nicho_id, 1::int AS peso
+         FROM campanhas c
+         WHERE c.usuario_id = $1 AND c.criado_em >= $2 AND c.nicho_id IS NOT NULL
+       )
+       SELECT n.id, n.slug, n.nome, SUM(s.peso)::int AS relevancia
+       FROM sinais_nicho s
+       INNER JOIN nichos n ON n.id = s.nicho_id
+       GROUP BY n.id, n.slug, n.nome
+       ORDER BY relevancia DESC, n.nome ASC
+       LIMIT 1`,
+      [user.id, inicio]
+    );
+
+    let nichoReferencia = nichoResult.rows[0]
+      ? { ...nichoResult.rows[0], origem: "historico_recente" }
+      : null;
+
+    if (!nichoReferencia) {
+      const nichoHabilitado = await client.query(
+        `SELECT n.id, n.slug, n.nome
+         FROM usuario_nichos un
+         INNER JOIN nichos n ON n.id = un.nicho_id
+         WHERE un.usuario_id = $1
+         ORDER BY n.nome ASC
+         LIMIT 2`,
+        [user.id]
+      );
+      if (nichoHabilitado.rows.length === 1) {
+        nichoReferencia = { ...nichoHabilitado.rows[0], origem: "nicho_habilitado" };
+      }
+    }
+
+    const plataformas = Object.fromEntries(
+      metricasResult.rows.map((row: any) => [row.plataforma, {
+        leads: Number(row.leads || 0),
+        qualificados: Number(row.qualificados || 0),
+        fechados: Number(row.fechados || 0),
+        perdidos: Number(row.perdidos || 0),
+        ultimo_lead_em: row.ultimo_lead_em || null
+      }])
+    );
+
+    return c.json({
+      periodo_dias: periodoDias,
+      periodo_inicio: inicio.toISOString(),
+      atualizado_em: new Date().toISOString(),
+      nicho_referencia: nichoReferencia,
+      plataformas
+    });
+  } catch (err: any) {
+    console.error("ERRO RANKING DE PLATAFORMAS:", err);
+    return c.json({
+      error: "Erro ao calcular ranking de plataformas",
+      detalhe: err?.message || String(err)
     }, 500);
   }
 });
