@@ -8935,6 +8935,165 @@ async function obterConexaoTikTok(
   };
 }
 
+type PagamentoTikTok = {
+  disponivel: boolean;
+  moeda: string | null;
+  status_conta: string | null;
+  saldo_total: number | null;
+  saldo_disponivel: number | null;
+  saldo_dinheiro: number | null;
+  saldo_bonus: number | null;
+  saldo_credito: number | null;
+  saldo_congelado: number | null;
+  orcamento_modo: string | null;
+  orcamento: number | null;
+  orcamento_restante: number | null;
+  detalhamento_disponivel: boolean;
+  aviso: string | null;
+  atualizado_em: string;
+};
+
+function numeroPagamentoTikTok(valor: unknown): number | null {
+  if (valor === null || valor === undefined || valor === "") return null;
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero : null;
+}
+
+// A consulta básica de /advertiser/info está disponível para a conta de
+// anúncios autorizada e informa saldo total, moeda e status. O detalhamento de
+// caixa, bônus, crédito e valores congelados vem de /advertiser/balance/get e
+// exige a permissão financeira do Business Center. Por isso a segunda chamada
+// é best-effort e nunca impede a exibição dos dados básicos.
+async function consultarPagamentoTikTok(
+  conexao: { token: string; advertiserId: string | null }
+): Promise<PagamentoTikTok> {
+  const atualizadoEm = new Date().toISOString();
+  const indisponivel = (aviso: string): PagamentoTikTok => ({
+    disponivel: false,
+    moeda: null,
+    status_conta: null,
+    saldo_total: null,
+    saldo_disponivel: null,
+    saldo_dinheiro: null,
+    saldo_bonus: null,
+    saldo_credito: null,
+    saldo_congelado: null,
+    orcamento_modo: null,
+    orcamento: null,
+    orcamento_restante: null,
+    detalhamento_disponivel: false,
+    aviso,
+    atualizado_em: atualizadoEm,
+  });
+
+  if (!conexao.advertiserId) {
+    return indisponivel("Selecione uma conta de anúncios para consultar o pagamento.");
+  }
+
+  const contaParams = new URLSearchParams({
+    advertiser_ids: JSON.stringify([conexao.advertiserId]),
+    fields: JSON.stringify([
+      "advertiser_id", "name", "currency", "status", "balance",
+      "timezone", "display_timezone", "owner_bc_id"
+    ]),
+  });
+  const contaRes = await tiktokFetch(
+    `/advertiser/info/?${contaParams.toString()}`,
+    conexao.token
+  );
+
+  if (!contaRes.ok) {
+    console.warn("AVISO PAGAMENTO TIKTOK (conta):", contaRes.error);
+    return indisponivel("O TikTok não liberou os dados financeiros desta conta para a conexão atual.");
+  }
+
+  const contas = Array.isArray(contaRes.data?.data?.list)
+    ? contaRes.data.data.list
+    : [];
+  const conta = contas.find(
+    (item: any) => String(item?.advertiser_id) === String(conexao.advertiserId)
+  ) || contas[0] || null;
+
+  if (!conta) {
+    return indisponivel("A conta selecionada não foi encontrada na resposta do TikTok.");
+  }
+
+  let detalhe: any = null;
+  let avisoDetalhamento: string | null = null;
+  const ownerBcId = String(conta.owner_bc_id || "").trim();
+
+  if (ownerBcId) {
+    const saldoParams = new URLSearchParams({
+      bc_id: ownerBcId,
+      fields: JSON.stringify([
+        "budget_remaining",
+        "budget_frequency_restriction",
+        "budget_amount_restriction",
+        "min_transferable_amount",
+        "max_transferable_amount",
+        "balance_info",
+      ]),
+      filtering: JSON.stringify({ keyword: String(conexao.advertiserId) }),
+      page: "1",
+      page_size: "50",
+    });
+    const saldoRes = await tiktokFetch(
+      `/advertiser/balance/get/?${saldoParams.toString()}`,
+      conexao.token
+    );
+
+    if (saldoRes.ok) {
+      const lista = saldoRes.data?.data?.advertiser_account_list
+        || saldoRes.data?.data?.list
+        || [];
+      detalhe = Array.isArray(lista)
+        ? lista.find(
+            (item: any) => String(item?.advertiser_id) === String(conexao.advertiserId)
+          ) || lista[0] || null
+        : null;
+      if (!detalhe) {
+        avisoDetalhamento = "Saldo total atualizado. O TikTok não retornou a composição financeira desta conta no Business Center.";
+      }
+    } else {
+      console.warn("AVISO PAGAMENTO TIKTOK (detalhamento BC):", saldoRes.error);
+      avisoDetalhamento = "Saldo total atualizado. O detalhamento de dinheiro, bônus e crédito requer permissão financeira do Business Center no aplicativo TikTok.";
+    }
+  } else {
+    avisoDetalhamento = "Saldo total atualizado. Esta conta não informou um Business Center para consultar o detalhamento financeiro.";
+  }
+
+  const saldos = detalhe?.balance_info || detalhe || {};
+  return {
+    disponivel: true,
+    moeda: conta.currency || detalhe?.currency || null,
+    status_conta: conta.status || detalhe?.advertiser_status || null,
+    saldo_total: numeroPagamentoTikTok(
+      saldos.account_balance ?? detalhe?.account_balance ?? conta.balance
+    ),
+    saldo_disponivel: numeroPagamentoTikTok(
+      saldos.valid_account_balance ?? detalhe?.valid_account_balance
+    ),
+    saldo_dinheiro: numeroPagamentoTikTok(
+      saldos.valid_cash_balance ?? detalhe?.valid_cash_balance ?? saldos.cash_balance ?? detalhe?.cash_balance
+    ),
+    saldo_bonus: numeroPagamentoTikTok(
+      saldos.valid_grant_balance ?? detalhe?.valid_grant_balance ?? saldos.grant_balance ?? detalhe?.grant_balance
+    ),
+    saldo_credito: numeroPagamentoTikTok(
+      saldos.valid_credit_balance ?? detalhe?.valid_credit_balance ?? saldos.credit_balance ?? detalhe?.credit_balance
+    ),
+    saldo_congelado: numeroPagamentoTikTok(
+      saldos.frozen_balance ?? detalhe?.frozen_balance
+    ),
+    orcamento_modo: detalhe?.budget_mode || null,
+    orcamento: numeroPagamentoTikTok(detalhe?.budget),
+    orcamento_restante: numeroPagamentoTikTok(detalhe?.budget_remaining),
+    detalhamento_disponivel: Boolean(detalhe),
+    aviso: detalhe ? null : avisoDetalhamento,
+    atualizado_em: atualizadoEm,
+  };
+}
+
 type EstruturaCampanhaTikTok = {
   campanha: any | null;
   adgroup: any | null;
@@ -9550,22 +9709,44 @@ app.get("/tiktok/status-completo", authMiddleware, async (c) => {
     };
 
     if (!conexao.advertiserId) {
-      return c.json({ ...base, gasto_hoje: null });
+      return c.json({
+        ...base,
+        gasto_hoje: null,
+        pagamento: await consultarPagamentoTikTok(conexao),
+      });
     }
 
-    try {
-      const hojeStr = new Date().toISOString().slice(0, 10);
-      const relatorioHoje = await relatorioTikTokCampanhas(
+    const hojeStr = new Date().toISOString().slice(0, 10);
+    const [resultadoGasto, resultadoPagamento] = await Promise.allSettled([
+      relatorioTikTokCampanhas(
         conexao.token, conexao.advertiserId, hojeStr, hojeStr, ["advertiser_id"]
-      );
-      const gastoHoje = relatorioHoje.reduce(
+      ),
+      consultarPagamentoTikTok(conexao),
+    ]);
+
+    let gastoHoje: number | null = null;
+    let avisoGasto: string | null = null;
+    if (resultadoGasto.status === "fulfilled") {
+      gastoHoje = resultadoGasto.value.reduce(
         (soma, item) => soma + Number(item.metrics?.spend || 0), 0
       );
-      return c.json({ ...base, gasto_hoje: gastoHoje });
-    } catch (errApi: any) {
-      console.error("ERRO /tiktok/status-completo (API TikTok):", errApi.message);
-      return c.json({ ...base, gasto_hoje: null, aviso: "Nao foi possivel consultar dados ao vivo do TikTok Ads" });
+    } else {
+      console.error("ERRO /tiktok/status-completo (gasto TikTok):", resultadoGasto.reason?.message || resultadoGasto.reason);
+      avisoGasto = "Nao foi possivel consultar o gasto ao vivo do TikTok Ads";
     }
+
+    const pagamento = resultadoPagamento.status === "fulfilled"
+      ? resultadoPagamento.value
+      : null;
+    if (resultadoPagamento.status === "rejected") {
+      console.error("ERRO /tiktok/status-completo (pagamento TikTok):", resultadoPagamento.reason?.message || resultadoPagamento.reason);
+    }
+    return c.json({
+      ...base,
+      gasto_hoje: gastoHoje,
+      pagamento,
+      aviso: avisoGasto,
+    });
   } catch (err: any) {
     console.error("ERRO /tiktok/status-completo:", err);
     return c.json({ error: "Erro interno" }, 500);
