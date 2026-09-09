@@ -6522,6 +6522,232 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
   }
 });
 
+type PagamentoGoogleAds = {
+  disponivel: boolean;
+  modalidade: "gerenciadora" | "faturamento_mensal" | "gerenciado_google" | "nao_identificado";
+  modalidade_texto: string;
+  status: string | null;
+  texto: string;
+  conta_pagamentos_nome: string | null;
+  perfil_pagamentos_nome: string | null;
+  saldo_consultavel: boolean;
+  saldo_disponivel: number | null;
+  orcamento_conta: {
+    nome: string | null;
+    status: string | null;
+    limite: number | null;
+    gasto: number | null;
+    restante: number | null;
+    infinito: boolean;
+    ajustes: number | null;
+    inicio: string | null;
+    fim: string | null;
+  } | null;
+  aviso: string | null;
+  atualizado_em: string;
+};
+
+function microsGoogleParaMoeda(valor: unknown): number | null {
+  if (valor === null || valor === undefined || valor === "") return null;
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero / 1_000_000 : null;
+}
+
+function textoStatusBillingGoogle(status: unknown): string {
+  const normalizado = String(status || "").toUpperCase();
+  if (normalizado === "APPROVED") return "Aprovado";
+  if (normalizado === "APPROVED_HELD") return "Aprovado, aguardando orçamento";
+  if (normalizado === "PENDING") return "Pendente";
+  if (normalizado === "CANCELLED") return "Cancelado";
+  return "Não identificado";
+}
+
+// O Google Ads só expõe BillingSetup e AccountBudget para contas configuradas
+// com faturamento mensal. Contas comuns, pré-pagas ou com cobrança automática
+// não fornecem saldo nem dados da forma de pagamento pela API. O retorno abaixo
+// distingue esses casos para não confundir orçamento de faturamento com saldo.
+async function consultarPagamentoGoogleAds(params: {
+  customerId: string;
+  accessToken: string;
+  loginCustomerId?: string | null;
+  contaGerenciadora: boolean;
+}): Promise<PagamentoGoogleAds> {
+  const atualizadoEm = new Date().toISOString();
+  const base = {
+    conta_pagamentos_nome: null,
+    perfil_pagamentos_nome: null,
+    saldo_consultavel: false,
+    saldo_disponivel: null,
+    orcamento_conta: null,
+    atualizado_em: atualizadoEm,
+  };
+
+  if (params.contaGerenciadora) {
+    return {
+      ...base,
+      disponivel: true,
+      modalidade: "gerenciadora",
+      modalidade_texto: "Conta gerenciadora (MCC)",
+      status: null,
+      texto: "Configurado nas contas anunciantes",
+      aviso: "A conta gerenciadora não possui saldo de anúncios próprio. Consulte o pagamento na conta anunciante selecionada.",
+    };
+  }
+
+  let billingResults: any[];
+  try {
+    billingResults = await googleAdsQuery(
+      params.customerId,
+      params.accessToken,
+      `SELECT billing_setup.status,
+              billing_setup.payments_account_info.payments_account_name,
+              billing_setup.payments_account_info.payments_profile_name,
+              billing_setup.start_date_time,
+              billing_setup.end_date_time,
+              billing_setup.end_time_type
+       FROM billing_setup`,
+      params.loginCustomerId
+    ) as any[];
+  } catch (err: any) {
+    console.warn("AVISO PAGAMENTO GOOGLE (billing setup indisponivel):", err?.message || err);
+    return {
+      ...base,
+      disponivel: false,
+      modalidade: "nao_identificado",
+      modalidade_texto: "Não identificado",
+      status: null,
+      texto: "Consulta indisponível",
+      aviso: "O Google Ads não liberou os dados de faturamento desta conta para a conexão atual.",
+    };
+  }
+
+  const setups = billingResults
+    .map((row: any) => row.billingSetup || row.billing_setup)
+    .filter(Boolean)
+    .sort((a: any, b: any) => String(
+      b.startDateTime || b.start_date_time || ""
+    ).localeCompare(String(
+      a.startDateTime || a.start_date_time || ""
+    )));
+  const billing = setups.find((item: any) => item.status === "APPROVED")
+    || setups.find((item: any) => item.status === "APPROVED_HELD")
+    || setups.find((item: any) => item.status === "PENDING")
+    || setups[0]
+    || null;
+
+  if (!billing) {
+    return {
+      ...base,
+      disponivel: true,
+      modalidade: "gerenciado_google",
+      modalidade_texto: "Pré-pago ou cobrança automática",
+      status: null,
+      texto: "Gerenciado no Google Ads",
+      aviso: "O Google não fornece pela API o saldo disponível nem a forma de pagamento das contas comuns. Consulte esses valores no Resumo de faturamento.",
+    };
+  }
+
+  let orcamentoConta: PagamentoGoogleAds["orcamento_conta"] = null;
+  let aviso: string | null = null;
+  try {
+    const budgetResults = await googleAdsQuery(
+      params.customerId,
+      params.accessToken,
+      `SELECT account_budget.name,
+              account_budget.status,
+              account_budget.amount_served_micros,
+              account_budget.adjusted_spending_limit_micros,
+              account_budget.adjusted_spending_limit_type,
+              account_budget.approved_spending_limit_micros,
+              account_budget.approved_spending_limit_type,
+              account_budget.total_adjustments_micros,
+              account_budget.approved_start_date_time,
+              account_budget.proposed_start_date_time,
+              account_budget.approved_end_date_time,
+              account_budget.approved_end_time_type,
+              account_budget.proposed_end_date_time,
+              account_budget.proposed_end_time_type
+       FROM account_budget
+       ORDER BY account_budget.approved_start_date_time DESC
+       LIMIT 20`,
+      params.loginCustomerId
+    ) as any[];
+    const budgets = budgetResults
+      .map((row: any) => row.accountBudget || row.account_budget)
+      .filter(Boolean);
+    const budget = budgets.find((item: any) => item.status === "APPROVED")
+      || budgets.find((item: any) => item.status === "PENDING")
+      || budgets[0]
+      || null;
+
+    if (budget) {
+      const tipoLimite = budget.adjustedSpendingLimitType
+        || budget.adjusted_spending_limit_type
+        || budget.approvedSpendingLimitType
+        || budget.approved_spending_limit_type;
+      const infinito = tipoLimite === "INFINITE";
+      const limite = microsGoogleParaMoeda(
+        budget.adjustedSpendingLimitMicros
+        ?? budget.adjusted_spending_limit_micros
+        ?? budget.approvedSpendingLimitMicros
+        ?? budget.approved_spending_limit_micros
+      );
+      const gasto = microsGoogleParaMoeda(
+        budget.amountServedMicros ?? budget.amount_served_micros
+      );
+      orcamentoConta = {
+        nome: budget.name || null,
+        status: budget.status || null,
+        limite: infinito ? null : limite,
+        gasto,
+        restante: infinito || limite === null || gasto === null
+          ? null
+          : Math.max(0, limite - gasto),
+        infinito,
+        ajustes: microsGoogleParaMoeda(
+          budget.totalAdjustmentsMicros ?? budget.total_adjustments_micros
+        ),
+        inicio: budget.approvedStartDateTime
+          || budget.approved_start_date_time
+          || budget.proposedStartDateTime
+          || budget.proposed_start_date_time
+          || null,
+        fim: budget.approvedEndTimeType === "FOREVER"
+          || budget.approved_end_time_type === "FOREVER"
+          || budget.proposedEndTimeType === "FOREVER"
+          || budget.proposed_end_time_type === "FOREVER"
+          ? null
+          : budget.approvedEndDateTime
+            || budget.approved_end_date_time
+            || budget.proposedEndDateTime
+            || budget.proposed_end_date_time
+            || null,
+      };
+    } else {
+      aviso = "O faturamento mensal foi identificado, mas o Google não retornou um orçamento de conta ativo.";
+    }
+  } catch (err: any) {
+    console.warn("AVISO PAGAMENTO GOOGLE (account budget indisponivel):", err?.message || err);
+    aviso = "O faturamento mensal foi identificado, mas o orçamento detalhado não está disponível para esta conexão.";
+  }
+
+  const info = billing.paymentsAccountInfo || billing.payments_account_info || {};
+  return {
+    disponivel: true,
+    modalidade: "faturamento_mensal",
+    modalidade_texto: "Faturamento mensal",
+    status: billing.status || null,
+    texto: textoStatusBillingGoogle(billing.status),
+    conta_pagamentos_nome: info.paymentsAccountName || info.payments_account_name || null,
+    perfil_pagamentos_nome: info.paymentsProfileName || info.payments_profile_name || null,
+    saldo_consultavel: false,
+    saldo_disponivel: null,
+    orcamento_conta: orcamentoConta,
+    aviso,
+    atualizado_em: atualizadoEm,
+  };
+}
+
 // Resumo da conta conectada: dados da conta, gasto de hoje e contagens locais
 app.get("/google/status-completo", authMiddleware, async (c) => {
   const user: any = c.get("user");
@@ -6608,29 +6834,12 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
         }
       }
 
-      // Status de pagamento: consulta best-effort — nem toda conta expoe billing_setup
-      // (ex: contas gerenciadas so pelo billing do MCC), entao falha aqui nao quebra o resto.
-      let pagamento: { status: string | null; texto: string } = {
-        status: null,
-        texto: contaInfo?.manager ? "Não se aplica (conta gerenciadora)" : "Não identificado",
-      };
-      if (!contaInfo?.manager) {
-        try {
-          const billingResults = await googleAdsQuery(
-            customerId, accessToken,
-            "SELECT billing_setup.status FROM billing_setup",
-            loginCustomerId
-          );
-          const statusBilling = (billingResults[0] as any)?.billingSetup?.status ?? null;
-          pagamento = {
-            status: statusBilling,
-            texto: statusBilling === "APPROVED" ? "Aprovado"
-              : statusBilling === "PENDING" ? "Pendente"
-              : statusBilling === "CANCELLED" ? "Cancelado"
-              : "Não identificado",
-          };
-        } catch (_) {}
-      }
+      const pagamento = await consultarPagamentoGoogleAds({
+        customerId: String(customerId),
+        accessToken,
+        loginCustomerId,
+        contaGerenciadora: Boolean(contaInfo?.manager),
+      });
 
       return c.json({
         ...base,
