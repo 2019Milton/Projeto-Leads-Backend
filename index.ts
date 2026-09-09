@@ -5043,7 +5043,8 @@ function extrairLeadsActionsMeta(actions: any[] = []) {
 
 async function listarCampaignIdsMetaDoUsuario(
   usuarioId: number,
-  contaAnunciosId: string
+  contaAnunciosId: string,
+  nichoId: number | null = null
 ) {
   const result = await client.query(
     `
@@ -5052,8 +5053,9 @@ async function listarCampaignIdsMetaDoUsuario(
     WHERE usuario_id = $1
       AND conta_anuncios_id = $2
       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+      AND ($3::int IS NULL OR nicho_id = $3)
       AND campaign_id IS NOT NULL
-      AND COALESCE(status, '') <> 'DELETED'
+      AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')
       AND (
         ad_id IS NOT NULL
         OR adset_id IS NOT NULL
@@ -5067,7 +5069,7 @@ async function listarCampaignIdsMetaDoUsuario(
         )
       )
     `,
-    [usuarioId, contaAnunciosId]
+    [usuarioId, contaAnunciosId, nichoId]
   );
 
   return new Set(
@@ -21637,52 +21639,9 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
     const periodoDias = Number.isFinite(periodoSolicitado)
       ? Math.min(90, Math.max(7, Math.trunc(periodoSolicitado)))
       : 30;
-    const inicio = new Date(Date.now() - periodoDias * 24 * 60 * 60 * 1000);
-
-    const metricasResult = await client.query(
-      `WITH leads_origem AS (
-         SELECT
-           LOWER(COALESCE(
-             NULLIF(NULLIF(LOWER(NULLIF(l.plataforma, '')), 'whatsapp'), ''),
-             NULLIF(LOWER(NULLIF(l.origem, '')), ''),
-             'formulario'
-           )) AS origem_normalizada,
-           LOWER(COALESCE(l.status, 'novo')) AS status,
-           l.nicho_id,
-           l.criado_em
-         FROM leads l
-         WHERE l.usuario_id = $1
-           AND l.criado_em >= $2
-       ), leads_normalizados AS (
-         SELECT
-           CASE
-             WHEN origem_normalizada IN ('meta', 'facebook', 'instagram') THEN 'meta'
-             WHEN origem_normalizada IN ('google', 'google_ads') THEN 'google'
-             WHEN origem_normalizada IN ('tiktok', 'tiktok_ads') THEN 'tiktok'
-             WHEN origem_normalizada IN ('linkedin', 'linkedin_ads') THEN 'linkedin'
-             WHEN origem_normalizada IN ('kwai', 'kwai_ads') THEN 'kwai'
-             WHEN origem_normalizada IN ('pinterest', 'pinterest_ads') THEN 'pinterest'
-             WHEN origem_normalizada IN ('snapchat', 'snapchat_ads') THEN 'snapchat'
-             WHEN origem_normalizada IN ('microsoft', 'microsoft_ads', 'bing') THEN 'microsoft'
-             ELSE NULL
-           END AS plataforma,
-           status,
-           nicho_id,
-           criado_em
-         FROM leads_origem
-       )
-       SELECT
-         plataforma,
-         COUNT(*)::int AS leads,
-         COUNT(*) FILTER (WHERE status IN ('em_conversa', 'fechado'))::int AS qualificados,
-         COUNT(*) FILTER (WHERE status = 'fechado')::int AS fechados,
-         COUNT(*) FILTER (WHERE status = 'perdido')::int AS perdidos,
-         MAX(criado_em) AS ultimo_lead_em
-       FROM leads_normalizados
-       WHERE plataforma IS NOT NULL
-       GROUP BY plataforma`,
-      [user.id, inicio]
-    );
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - (periodoDias - 1));
+    inicio.setHours(0, 0, 0, 0);
 
     // O nicho de referência é o que mais apareceu nos leads recentes. Quando a
     // conta ainda não recebeu leads, usamos as campanhas recentes. Só adotamos o
@@ -21697,6 +21656,7 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
          SELECT c.nicho_id, 1::int AS peso
          FROM campanhas c
          WHERE c.usuario_id = $1 AND c.criado_em >= $2 AND c.nicho_id IS NOT NULL
+           AND UPPER(COALESCE(c.status, '')) NOT IN ('DELETED', 'REMOVED')
        )
        SELECT n.id, n.slug, n.nome, SUM(s.peso)::int AS relevancia
        FROM sinais_nicho s
@@ -21726,6 +21686,51 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
       }
     }
 
+    const nichoReferenciaId = Number(nichoReferencia?.id || 0) || null;
+    const metricasResult = await client.query(
+      `WITH leads_origem AS (
+         SELECT
+           LOWER(COALESCE(
+             NULLIF(NULLIF(LOWER(NULLIF(l.plataforma, '')), 'whatsapp'), ''),
+             NULLIF(LOWER(NULLIF(l.origem, '')), ''),
+             'formulario'
+           )) AS origem_normalizada,
+           LOWER(COALESCE(l.status, 'novo')) AS status,
+           l.criado_em
+         FROM leads l
+         WHERE l.usuario_id = $1
+           AND l.criado_em >= $2
+           AND ($3::int IS NULL OR l.nicho_id = $3)
+       ), leads_normalizados AS (
+         SELECT
+           CASE
+             WHEN origem_normalizada IN ('meta', 'facebook', 'instagram') THEN 'meta'
+             WHEN origem_normalizada IN ('google', 'google_ads') THEN 'google'
+             WHEN origem_normalizada IN ('tiktok', 'tiktok_ads') THEN 'tiktok'
+             WHEN origem_normalizada IN ('linkedin', 'linkedin_ads') THEN 'linkedin'
+             WHEN origem_normalizada IN ('kwai', 'kwai_ads') THEN 'kwai'
+             WHEN origem_normalizada IN ('pinterest', 'pinterest_ads') THEN 'pinterest'
+             WHEN origem_normalizada IN ('snapchat', 'snapchat_ads') THEN 'snapchat'
+             WHEN origem_normalizada IN ('microsoft', 'microsoft_ads', 'bing') THEN 'microsoft'
+             ELSE NULL
+           END AS plataforma,
+           status,
+           criado_em
+         FROM leads_origem
+       )
+       SELECT
+         plataforma,
+         COUNT(*)::int AS leads,
+         COUNT(*) FILTER (WHERE status IN ('em_conversa', 'fechado'))::int AS qualificados,
+         COUNT(*) FILTER (WHERE status = 'fechado')::int AS fechados,
+         COUNT(*) FILTER (WHERE status = 'perdido')::int AS perdidos,
+         MAX(criado_em) AS ultimo_lead_em
+       FROM leads_normalizados
+       WHERE plataforma IS NOT NULL
+       GROUP BY plataforma`,
+      [user.id, inicio, nichoReferenciaId]
+    );
+
     const plataformas = Object.fromEntries(
       metricasResult.rows.map((row: any) => [row.plataforma, {
         leads: Number(row.leads || 0),
@@ -21741,6 +21746,7 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
       periodo_inicio: inicio.toISOString(),
       atualizado_em: new Date().toISOString(),
       nicho_referencia: nichoReferencia,
+      escopo_metricas: nichoReferenciaId ? "nicho" : "geral",
       plataformas
     });
   } catch (err: any) {
@@ -21758,6 +21764,10 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
   try {
 
     const user: any = c.get("user");
+    const nichoSolicitado = Number(c.req.query("nicho_id") || 0);
+    const nichoId = Number.isInteger(nichoSolicitado) && nichoSolicitado > 0
+      ? nichoSolicitado
+      : null;
 
     const periodoParam =
       String(c.req.query("periodo") || "semanal")
@@ -21811,7 +21821,8 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
     const campaignIdsUsuario =
       await listarCampaignIdsMetaDoUsuario(
         Number(user.id),
-        adAccountId
+        adAccountId,
+        nichoId
       );
 
     const inicio = new Date();
@@ -21855,12 +21866,14 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
       WHERE usuario_id = $1
       AND conta_anuncios_id = $2
       AND criado_em >= $3
+      AND ($4::int IS NULL OR nicho_id = $4)
       GROUP BY DATE(criado_em)
       `,
       [
         user.id,
         adAccountId,
-        inicio
+        inicio,
+        nichoId
       ]
     );
 
@@ -22019,6 +22032,7 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         moeda: contaAds.currency || "BRL"
       },
       periodo,
+      nicho_id: nichoId,
       periodo_dias: dias,
       periodo_inicio: since,
       periodo_fim: until,
@@ -22160,6 +22174,10 @@ function montarResumoPerformanceDiaria(diasPerformance: any[], periodo: string) 
 app.get("/google/performance-diaria", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const nichoSolicitado = Number(c.req.query("nicho_id") || 0);
+    const nichoId = Number.isInteger(nichoSolicitado) && nichoSolicitado > 0
+      ? nichoSolicitado
+      : null;
 
     const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
     const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
@@ -22197,9 +22215,10 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
     // por aqui.
     const campanhaIdsResult = await client.query(
       `SELECT DISTINCT campaign_id FROM campanhas
-       WHERE usuario_id = $1 AND plataforma = 'google' AND campaign_id IS NOT NULL
-         AND COALESCE(status, '') <> 'DELETED'`,
-      [user.id]
+       WHERE usuario_id = $1 AND LOWER(COALESCE(plataforma, '')) IN ('google', 'google_ads') AND campaign_id IS NOT NULL
+         AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')
+         AND ($2::int IS NULL OR nicho_id = $2)`,
+      [user.id, nichoId]
     );
     const campaignIdsUsuario = new Set(campanhaIdsResult.rows.map((r: any) => String(r.campaign_id)));
 
@@ -22254,9 +22273,10 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
 
     const leadsBanco = await client.query(
       `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
-       FROM leads WHERE usuario_id = $1 AND plataforma = 'google' AND criado_em >= $2
+       FROM leads WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads') AND criado_em >= $2
+         AND ($3::int IS NULL OR nicho_id = $3)
        GROUP BY DATE(criado_em)`,
-      [user.id, inicio]
+      [user.id, inicio, nichoId]
     );
     const leadsBancoPorDia = new Map(
       leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
@@ -22294,6 +22314,7 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
         moeda: contaInfo?.currencyCode || "BRL",
       },
       periodo,
+      nicho_id: nichoId,
       periodo_dias: dias,
       periodo_inicio: since,
       periodo_fim: until,
@@ -22314,6 +22335,10 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
 app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const nichoSolicitado = Number(c.req.query("nicho_id") || 0);
+    const nichoId = Number.isInteger(nichoSolicitado) && nichoSolicitado > 0
+      ? nichoSolicitado
+      : null;
 
     const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
     const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
@@ -22340,9 +22365,10 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
 
     const campanhaIdsResult = await client.query(
       `SELECT DISTINCT campaign_id FROM campanhas
-       WHERE usuario_id = $1 AND plataforma = 'tiktok' AND campaign_id IS NOT NULL
-         AND COALESCE(status, '') <> 'DELETED'`,
-      [user.id]
+       WHERE usuario_id = $1 AND LOWER(COALESCE(plataforma, '')) IN ('tiktok', 'tiktok_ads') AND campaign_id IS NOT NULL
+         AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')
+         AND ($2::int IS NULL OR nicho_id = $2)`,
+      [user.id, nichoId]
     );
     const campaignIdsUsuario = new Set(campanhaIdsResult.rows.map((r: any) => String(r.campaign_id)));
 
@@ -22367,9 +22393,10 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
 
     const leadsBanco = await client.query(
       `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
-       FROM leads WHERE usuario_id = $1 AND plataforma = 'tiktok' AND criado_em >= $2
+       FROM leads WHERE usuario_id = $1 AND plataforma IN ('tiktok', 'tiktok_ads') AND criado_em >= $2
+         AND ($3::int IS NULL OR nicho_id = $3)
        GROUP BY DATE(criado_em)`,
-      [user.id, inicio]
+      [user.id, inicio, nichoId]
     );
     const leadsBancoPorDia = new Map(
       leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
@@ -22407,6 +22434,7 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
         moeda: "BRL",
       },
       periodo,
+      nicho_id: nichoId,
       periodo_dias: dias,
       periodo_inicio: since,
       periodo_fim: until,
