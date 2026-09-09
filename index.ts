@@ -9718,7 +9718,7 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
 
     while (hasMore) {
       const leadsRes = await fetch(
-        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&start_time=${startTime}&page=${page}&page_size=100`,
+        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&start_time=${startTime}&page=${page}&page_size=100`,
         { headers: tiktokHeaders(token) }
       );
       const leadsData = await leadsRes.json() as any;
@@ -16866,7 +16866,7 @@ app.post("/webhook/tiktok", async (c) => {
 
       // Busca os dados completos do lead
       const leadRes = await fetch(
-        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_id=${leadId}`,
+        `${TIKTOK_API}/lead/get/?advertiser_id=${advertiserId}&lead_source=INSTANT_FORM&lead_id=${leadId}`,
         { headers: tiktokHeaders(token) }
       );
       const leadData = await leadRes.json() as any;
