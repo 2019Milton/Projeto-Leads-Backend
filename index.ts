@@ -12198,7 +12198,7 @@ app.get("/linkedin/contas", authMiddleware, async (c) => {
 app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
-    const { ad_account_id, org_urn, moeda } = await c.req.json();
+    const { ad_account_id, org_urn, moeda, conversion_rule_qualified_urn, conversion_rule_closed_urn } = await c.req.json();
     const contaId = textoOpcional(ad_account_id);
     if (!contaId) return c.json({ error: "ad_account_id obrigatório" }, 400);
 
@@ -12207,11 +12207,20 @@ app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
        SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
              'ad_account_id', $1::text,
              'org_urn', $2::text,
-             'moeda', $3::text
+             'moeda', $3::text,
+             'conversion_rule_qualified_urn', COALESCE($4::text, dados_conta->>'conversion_rule_qualified_urn'),
+             'conversion_rule_closed_urn', COALESCE($5::text, dados_conta->>'conversion_rule_closed_urn')
            ),
            atualizado_em = NOW()
-       WHERE usuario_id = $4 AND plataforma = 'linkedin'`,
-      [contaId, textoOpcional(org_urn), textoOpcional(moeda) || "BRL", user.id]
+       WHERE usuario_id = $6 AND plataforma = 'linkedin'`,
+      [
+        contaId,
+        textoOpcional(org_urn),
+        textoOpcional(moeda) || "BRL",
+        textoOpcional(conversion_rule_qualified_urn),
+        textoOpcional(conversion_rule_closed_urn),
+        user.id
+      ]
     );
     return c.json({ sucesso: true });
   } catch (err: any) {
@@ -12459,7 +12468,7 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
     const user: any = c.get("user");
     const {
       usuario_id, nome_negocio, headline, descricao,
-      obrigado_titulo, obrigado_texto, privacidade_url
+      obrigado_titulo, obrigado_texto, privacidade_url, perguntas
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -12467,6 +12476,17 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
 
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    // Perguntas qualificadoras customizadas (mesmo campo "perguntas" que Meta/
+    // Google usam) — o LinkedIn documenta no máximo 3 perguntas CUSTOM por
+    // Lead Gen Form, além dos campos PREFILL. ASSUMPTION: shape do objeto
+    // (questionType/question/responseFormat) conferido só contra a
+    // documentação pública, não testado ainda — ver aviso maior da seção
+    // logo acima sobre o form inteiro não ter sido testado contra a API real.
+    const perguntasCustom = (Array.isArray(perguntas) ? perguntas : [])
+      .map(textoOpcional)
+      .filter(Boolean)
+      .slice(0, 3);
 
     // Limites de caracteres do LinkedIn Lead Gen Form (headline 60,
     // descrição 160, nome do formulário 256) — truncados pra não derrubar a
@@ -12485,6 +12505,11 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
         { questionType: "PREFILL", predefinedField: "LAST_NAME" },
         { questionType: "PREFILL", predefinedField: "EMAIL_ADDRESS" },
         { questionType: "PREFILL", predefinedField: "PHONE_NUMBER" },
+        ...perguntasCustom.map(pergunta => ({
+          questionType: "CUSTOM",
+          question: truncarSemCortarPalavra(pergunta, 200),
+          responseFormat: "SINGLE_LINE_TEXT",
+        })),
       ],
       confirmationMessage: {
         headline: truncarSemCortarPalavra(textoOpcional(obrigado_titulo) || "Obrigado!", 60),
@@ -12754,6 +12779,97 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
   }
 });
 
+// Edita nome/orçamento de uma campanha LinkedIn já publicada — equivalente
+// reduzido do /meta/editar-campanha, /google/editar-campanha e
+// /tiktok/editar-campanha (que também trocam texto, criativo, targeting e
+// destino). PRIMEIRA VERSÃO deliberadamente mais simples: o LinkedIn separa
+// Campaign Group (nome/orçamento vivem no Campaign, um nível abaixo) de Post
+// + Creative (texto/imagem, entidades hoje só criadas em /linkedin/anuncio,
+// sem endpoint de atualização) — editar criativo/targeting aqui exigiria
+// recriar Post+Creative, ainda não coberto. Ainda assim cobre o caso mais
+// comum de edição (ajustar orçamento/nome sem trocar o anúncio).
+app.post("/linkedin/editar-campanha", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, campanha_local_id, campaign_id, nome, daily_budget, nicho_id } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const nomeSolicitado = textoOpcional(nome);
+    const dailyBudgetValor = numeroOpcional(daily_budget);
+    if (!nomeSolicitado) return c.json({ error: "Nome da campanha é obrigatório" }, 400);
+    if (!dailyBudgetValor || dailyBudgetValor <= 0) return c.json({ error: "Orçamento diário é obrigatório" }, 400);
+
+    const campanhaLocalRes = campanha_local_id
+      ? await client.query(
+          `SELECT id, campaign_id, adset_id, plataforma, conta_anuncios_id
+           FROM campanhas WHERE id = $1 AND usuario_id = $2 LIMIT 1`,
+          [campanha_local_id, usuarioId]
+        )
+      : await client.query(
+          `SELECT id, campaign_id, adset_id, plataforma, conta_anuncios_id
+           FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
+          [textoOpcional(campaign_id), usuarioId]
+        );
+    const campanhaLocal = campanhaLocalRes.rows[0] || null;
+    if (!campanhaLocal) return c.json({ error: "Campanha LinkedIn não encontrada para este usuário" }, 404);
+    if (String(campanhaLocal.plataforma || "").toLowerCase() !== "linkedin") {
+      return c.json({ error: "Esta edição pertence a outra plataforma e não pode ser processada pelo LinkedIn" }, 409);
+    }
+
+    // Rascunho local (falhou antes de publicar de verdade) — só atualiza o banco.
+    if (!campanhaLocal.campaign_id) {
+      await client.query(
+        `UPDATE campanhas SET nome = $1, daily_budget = $2, nicho_id = COALESCE($3, nicho_id), atualizado_em = NOW()
+         WHERE id = $4 AND usuario_id = $5 AND plataforma = 'linkedin'`,
+        [nomeSolicitado, dailyBudgetValor, numeroOpcional(nicho_id), campanhaLocal.id, usuarioId]
+      );
+      return c.json({ sucesso: true });
+    }
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+    if (!campanhaPertenceContaAnuncios(campanhaLocal.conta_anuncios_id, conexao.adAccountId)) {
+      return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
+    }
+    if (!campanhaLocal.adset_id) {
+      return c.json({ error: "O Campaign deste grupo não foi localizado no LinkedIn. Sincronize e tente novamente." }, 409);
+    }
+
+    const headersPartialUpdate = { "X-RestLi-Method": "PARTIAL_UPDATE" };
+
+    const grupoRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campanhaLocal.campaign_id}`, conexao.accessToken, {
+      method: "POST",
+      headers: headersPartialUpdate,
+      body: { patch: { $set: { name: nomeSolicitado } } }
+    });
+    if (!grupoRes.ok) {
+      return c.json({ error: grupoRes.error || "Erro ao renomear a campanha no LinkedIn" }, 400);
+    }
+
+    const campanhaRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns/${campanhaLocal.adset_id}`, conexao.accessToken, {
+      method: "POST",
+      headers: headersPartialUpdate,
+      body: { patch: { $set: { dailyBudget: { amount: dailyBudgetValor.toFixed(2), currencyCode: conexao.moeda } } } }
+    });
+    if (!campanhaRes.ok) {
+      return c.json({ error: campanhaRes.error || "Erro ao alterar orçamento da campanha no LinkedIn" }, 400);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET nome = $1, daily_budget = $2, nicho_id = COALESCE($3, nicho_id), atualizado_em = NOW()
+       WHERE id = $4 AND usuario_id = $5 AND plataforma = 'linkedin'`,
+      [nomeSolicitado, dailyBudgetValor, numeroOpcional(nicho_id), campanhaLocal.id, usuarioId]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/editar-campanha:", err);
+    return c.json({ error: "Erro ao editar campanha LinkedIn" }, 500);
+  }
+});
+
 // Exclui o Campaign Group criado pela plataforma quando uma etapa seguinte
 // (Campaign, formulário ou anúncio) falha — mesma ideia do
 // /google/excluir-campanha, evita deixar rascunhos órfãos na conta do
@@ -12817,8 +12933,11 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
 });
 
 // Sincroniza campanhas e leads (Lead Gen Form Responses) do LinkedIn Ads —
-// mesmo padrão de polling do Google/TikTok (o LinkedIn também não tem
-// webhook de leads em tempo real pra este produto).
+// mesmo padrão de polling que o Google usa (sem webhook). Diferente do
+// TikTok, que tem polling E webhook em tempo real (/webhook/tiktok): o
+// LinkedIn hoje só tem este polling — nenhum endpoint de webhook de leads
+// foi implementado ainda, então um lead só aparece aqui após o próximo
+// /linkedin/sincronizar-campanhas (manual ou pelo cron), nunca na hora.
 async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
   const conn = await client.query(
     `SELECT access_token, dados_conta FROM plataforma_conexoes
@@ -23068,6 +23187,148 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
   }
 });
 
+// Equivalente LinkedIn de /tiktok/performance-diaria — mesma ideia (gasto/
+// cliques/impressões por dia, batendo só as campanhas já sincronizadas pra
+// esse usuário), reaproveitando a mesma chamada Ad Analytics (pivot
+// CAMPAIGN_GROUP) já usada em carregarMetricasLinkedInCampanhas. Sem esse
+// endpoint o card de integração do LinkedIn não tem de onde puxar
+// gasto/entrega (ver comentário em /plataformas/ranking-base sobre cada
+// plataforma ter sua própria rota de performance-diaria).
+app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const nichoSolicitado = Number(c.req.query("nicho_id") || 0);
+    const nichoId = Number.isInteger(nichoSolicitado) && nichoSolicitado > 0
+      ? nichoSolicitado
+      : null;
+
+    const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
+    const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
+    const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
+
+    const conn = await client.query(
+      `SELECT access_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [user.id]
+    );
+    const row = conn.rows[0];
+    const adAccountId = row?.dados_conta?.ad_account_id;
+    if (!row?.access_token || !adAccountId) {
+      return c.json({ error: "LinkedIn Ads nao conectado" }, 400);
+    }
+
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - (dias - 1));
+    inicio.setHours(0, 0, 0, 0);
+    const fim = new Date();
+    fim.setHours(23, 59, 59, 999);
+    const since = inicio.toISOString().slice(0, 10);
+    const until = fim.toISOString().slice(0, 10);
+
+    const campanhaIdsResult = await client.query(
+      `SELECT DISTINCT campaign_id FROM campanhas
+       WHERE usuario_id = $1 AND plataforma = 'linkedin' AND campaign_id IS NOT NULL
+         AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')
+         AND ($2::int IS NULL OR nicho_id = $2)`,
+      [user.id, nichoId]
+    );
+    const campaignIdsUsuario = new Set(campanhaIdsResult.rows.map((r: any) => String(r.campaign_id)));
+
+    const linkedinPorDia = new Map<string, { spend: number; clicks: number; impressions: number }>();
+
+    if (campaignIdsUsuario.size > 0) {
+      const [anoI, mesI, diaI] = since.split("-").map(Number);
+      const [anoF, mesF, diaF] = until.split("-").map(Number);
+      const params = new URLSearchParams({
+        q: "analytics",
+        pivot: "CAMPAIGN_GROUP",
+        accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
+        timeGranularity: "DAILY",
+        fields: "campaignGroup,impressions,clicks,costInLocalCurrency,dateRange",
+      });
+      params.set(
+        "dateRange",
+        `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
+      );
+
+      const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, row.access_token);
+      if (!resposta.ok) {
+        return c.json({ error: resposta.error || "Erro ao buscar performance diaria do LinkedIn Ads" }, 400);
+      }
+
+      for (const item of resposta.data?.elements ?? []) {
+        const campaignGroupUrn = String(item.campaignGroup || "");
+        const campaignGroupId = campaignGroupUrn.split(":").pop() || "";
+        if (!campaignGroupId || !campaignIdsUsuario.has(campaignGroupId)) continue;
+        const dr = item.dateRange?.start;
+        const data = dr ? `${dr.year}-${String(dr.month).padStart(2, "0")}-${String(dr.day).padStart(2, "0")}` : "";
+        if (!data) continue;
+        const atual = linkedinPorDia.get(data) || { spend: 0, clicks: 0, impressions: 0 };
+        atual.spend += Number(item.costInLocalCurrency || 0);
+        atual.clicks += Number(item.clicks || 0);
+        atual.impressions += Number(item.impressions || 0);
+        linkedinPorDia.set(data, atual);
+      }
+    }
+
+    const leadsBanco = await client.query(
+      `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
+       FROM leads WHERE usuario_id = $1 AND plataforma = 'linkedin' AND criado_em >= $2
+         AND ($3::int IS NULL OR nicho_id = $3)
+       GROUP BY DATE(criado_em)`,
+      [user.id, inicio, nichoId]
+    );
+    const leadsBancoPorDia = new Map(
+      leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
+    );
+
+    const datasPeriodo = Array.from({ length: dias }, (_, index) => {
+      const data = new Date(inicio);
+      data.setDate(inicio.getDate() + index);
+      return data.toISOString().slice(0, 10);
+    });
+
+    const diasPerformance = datasPeriodo.map((data) => {
+      const linha = linkedinPorDia.get(data) || { spend: 0, clicks: 0, impressions: 0 };
+      const leadsPlataforma = leadsBancoPorDia.get(data) || 0;
+      const gasto = Number(linha.spend || 0);
+      return {
+        data,
+        gasto,
+        leads: leadsPlataforma,
+        leads_meta: null,
+        leads_plataforma: leadsPlataforma,
+        custo_por_lead: leadsPlataforma > 0 ? gasto / leadsPlataforma : null,
+        cliques: Number(linha.clicks || 0),
+        impressoes: Number(linha.impressions || 0),
+        alcance: 0,
+      };
+    });
+
+    const { resumo, registros } = montarResumoPerformanceDiaria(diasPerformance, periodo);
+
+    return c.json({
+      conta_anuncios: {
+        id: String(adAccountId),
+        nome: String(adAccountId),
+        moeda: row?.dados_conta?.moeda || "BRL",
+      },
+      periodo,
+      nicho_id: nichoId,
+      periodo_dias: dias,
+      periodo_inicio: since,
+      periodo_fim: until,
+      agrupamento: periodo === "anual" ? "mensal" : "diario",
+      resumo,
+      dias: diasPerformance,
+      registros,
+    });
+  } catch (err: any) {
+    console.error("ERRO PERFORMANCE DIARIA LINKEDIN:", err);
+    return c.json({ error: "Erro ao buscar performance diaria do LinkedIn Ads", detalhe: err?.message || err }, 500);
+  }
+});
+
 app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: any) => {
   try {
     const user: any = c.get("user");
@@ -26059,7 +26320,19 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
         COUNT(*) FILTER (
           WHERE kwai_evento_fechado_enviado_em IS NOT NULL
           AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'kwai'
-        )::int AS fechados_enviados_kwai
+        )::int AS fechados_enviados_kwai,
+
+        COUNT(*) FILTER (
+          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'linkedin'
+        )::int AS total_leads_linkedin,
+        COUNT(*) FILTER (
+          WHERE linkedin_evento_qualificado_enviado_em IS NOT NULL
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'linkedin'
+        )::int AS qualificados_enviados_linkedin,
+        COUNT(*) FILTER (
+          WHERE linkedin_evento_fechado_enviado_em IS NOT NULL
+          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'linkedin'
+        )::int AS fechados_enviados_linkedin
       FROM leads
       WHERE usuario_id = $1
       `,
@@ -26070,7 +26343,8 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       total_leads_meta, qualificados_enviados, fechados_enviados,
       total_leads_google, qualificados_enviados_google, fechados_enviados_google,
       total_leads_tiktok, qualificados_enviados_tiktok, fechados_enviados_tiktok,
-      total_leads_kwai, qualificados_enviados_kwai, fechados_enviados_kwai
+      total_leads_kwai, qualificados_enviados_kwai, fechados_enviados_kwai,
+      total_leads_linkedin, qualificados_enviados_linkedin, fechados_enviados_linkedin
     } = resumo.rows[0];
 
     const taxa = (num: number, den: number) => den > 0 ? (num / den) * 100 : null;
@@ -26087,7 +26361,9 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
         tiktok_evento_qualificado_enviado_em,
         tiktok_evento_fechado_enviado_em,
         kwai_evento_qualificado_enviado_em,
-        kwai_evento_fechado_enviado_em
+        kwai_evento_fechado_enviado_em,
+        linkedin_evento_qualificado_enviado_em,
+        linkedin_evento_fechado_enviado_em
       FROM leads
       WHERE usuario_id = $1
       AND (
@@ -26099,13 +26375,16 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
         OR tiktok_evento_fechado_enviado_em IS NOT NULL
         OR kwai_evento_qualificado_enviado_em IS NOT NULL
         OR kwai_evento_fechado_enviado_em IS NOT NULL
+        OR linkedin_evento_qualificado_enviado_em IS NOT NULL
+        OR linkedin_evento_fechado_enviado_em IS NOT NULL
       )
       ORDER BY
         COALESCE(
           meta_evento_fechado_enviado_em, meta_evento_qualificado_enviado_em,
           google_evento_fechado_enviado_em, google_evento_qualificado_enviado_em,
           tiktok_evento_fechado_enviado_em, tiktok_evento_qualificado_enviado_em,
-          kwai_evento_fechado_enviado_em, kwai_evento_qualificado_enviado_em
+          kwai_evento_fechado_enviado_em, kwai_evento_qualificado_enviado_em,
+          linkedin_evento_fechado_enviado_em, linkedin_evento_qualificado_enviado_em
         ) DESC
       LIMIT 30
       `,
@@ -26137,12 +26416,19 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       taxa_qualificacao_kwai: taxa(qualificados_enviados_kwai, total_leads_kwai),
       taxa_fechamento_kwai: taxa(fechados_enviados_kwai, total_leads_kwai),
 
+      total_leads_linkedin,
+      qualificados_enviados_linkedin,
+      fechados_enviados_linkedin,
+      taxa_qualificacao_linkedin: taxa(qualificados_enviados_linkedin, total_leads_linkedin),
+      taxa_fechamento_linkedin: taxa(fechados_enviados_linkedin, total_leads_linkedin),
+
       ultimos_eventos: ultimosEventos.rows.map(row => {
         const fechadoEm =
           row.meta_evento_fechado_enviado_em ||
           row.google_evento_fechado_enviado_em ||
           row.tiktok_evento_fechado_enviado_em ||
-          row.kwai_evento_fechado_enviado_em;
+          row.kwai_evento_fechado_enviado_em ||
+          row.linkedin_evento_fechado_enviado_em;
         return {
           nome: row.nome,
           plataforma: row.plataforma,
@@ -26152,7 +26438,8 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
             row.meta_evento_qualificado_enviado_em ||
             row.google_evento_qualificado_enviado_em ||
             row.tiktok_evento_qualificado_enviado_em ||
-            row.kwai_evento_qualificado_enviado_em
+            row.kwai_evento_qualificado_enviado_em ||
+            row.linkedin_evento_qualificado_enviado_em
         };
       })
     });
@@ -26207,6 +26494,8 @@ app.get("/leads", authMiddleware, async (c) => {
         l.tiktok_evento_fechado_enviado_em,
         l.kwai_evento_qualificado_enviado_em,
         l.kwai_evento_fechado_enviado_em,
+        l.linkedin_evento_qualificado_enviado_em,
+        l.linkedin_evento_fechado_enviado_em,
         COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma,
         l.rede_origem,
         wt.transcricao AS whatsapp_transcricao
