@@ -12729,8 +12729,13 @@ app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
         contaId,
         textoOpcional(org_urn),
         textoOpcional(moeda) || "BRL",
-        textoOpcional(conversion_rule_qualified_urn),
-        textoOpcional(conversion_rule_closed_urn),
+        // null real (não textoOpcional, que devolveria "") — o COALESCE do
+        // SQL acima só preserva o valor já salvo quando o parâmetro chega
+        // NULL; "" não é NULL e sobrescreveria a Conversion Rule já
+        // configurada toda vez que a conta fosse apenas reselecionada sem
+        // reenviar os dois campos junto (bug confirmado nesta auditoria).
+        textoOpcional(conversion_rule_qualified_urn) || null,
+        textoOpcional(conversion_rule_closed_urn) || null,
         user.id
       ]
     );
@@ -12824,15 +12829,20 @@ app.post("/linkedin/direcionamento/interesses", authMiddleware, async (c) => {
       return c.json({ error: resposta.error || "Erro ao buscar interesses no LinkedIn" }, 400);
     }
 
+    // Shape {id, nome, caminho} pra bater com /meta e /tiktok
+    // /direcionamento/interesses (localizacao acima usa {key,...} de
+    // propósito — é a convenção que os dois endpoints TikKok/Meta seguem
+    // cada um: localização usa key, interesses usa id+caminho).
     const elementos = Array.isArray(resposta.data?.elements) ? resposta.data.elements : [];
     const data = elementos
       .map((el: any) => ({
-        key: textoOpcional(el.urn ?? el.entityUrn ?? el.value),
+        id: textoOpcional(el.urn ?? el.entityUrn ?? el.value),
         nome: textoOpcional(
           el.name?.localized?.pt_BR ?? el.name?.localized?.en_US ?? (typeof el.name === "string" ? el.name : "")
         ),
+        caminho: [] as string[],
       }))
-      .filter((item: any) => item.key && item.nome)
+      .filter((item: any) => item.id && item.nome)
       .slice(0, 12);
 
     return c.json({ data });
@@ -24075,12 +24085,18 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
       }
     }
 
+    // conta_anuncios_id (não plataforma = 'linkedin') pra também contar leads
+    // vindos do destino=whatsapp, que criarLeadDeConversaLinkedIn grava com
+    // plataforma='whatsapp'/origem='linkedin' (mesmo padrão que o
+    // /meta/performance-diaria já usa pra pegar os leads de CTWA da Meta —
+    // sem isso, o gráfico do LinkedIn subcontava qualquer lead vindo de
+    // campanha com destino WhatsApp).
     const leadsBanco = await client.query(
       `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
-       FROM leads WHERE usuario_id = $1 AND plataforma = 'linkedin' AND criado_em >= $2
-         AND ($3::int IS NULL OR nicho_id = $3)
+       FROM leads WHERE usuario_id = $1 AND conta_anuncios_id = $2 AND criado_em >= $3
+         AND ($4::int IS NULL OR nicho_id = $4)
        GROUP BY DATE(criado_em)`,
-      [user.id, inicio, nichoId]
+      [user.id, String(adAccountId), inicio, nichoId]
     );
     const leadsBancoPorDia = new Map(
       leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
