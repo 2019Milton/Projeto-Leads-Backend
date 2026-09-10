@@ -5002,6 +5002,99 @@ function extrairSaldoDisponivelMeta(displayString?: string | null) {
   return negativo ? -saldo : saldo;
 }
 
+// Mesma URL montada no frontend (ver Projeto-Leads/index.html, variável
+// billingUrl) — portada pro backend pra poder mandar no aviso de WhatsApp.
+function montarLinkPagamentoMeta(contaAnunciosId: unknown): string {
+  const id = String(contaAnunciosId || "").replace("act_", "");
+  return id
+    ? `https://business.facebook.com/billing_hub/payment_settings/?placement=ads_manager&asset_id=${id}&payment_account_id_from_jsmodule=${id}`
+    : "https://business.facebook.com/billing_hub/payment_settings/";
+}
+
+const LIMIAR_ALERTA_SALDO_META = 0.9; // 90% do limite de gastos
+const ALERTA_SALDO_META_INTERVALO_HORAS = 24; // não repete o aviso antes disso
+
+// Verifica se a conta Meta do usuário está perto do limite de gastos (cobrança
+// automática) ou com o saldo pré-pago zerado, e manda um aviso por WhatsApp com
+// o link direto de pagamento — pra ele resolver sem precisar entrar na
+// plataforma. Chamada a cada ciclo do AUTO SYNC (sincronizarTodasCampanhas),
+// mas o envio de fato é throttlado a 1x por dia por usuário (alerta_saldo_meta).
+async function verificarSaldoMetaEAlertar(
+  usuarioId: number,
+  accessToken: string,
+  contaAnunciosId: string
+) {
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/v19.0/${contaAnunciosId}?fields=name,currency,balance,funding_source,funding_source_details,is_prepay_account,spend_cap,amount_spent&access_token=${accessToken}`
+    );
+    const conta = await res.json() as any;
+    if (conta.error) {
+      console.error("ERRO ALERTA SALDO META (buscar conta):", conta.error);
+      return;
+    }
+
+    const pagamentoManual = conta.is_prepay_account === true;
+    // Mesma conversão de centavos->reais e mesmo cuidado de /meta/status-completo:
+    // GET da Marketing API devolve spend_cap/amount_spent em centavos.
+    const limiteGastos = conta.spend_cap ? Number(conta.spend_cap) / 100 : null;
+    const gastoAtual = conta.amount_spent ? Number(conta.amount_spent) / 100 : null;
+    const saldoPrePago = extrairSaldoDisponivelMeta(
+      conta.funding_source_details?.display_string ?? null
+    );
+
+    let motivo: string | null = null;
+    if (pagamentoManual) {
+      if (saldoPrePago !== null && saldoPrePago <= 0) {
+        motivo = `o saldo pré-pago zerou`;
+      }
+    } else if (limiteGastos !== null && gastoAtual !== null && limiteGastos > 0) {
+      const percentual = gastoAtual / limiteGastos;
+      if (percentual >= LIMIAR_ALERTA_SALDO_META) {
+        motivo = `o gasto já chegou a ${(percentual * 100).toFixed(0)}% do limite (${formatarMoedaBRLTexto(gastoAtual)} de ${formatarMoedaBRLTexto(limiteGastos)})`;
+      }
+    }
+
+    if (!motivo) return;
+
+    const throttle = await client.query(
+      `SELECT ultimo_alerta_em FROM alerta_saldo_meta WHERE usuario_id = $1`,
+      [usuarioId]
+    );
+    const ultimoAlerta = throttle.rows[0]?.ultimo_alerta_em;
+    if (ultimoAlerta) {
+      const horasDesdeUltimo = (Date.now() - new Date(ultimoAlerta).getTime()) / 3600000;
+      if (horasDesdeUltimo < ALERTA_SALDO_META_INTERVALO_HORAS) return;
+    }
+
+    const usuarioRow = await client.query(
+      `SELECT whatsapp FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+    const telefone = usuarioRow.rows[0]?.whatsapp;
+    if (!telefone) return;
+
+    const link = montarLinkPagamentoMeta(contaAnunciosId);
+    const nomeConta = conta.name || "sua conta de anúncios";
+    const msg =
+      `⚠️ *Saldo/limite da conta Meta baixo*\n\n` +
+      `A conta "${nomeConta}" está perto de pausar: ${motivo}.\n\n` +
+      `Resolva agora sem precisar entrar na plataforma:\n${link}`;
+
+    await enviarLembreteWhatsApp(telefone, msg);
+
+    await client.query(
+      `INSERT INTO alerta_saldo_meta (usuario_id, conta_anuncios_id, ultimo_alerta_em)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (usuario_id) DO UPDATE
+       SET conta_anuncios_id = EXCLUDED.conta_anuncios_id, ultimo_alerta_em = NOW()`,
+      [usuarioId, String(contaAnunciosId)]
+    );
+  } catch (err) {
+    console.error("ERRO ALERTA SALDO META:", usuarioId, err);
+  }
+}
+
 function extrairLeadsActionsMeta(actions: any[] = []) {
   const prioridade = [
     "onsite_conversion.lead_grouped",
@@ -5487,6 +5580,11 @@ async function sincronizarTodasCampanhas() {
           user.conta_anuncios_id
         );
         await sincronizarLeadsMetaUsuario(
+          user.usuario_id,
+          user.access_token,
+          user.conta_anuncios_id
+        );
+        await verificarSaldoMetaEAlertar(
           user.usuario_id,
           user.access_token,
           user.conta_anuncios_id
@@ -19941,6 +20039,17 @@ await client.query(`
     usuario_id INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
     gasto_no_momento_zerado NUMERIC(12,2) NOT NULL,
     zerado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// Throttle do alerta de saldo/limite baixo da Meta (ver verificarSaldoMetaEAlertar)
+// — evita mandar WhatsApp de novo a cada ciclo do AUTO SYNC (30 min) enquanto o
+// problema persistir; o lembrete é diário, não a cada sincronização.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS alerta_saldo_meta (
+    usuario_id INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    conta_anuncios_id TEXT,
+    ultimo_alerta_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
