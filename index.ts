@@ -9908,7 +9908,7 @@ async function executarPreflightPublicacaoTikTok(
       otimizacao: "CLICK",
       mmt_verificavel: false
     };
-    avisos.push("A publicação usa clique/CPC. O número também precisa estar vinculado ao Messaging Management Tool (MMT) do TikTok; a API confirma esse vínculo ao criar o grupo de anúncios.");
+    avisos.push("A publicação usa clique/CPC e pode abrir o WhatsApp sem um conjunto de eventos. Para medir e otimizar conversas, recomendamos configurar uma fonte de dados de Mensagens no TikTok Events Manager.");
   }
 
   return base;
@@ -11632,7 +11632,8 @@ app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
   }
 });
 
-// Confirma, na conta remota selecionada, tudo o que pode impedir a publicação.
+// Confirma, na conta remota selecionada, tudo o que a API permite consultar
+// antes da criação. Integrações opcionais de mensuração não bloqueiam o fluxo.
 // Esta rota deve ser chamada antes dos uploads para não deixar arquivos órfãos.
 app.post("/tiktok/preflight-publicacao", authMiddleware, async (c) => {
   try {
@@ -11833,9 +11834,9 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
     // - Instant Form: LEAD_GENERATION + INSTANT_PAGE, otimizado para Lead Generation;
     // - site: LEAD_GENERATION + EXTERNAL_WEBSITE, otimizado para clique sem exigir Pixel;
     // - WhatsApp: LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE + WHATSAPP.
-    // Em CLICK/CPC, message_event_set_id não é obrigatório no payload e o TikTok
-    // pode preenchê-lo quando encontra um único conjunto compatível. O número,
-    // porém, precisa estar previamente vinculado ao MMT do TikTok.
+    // Em CLICK/CPC, message_event_set_id não é obrigatório no payload. Uma fonte
+    // de dados de Mensagens é opcional nesse modo, embora recomendada para medir
+    // conversas e habilitar otimizações mais avançadas.
     const ehFormulario = destinoResolvido === "lead_ads";
     const payloadAdgroup: any = {
       advertiser_id: conexao.advertiserId,
