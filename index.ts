@@ -9373,6 +9373,414 @@ async function obterConexaoTikTok(
   };
 }
 
+type ConexaoTikTokAtiva = NonNullable<Awaited<ReturnType<typeof obterConexaoTikTok>>>;
+
+type FalhaPreflightTikTok = {
+  ok: false;
+  status: 400 | 409 | 502;
+  erro: string;
+  codigo: string;
+};
+
+type SucessoPreflightTikTok = {
+  ok: true;
+  destino: DestinoCampanhaTikTok;
+  advertiser_id: string;
+  identidade: { identity_id: string; identity_type: string; nome: string | null };
+  formulario?: { page_id: string; nome: string | null; campos: number };
+  site?: { url: string; otimizacao: "CLICK" };
+  whatsapp?: { final_numero: string; otimizacao: "CLICK"; mmt_verificavel: false };
+  avisos: string[];
+};
+
+type ResultadoPreflightTikTok = FalhaPreflightTikTok | SucessoPreflightTikTok;
+
+function listaIdentidadesTikTok(payload: any): any[] {
+  return Array.isArray(payload?.data?.identity_list)
+    ? payload.data.identity_list
+    : Array.isArray(payload?.identity_list)
+    ? payload.identity_list
+    : [];
+}
+
+async function validarIdentidadeTikTok(
+  conexao: ConexaoTikTokAtiva,
+  identityId: string,
+  identityType: string
+): Promise<{ ok: true; nome: string | null } | FalhaPreflightTikTok> {
+  const params = new URLSearchParams({ advertiser_id: String(conexao.advertiserId) });
+  const resposta = await tiktokFetch(`/identity/get/?${params}`, conexao.token);
+  if (!resposta.ok) {
+    return {
+      ok: false,
+      status: 502,
+      codigo: "TIKTOK_IDENTITY_CHECK_FAILED",
+      erro: resposta.error || "Não foi possível confirmar a identidade na conta TikTok selecionada."
+    };
+  }
+
+  const identidade = listaIdentidadesTikTok(resposta.data).find((item: any) => {
+    const idRemoto = textoOpcional(item?.identity_id ?? item?.id);
+    const tipoRemoto = textoOpcional(item?.identity_type ?? item?.type);
+    return idRemoto === identityId && (!tipoRemoto || tipoRemoto === identityType);
+  });
+
+  if (!identidade) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_IDENTITY_ACCOUNT_MISMATCH",
+      erro: "A identidade escolhida não está disponível na conta de anúncios TikTok selecionada. Atualize as identidades e escolha novamente."
+    };
+  }
+
+  return {
+    ok: true,
+    nome: textoOpcional(
+      identidade.display_name ?? identidade.identity_name ?? identidade.user_name ?? identidade.name
+    ) || null
+  };
+}
+
+function normalizarFormularioTikTok(item: any) {
+  const pageId = textoOpcional(item?.page_id ?? item?.id);
+  if (!pageId) return null;
+  return {
+    page_id: pageId,
+    form_id: pageId,
+    page_name: textoOpcional(item?.title ?? item?.page_name ?? item?.name) || `Formulário ${pageId}`,
+    status: textoOpcional(item?.status ?? item?.page_status) || "PUBLISHED",
+    preview_url: urlOpcional(item?.preview_url, "") || null,
+    update_time: textoOpcional(item?.update_time) || null
+  };
+}
+
+async function listarFormulariosTikTokPublicados(
+  conexao: ConexaoTikTokAtiva
+): Promise<{ ok: true; formularios: any[] } | { ok: false; erro: string }> {
+  const todos: any[] = [];
+  const vistos = new Set<string>();
+  const pageSize = 100;
+
+  for (let pagina = 1; pagina <= 20; pagina++) {
+    const params = new URLSearchParams({
+      advertiser_id: String(conexao.advertiserId),
+      page: String(pagina),
+      page_size: String(pageSize),
+      page_status: "PUBLISHED",
+      business_type: "LEAD_GEN"
+    });
+    const resposta = await tiktokFetch(`/page/get/?${params}`, conexao.token);
+    if (!resposta.ok) {
+      return { ok: false, erro: resposta.error || "Não foi possível listar os formulários TikTok." };
+    }
+
+    const dados = resposta.data?.data ?? {};
+    const itens = Array.isArray(dados?.list)
+      ? dados.list
+      : Array.isArray(dados?.pages)
+      ? dados.pages
+      : [];
+
+    for (const item of itens) {
+      const formulario = normalizarFormularioTikTok(item);
+      if (formulario && !vistos.has(formulario.page_id)) {
+        vistos.add(formulario.page_id);
+        todos.push(formulario);
+      }
+    }
+
+    const pageInfo = dados?.page_info ?? {};
+    const totalPaginas = Number(pageInfo.total_page ?? pageInfo.total_pages ?? 0);
+    const acabou = totalPaginas > 0
+      ? pagina >= totalPaginas
+      : itens.length < pageSize;
+    if (acabou) break;
+  }
+
+  return { ok: true, formularios: todos };
+}
+
+async function validarFormularioTikTok(
+  conexao: ConexaoTikTokAtiva,
+  pageId: string
+): Promise<
+  | { ok: true; formulario: { page_id: string; nome: string | null; campos: number } }
+  | FalhaPreflightTikTok
+> {
+  const params = new URLSearchParams({
+    advertiser_id: String(conexao.advertiserId),
+    page_id: pageId
+  });
+  const resposta = await tiktokFetch(`/page/field/get/?${params}`, conexao.token);
+  if (!resposta.ok) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_FORM_NOT_AVAILABLE",
+      erro: resposta.error || "O formulário informado não está disponível nesta conta TikTok."
+    };
+  }
+
+  const dados = resposta.data?.data;
+  const meta = dados?.meta_data ?? dados?.meta ?? {};
+  const idRemoto = textoOpcional(meta?.page_id);
+  if (!dados || (idRemoto && idRemoto !== pageId)) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_FORM_INVALID_RESPONSE",
+      erro: "O TikTok não confirmou o formulário selecionado. Atualize a lista e escolha novamente."
+    };
+  }
+
+  return {
+    ok: true,
+    formulario: {
+      page_id: pageId,
+      nome: textoOpcional(meta?.page_name ?? meta?.title) || null,
+      campos: Array.isArray(dados?.fields) ? dados.fields.length : 0
+    }
+  };
+}
+
+async function validarUrlTikTok(
+  conexao: ConexaoTikTokAtiva,
+  valor: unknown
+): Promise<{ ok: true; url: string } | FalhaPreflightTikTok> {
+  const url = urlOpcional(valor, "");
+  if (!url) {
+    return {
+      ok: false,
+      status: 400,
+      codigo: "TIKTOK_SITE_URL_INVALID",
+      erro: "Informe um endereço completo e válido para o anúncio TikTok, começando com https://."
+    };
+  }
+
+  const params = new URLSearchParams({
+    advertiser_id: String(conexao.advertiserId),
+    url
+  });
+  const resposta = await tiktokFetch(`/tool/url_validate/?${params}`, conexao.token);
+  if (!resposta.ok) {
+    return {
+      ok: false,
+      status: 502,
+      codigo: "TIKTOK_SITE_URL_CHECK_FAILED",
+      erro: resposta.error || "O TikTok não conseguiu validar o endereço do site."
+    };
+  }
+
+  const validacao = resposta.data?.data?.url_info?.validate_info;
+  if (validacao?.is_valid_url === false) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_SITE_URL_REJECTED",
+      erro: "O TikTok considerou o endereço do site inválido para publicação. Revise a URL e tente novamente."
+    };
+  }
+
+  return { ok: true, url };
+}
+
+async function validarWhatsappTikTok(
+  usuarioId: number,
+  conexao: ConexaoTikTokAtiva
+): Promise<{ ok: true; numero: string } | FalhaPreflightTikTok> {
+  const whatsappRes = await client.query(
+    `SELECT access_token, dados_conta
+     FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'
+     ORDER BY atualizado_em DESC, id DESC
+     LIMIT 1`,
+    [usuarioId]
+  );
+  const linha = whatsappRes.rows[0];
+  const dadosConta = linha?.dados_conta ?? {};
+  const numero = prepararNumeroWhatsappBrasilTikTok(dadosConta?.numero);
+  if (!linha || !dadosConta?.waba_id || !dadosConta?.phone_number_id || !numero) {
+    return {
+      ok: false,
+      status: 400,
+      codigo: "TIKTOK_WHATSAPP_NOT_CONNECTED",
+      erro: "Conecte um número brasileiro da WhatsApp Business API na aba WhatsApp Bot antes de publicar no TikTok."
+    };
+  }
+
+  const tokenWhatsapp = linha.access_token || Bun.env.WHATSAPP_SYSTEM_USER_TOKEN;
+  if (!tokenWhatsapp) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_WHATSAPP_TOKEN_MISSING",
+      erro: "A conexão do WhatsApp está incompleta. Reconecte o WhatsApp Bot antes de publicar no TikTok."
+    };
+  }
+
+  const [debug, wabaRes, numerosRes, subscriptionsRes] = await Promise.all([
+    depurarTokenWhatsapp(tokenWhatsapp),
+    fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}?fields=account_review_status`, {
+      headers: { Authorization: `Bearer ${tokenWhatsapp}` }
+    }),
+    fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}/phone_numbers?fields=id,code_verification_status,status`, {
+      headers: { Authorization: `Bearer ${tokenWhatsapp}` }
+    }),
+    fetch(`https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${dadosConta.waba_id}/subscribed_apps`, {
+      headers: { Authorization: `Bearer ${tokenWhatsapp}` }
+    })
+  ]);
+  const [wabaData, numerosData, subscriptionsData] = await Promise.all([
+    lerRespostaMeta(wabaRes),
+    lerRespostaMeta(numerosRes),
+    lerRespostaMeta(subscriptionsRes)
+  ]) as any[];
+
+  const permissoes = debug.resposta.ok && debug.payload?.data?.is_valid === true
+    ? diagnosticarPermissoesToken(debug.payload.data, String(dadosConta.waba_id))
+    : { faltantes: ["token_invalido"] };
+  const telefone = (numerosData?.data || []).find(
+    (item: any) => String(item?.id) === String(dadosConta.phone_number_id)
+  );
+  const webhookInscrito = subscriptionsRes.ok && (subscriptionsData?.data || []).some((item: any) =>
+    String(item?.whatsapp_business_api_data?.id || item?.id || "") === String(Bun.env.META_APP_ID || "")
+  );
+  const pronto = wabaRes.ok && numerosRes.ok &&
+    wabaData?.account_review_status === "APPROVED" &&
+    telefone?.status === "CONNECTED" &&
+    webhookInscrito &&
+    !permissoes.faltantes.length;
+
+  if (!pronto) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_WHATSAPP_NOT_READY",
+      erro: "O WhatsApp Business API está conectado, mas ainda não está totalmente pronto para receber e atender as conversas do anúncio. Revise a aba WhatsApp Bot."
+    };
+  }
+
+  const regioesParams = new URLSearchParams({ advertiser_id: String(conexao.advertiserId) });
+  const regioes = await tiktokFetch(`/tool/phone_region_code/?${regioesParams}`, conexao.token);
+  if (!regioes.ok) {
+    return {
+      ok: false,
+      status: 502,
+      codigo: "TIKTOK_WHATSAPP_REGION_CHECK_FAILED",
+      erro: regioes.error || "O TikTok não conseguiu confirmar a região do número do WhatsApp."
+    };
+  }
+  const opcoes = Array.isArray(regioes.data?.data?.phone_region_code_infos)
+    ? regioes.data.data.phone_region_code_infos
+    : [];
+  const brasilDisponivel = opcoes.some((item: any) =>
+    textoOpcional(item?.phone_region_code).toUpperCase() === "BR" &&
+    textoOpcional(item?.phone_region_calling_code).replace(/\s/g, "") === "+55"
+  );
+  if (!brasilDisponivel) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_WHATSAPP_REGION_UNAVAILABLE",
+      erro: "A conta TikTok selecionada não disponibilizou a região Brasil (+55) para anúncios de mensagens."
+    };
+  }
+
+  return { ok: true, numero };
+}
+
+async function executarPreflightPublicacaoTikTok(
+  usuarioId: number,
+  entrada: any
+): Promise<ResultadoPreflightTikTok> {
+  const destino = resolverDestinoCampanhaTikTok(entrada?.destino ?? entrada?.configuracoes_avancadas?.destino);
+  const conexao = await obterConexaoTikTok(usuarioId);
+  if (!conexao?.advertiserId) {
+    return {
+      ok: false,
+      status: 400,
+      codigo: "TIKTOK_ADVERTISER_NOT_SELECTED",
+      erro: "Selecione a conta de anúncios TikTok antes de publicar."
+    };
+  }
+
+  const avancadas = entrada?.configuracoes_avancadas ?? {};
+  const identityId = textoOpcional(entrada?.identity_id ?? avancadas.identity_id ?? conexao.identityId);
+  const identityType = textoOpcional(entrada?.identity_type ?? avancadas.identity_type ?? conexao.identityType);
+  if (!identityId || !identityType) {
+    return {
+      ok: false,
+      status: 400,
+      codigo: "TIKTOK_IDENTITY_REQUIRED",
+      erro: "Selecione a identidade (perfil) do TikTok antes de publicar."
+    };
+  }
+
+  const localidades = Array.isArray(avancadas.localidades) ? avancadas.localidades : [];
+  if (!localidades.some((item: any) => textoOpcional(item?.key ?? item?.id))) {
+    return {
+      ok: false,
+      status: 400,
+      codigo: "TIKTOK_LOCATION_REQUIRED",
+      erro: "Selecione ao menos uma localização para o TikTok antes de publicar."
+    };
+  }
+
+  const orcamentoCentavos = numeroOpcional(entrada?.daily_budget ?? avancadas.daily_budget);
+  if (!orcamentoCentavos || orcamentoCentavos <= 0) {
+    return {
+      ok: false,
+      status: 400,
+      codigo: "TIKTOK_BUDGET_REQUIRED",
+      erro: "Informe um orçamento diário válido para a campanha TikTok."
+    };
+  }
+
+  const identidade = await validarIdentidadeTikTok(conexao, identityId, identityType);
+  if (!identidade.ok) return identidade;
+
+  const avisos: string[] = [];
+  const base: SucessoPreflightTikTok = {
+    ok: true,
+    destino,
+    advertiser_id: String(conexao.advertiserId),
+    identidade: { identity_id: identityId, identity_type: identityType, nome: identidade.nome },
+    avisos
+  };
+
+  if (destino === "lead_ads") {
+    const pageId = textoOpcional(entrada?.form_id ?? avancadas.form_id);
+    if (!pageId) {
+      return {
+        ok: false,
+        status: 400,
+        codigo: "TIKTOK_FORM_REQUIRED",
+        erro: "Escolha um formulário instantâneo do TikTok antes de publicar."
+      };
+    }
+    const formulario = await validarFormularioTikTok(conexao, pageId);
+    if (!formulario.ok) return formulario;
+    base.formulario = formulario.formulario;
+  } else if (destino === "site") {
+    const site = await validarUrlTikTok(conexao, entrada?.url_destino ?? avancadas.url_destino);
+    if (!site.ok) return site;
+    base.site = { url: site.url, otimizacao: "CLICK" };
+    avisos.push("Este modo direciona ao site e otimiza por clique. Conversões do formulário exigem Pixel/evento instalado no site.");
+  } else {
+    const whatsapp = await validarWhatsappTikTok(usuarioId, conexao);
+    if (!whatsapp.ok) return whatsapp;
+    base.whatsapp = {
+      final_numero: whatsapp.numero.slice(-4),
+      otimizacao: "CLICK",
+      mmt_verificavel: false
+    };
+    avisos.push("A publicação usa clique/CPC. O número também precisa estar vinculado ao Messaging Management Tool (MMT) do TikTok; a API confirma esse vínculo ao criar o grupo de anúncios.");
+  }
+
+  return base;
+}
+
 type PagamentoTikTok = {
   disponivel: boolean;
   moeda: string | null;
@@ -9954,6 +10362,23 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       return c.json({ error: "A nova mídia do anúncio TikTok não foi enviada" }, 400);
     }
 
+    const identidadeValidada = await validarIdentidadeTikTok(conexao, identidadeId, identidadeTipo);
+    if (!identidadeValidada.ok) {
+      return c.json({ error: identidadeValidada.erro, codigo: identidadeValidada.codigo }, identidadeValidada.status);
+    }
+    if (destinoSolicitado === "lead_ads") {
+      const formularioValidado = await validarFormularioTikTok(conexao, formIdSolicitado);
+      if (!formularioValidado.ok) {
+        return c.json({ error: formularioValidado.erro, codigo: formularioValidado.codigo }, formularioValidado.status);
+      }
+    }
+    if (destinoSolicitado === "site") {
+      const siteValidado = await validarUrlTikTok(conexao, urlSolicitada);
+      if (!siteValidado.ok) {
+        return c.json({ error: siteValidado.erro, codigo: siteValidado.codigo }, siteValidado.status);
+      }
+    }
+
     const targeting = montarTargetingTikTok(configuracoesEdicao);
     if (!targeting.location_ids?.length && Array.isArray(estrutura.adgroup?.location_ids)) {
       targeting.location_ids = estrutura.adgroup.location_ids.map(String).filter(Boolean);
@@ -10461,9 +10886,9 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
     // A TikTok nao oferece um /lead/get/ paginado por data (isso foi uma suposicao
     // errada da versao anterior) — o export em massa e assincrono: criar uma "lead
     // download task" por page_id (Instant Form), fazer polling do status e baixar
-    // um CSV quando pronto. Os page_id vem das nossas proprias campanhas ja
-    // sincronizadas (form_id), ja que nao existe um /page/get/ testado ainda para
-    // listar formularios direto na conta. Ver baixarLeadsTikTokPorFormulario.
+    // um CSV quando pronto. Usamos apenas os page_id já associados às campanhas
+    // locais (form_id), para não importar leads de formulários que não pertencem
+    // às campanhas acompanhadas nesta plataforma. Ver baixarLeadsTikTokPorFormulario.
     const formsLocais = await client.query(
       `SELECT DISTINCT form_id FROM campanhas
        WHERE usuario_id = $1 AND plataforma = 'tiktok' AND conta_anuncios_id = $2
@@ -11074,10 +11499,36 @@ app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
   }
 });
 
+// Confirma, na conta remota selecionada, tudo o que pode impedir a publicação.
+// Esta rota deve ser chamada antes dos uploads para não deixar arquivos órfãos.
+app.post("/tiktok/preflight-publicacao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const entrada = await c.req.json();
+    const usuarioId = resolverUsuarioIdOperacao(user, entrada?.usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const resultado = await executarPreflightPublicacaoTikTok(usuarioId, entrada);
+    if (!resultado.ok) {
+      return c.json({
+        error: resultado.erro,
+        codigo: resultado.codigo,
+        preflight: false
+      }, resultado.status);
+    }
+
+    return c.json({ ...resultado, preflight: true });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/preflight-publicacao:", err);
+    return c.json({ error: err?.message || "Erro ao validar a publicação TikTok", preflight: false }, 500);
+  }
+});
+
 // Cria a Campanha na TikTok Ads (equivalente ao /meta/campanha)
 app.post("/tiktok/campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    const entrada = await c.req.json();
     const {
       usuario_id,
       nome,
@@ -11086,18 +11537,20 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
       daily_budget,
       publicacao_grupo_id,
       destino
-    } = await c.req.json();
+    } = entrada;
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) {
       return negarAcessoConta(c);
     }
 
-    const conexao = await obterConexaoTikTok(usuarioId);
-    if (!conexao) {
-      return c.json({ error: "TikTok não conectada" }, 400);
+    const preflight = await executarPreflightPublicacaoTikTok(usuarioId, entrada);
+    if (!preflight.ok) {
+      return c.json({ error: preflight.erro, codigo: preflight.codigo, preflight: false }, preflight.status);
     }
-    if (!conexao.advertiserId) {
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao?.advertiserId) {
       return c.json({ error: "Selecione a conta de anúncios TikTok antes de criar a campanha" }, 400);
     }
 
@@ -11167,7 +11620,12 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
       ]
     );
 
-    return c.json({ id: campaignId, campaign_id: campaignId });
+    return c.json({
+      id: campaignId,
+      campaign_id: campaignId,
+      preflight: true,
+      avisos: preflight.avisos
+    });
   } catch (err: any) {
     console.error("ERRO /tiktok/campanha:", err);
     return c.json({ error: "Erro ao criar campanha TikTok" }, 500);
@@ -11231,25 +11689,20 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
 
     let numeroWhatsappTikTok = "";
     if (destinoResolvido === "whatsapp") {
-      const numeroConectado = await obterNumeroWhatsappConectadoUsuario(usuarioId);
-      if (!numeroConectado) {
-        return c.json({
-          error: "Conecte o WhatsApp da plataforma (aba WhatsApp Bot) antes de publicar uma campanha TikTok com destino WhatsApp."
-        }, 400);
+      const whatsapp = await validarWhatsappTikTok(usuarioId, conexao);
+      if (!whatsapp.ok) {
+        return c.json({ error: whatsapp.erro, codigo: whatsapp.codigo }, whatsapp.status);
       }
-      numeroWhatsappTikTok = prepararNumeroWhatsappBrasilTikTok(numeroConectado);
-      if (!numeroWhatsappTikTok) {
-        return c.json({
-          error: "O número conectado ao WhatsApp precisa ser brasileiro e conter DDD para ser usado no TikTok Ads."
-        }, 400);
-      }
+      numeroWhatsappTikTok = whatsapp.numero;
     }
 
     // Mapeamento oficial da TikTok Business API v1.3:
     // - Instant Form: LEAD_GENERATION + INSTANT_PAGE, otimizado para Lead Generation;
     // - site: LEAD_GENERATION + EXTERNAL_WEBSITE, otimizado para clique sem exigir Pixel;
     // - WhatsApp: LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE + WHATSAPP.
-    // Click/CPC no WhatsApp funciona sem parceiro de mensagens nem event set.
+    // Em CLICK/CPC, message_event_set_id não é obrigatório no payload e o TikTok
+    // pode preenchê-lo quando encontra um único conjunto compatível. O número,
+    // porém, precisa estar previamente vinculado ao MMT do TikTok.
     const ehFormulario = destinoResolvido === "lead_ads";
     const payloadAdgroup: any = {
       advertiser_id: conexao.advertiserId,
@@ -11308,45 +11761,35 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
   }
 });
 
-// Lista os formulários instantâneos (Instant Form) já existentes do anunciante conectado.
-// Diferente do Meta, a TikTok não cria formulário via API neste fluxo — o usuário escolhe
-// um já criado no TikTok Ads Manager. Se a listagem falhar (endpoint incerto até validação
-// na Fase 2B), devolve lista vazia com aviso em vez de erro, para o frontend usar o campo
-// de ID manual como alternativa (a UI já foi desenhada prevendo esse fallback).
+// Lista Instant Forms publicados do anunciante conectado. A criação do formulário
+// continua sendo feita no TikTok Ads Manager; aqui usamos o endpoint oficial de Pages.
 app.get("/tiktok/formularios", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
-    const conexao = await obterConexaoTikTok(user.id);
+    const usuarioId = resolverUsuarioIdOperacao(user, c.req.query("usuario_id"));
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await obterConexaoTikTok(usuarioId);
     if (!conexao) return c.json({ error: "TikTok nao conectado" }, 400);
     if (!conexao.advertiserId) {
       return c.json({ error: "Selecione a conta de anunciante TikTok antes de listar formularios" }, 400);
     }
 
-    // ASSUMPTION MAIS ARRISCADA DE TODA A FASE 2A: endpoint e formato de listagem de
-    // Instant Forms — confirmar contra o SDK oficial na Fase 2B.
-    const params = new URLSearchParams({ advertiser_id: conexao.advertiserId });
-    const resposta = await tiktokFetch(`/page/lead_gen/get/?${params}`, conexao.token);
-
-    if (!resposta.ok) {
-      console.warn("TIKTOK FORMULARIOS: listagem indisponivel, frontend deve oferecer ID manual:", resposta.error);
+    const resultado = await listarFormulariosTikTokPublicados(conexao);
+    if (!resultado.ok) {
+      console.warn("TIKTOK FORMULARIOS: listagem indisponível:", resultado.erro);
       return c.json({
         formularios: [],
-        aviso: "Não foi possível listar formulários existentes. Informe o ID manualmente."
+        aviso: "Não foi possível listar os formulários publicados nesta conta TikTok. Atualize a conexão e tente novamente."
       });
     }
 
-    const formularios = Array.isArray(resposta.data?.data?.pages)
-      ? resposta.data.data.pages
-      : Array.isArray(resposta.data?.data)
-      ? resposta.data.data
-      : [];
-
-    return c.json({ formularios });
+    return c.json({ formularios: resultado.formularios });
   } catch (err: any) {
     console.error("ERRO /tiktok/formularios:", err);
     return c.json({
       formularios: [],
-      aviso: "Não foi possível listar formulários existentes. Informe o ID manualmente."
+      aviso: "Não foi possível listar os formulários publicados nesta conta TikTok."
     });
   }
 });
@@ -11410,6 +11853,24 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
 
     if (!identidadeId || !identidadeTipo) {
       return c.json({ error: "Selecione a identidade (perfil TikTok) antes de publicar o anúncio" }, 400);
+    }
+
+    const identidadeValidada = await validarIdentidadeTikTok(conexao, identidadeId, identidadeTipo);
+    if (!identidadeValidada.ok) {
+      return c.json({ error: identidadeValidada.erro, codigo: identidadeValidada.codigo }, identidadeValidada.status);
+    }
+
+    if (destinoResolvido === "lead_ads") {
+      const formularioValidado = await validarFormularioTikTok(conexao, String(form_id));
+      if (!formularioValidado.ok) {
+        return c.json({ error: formularioValidado.erro, codigo: formularioValidado.codigo }, formularioValidado.status);
+      }
+    }
+    if (destinoResolvido === "site") {
+      const siteValidado = await validarUrlTikTok(conexao, urlDestino);
+      if (!siteValidado.ok) {
+        return c.json({ error: siteValidado.erro, codigo: siteValidado.codigo }, siteValidado.status);
+      }
     }
 
     const tituloAnuncio = textoOpcional(avancadas.titulo) || "Saiba mais";
@@ -12122,16 +12583,62 @@ async function linkedinFetch(
   }
 }
 
+// Renova o access_token do LinkedIn quando existe refresh_token salvo — só
+// acontece de verdade se o produto "Programmatic Refresh Tokens" foi
+// aprovado pro app (ver aviso abaixo, em resolverConexaoLinkedIn); sem essa
+// aprovação refreshToken vem null do banco e esta função só devolve o
+// access_token atual, sem chamar a API — mesmo comportamento de antes.
+// Mesmo padrão do Google (obterAccessTokenGoogle): renova a cada uso em vez
+// de guardar/checar data de expiração, mais simples e sem risco de usar um
+// token expirado por poucos segundos de diferença. O refresh_token em si já
+// é capturado automaticamente pelo callback OAuth genérico (/auth/:plataforma
+// /callback) sempre que o LinkedIn devolver um — nada a mudar lá.
+async function obterAccessTokenLinkedInValido(
+  usuarioId: number,
+  accessTokenAtual: string,
+  refreshToken: string | null
+): Promise<string> {
+  if (!refreshToken) return accessTokenAtual;
+  try {
+    const res = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: Bun.env.LINKEDIN_ADS_CLIENT_ID || "",
+        client_secret: Bun.env.LINKEDIN_ADS_CLIENT_SECRET || "",
+      }),
+    });
+    const data = await res.json() as any;
+    if (!res.ok || !data.access_token) {
+      console.error("ERRO REFRESH TOKEN LINKEDIN:", data);
+      return accessTokenAtual;
+    }
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET access_token = $1, refresh_token = COALESCE($2, refresh_token), atualizado_em = NOW()
+       WHERE usuario_id = $3 AND plataforma = 'linkedin'`,
+      [data.access_token, data.refresh_token || null, usuarioId]
+    );
+    return data.access_token;
+  } catch (err) {
+    console.error("ERRO REFRESH TOKEN LINKEDIN:", err);
+    return accessTokenAtual;
+  }
+}
+
 // Busca token + conta de anúncios + organização (dona do Direct Sponsored
-// Content) já selecionadas pelo usuário. Diferente do Google, o LinkedIn não
-// devolve refresh_token garantido (só com o produto "Programmatic Refresh
-// Tokens" aprovado à parte) — o access_token dura ~60 dias; expirando sem
-// esse produto, o usuário precisa reconectar manualmente pela tela.
+// Content) já selecionadas pelo usuário. Diferente do Google, o LinkedIn só
+// devolve refresh_token garantido com o produto "Programmatic Refresh
+// Tokens" aprovado à parte — sem ele o access_token dura ~60 dias e,
+// expirando, o usuário precisa reconectar manualmente pela tela (com o
+// produto aprovado, obterAccessTokenLinkedInValido acima renova sozinho).
 async function resolverConexaoLinkedIn(
   usuarioId: number
 ): Promise<{ erro: string } | { accessToken: string; adAccountId: string; orgUrn: string | null; moeda: string }> {
   const conn = await client.query(
-    `SELECT access_token, dados_conta FROM plataforma_conexoes
+    `SELECT access_token, refresh_token, dados_conta FROM plataforma_conexoes
      WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
     [usuarioId]
   );
@@ -12142,8 +12649,13 @@ async function resolverConexaoLinkedIn(
   if (!dadosConta.ad_account_id) {
     return { erro: "Selecione a conta de anúncios do LinkedIn antes de publicar" };
   }
+  const accessToken = await obterAccessTokenLinkedInValido(
+    usuarioId,
+    conn.rows[0].access_token,
+    conn.rows[0].refresh_token
+  );
   return {
-    accessToken: conn.rows[0].access_token,
+    accessToken,
     adAccountId: String(dadosConta.ad_account_id),
     orgUrn: dadosConta.org_urn || null,
     // Fallback BRL cobre conexões selecionadas antes desse campo existir —
@@ -12159,11 +12671,11 @@ app.get("/linkedin/contas", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const conn = await client.query(
-      `SELECT access_token FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      `SELECT access_token, refresh_token FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
       [user.id]
     );
-    const token = conn.rows[0]?.access_token;
-    if (!token) return c.json({ error: "LinkedIn Ads não conectado" }, 400);
+    if (!conn.rows[0]?.access_token) return c.json({ error: "LinkedIn Ads não conectado" }, 400);
+    const token = await obterAccessTokenLinkedInValido(user.id, conn.rows[0].access_token, conn.rows[0].refresh_token);
 
     // ASSUMPTION: q=search sem filtro devolve as contas às quais o usuário
     // do token tem acesso — conferir contra a Ad Accounts API oficial na
@@ -12226,6 +12738,107 @@ app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
   } catch (err: any) {
     console.error("ERRO /linkedin/selecionar-conta:", err);
     return c.json({ error: "Erro interno" }, 500);
+  }
+});
+
+// Busca de localizações para segmentação (equivalente ao /meta, /tiktok e
+// /kwai /direcionamento/localizacao) — usa a Ad Targeting Entities Typeahead
+// API do LinkedIn. Hoje só alimenta o campo único geo_urn lido em
+// /linkedin/adgroup (que sem seleção continua caindo no fallback
+// LINKEDIN_GEO_URN_BRASIL, igual antes). ASSUMPTION: endpoint/parâmetros
+// (q=TYPEAHEAD, facet de locations) e o formato da resposta (elements[].urn/
+// name) conferidos só contra a documentação pública — mesma ressalva do
+// resto da seção LINKEDIN ADS, não testado contra tráfego real ainda.
+app.post("/linkedin/direcionamento/localizacao", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, busca } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const termo = textoOpcional(busca).slice(0, 80);
+    if (termo.length < 2) return c.json({ data: [] });
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const params = new URLSearchParams({
+      q: "TYPEAHEAD",
+      query: termo,
+      facet: "urn:li:adTargetingFacet:locations",
+      locale: "(language:pt,country:BR)",
+    });
+
+    const resposta = await linkedinFetch(`/adTargetingEntities?${params.toString()}`, conexao.accessToken);
+    if (!resposta.ok) {
+      return c.json({ error: resposta.error || "Erro ao buscar localizações no LinkedIn" }, 400);
+    }
+
+    const elementos = Array.isArray(resposta.data?.elements) ? resposta.data.elements : [];
+    const data = elementos
+      .map((el: any) => ({
+        key: textoOpcional(el.urn ?? el.entityUrn ?? el.value),
+        nome: textoOpcional(
+          el.name?.localized?.pt_BR ?? el.name?.localized?.en_US ?? (typeof el.name === "string" ? el.name : "")
+        ),
+      }))
+      .filter((item: any) => item.key && item.nome)
+      .slice(0, 12);
+
+    return c.json({ data });
+  } catch (err) {
+    console.error("ERRO BUSCA LOCALIZACAO LINKEDIN:", err);
+    return c.json({ error: "Erro ao buscar localizações LinkedIn" }, 500);
+  }
+});
+
+// Busca de interesses para segmentação (equivalente ao /meta, /tiktok e
+// /kwai /direcionamento/interesses) — mesma Ad Targeting Entities Typeahead
+// API acima, trocando o facet pra interesses de membro. Endpoint pronto no
+// backend mas ainda sem UI própria no formulário de campanha (mesmo estado
+// em que o /tiktok/direcionamento/interesses já vive hoje nesta plataforma).
+app.post("/linkedin/direcionamento/interesses", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, busca } = await c.req.json();
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const termo = textoOpcional(busca).slice(0, 80);
+    if (termo.length < 2) return c.json({ data: [] });
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const params = new URLSearchParams({
+      q: "TYPEAHEAD",
+      query: termo,
+      facet: "urn:li:adTargetingFacet:interests",
+      locale: "(language:pt,country:BR)",
+    });
+
+    const resposta = await linkedinFetch(`/adTargetingEntities?${params.toString()}`, conexao.accessToken);
+    if (!resposta.ok) {
+      return c.json({ error: resposta.error || "Erro ao buscar interesses no LinkedIn" }, 400);
+    }
+
+    const elementos = Array.isArray(resposta.data?.elements) ? resposta.data.elements : [];
+    const data = elementos
+      .map((el: any) => ({
+        key: textoOpcional(el.urn ?? el.entityUrn ?? el.value),
+        nome: textoOpcional(
+          el.name?.localized?.pt_BR ?? el.name?.localized?.en_US ?? (typeof el.name === "string" ? el.name : "")
+        ),
+      }))
+      .filter((item: any) => item.key && item.nome)
+      .slice(0, 12);
+
+    return c.json({ data });
+  } catch (err) {
+    console.error("ERRO BUSCA INTERESSES LINKEDIN:", err);
+    return c.json({ error: "Erro ao buscar interesses LinkedIn" }, 500);
   }
 });
 
@@ -12456,6 +13069,110 @@ app.post("/linkedin/upload-imagem", authMiddleware, async (c) => {
   }
 });
 
+// Upload de vídeo como asset do LinkedIn (equivalente ao /tiktok/upload-video)
+// — parecido com /linkedin/upload-imagem, mas em 3 passos em vez de 2:
+// initializeUpload (reserva a URN e devolve 1+ uploadInstructions, já que
+// vídeo pode exigir envio em partes), PUT de cada parte coletando o ETag
+// devolvido, e finalizeUpload com a lista de ETags. Depois disso o
+// processamento do LinkedIn é assíncrono (transcodifica antes de liberar pra
+// uso em anúncio) — faz um polling curto e limitado aqui; se não terminar a
+// tempo, devolve pronto:false e uma tentativa de usar essa URN num anúncio
+// antes dela ficar disponível vai receber erro do próprio LinkedIn (não
+// tratado à parte). ⚠️ ASSUMPTION: shape de initializeUpload/finalizeUpload e
+// do polling de status conferidos só contra a documentação pública da Video
+// Ads API — nunca testado contra um upload real.
+app.post("/linkedin/upload-video", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+    let video = body.get("video") as File | null;
+    const videoUrl = textoOpcional(body.get("video_url"));
+    const usuario_id = body.get("usuario_id");
+
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+    if (!video && videoUrl) {
+      const baixado = await baixarVideoDeUrl(videoUrl);
+      if ("erro" in baixado) return c.json({ error: baixado.erro }, 400);
+      video = baixado.arquivo;
+    }
+    if (!video) return c.json({ error: "Vídeo não enviado" }, 400);
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const bytes = new Uint8Array(await video.arrayBuffer());
+
+    const init = await linkedinFetch(`/videos?action=initializeUpload`, conexao.accessToken, {
+      method: "POST",
+      body: {
+        initializeUploadRequest: {
+          owner: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
+          fileSizeBytes: bytes.byteLength,
+          uploadCaptions: false,
+          uploadThumbnail: false,
+        }
+      }
+    });
+
+    const uploadInstructions = init.data?.value?.uploadInstructions;
+    const videoUrn = init.data?.value?.video;
+    if (!init.ok || !Array.isArray(uploadInstructions) || !uploadInstructions.length || !videoUrn) {
+      console.error("ERRO INIT UPLOAD VIDEO LINKEDIN:", init.data);
+      return c.json({ error: init.error || "Erro ao iniciar upload de vídeo no LinkedIn", detalhe: init.data }, 400);
+    }
+
+    const uploadedPartIds: string[] = [];
+    for (const instrucao of uploadInstructions) {
+      const inicio = Number(instrucao.firstByte ?? 0);
+      const fim = Number(instrucao.lastByte ?? bytes.byteLength - 1);
+      const parte = bytes.slice(inicio, fim + 1);
+      const uploadRes = await fetch(instrucao.uploadUrl, {
+        method: "PUT",
+        headers: { "Authorization": `Bearer ${conexao.accessToken}` },
+        body: parte
+      });
+      if (!uploadRes.ok) {
+        console.error("ERRO PUT PARTE VIDEO LINKEDIN:", uploadRes.status, await uploadRes.text().catch(() => ""));
+        return c.json({ error: "Erro ao enviar bytes do vídeo para o LinkedIn" }, 502);
+      }
+      uploadedPartIds.push(uploadRes.headers.get("etag") || "");
+    }
+
+    const finalize = await linkedinFetch(`/videos?action=finalizeUpload`, conexao.accessToken, {
+      method: "POST",
+      body: {
+        finalizeUploadRequest: {
+          video: videoUrn,
+          uploadToken: "",
+          uploadedPartIds
+        }
+      }
+    });
+    if (!finalize.ok) {
+      console.error("ERRO FINALIZE UPLOAD VIDEO LINKEDIN:", finalize.data);
+      return c.json({ error: finalize.error || "Erro ao finalizar upload de vídeo no LinkedIn", detalhe: finalize.data }, 400);
+    }
+
+    // Processamento assíncrono — espera até ~20s pelo status AVAILABLE antes
+    // de devolver, pra cobrir vídeos curtos sem segurar a requisição demais.
+    let pronto = false;
+    for (let tentativa = 0; tentativa < 8; tentativa++) {
+      const status = await linkedinFetch(`/videos/${encodeURIComponent(videoUrn)}`, conexao.accessToken);
+      if (status.ok && status.data?.status === "AVAILABLE") {
+        pronto = true;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 2500));
+    }
+
+    return c.json({ video_urn: videoUrn, pronto });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/upload-video:", err);
+    return c.json({ error: err.message || "Erro ao enviar vídeo para o LinkedIn" }, 500);
+  }
+});
+
 // Cria o Lead Gen Form (equivalente ao /google/formulario) — diferente da
 // TikTok (só permite escolher um formulário já criado manualmente), o
 // LinkedIn tem API própria de criação, igual ao Google.
@@ -12557,7 +13274,7 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
     const user: any = c.get("user");
     const {
       usuario_id, campaign_id, adgroup_id, form_id,
-      texto, cta, titulo, configuracoes_avancadas, image_urn, daily_budget, destino
+      texto, cta, titulo, configuracoes_avancadas, image_urn, video_urn, daily_budget, destino
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -12620,6 +13337,11 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
           description: truncarSemCortarPalavra(texto || "", 100) || undefined,
         }
       };
+    } else if (video_urn) {
+      // Mesmo shape content.media do image_urn abaixo — a Posts API do
+      // LinkedIn aceita tanto imagem quanto vídeo como media.id, o tipo é
+      // inferido pela própria URN do asset.
+      payloadPost.content = { media: { id: video_urn } };
     } else if (image_urn) {
       payloadPost.content = { media: { id: image_urn } };
     }
@@ -12933,20 +13655,103 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
 });
 
 // Sincroniza campanhas e leads (Lead Gen Form Responses) do LinkedIn Ads —
-// mesmo padrão de polling que o Google usa (sem webhook). Diferente do
-// TikTok, que tem polling E webhook em tempo real (/webhook/tiktok): o
-// LinkedIn hoje só tem este polling — nenhum endpoint de webhook de leads
-// foi implementado ainda, então um lead só aparece aqui após o próximo
-// /linkedin/sincronizar-campanhas (manual ou pelo cron), nunca na hora.
+// mesmo padrão de polling que o Google usa. Existe também um /webhook/linkedin
+// (ver seção WEBHOOK LINKEDIN mais abaixo) pra entrega em tempo real, mas seu
+// mecanismo de inscrição/formato nunca foi confirmado contra a API real — até
+// isso ser validado, este polling continua sendo o caminho garantido: um
+// lead aparece aqui no próximo /linkedin/sincronizar-campanhas (manual ou
+// pelo cron) mesmo que o webhook nunca chegue a disparar.
+// Processa uma única resposta de Lead Gen Form do LinkedIn (formato
+// LeadGenFormResponse) — compartilhado entre o polling de
+// sincronizarLinkedInAdsUsuario abaixo e o webhook de leads em tempo real
+// (/webhook/linkedin), pra não ter duas cópias divergentes da mesma lógica
+// de parsing/inserção. Idempotente: se o lead_id já existir pra esse
+// usuário, não insere de novo (importante pro webhook, que pode reentregar
+// o mesmo evento) — devolve false nesse caso, true quando inseriu.
+async function processarLeadGenFormResponseLinkedIn(
+  usuarioId: number,
+  adAccountId: string,
+  lead: any
+): Promise<boolean> {
+  const formUrnResposta = String(
+    lead.formResponse?.leadGenFormUrn || lead.leadGenFormUrn || lead.leadGenForm || ""
+  );
+  const formIdResposta = formUrnResposta.split(":").pop() || "";
+
+  const leadId = String(lead.id ?? `${formIdResposta || "linkedin"}-${lead.submittedAt}`);
+
+  const jaExiste = await client.query(
+    `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+    [leadId, usuarioId]
+  );
+  if (jaExiste.rows.length > 0) return false;
+
+  const campanhaEncontrada = formIdResposta
+    ? (await client.query(
+        `SELECT nome, nicho_id FROM campanhas
+         WHERE usuario_id = $1 AND plataforma = 'linkedin' AND conta_anuncios_id = $2 AND form_id = $3
+         LIMIT 1`,
+        [usuarioId, adAccountId, formIdResposta]
+      )).rows[0]
+    : null;
+  const nomeCampanha = campanhaEncontrada?.nome || "Campanha LinkedIn";
+  const nichoId = campanhaEncontrada?.nicho_id ?? null;
+
+  let nome = "";
+  let email = "";
+  let telefone = "";
+  const respostasQualificacao: any[] = [];
+
+  for (const resposta of lead.formResponse?.answers ?? []) {
+    const campo = String(resposta.questionField?.predefinedField ?? "").toUpperCase();
+    const valor = resposta.answerDetails?.textQuestionAnswer?.answer ?? "";
+    if (campo === "FIRST_NAME") nome = `${valor} ${nome}`.trim();
+    else if (campo === "LAST_NAME") nome = `${nome} ${valor}`.trim();
+    else if (campo === "EMAIL_ADDRESS") email = valor;
+    else if (campo === "PHONE_NUMBER") telefone = valor;
+    else respostasQualificacao.push({ pergunta: campo, resposta: valor });
+  }
+
+  const leadInseridoLinkedIn = await client.query(
+    `INSERT INTO leads
+       (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+        origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'linkedin','linkedin','novo',$8,$9,COALESCE(to_timestamp($10::bigint / 1000), NOW()))
+     RETURNING id`,
+    [
+      usuarioId, leadId, nome || "Lead LinkedIn", email, telefone,
+      nomeCampanha, adAccountId,
+      JSON.stringify(respostasQualificacao), nichoId, lead.submittedAt ?? null
+    ]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+
+  avaliarEEnviarQualificacaoLead(
+    {
+      id: leadInseridoLinkedIn.rows[0]?.id,
+      lead_id: leadId,
+      plataforma: "linkedin",
+      status: "novo",
+      email,
+      telefone,
+      respostas_qualificacao: respostasQualificacao
+    },
+    usuarioId
+  ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (linkedin):", err));
+
+  return true;
+}
+
 async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
   const conn = await client.query(
-    `SELECT access_token, dados_conta FROM plataforma_conexoes
+    `SELECT access_token, refresh_token, dados_conta FROM plataforma_conexoes
      WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
     [usuarioId]
   );
   if (!conn.rows.length) throw new Error("LinkedIn não conectado");
 
-  const token = conn.rows[0].access_token;
+  const token = await obterAccessTokenLinkedInValido(usuarioId, conn.rows[0].access_token, conn.rows[0].refresh_token);
   const dadosConta = conn.rows[0].dados_conta ?? {};
   const adAccountId = dadosConta.ad_account_id;
   if (!adAccountId) throw new Error("Selecione a conta de anúncios do LinkedIn antes de sincronizar");
@@ -13012,17 +13817,6 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
   const trintaDiasAtras = Date.now() - 30 * 24 * 60 * 60 * 1000;
   let totalLeads = 0;
 
-  const formulariosDaConta = await client.query(
-    `SELECT form_id, nome, nicho_id FROM campanhas
-     WHERE usuario_id = $1 AND plataforma = 'linkedin'
-       AND conta_anuncios_id = $2 AND form_id IS NOT NULL`,
-    [usuarioId, String(adAccountId)]
-  );
-  const campanhaPorFormId = new Map<string, { nome: string; nicho_id: number | null }>();
-  for (const row of formulariosDaConta.rows) {
-    campanhaPorFormId.set(String(row.form_id), { nome: row.nome, nicho_id: row.nicho_id ?? null });
-  }
-
   const leadsRes = await linkedinFetch(
     `/leadGenFormResponses?q=leadType&owner=(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})&leadType=SPONSORED&submittedAtAfter=${trintaDiasAtras}`,
     token
@@ -13032,73 +13826,9 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
     console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
   } else {
     const leadsList = leadsRes.data?.elements ?? [];
-
     for (const lead of leadsList) {
-      // ASSUMPTION: nome/posição exatos do campo que identifica o formulário
-      // de origem dentro da resposta — tentados 3 caminhos plausíveis da
-      // documentação pública, com fallback pra "campanha desconhecida" em
-      // vez de atribuir errado se nenhum bater.
-      const formUrnResposta = String(
-        lead.formResponse?.leadGenFormUrn || lead.leadGenFormUrn || lead.leadGenForm || ""
-      );
-      const formIdResposta = formUrnResposta.split(":").pop() || "";
-
-      const leadId = String(lead.id ?? `${formIdResposta || "linkedin"}-${lead.submittedAt}`);
-
-      const jaExiste = await client.query(
-        `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
-        [leadId, usuarioId]
-      );
-      if (jaExiste.rows.length > 0) continue;
-
-      const campanhaEncontrada = formIdResposta ? campanhaPorFormId.get(formIdResposta) : null;
-      const nomeCampanha = campanhaEncontrada?.nome || "Campanha LinkedIn";
-      const nichoId = campanhaEncontrada?.nicho_id ?? null;
-
-      let nome = "";
-      let email = "";
-      let telefone = "";
-      const respostasQualificacao: any[] = [];
-
-      for (const resposta of lead.formResponse?.answers ?? []) {
-        const campo = String(resposta.questionField?.predefinedField ?? "").toUpperCase();
-        const valor = resposta.answerDetails?.textQuestionAnswer?.answer ?? "";
-        if (campo === "FIRST_NAME") nome = `${valor} ${nome}`.trim();
-        else if (campo === "LAST_NAME") nome = `${nome} ${valor}`.trim();
-        else if (campo === "EMAIL_ADDRESS") email = valor;
-        else if (campo === "PHONE_NUMBER") telefone = valor;
-        else respostasQualificacao.push({ pergunta: campo, resposta: valor });
-      }
-
-      const leadInseridoLinkedIn = await client.query(
-        `INSERT INTO leads
-           (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
-            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'linkedin','linkedin','novo',$8,$9,COALESCE(to_timestamp($10::bigint / 1000), NOW()))
-         RETURNING id`,
-        [
-          usuarioId, leadId, nome || "Lead LinkedIn", email, telefone,
-          nomeCampanha, String(adAccountId),
-          JSON.stringify(respostasQualificacao), nichoId, lead.submittedAt ?? null
-        ]
-      );
-
-      await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
-
-      avaliarEEnviarQualificacaoLead(
-        {
-          id: leadInseridoLinkedIn.rows[0]?.id,
-          lead_id: leadId,
-          plataforma: "linkedin",
-          status: "novo",
-          email,
-          telefone,
-          respostas_qualificacao: respostasQualificacao
-        },
-        usuarioId
-      ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync linkedin):", err));
-
-      totalLeads++;
+      const inserido = await processarLeadGenFormResponseLinkedIn(usuarioId, String(adAccountId), lead);
+      if (inserido) totalLeads++;
     }
   }
 
@@ -17797,6 +18527,78 @@ app.post("/webhook/tiktok", async (c) => {
 });
 
 /* =========================
+   💼 WEBHOOK LINKEDIN — leads em tempo real
+   ⚠️ ASSUMPTION: diferente do TikTok acima, o mecanismo exato de assinatura/
+   verificação do "Lead Sync" (notificação em tempo real de Lead Gen Form) do
+   LinkedIn NÃO foi confirmado contra a documentação — a Advertising API
+   ainda nem foi aprovada pra essa conta, então não há como testar a
+   inscrição do endpoint nem o formato exato que o LinkedIn de fato entrega.
+   A verificação por challenge (GET) segue o mesmo padrão genérico usado
+   acima pelo TikTok; o corpo do POST assume o mesmo formato
+   LeadGenFormResponse já usado no polling (sincronizarLinkedInAdsUsuario/
+   processarLeadGenFormResponseLinkedIn), aceitando 1 evento ou uma lista.
+   Se o LinkedIn de fato ativar esse recurso pra essa conta, este é o
+   primeiro ponto a conferir contra um evento real — o polling continua
+   sendo o caminho garantido enquanto isso.
+========================= */
+app.get("/webhook/linkedin", async (c) => {
+  const challenge = c.req.query("challenge");
+  if (challenge) return c.text(challenge);
+  return c.text("LinkedIn webhook ativo");
+});
+
+app.post("/webhook/linkedin", async (c) => {
+  const linkedinSecret = Bun.env.LINKEDIN_WEBHOOK_SECRET;
+  if (linkedinSecret) {
+    const auth = c.req.header("authorization") || "";
+    const provided = auth.replace(/^Bearer\s+/i, "").trim();
+    if (
+      !provided ||
+      provided.length !== linkedinSecret.length ||
+      !timingSafeEqual(Buffer.from(provided), Buffer.from(linkedinSecret))
+    ) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+  }
+
+  try {
+    const body = await c.req.json() as any;
+    console.log("WEBHOOK LINKEDIN RECEBIDO:", JSON.stringify(body));
+
+    const eventos = Array.isArray(body?.elements) ? body.elements : Array.isArray(body) ? body : [body];
+
+    for (const lead of eventos) {
+      const ownerUrn = String(lead?.owner?.sponsoredAccount || lead?.owner || "");
+      const adAccountId = ownerUrn.split(":").pop() || "";
+      if (!adAccountId) {
+        console.log("LINKEDIN WEBHOOK: evento sem conta de anuncios identificavel");
+        continue;
+      }
+
+      const conn = await client.query(
+        `SELECT usuario_id FROM plataforma_conexoes
+         WHERE plataforma = 'linkedin' AND dados_conta->>'ad_account_id' = $1
+         LIMIT 1`,
+        [adAccountId]
+      );
+      if (!conn.rows.length) {
+        console.log("LinkedIn webhook: conta de anuncios nao identificada:", adAccountId);
+        continue;
+      }
+
+      const usuarioId = Number(conn.rows[0].usuario_id);
+      const inserido = await processarLeadGenFormResponseLinkedIn(usuarioId, adAccountId, lead);
+      if (inserido) console.log("✅ LINKEDIN LEAD SALVO (webhook), usuario:", usuarioId);
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK LINKEDIN:", err);
+    return c.json({ error: "Erro webhook LinkedIn" }, 500);
+  }
+});
+
+/* =========================
    🎬 WEBHOOK KWAI — leads em tempo real
    🚧 STUB: diferente do webhook do TikTok acima, o payload/challenge reais de
    verificação da Kuaishou Marketing API ainda NÃO estão confirmados —
@@ -21549,7 +22351,7 @@ async function carregarMetricasLinkedInCampanhas(
 
   try {
     const conexao = await client.query(
-      `SELECT access_token, dados_conta
+      `SELECT access_token, refresh_token, dados_conta
        FROM plataforma_conexoes
        WHERE usuario_id = $1 AND plataforma = 'linkedin' AND status = 'conectado'
        LIMIT 1`,
@@ -21560,6 +22362,7 @@ async function carregarMetricasLinkedInCampanhas(
     if (!row?.access_token || !adAccountId) {
       return { disponivel: false, erro: null, metricas };
     }
+    const accessToken = await obterAccessTokenLinkedInValido(usuarioId, row.access_token, row.refresh_token);
 
     const [anoI, mesI, diaI] = inicio.split("-").map(Number);
     const [anoF, mesF, diaF] = fim.split("-").map(Number);
@@ -21576,7 +22379,7 @@ async function carregarMetricasLinkedInCampanhas(
       `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
     );
 
-    const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, row.access_token);
+    const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, accessToken);
     if (!resposta.ok) {
       return { disponivel: false, erro: resposta.error || "Métricas indisponíveis no LinkedIn Ads", metricas };
     }
@@ -23207,7 +24010,7 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
     const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
 
     const conn = await client.query(
-      `SELECT access_token, dados_conta FROM plataforma_conexoes
+      `SELECT access_token, refresh_token, dados_conta FROM plataforma_conexoes
        WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
       [user.id]
     );
@@ -23216,6 +24019,7 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
     if (!row?.access_token || !adAccountId) {
       return c.json({ error: "LinkedIn Ads nao conectado" }, 400);
     }
+    const accessToken = await obterAccessTokenLinkedInValido(user.id, row.access_token, row.refresh_token);
 
     const inicio = new Date();
     inicio.setDate(inicio.getDate() - (dias - 1));
@@ -23251,7 +24055,7 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
         `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
       );
 
-      const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, row.access_token);
+      const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, accessToken);
       if (!resposta.ok) {
         return c.json({ error: resposta.error || "Erro ao buscar performance diaria do LinkedIn Ads" }, 400);
       }
