@@ -5026,7 +5026,7 @@ async function verificarSaldoMetaEAlertar(
 ) {
   try {
     const res = await fetch(
-      `https://graph.facebook.com/v19.0/${contaAnunciosId}?fields=name,currency,balance,funding_source,funding_source_details,is_prepay_account,spend_cap,amount_spent&access_token=${accessToken}`
+      `https://graph.facebook.com/v19.0/${contaAnunciosId}?fields=name,account_status,currency,balance,funding_source,funding_source_details,is_prepay_account,spend_cap,amount_spent&access_token=${accessToken}`
     );
     const conta = await res.json() as any;
     if (conta.error) {
@@ -5035,23 +5035,29 @@ async function verificarSaldoMetaEAlertar(
     }
 
     const pagamentoManual = conta.is_prepay_account === true;
+    const pagamentoAutomatico = Boolean(conta.funding_source);
+    // 3=UNSETTLED, 8=PENDING_SETTLEMENT, 9=IN_GRACE_PERIOD — mesmos códigos de
+    // /meta/status-completo (pendenciaPagamento).
+    const pendenciaPagamento = [3, 8, 9].includes(Number(conta.account_status));
     // Mesma conversão de centavos->reais e mesmo cuidado de /meta/status-completo:
     // GET da Marketing API devolve spend_cap/amount_spent em centavos.
     const limiteGastos = conta.spend_cap ? Number(conta.spend_cap) / 100 : null;
     const gastoAtual = conta.amount_spent ? Number(conta.amount_spent) / 100 : null;
+    const saldoApi = normalizarValorMonetarioMeta(conta.balance, conta.currency);
     const saldoPrePago = extrairSaldoDisponivelMeta(
       conta.funding_source_details?.display_string ?? null
     );
+    const saldoPrePagoZerado = pagamentoManual && saldoPrePago !== null && saldoPrePago <= 0;
 
     let motivo: string | null = null;
     if (pagamentoManual) {
-      if (saldoPrePago !== null && saldoPrePago <= 0) {
+      if (saldoPrePagoZerado) {
         motivo = `o saldo pré-pago zerou`;
       }
     } else if (limiteGastos !== null && gastoAtual !== null && limiteGastos > 0) {
       const percentual = gastoAtual / limiteGastos;
       if (percentual >= LIMIAR_ALERTA_SALDO_META) {
-        motivo = `o gasto já chegou a ${(percentual * 100).toFixed(0)}% do limite (${formatarMoedaBRLTexto(gastoAtual)} de ${formatarMoedaBRLTexto(limiteGastos)})`;
+        motivo = `o gasto já chegou a ${(percentual * 100).toFixed(0)}% do limite`;
       }
     }
 
@@ -5074,11 +5080,34 @@ async function verificarSaldoMetaEAlertar(
     const telefone = usuarioRow.rows[0]?.whatsapp;
     if (!telefone) return;
 
+    // Mesmos 2 badges do card "💳 Status de Pagamento Meta" no frontend
+    // (index.html — pagamento-modos), pra dar o mesmo contexto completo no
+    // WhatsApp, não só o percentual do limite.
+    const badgeCobrancaAutomatica = pendenciaPagamento
+      ? "Pendência detectada"
+      : pagamentoAutomatico && !pagamentoManual
+      ? "Em vigor"
+      : "Não detectada";
+    const badgeManualPrePago = saldoPrePagoZerado
+      ? "Sem saldo"
+      : pagamentoManual
+      ? "Em vigor"
+      : "Não detectado";
+    const saldoFinal = pagamentoManual && saldoPrePago !== null ? saldoPrePago : saldoApi;
+    const saldoTexto = saldoFinal !== null ? formatarMoedaBRLTexto(saldoFinal) : "Não informado";
+    const limiteGastosTexto =
+      limiteGastos !== null && gastoAtual !== null
+        ? `${formatarMoedaBRLTexto(gastoAtual)} de ${formatarMoedaBRLTexto(limiteGastos)}`
+        : "Não configurado";
+
     const link = montarLinkPagamentoMeta(contaAnunciosId);
     const nomeConta = conta.name || "sua conta de anúncios";
     const msg =
-      `⚠️ *Saldo/limite da conta Meta baixo*\n\n` +
+      `⚠️ *Limite de gastos da conta*\n\n` +
       `A conta "${nomeConta}" está perto de pausar: ${motivo}.\n\n` +
+      `📊 Gasto acumulado: ${limiteGastosTexto}\n` +
+      `💳 Cobrança automática: ${badgeCobrancaAutomatica}\n` +
+      `🏦 Manual/pré-pago (${saldoTexto}): ${badgeManualPrePago}\n\n` +
       `Resolva agora sem precisar entrar na plataforma:\n${link}`;
 
     await enviarLembreteWhatsApp(telefone, msg);
