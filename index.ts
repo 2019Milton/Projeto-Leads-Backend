@@ -5049,8 +5049,14 @@ async function verificarSaldoMetaEAlertar(
     );
     const saldoPrePagoZerado = pagamentoManual && saldoPrePago !== null && saldoPrePago <= 0;
 
+    // 3 gatilhos independentes — qualquer um dispara o alerta: pendência de
+    // pagamento na cobrança automática, saldo pré-pago zerado, ou gasto perto
+    // do limite configurado (esses 2 últimos continuam mutuamente exclusivos,
+    // conforme qual modalidade é a principal da conta).
     let motivo: string | null = null;
-    if (pagamentoManual) {
+    if (pendenciaPagamento) {
+      motivo = `há uma pendência de pagamento detectada na cobrança automática`;
+    } else if (pagamentoManual) {
       if (saldoPrePagoZerado) {
         motivo = `o saldo pré-pago zerou`;
       }
