@@ -10611,6 +10611,7 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       url_destino,
       identity_id,
       identity_type,
+      formato_criativo,
       image_ids,
       video_id,
       midia_alterada,
@@ -10746,6 +10747,7 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
     const imageIdsSolicitados = Array.isArray(image_ids) ? image_ids.map(String).filter(Boolean) : [];
     const videoIdSolicitado = textoOpcional(video_id);
     const midiaFoiAlterada = midia_alterada === true || midia_alterada === 1 || midia_alterada === "true";
+    const formatoCriativoSolicitado = formato_criativo === "imagem" ? "imagem" : "video";
 
     if (!textoSolicitado) {
       return c.json({ error: "Texto do anúncio TikTok é obrigatório" }, 400);
@@ -10761,6 +10763,24 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
     }
     if (midiaFoiAlterada && !imageIdsSolicitados.length && !videoIdSolicitado) {
       return c.json({ error: "A nova mídia do anúncio TikTok não foi enviada" }, 400);
+    }
+    if (
+      midiaFoiAlterada &&
+      formatoCriativoSolicitado === "video" &&
+      (!videoIdSolicitado || imageIdsSolicitados.length)
+    ) {
+      return c.json({
+        error: "O formato Vídeo único do TikTok exige um vídeo e não aceita imagens no mesmo anúncio"
+      }, 400);
+    }
+    if (
+      midiaFoiAlterada &&
+      formatoCriativoSolicitado === "imagem" &&
+      (imageIdsSolicitados.length !== 1 || videoIdSolicitado)
+    ) {
+      return c.json({
+        error: "O formato Imagem única do TikTok exige exatamente uma imagem e não aceita vídeo no mesmo anúncio"
+      }, 400);
     }
 
     const identidadeValidada = await validarIdentidadeTikTok(conexao, identidadeId, identidadeTipo);
@@ -10853,11 +10873,11 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       };
 
       if (midiaFoiAlterada) {
-        if (videoIdSolicitado) {
+        if (formatoCriativoSolicitado === "video") {
           criativo.ad_format = "SINGLE_VIDEO";
           criativo.video_id = videoIdSolicitado;
         } else {
-          criativo.ad_format = imageIdsSolicitados.length > 1 ? "CAROUSEL_ADS" : "SINGLE_IMAGE";
+          criativo.ad_format = "SINGLE_IMAGE";
           criativo.image_ids = imageIdsSolicitados;
         }
       }
@@ -10893,6 +10913,9 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       url_destino: destinoOriginal === "site"
         ? (criativoAtualizado ? urlSolicitada : (cfgBanco.url_destino || textoOpcional(estrutura.anuncio?.landing_page_url) || null))
         : null,
+      formato_criativo: criativoAtualizado && midiaFoiAlterada
+        ? formatoCriativoSolicitado
+        : (cfgBanco.formato_criativo || (cfgBanco.video_id || estrutura.anuncio?.video_id ? "video" : "imagem")),
       image_ids: criativoAtualizado && midiaFoiAlterada
         ? imageIdsSolicitados
         : (Array.isArray(cfgBanco.image_ids) ? cfgBanco.image_ids : (estrutura.anuncio?.image_ids || [])),
@@ -11606,11 +11629,15 @@ app.post("/tiktok/upload-imagem", authMiddleware, async (c) => {
       nomeArquivoImagem = `imagem-${Date.now()}.jpg`;
     }
 
-    // ASSUMPTION: endpoint/campos de multipart conforme documentação pública —
-    // confirmar contra o SDK oficial (github.com/tiktok/tiktok-business-api-sdk) na Fase 2B.
+    // A API exige o MD5 quando upload_type=UPLOAD_BY_FILE. Sem a assinatura,
+    // algumas contas aceitam o multipart e outras recusam o arquivo na validação.
+    const bytesImagem = new Uint8Array(await arquivoImagem.arrayBuffer());
+    const assinaturaImagem = createHash("md5").update(bytesImagem).digest("hex");
     const tiktokForm = new FormData();
     tiktokForm.append("advertiser_id", conexao.advertiserId);
     tiktokForm.append("upload_type", "UPLOAD_BY_FILE");
+    tiktokForm.append("file_name", nomeArquivoImagem.slice(0, 100));
+    tiktokForm.append("image_signature", assinaturaImagem);
     tiktokForm.append("image_file", arquivoImagem, nomeArquivoImagem);
 
     const response = await fetch(`${TIKTOK_API}/file/image/ad/upload/`, {
@@ -12215,6 +12242,7 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       image_ids,
       image_id,
       video_id,
+      formato_criativo,
       destino,
       url_destino
     } = await c.req.json();
@@ -12283,16 +12311,25 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
         : image_id
         ? [image_id]
         : [];
+    const videoId = textoOpcional(video_id);
+    const formatoCriativo = formato_criativo === "imagem" ? "imagem" : "video";
 
-    if (!imagens.length && !video_id) {
-      return c.json({ error: "Envie ao menos uma imagem ou vídeo para o anúncio TikTok" }, 400);
+    if (formatoCriativo === "video" && (!videoId || imagens.length)) {
+      return c.json({
+        error: "O formato Vídeo único do TikTok exige um vídeo e não aceita imagens no mesmo anúncio"
+      }, 400);
+    }
+    if (formatoCriativo === "imagem" && (imagens.length !== 1 || videoId)) {
+      return c.json({
+        error: "O formato Imagem única do TikTok exige exatamente uma imagem e não aceita vídeo no mesmo anúncio"
+      }, 400);
     }
 
     // page_id só é válido para Instant Form. No site a URL vai no criativo; no
     // WhatsApp o destino já foi definido no ad group e a própria TikTok o preenche.
     const criativo: any = {
       ad_name: `Anuncio Leads ${Date.now()}`,
-      ad_format: video_id ? "SINGLE_VIDEO" : imagens.length > 1 ? "CAROUSEL_ADS" : "SINGLE_IMAGE",
+      ad_format: formatoCriativo === "video" ? "SINGLE_VIDEO" : "SINGLE_IMAGE",
       identity_id: identidadeId,
       identity_type: identidadeTipo,
       ad_text: texto || "Quer mais clientes? 🚀",
@@ -12301,8 +12338,8 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       ...(destinoResolvido === "site" ? { landing_page_url: urlDestino } : {})
     };
 
-    if (video_id) {
-      criativo.video_id = video_id;
+    if (formatoCriativo === "video") {
+      criativo.video_id = videoId;
     } else {
       criativo.image_ids = imagens;
     }
@@ -12340,14 +12377,15 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       form_id: destinoResolvido === "lead_ads" ? String(form_id) : null,
       identity_id: identidadeId,
       identity_type: identidadeTipo,
+      formato_criativo: formatoCriativo,
       image_ids: imagens,
-      video_id: video_id || null,
+      video_id: videoId || null,
       criativo: {
         ad_id: String(adId),
-        tipo: video_id ? "video" : imagens.length > 1 ? "carrossel" : "imagem",
+        tipo: formatoCriativo,
         titulo: tituloAnuncio,
         image_ids: imagens,
-        video_id: video_id || null
+        video_id: videoId || null
       }
     };
 
