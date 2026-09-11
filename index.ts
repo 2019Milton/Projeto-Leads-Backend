@@ -8043,6 +8043,153 @@ app.get("/google/formularios", authMiddleware, async (c) => {
   }
 });
 
+function operacaoValidacaoLeadFormGoogle() {
+  return {
+    create: {
+      name: `Validacao Lead Form Plataforma de Leads - ${Date.now()}`,
+      finalUrls: ["https://example.com/"],
+      leadFormAsset: {
+        businessName: "Plataforma de Leads",
+        callToActionType: "GET_INFO",
+        callToActionDescription: "Receba mais informações",
+        headline: "Receba mais informações",
+        description: "Preencha seus dados para receber atendimento.",
+        privacyPolicyUrl: "https://example.com/privacy",
+        postSubmitHeadline: "Obrigado!",
+        postSubmitDescription: "Recebemos seus dados e entraremos em contato.",
+        postSubmitCallToActionType: "VISIT_SITE",
+        fields: [
+          { inputType: "FULL_NAME" },
+          { inputType: "PHONE_NUMBER" },
+          { inputType: "EMAIL" },
+        ],
+      },
+    },
+  };
+}
+
+// Faz a validação oficial do Google Ads sem criar nenhum recurso. A API não
+// expõe um campo único de "conta qualificada" nem o aceite dos termos como
+// atributos consultáveis; validateOnly é a forma segura de receber os mesmos
+// erros de elegibilidade e acordo que seriam devolvidos na criação real.
+app.get("/google/lead-form-elegibilidade", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const usuarioId = resolverUsuarioIdOperacao(user, c.req.query("usuario_id"));
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) {
+      return c.json({
+        status: "erro",
+        termos: "indeterminado",
+        elegibilidade: "indeterminada",
+        pode_criar: false,
+        mensagem: conexao.erro,
+      }, 400);
+    }
+
+    let totalFormularios: number | null = null;
+    try {
+      const existentes = await googleAdsQuery(
+        conexao.customerId,
+        conexao.accessToken,
+        `SELECT asset.resource_name FROM asset WHERE asset.type = 'LEAD_FORM'`,
+        conexao.loginCustomerId
+      );
+      totalFormularios = Array.isArray(existentes) ? existentes.length : 0;
+    } catch (err: any) {
+      console.warn("AVISO GOOGLE LEAD FORM PREFLIGHT: não foi possível contar formulários:", err?.message);
+    }
+
+    try {
+      await googleAdsMutate(
+        conexao.customerId,
+        conexao.accessToken,
+        "assets",
+        [operacaoValidacaoLeadFormGoogle()],
+        conexao.loginCustomerId,
+        { validateOnly: true }
+      );
+
+      return c.json({
+        status: "aprovado",
+        termos: "aceitos",
+        elegibilidade: "pre_aprovada",
+        pode_criar: true,
+        total_formularios: totalFormularios,
+        possui_formulario_existente: Number(totalFormularios || 0) > 0,
+        mensagem: Number(totalFormularios || 0) > 0
+          ? `Pré-verificação aprovada. Termos aceitos e ${totalFormularios} formulário(s) encontrado(s) na conta.`
+          : "Pré-verificação aprovada. O Google aceitou a validação de um novo formulário sem criar nenhum recurso.",
+        observacao: "A veiculação ainda depende da análise de políticas e da configuração final da campanha.",
+      });
+    } catch (err: any) {
+      const codigos = googleAdsCodigosErro(err);
+      const termosPendentes = codigos.includes("LEAD_FORM_MISSING_AGREEMENT");
+      const contaNaoElegivel = codigos.some(codigo =>
+        codigo.includes("NOT_ELIGIBLE") ||
+        codigo.includes("NOT_ALLOWLISTED") ||
+        codigo === "CUSTOMER_NOT_VERIFIED"
+      );
+      const termosConhecidos = termosPendentes
+        ? "pendentes"
+        : Number(totalFormularios || 0) > 0
+        ? "aceitos"
+        : "indeterminado";
+
+      if (termosPendentes) {
+        return c.json({
+          status: "termos_pendentes",
+          termos: termosConhecidos,
+          elegibilidade: "indeterminada",
+          pode_criar: false,
+          total_formularios: totalFormularios,
+          possui_formulario_existente: Number(totalFormularios || 0) > 0,
+          codigos,
+          mensagem: "Os Termos de Serviço de Lead Forms ainda precisam ser aceitos na interface do Google Ads.",
+        });
+      }
+
+      if (contaNaoElegivel) {
+        return c.json({
+          status: "nao_elegivel",
+          termos: termosConhecidos,
+          elegibilidade: "nao_elegivel",
+          pode_criar: false,
+          total_formularios: totalFormularios,
+          possui_formulario_existente: Number(totalFormularios || 0) > 0,
+          codigos,
+          mensagem: mensagemErroLeadFormGoogle(err),
+        });
+      }
+
+      const detalhe = googleAdsPrimeiraMensagemDetalhada(err);
+      return c.json({
+        status: "inconclusivo",
+        termos: termosConhecidos,
+        elegibilidade: "indeterminada",
+        pode_criar: false,
+        total_formularios: totalFormularios,
+        possui_formulario_existente: Number(totalFormularios || 0) > 0,
+        codigos,
+        mensagem: detalhe
+          ? `O Google não concluiu a pré-verificação: ${detalhe}`
+          : "Não foi possível confirmar a elegibilidade desta conta agora. A publicação fará uma nova validação.",
+      });
+    }
+  } catch (err: any) {
+    console.error("ERRO /google/lead-form-elegibilidade:", err);
+    return c.json({
+      status: "erro",
+      termos: "indeterminado",
+      elegibilidade: "indeterminada",
+      pode_criar: false,
+      mensagem: err?.message || "Não foi possível verificar o formulário de leads no Google Ads.",
+    }, 500);
+  }
+});
+
 // Cria um Lead Form asset novo (equivalente ao /meta/formulario). O Google exige
 // uma política de privacidade real do anunciante e uma URL final válida; nenhum
 // desses endereços pode ser inventado ou substituído silenciosamente.
