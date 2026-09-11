@@ -4625,11 +4625,6 @@ async function listarContasAnuncios(token: string) {
     `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account,spend_cap,amount_spent,business{id,name}&access_token=${token}`
   ).then(r => r.json());
 
-  console.log(
-    "META AD ACCOUNTS:",
-    JSON.stringify(adAccounts, null, 2)
-  );
-
   if (
     adAccounts.error
   ) {
@@ -19655,11 +19650,6 @@ app.post("/webhook/meta", async (c) => {
               `https://graph.facebook.com/v19.0/${leadgen_id}?access_token=${token}`
             ).then(r => r.json());
 
-            console.log(
-              "LEAD DATA:",
-              JSON.stringify(leadData, null, 2)
-            );
-
             // 🔥 CAMPOS
             let nome = null;
             let email = null;
@@ -23625,14 +23615,16 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         ).catch(() => {});
       }
 
-      console.log(
-        "ERRO PAGAMENTO CAMPANHA:",
-        campanha.nome,
-        "status:", campanha.status,
-        "campanhaAtiva:", campanhaAtiva,
-        "erroPagamentoConta:", erroPagamentoConta,
-        "mensagemErroPagamento:", mensagemErroPagamento
-      );
+      if (erroPagamentoConta || mensagemErroPagamento) {
+        console.error(
+          "ERRO PAGAMENTO CAMPANHA:",
+          campanha.nome,
+          "status:", campanha.status,
+          "campanhaAtiva:", campanhaAtiva,
+          "erroPagamentoConta:", erroPagamentoConta,
+          "mensagemErroPagamento:", mensagemErroPagamento
+        );
+      }
 
       const configuracoesCampanha = {
         ...(campanha.configuracoes_avancadas || {}),
@@ -24912,11 +24904,6 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
     const campanhasMeta = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?fields=id,name,status,effective_status,objective&limit=500&access_token=${token}`
     ).then(r => r.json());
-
-    console.log(
-      "META CAMPANHAS:",
-      JSON.stringify(campanhasMeta, null, 2)
-    );
 
     console.log("TOTAL META:", campanhasMeta.data?.length);
 
