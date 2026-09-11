@@ -8276,6 +8276,204 @@ app.post("/google/upload-imagem", authMiddleware, async (c) => {
   }
 });
 
+const TIPOS_VIDEO_GOOGLE = new Set([
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+]);
+
+// O Google Ads v24 recebe o arquivo pelo YouTubeVideoUploadService. Quando o
+// channel_id é omitido, o próprio Google usa um canal gerenciado e publica o
+// vídeo como não listado; o usuário não precisa manter um canal do YouTube.
+app.post("/google/upload-video", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.formData();
+    const videoEnviado = body.get("video") as File | null;
+    const videoUrl = textoOpcional(body.get("video_url"));
+    const usuarioId = resolverUsuarioIdOperacao(user, body.get("usuario_id"));
+    const titulo = truncarSemCortarPalavra(
+      textoOpcional(body.get("titulo")) || `Vídeo do anúncio ${Date.now()}`,
+      100
+    );
+
+    if (!usuarioId) return negarAcessoConta(c);
+    if (!videoEnviado && !videoUrl) return c.json({ error: "Vídeo não enviado" }, 400);
+
+    let arquivo = videoEnviado;
+    if (!arquivo && videoUrl) {
+      const baixado = await baixarVideoDeUrl(videoUrl);
+      if ("erro" in baixado) return c.json({ error: baixado.erro }, 502);
+      arquivo = baixado.arquivo;
+    }
+    if (!arquivo) return c.json({ error: "Vídeo não enviado" }, 400);
+    if (arquivo.size > VIDEO_REAPROVEITADO_MAX_BYTES) {
+      return c.json({ error: "O vídeo pode ter no máximo 200 MB" }, 400);
+    }
+    const extensaoValida = /\.(mp4|mov|webm)$/i.test(arquivo.name || "");
+    if (!TIPOS_VIDEO_GOOGLE.has(arquivo.type) && !extensaoValida) {
+      return c.json({ error: "Use um vídeo em MP4, MOV ou WebM" }, 400);
+    }
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const bytes = await arquivo.arrayBuffer();
+    const inicioRes = await fetch(
+      `https://googleads.googleapis.com/resumable/upload/${GOOGLE_ADS_API_VERSION}/customers/${conexao.customerId}/youTubeVideoUploads:create`,
+      {
+        method: "POST",
+        headers: {
+          ...googleAdsHeaders(conexao.accessToken, conexao.loginCustomerId),
+          "X-Goog-Upload-Protocol": "resumable",
+          "X-Goog-Upload-Command": "start",
+          "X-Goog-Upload-Header-Content-Length": String(bytes.byteLength),
+          "X-Goog-Upload-Header-Content-Type": arquivo.type || "application/octet-stream",
+        },
+        body: JSON.stringify({
+          customer_id: conexao.customerId,
+          you_tube_video_upload: {
+            video_title: titulo,
+            video_description: "Vídeo enviado pela Plataforma de Leads para uso em anúncio Google Ads.",
+            video_privacy: "UNLISTED",
+          },
+        }),
+      }
+    );
+
+    if (!inicioRes.ok) {
+      const erro = await inicioRes.json().catch(() => ({})) as any;
+      console.error("ERRO GOOGLE VIDEO INICIAR:", JSON.stringify(erro));
+      return c.json({
+        error: erro?.error?.message || "O Google não autorizou o início do upload do vídeo"
+      }, 502);
+    }
+
+    const uploadUrl = inicioRes.headers.get("x-goog-upload-url");
+    if (!uploadUrl) {
+      return c.json({ error: "O Google não retornou a sessão de upload do vídeo" }, 502);
+    }
+
+    const finalizarRes = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${conexao.accessToken}`,
+        "Content-Type": arquivo.type || "application/octet-stream",
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Command": "upload, finalize",
+      },
+      body: Buffer.from(bytes),
+    });
+    const finalizado = await finalizarRes.json().catch(() => ({})) as any;
+    if (!finalizarRes.ok || !finalizado?.resourceName) {
+      console.error("ERRO GOOGLE VIDEO FINALIZAR:", JSON.stringify(finalizado));
+      return c.json({
+        error: finalizado?.error?.message || "O Google não conseguiu finalizar o upload do vídeo"
+      }, 502);
+    }
+
+    return c.json({
+      upload_resource_name: finalizado.resourceName,
+      state: "UPLOADED",
+    });
+  } catch (err: any) {
+    console.error("ERRO /google/upload-video:", err);
+    return c.json({ error: err?.message || "Erro ao enviar vídeo para o Google Ads" }, 500);
+  }
+});
+
+// Consulta o processamento iniciado acima e só cria o YoutubeVideoAsset quando
+// o Google informa PROCESSED. O asset é reaproveitado se o mesmo vídeo já tiver
+// sido convertido antes, deixando a consulta idempotente para novas tentativas.
+app.post("/google/video-status", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const { usuario_id, upload_resource_name } = await c.req.json();
+    const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await resolverConexaoGoogleAds(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const uploadResourceName = textoOpcional(upload_resource_name);
+    const recursoPermitido = new RegExp(
+      `^customers/${conexao.customerId}/youTubeVideoUploads/[0-9]+$`
+    );
+    if (!recursoPermitido.test(uploadResourceName)) {
+      return c.json({ error: "Upload de vídeo inválido para a conta Google Ads selecionada" }, 400);
+    }
+
+    const resultados = await googleAdsQuery(
+      conexao.customerId,
+      conexao.accessToken,
+      `SELECT you_tube_video_upload.resource_name, you_tube_video_upload.video_id, you_tube_video_upload.state
+       FROM you_tube_video_upload
+       WHERE you_tube_video_upload.resource_name = '${uploadResourceName}'`,
+      conexao.loginCustomerId
+    );
+    const upload = resultados[0]?.youTubeVideoUpload;
+    if (!upload) return c.json({ error: "Upload de vídeo não localizado no Google Ads" }, 404);
+
+    const estado = String(upload.state || "UNKNOWN").toUpperCase();
+    if (["FAILED", "REJECTED", "UNAVAILABLE"].includes(estado)) {
+      return c.json({
+        error: `O Google não aprovou o processamento do vídeo (status: ${estado}). Revise o arquivo e tente novamente.`
+      }, 400);
+    }
+    if (estado !== "PROCESSED" || !upload.videoId) {
+      return c.json({ pronto: false, state: estado }, 202);
+    }
+
+    const videoId = String(upload.videoId);
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+      return c.json({ error: "O Google processou o vídeo, mas retornou um identificador inválido" }, 502);
+    }
+    const existentes = await googleAdsQuery(
+      conexao.customerId,
+      conexao.accessToken,
+      `SELECT asset.resource_name
+       FROM asset
+       WHERE asset.type = 'YOUTUBE_VIDEO'
+         AND asset.youtube_video_asset.youtube_video_id = '${videoId}'
+       LIMIT 1`,
+      conexao.loginCustomerId
+    );
+    let assetResourceName = existentes[0]?.asset?.resourceName || "";
+
+    if (!assetResourceName) {
+      const assets = await googleAdsMutate(
+        conexao.customerId,
+        conexao.accessToken,
+        "assets",
+        [{
+          create: {
+            name: `Vídeo Display ${Date.now()}`,
+            type: "YOUTUBE_VIDEO",
+            youtubeVideoAsset: { youtubeVideoId: videoId },
+          },
+        }],
+        conexao.loginCustomerId
+      );
+      assetResourceName = assets[0]?.resourceName || "";
+    }
+
+    if (!assetResourceName) {
+      return c.json({ error: "O vídeo foi processado, mas o asset não pôde ser criado no Google Ads" }, 502);
+    }
+
+    return c.json({
+      pronto: true,
+      state: estado,
+      resource_name: assetResourceName,
+      video_id: videoId,
+      upload_resource_name: uploadResourceName,
+    });
+  } catch (err: any) {
+    console.error("ERRO /google/video-status:", err);
+    return c.json({ error: err?.message || "Erro ao verificar vídeo no Google Ads" }, 500);
+  }
+});
+
 async function salvarEstruturaNichoCampanhaGoogle(
   campanhaId: number,
   nichoSlug: string,
@@ -8429,7 +8627,9 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       titulos, descricoes, nome_anunciante, url_destino,
       daily_budget, configuracoes_avancadas,
       tipo_campanha, titulo_longo, destino, mensagem_whatsapp,
-      imagem_paisagem_asset, imagem_quadrada_asset
+      imagem_paisagem_asset, imagem_quadrada_asset,
+      imagens_paisagem_assets, imagens_quadradas_assets,
+      youtube_video_asset, youtube_video_id, youtube_upload_resource_name
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -8478,11 +8678,21 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const nomeAnunciante = textoOpcional(nome_anunciante);
     const url = urlOpcional(url_destino, "");
     const tituloLongo = textoOpcional(titulo_longo);
-    const imagemPaisagem = textoOpcional(imagem_paisagem_asset);
-    const imagemQuadrada = textoOpcional(imagem_quadrada_asset);
+    const listaAssets = (lista: unknown, singular: unknown) => [
+      ...(Array.isArray(lista) ? lista : []),
+      singular,
+    ].map(textoOpcional).filter(Boolean).filter((item, indice, todos) => todos.indexOf(item) === indice);
+    const imagensPaisagem = listaAssets(imagens_paisagem_assets, imagem_paisagem_asset).slice(0, 10);
+    const imagensQuadradas = listaAssets(imagens_quadradas_assets, imagem_quadrada_asset).slice(0, 10);
+    const youtubeVideoAsset = textoOpcional(youtube_video_asset);
+    const youtubeVideoId = textoOpcional(youtube_video_id);
+    const youtubeUploadResourceName = textoOpcional(youtube_upload_resource_name);
 
     if (!url) {
       return c.json({ error: "Informe uma URL de destino completa e válida para o anúncio Google Ads." }, 400);
+    }
+    if (!nomeAnunciante) {
+      return c.json({ error: "Informe o nome do anunciante para o anúncio Google Ads." }, 400);
     }
     if (destinoGoogle === "whatsapp" && listaTitulos.some(titulo => /whats[\s-]*app/i.test(titulo))) {
       return c.json({
@@ -8502,9 +8712,15 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       if (listaTitulos.length < 1) return c.json({ error: "Informe ao menos 1 título para o anúncio de Display" }, 400);
       if (!tituloLongo) return c.json({ error: "Informe o título longo para o anúncio de Display" }, 400);
       if (listaDescricoes.length < 1) return c.json({ error: "Informe ao menos 1 descrição para o anúncio de Display" }, 400);
-      if (!imagemPaisagem || !imagemQuadrada) {
+      if (!imagensPaisagem.length || !imagensQuadradas.length) {
         return c.json({ error: "Envie a imagem do anúncio de Display antes de publicar" }, 400);
       }
+      if (imagensPaisagem.length + imagensQuadradas.length > 15) {
+        return c.json({ error: "O anúncio de Display aceita no máximo 15 recursos de imagem combinados" }, 400);
+      }
+    }
+    if (tipoCampanha === "search" && youtubeVideoAsset) {
+      return c.json({ error: "Campanhas de Pesquisa não aceitam vídeo como criativo. Use Display para adicionar o vídeo." }, 400);
     }
 
     const conexao = await resolverConexaoGoogleAds(usuarioId);
@@ -8519,6 +8735,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const campaignResourceName = `customers/${conexao.customerId}/campaigns/${campaign_id}`;
     const adGroupResourceName = `customers/${conexao.customerId}/adGroups/${adgroup_id}`;
     let businessMessageAssetResourceName: string | null = null;
+    const avisosPublicacao: string[] = [];
 
     if (destinoGoogle === "whatsapp") {
       const numeroWhatsapp = await resolverNumeroWhatsappGoogle(usuarioId);
@@ -8554,12 +8771,13 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       : {
           finalUrls: [url],
           responsiveDisplayAd: {
-            marketingImages: [{ asset: imagemPaisagem }],
-            squareMarketingImages: [{ asset: imagemQuadrada }],
+            marketingImages: imagensPaisagem.map(asset => ({ asset })),
+            squareMarketingImages: imagensQuadradas.map(asset => ({ asset })),
             headlines: listaTitulos.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
             longHeadline: { text: truncarSemCortarPalavra(tituloLongo, 90) },
             descriptions: listaDescricoes.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
-            ...(nomeAnunciante ? { businessName: truncarSemCortarPalavra(nomeAnunciante, 25) } : {}),
+            businessName: truncarSemCortarPalavra(nomeAnunciante, 25),
+            ...(youtubeVideoAsset ? { youtubeVideos: [{ asset: youtubeVideoAsset }] } : {}),
           },
         };
 
@@ -8575,6 +8793,45 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const adId = adResourceName.includes("~")
       ? adResourceName.split("~")[1]
       : adResourceName.split("/").pop();
+
+    if (tipoCampanha === "search" && (imagensPaisagem.length || imagensQuadradas.length)) {
+      const operacoesImagemPesquisa = [
+        ...imagensPaisagem.map(asset => ({
+          create: {
+            adGroup: adGroupResourceName,
+            asset,
+            fieldType: "MARKETING_IMAGE",
+            status: "ENABLED",
+          },
+        })),
+        ...imagensQuadradas.map(asset => ({
+          create: {
+            adGroup: adGroupResourceName,
+            asset,
+            fieldType: "SQUARE_MARKETING_IMAGE",
+            status: "ENABLED",
+          },
+        })),
+      ];
+
+      try {
+        await googleAdsMutate(
+          conexao.customerId,
+          conexao.accessToken,
+          "adGroupAssets",
+          operacoesImagemPesquisa,
+          conexao.loginCustomerId
+        );
+      } catch (errImagemPesquisa: any) {
+        console.warn("AVISO /google/anuncio (imagens Pesquisa):", errImagemPesquisa);
+        const detalhe = googleAdsPrimeiraMensagemDetalhada(errImagemPesquisa);
+        avisosPublicacao.push(
+          detalhe
+            ? `A campanha de Pesquisa foi criada, mas o Google não liberou as imagens complementares: ${detalhe}`
+            : "A campanha de Pesquisa foi criada, mas esta conta ainda não está elegível para exibir imagens complementares."
+        );
+      }
+    }
 
     if (tipoCampanha === "search") {
       // Campanha de Pesquisa exige palavras-chave pra veicular (sem elas o anuncio nunca
@@ -8661,6 +8918,16 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       nome_anunciante: nomeAnunciante,
       url_destino: url,
       destino: destinoGoogle,
+      imagem_paisagem_asset: imagensPaisagem[0] || null,
+      imagem_quadrada_asset: imagensQuadradas[0] || null,
+      imagens_paisagem_assets: imagensPaisagem,
+      imagens_quadradas_assets: imagensQuadradas,
+      ...(youtubeVideoAsset ? {
+        youtube_video_asset: youtubeVideoAsset,
+        youtube_video_id: youtubeVideoId,
+        youtube_upload_resource_name: youtubeUploadResourceName,
+        video_id: youtubeVideoId,
+      } : {}),
       ...(destinoGoogle === "lead_ads" ? {
         lead_form_goal: metaFormularioOtimizada ? "BIDDABLE" : "AGUARDANDO_APROVACAO_GOOGLE",
       } : {}),
@@ -8707,6 +8974,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     return c.json({
       id: String(adId),
       ad_id: String(adId),
+      ...(avisosPublicacao.length ? { aviso: avisosPublicacao.join(" ") } : {}),
       ...(destinoGoogle === "lead_ads" ? { lead_form_goal_configured: metaFormularioOtimizada } : {}),
       ...(businessMessageAssetResourceName ? { business_message_asset: businessMessageAssetResourceName } : {})
     });
