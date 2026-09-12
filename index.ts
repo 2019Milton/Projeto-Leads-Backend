@@ -11733,6 +11733,25 @@ app.post("/tiktok/restaurar-campanha", authMiddleware, async (c) => {
   }, 409);
 });
 
+// A biblioteca de criativos do TikTok exige um file_name único por anunciante.
+// O mesmo arquivo pode ser reaproveitado em outra publicação, então nunca use o
+// nome original diretamente no upload: preserve-o apenas como metadado local e
+// acrescente um sufixo imprevisível ao nome técnico enviado ao TikTok.
+function gerarNomeUnicoMaterialTikTok(nomeOriginal: unknown, fallback: string) {
+  const nomeLimpo = String(nomeOriginal || fallback || "material")
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-")
+    .trim() || "material";
+  const ultimoPonto = nomeLimpo.lastIndexOf(".");
+  const extensaoCandidata = ultimoPonto > 0 ? nomeLimpo.slice(ultimoPonto) : "";
+  const extensao = /^\.[a-z0-9]{1,10}$/i.test(extensaoCandidata)
+    ? extensaoCandidata
+    : "";
+  const base = (extensao ? nomeLimpo.slice(0, -extensao.length) : nomeLimpo) || "material";
+  const sufixo = `-${Date.now()}-${randomBytes(4).toString("hex")}`;
+  const tamanhoBase = Math.max(1, 100 - sufixo.length - extensao.length);
+  return `${base.slice(0, tamanhoBase)}${sufixo}${extensao}`;
+}
+
 // Upload de imagem de criativo para a TikTok Ads (equivalente ao /meta/upload-imagem)
 app.post("/tiktok/upload-imagem", authMiddleware, async (c) => {
   try {
@@ -11775,12 +11794,13 @@ app.post("/tiktok/upload-imagem", authMiddleware, async (c) => {
     // algumas contas aceitam o multipart e outras recusam o arquivo na validação.
     const bytesImagem = new Uint8Array(await arquivoImagem.arrayBuffer());
     const assinaturaImagem = createHash("md5").update(bytesImagem).digest("hex");
+    const nomeMaterialTikTok = gerarNomeUnicoMaterialTikTok(nomeArquivoImagem, "imagem.jpg");
     const tiktokForm = new FormData();
     tiktokForm.append("advertiser_id", conexao.advertiserId);
     tiktokForm.append("upload_type", "UPLOAD_BY_FILE");
-    tiktokForm.append("file_name", nomeArquivoImagem.slice(0, 100));
+    tiktokForm.append("file_name", nomeMaterialTikTok);
     tiktokForm.append("image_signature", assinaturaImagem);
-    tiktokForm.append("image_file", arquivoImagem, nomeArquivoImagem);
+    tiktokForm.append("image_file", arquivoImagem, nomeMaterialTikTok);
 
     const response = await fetch(`${TIKTOK_API}/file/image/ad/upload/`, {
       method: "POST",
@@ -11831,6 +11851,7 @@ app.post("/tiktok/upload-video", authMiddleware, async (c) => {
       return c.json({ error: "Vídeo não enviado" }, 400);
     }
     const nomeInformado = String(body.get("nome") || video.name || "video-campanha.mp4");
+    const nomeMaterialTikTok = gerarNomeUnicoMaterialTikTok(nomeInformado, "video-campanha.mp4");
 
     const conexao = await obterConexaoTikTok(usuarioId);
     if (!conexao) {
@@ -11848,8 +11869,9 @@ app.post("/tiktok/upload-video", authMiddleware, async (c) => {
     const tiktokForm = new FormData();
     tiktokForm.append("advertiser_id", conexao.advertiserId);
     tiktokForm.append("upload_type", "UPLOAD_BY_FILE");
+    tiktokForm.append("file_name", nomeMaterialTikTok);
     tiktokForm.append("video_signature", signature);
-    tiktokForm.append("video_file", video, nomeInformado);
+    tiktokForm.append("video_file", video, nomeMaterialTikTok);
 
     const response = await fetch(`${TIKTOK_API}/file/video/ad/upload/`, {
       method: "POST",
