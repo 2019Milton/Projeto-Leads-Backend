@@ -25902,6 +25902,34 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
       const story = creativeMeta?.object_story_spec || {};
       const linkData = story.link_data || {};
       const videoData = story.video_data || {};
+      const videoIdMeta =
+        textoOpcional(videoData.video_id) ||
+        textoOpcional(creativeMeta?.asset_feed_spec?.videos?.[0]?.video_id) ||
+        textoOpcional(configuracoes.video_id) ||
+        textoOpcional(configuracoes.videoId);
+      let videoMeta: any = null;
+
+      if (videoIdMeta) {
+        videoMeta = await consultarObjetoMeta(
+          videoIdMeta,
+          "id,title,source,picture,thumbnails"
+        ).catch(() =>
+          consultarObjetoMeta(
+            videoIdMeta,
+            "id,title,picture,thumbnails"
+          ).catch(() => null)
+        );
+      }
+
+      const thumbnailsVideo = Array.isArray(videoMeta?.thumbnails?.data)
+        ? videoMeta.thumbnails.data
+        : [];
+      const videoThumbnailUrl = textoOpcional(
+        thumbnailsVideo.find((item: any) => item?.is_preferred)?.uri ||
+        thumbnailsVideo[0]?.uri ||
+        videoMeta?.picture
+      );
+      const videoSourceUrl = textoOpcional(videoMeta?.source);
       const anexos = Array.isArray(linkData.child_attachments)
         ? linkData.child_attachments
         : [];
@@ -25932,6 +25960,13 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
       definir("creative_id", creativeId);
       definir("adset_id", adsetId);
       definir("ad_id", adId);
+      definir("video_id", videoIdMeta);
+      definir("videoId", videoIdMeta);
+      definir("video_url", videoSourceUrl);
+      definir("videoUrl", videoSourceUrl);
+      definir("video_thumbnail_url", videoThumbnailUrl);
+      definir("videoThumbnailUrl", videoThumbnailUrl);
+      definir("video_nome", videoMeta?.title);
       definir("objetivo", campanhaMeta?.objective);
       definir("categoria_especial", campanhaMeta?.special_ad_categories?.[0]);
 
@@ -26134,7 +26169,10 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
         creative_id: creativeId || configuracoes.criativo?.creative_id || null,
         image_hash: hashes[0] || configuracoes.criativo?.image_hash || null,
         image_hashes: hashes,
-        tipo: videoData.video_id
+        video_id: videoIdMeta || configuracoes.criativo?.video_id || null,
+        video_url: videoSourceUrl || configuracoes.criativo?.video_url || null,
+        video_thumbnail_url: videoThumbnailUrl || configuracoes.criativo?.video_thumbnail_url || null,
+        tipo: videoIdMeta
           ? "video"
           : hashes.length > 1
           ? "carrossel"
@@ -26220,8 +26258,13 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       nome,
       imageHash: imageHashNovo,
       imageHashes: imageHashesNovo,
-      imageUrls: imageUrlsNovo
+      imageUrls: imageUrlsNovo,
+      video_removido
     } = await c.req.json();
+
+    const videoRemovidoSolicitado = Boolean(
+      video_removido || configuracoes_avancadas?.video_removido
+    );
 
     // Um mesmo hash/URL de imagem é lido em varios formatos espalhados pelo
     // codigo (camelCase, snake_case, e uma copia dentro de `criativo`) — sem
@@ -26680,11 +26723,12 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       // mesmo quando o hash em si estava certo.
       sincronizarCamposImagem(avancadas, imageHashes, imageUrls);
 
-      const videoId =
-        textoOpcional(avancadas.video_id) ||
-        textoOpcional(avancadas.videoId) ||
-        textoOpcional(cfgBanco.video_id) ||
-        textoOpcional(cfgBanco.videoId) || "";
+      const videoId = videoRemovidoSolicitado
+        ? ""
+        : textoOpcional(avancadas.video_id) ||
+          textoOpcional(avancadas.videoId) ||
+          textoOpcional(cfgBanco.video_id) ||
+          textoOpcional(cfgBanco.videoId) || "";
 
       if (
         adId &&
@@ -26837,10 +26881,55 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           criativoAtualizadoComErro = novoCreativo?.error || { message: "Erro desconhecido ao criar criativo" };
           console.warn("EDITAR CAMPANHA: criativo não atualizado na Meta:", novoCreativo?.error);
         }
+      } else if (videoRemovidoSolicitado) {
+        criativoAtualizadoComErro = {
+          message: "O anúncio publicado não possui todos os identificadores necessários para remover o vídeo com segurança."
+        };
       }
     } catch (errCreativo: any) {
       criativoAtualizadoComErro = { message: errCreativo?.message || String(errCreativo) };
       console.warn("EDITAR CAMPANHA: erro ao atualizar criativo (ignorado):", errCreativo);
+    }
+
+    if (videoRemovidoSolicitado && criativoAtualizadoComErro) {
+      avancadas.video_id = configuracoesBanco.video_id || configuracoesBanco.videoId || null;
+      avancadas.videoId = configuracoesBanco.videoId || configuracoesBanco.video_id || null;
+      avancadas.video_url = configuracoesBanco.video_url || configuracoesBanco.videoUrl || null;
+      avancadas.videoUrl = configuracoesBanco.videoUrl || configuracoesBanco.video_url || null;
+      avancadas.video_nome = configuracoesBanco.video_nome || configuracoesBanco.video_name || null;
+      avancadas.video_tipo = configuracoesBanco.video_tipo || null;
+      avancadas.video_tamanho = configuracoesBanco.video_tamanho || null;
+      avancadas.video_thumbnail_url = configuracoesBanco.video_thumbnail_url || configuracoesBanco.videoThumbnailUrl || null;
+      avancadas.videoThumbnailUrl = configuracoesBanco.videoThumbnailUrl || configuracoesBanco.video_thumbnail_url || null;
+      avancadas.video_removido = false;
+      if (configuracoesBanco.criativo?.video_id || avancadas.criativo) {
+        avancadas.criativo = {
+          ...(avancadas.criativo || {}),
+          video_id: configuracoesBanco.criativo?.video_id || avancadas.video_id,
+          video_url: configuracoesBanco.criativo?.video_url || avancadas.video_url,
+          video_thumbnail_url: configuracoesBanco.criativo?.video_thumbnail_url || avancadas.video_thumbnail_url,
+          tipo: configuracoesBanco.criativo?.tipo || "video"
+        };
+      }
+    } else if (videoRemovidoSolicitado) {
+      avancadas.video_id = null;
+      avancadas.videoId = null;
+      avancadas.video_url = null;
+      avancadas.videoUrl = null;
+      avancadas.video_nome = null;
+      avancadas.video_tipo = null;
+      avancadas.video_tamanho = null;
+      avancadas.video_thumbnail_url = null;
+      avancadas.videoThumbnailUrl = null;
+      avancadas.video_removido = false;
+      if (avancadas.criativo) {
+        avancadas.criativo.video_id = null;
+        avancadas.criativo.video_url = null;
+        avancadas.criativo.video_thumbnail_url = null;
+        avancadas.criativo.tipo = Array.isArray(avancadas.imageHashes) && avancadas.imageHashes.length > 1
+          ? "carrossel"
+          : "imagem";
+      }
     }
 
     await client.query(
