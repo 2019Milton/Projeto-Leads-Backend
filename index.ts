@@ -12008,7 +12008,7 @@ app.post("/tiktok/direcionamento/interesses", authMiddleware, async (c) => {
 app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const { usuario_id, busca } = await c.req.json();
+    const { usuario_id, busca, pais, destino } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) {
@@ -12028,11 +12028,44 @@ app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
       return c.json({ error: "Selecione a conta de anúncios TikTok antes de buscar localizações" }, 400);
     }
 
-    // ASSUMPTION: /region/ retorna a árvore inteira de localidades disponíveis pro
-    // advertiser (sem busca por termo nativa), então o filtro por substring é feito
-    // aqui no backend. Confirmar o shape exato (campos de nível/hierarquia) na Fase 2B.
-    const params = new URLSearchParams({ advertiser_id: conexao.advertiserId });
-    const resposta = await tiktokFetch(`/region/?${params}`, conexao.token);
+    const paisNormalizado = textoOpcional(pais).toUpperCase();
+    const codigoPais = /^[A-Z]{2}$/.test(paisNormalizado) ? paisNormalizado : "BR";
+    const destinoResolvido = resolverDestinoCampanhaTikTok(destino);
+    const promotionType = destinoResolvido === "whatsapp"
+      ? "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE"
+      : "LEAD_GENERATION";
+
+    // A busca incremental usa o endpoint oficial de pesquisa geográfica. Além de
+    // evitar baixar a árvore mundial a cada tecla, ele entende nomes digitados
+    // parcialmente e devolve somente IDs válidos para o objetivo/placement atual.
+    let resposta = await tiktokFetch("/tool/targeting/search/", conexao.token, {
+      method: "POST",
+      body: {
+        advertiser_id: conexao.advertiserId,
+        placements: ["PLACEMENT_TIKTOK"],
+        objective_type: "LEAD_GENERATION",
+        promotion_type: promotionType,
+        search_type: "FUZZY_SEARCH",
+        keywords: [termo],
+        geo_types: ["COUNTRY", "PROVINCE", "CITY", "DISTRICT"],
+        region_codes: [codigoPais]
+      }
+    });
+    let usouBuscaNativa = resposta.ok;
+
+    // Compatibilidade com contas/versões que ainda não liberaram o typeahead:
+    // consulta a árvore oficial e faz o filtro local, sem voltar ao endpoint
+    // inexistente /region/ que fazia o campo sempre retornar vazio.
+    if (!resposta.ok) {
+      const params = new URLSearchParams({
+        advertiser_id: conexao.advertiserId,
+        placements: JSON.stringify(["PLACEMENT_TIKTOK"]),
+        objective_type: "LEAD_GENERATION",
+        level_range: "TO_CITY"
+      });
+      resposta = await tiktokFetch(`/tool/region/?${params}`, conexao.token);
+      usouBuscaNativa = false;
+    }
 
     if (!resposta.ok) {
       return c.json({
@@ -12041,26 +12074,78 @@ app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
       }, 400);
     }
 
-    const termoBusca = termo.toLowerCase();
-    const locais = Array.isArray(resposta.data?.data?.region_list)
-      ? resposta.data.data.region_list
-      : Array.isArray(resposta.data?.data)
-      ? resposta.data.data
-      : [];
+    const removerAcentos = (valor: unknown) => textoOpcional(valor)
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase();
+    const termoBusca = removerAcentos(termo);
+    const locaisEncontrados: any[] = [];
+    const objetosVisitados = new Set<any>();
 
-    const data = locais
-      .map((local: any) => ({
-        key: textoOpcional(local.region_code ?? local.id),
-        nome: textoOpcional(local.region_name ?? local.name),
-        tipo: textoOpcional(local.level ?? local.type),
-        pais: textoOpcional(local.country_code ?? local.pais)
-      }))
-      .filter((local: any) =>
-        local.key &&
-        local.nome &&
-        local.nome.toLowerCase().includes(termoBusca)
-      )
-      .slice(0, 10);
+    // A API já apresentou envelopes diferentes entre versões (list, results,
+    // region_list e árvores com children). O percurso abaixo lê todos eles e só
+    // aceita objetos que tenham simultaneamente ID e nome de localização.
+    const percorrerResposta = (valor: any) => {
+      if (!valor || typeof valor !== "object" || objetosVisitados.has(valor)) return;
+      objetosVisitados.add(valor);
+      if (Array.isArray(valor)) {
+        valor.forEach(percorrerResposta);
+        return;
+      }
+
+      const key = textoOpcional(
+        valor.geo_id ?? valor.location_id ?? valor.region_id ?? valor.targeting_id ?? valor.id
+      );
+      const nome = textoOpcional(
+        valor.geo_name ?? valor.location_name ?? valor.region_name ?? valor.display_name ?? valor.name
+      );
+      if (key && nome) {
+        locaisEncontrados.push({
+          key,
+          nome,
+          tipo: textoOpcional(valor.geo_type ?? valor.location_type ?? valor.level ?? valor.type),
+          pais: textoOpcional(
+            valor.country_code ?? valor.country_region_code ?? valor.parent_country_code ?? valor.pais
+          ),
+          caminho: textoOpcional(
+            valor.full_name ?? valor.path_name ?? valor.parent_name ?? valor.region_path
+          )
+        });
+      }
+
+      Object.values(valor).forEach(percorrerResposta);
+    };
+    percorrerResposta(resposta.data?.data ?? resposta.data);
+
+    const rotulosTipo: Record<string, string> = {
+      COUNTRY: "País",
+      PROVINCE: "Estado/região",
+      CITY: "Cidade",
+      DISTRICT: "Distrito",
+      DMA: "Área metropolitana",
+      ZIP_CODE: "CEP"
+    };
+    const localidadesUnicas = new Map<string, any>();
+    for (const local of locaisEncontrados) {
+      if (!usouBuscaNativa && !removerAcentos(`${local.nome} ${local.caminho}`).includes(termoBusca)) {
+        continue;
+      }
+      if (local.pais && local.pais.length === 2 && local.pais.toUpperCase() !== codigoPais) {
+        continue;
+      }
+      const tipoNormalizado = local.tipo.toUpperCase();
+      localidadesUnicas.set(local.key, {
+        key: local.key,
+        nome: local.nome,
+        tipo: tipoNormalizado,
+        pais: local.pais || codigoPais,
+        detalhe: [rotulosTipo[tipoNormalizado] || local.tipo, local.caminho]
+          .filter(Boolean)
+          .join(" · ")
+      });
+    }
+
+    const data = Array.from(localidadesUnicas.values()).slice(0, 15);
 
     return c.json({ data });
   } catch (err) {
