@@ -12035,87 +12035,51 @@ app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
       ? "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE"
       : "LEAD_GENERATION";
 
-    // A busca incremental usa o endpoint oficial de pesquisa geográfica. Além de
-    // evitar baixar a árvore mundial a cada tecla, ele entende nomes digitados
-    // parcialmente e devolve somente IDs válidos para o objetivo/placement atual.
-    let resposta = await tiktokFetch("/tool/targeting/search/", conexao.token, {
-      method: "POST",
-      body: {
-        advertiser_id: conexao.advertiserId,
-        placements: ["PLACEMENT_TIKTOK"],
-        objective_type: "LEAD_GENERATION",
-        promotion_type: promotionType,
-        search_type: "FUZZY_SEARCH",
-        keywords: [termo],
-        geo_types: ["COUNTRY", "PROVINCE", "CITY", "DISTRICT"],
-        region_codes: [codigoPais]
-      }
-    });
-    let usouBuscaNativa = resposta.ok;
-
-    // Compatibilidade com contas/versões que ainda não liberaram o typeahead:
-    // consulta a árvore oficial e faz o filtro local, sem voltar ao endpoint
-    // inexistente /region/ que fazia o campo sempre retornar vazio.
-    if (!resposta.ok) {
-      const params = new URLSearchParams({
-        advertiser_id: conexao.advertiserId,
-        placements: JSON.stringify(["PLACEMENT_TIKTOK"]),
-        objective_type: "LEAD_GENERATION",
-        level_range: "TO_CITY"
-      });
-      resposta = await tiktokFetch(`/tool/region/?${params}`, conexao.token);
-      usouBuscaNativa = false;
-    }
-
-    if (!resposta.ok) {
-      return c.json({
-        error: resposta.error || "Erro ao buscar localizações na TikTok",
-        detalhe: resposta.data
-      }, 400);
-    }
-
     const removerAcentos = (valor: unknown) => textoOpcional(valor)
       .normalize("NFD")
       .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase();
     const termoBusca = removerAcentos(termo);
-    const locaisEncontrados: any[] = [];
-    const objetosVisitados = new Set<any>();
-
     // A API já apresentou envelopes diferentes entre versões (list, results,
     // region_list e árvores com children). O percurso abaixo lê todos eles e só
     // aceita objetos que tenham simultaneamente ID e nome de localização.
-    const percorrerResposta = (valor: any) => {
-      if (!valor || typeof valor !== "object" || objetosVisitados.has(valor)) return;
-      objetosVisitados.add(valor);
-      if (Array.isArray(valor)) {
-        valor.forEach(percorrerResposta);
-        return;
-      }
+    const extrairLocalidades = (payload: any) => {
+      const locaisEncontrados: any[] = [];
+      const objetosVisitados = new Set<any>();
+      const percorrerResposta = (valor: any) => {
+        if (!valor || typeof valor !== "object" || objetosVisitados.has(valor)) return;
+        objetosVisitados.add(valor);
+        if (Array.isArray(valor)) {
+          valor.forEach(percorrerResposta);
+          return;
+        }
 
-      const key = textoOpcional(
-        valor.geo_id ?? valor.location_id ?? valor.region_id ?? valor.targeting_id ?? valor.id
-      );
-      const nome = textoOpcional(
-        valor.geo_name ?? valor.location_name ?? valor.region_name ?? valor.display_name ?? valor.name
-      );
-      if (key && nome) {
-        locaisEncontrados.push({
-          key,
-          nome,
-          tipo: textoOpcional(valor.geo_type ?? valor.location_type ?? valor.level ?? valor.type),
-          pais: textoOpcional(
-            valor.country_code ?? valor.country_region_code ?? valor.parent_country_code ?? valor.pais
-          ),
-          caminho: textoOpcional(
-            valor.full_name ?? valor.path_name ?? valor.parent_name ?? valor.region_path
-          )
-        });
-      }
+        const key = textoOpcional(
+          valor.geo_id ?? valor.location_id ?? valor.region_id ?? valor.targeting_id ??
+          valor.region_code ?? valor.id
+        );
+        const nome = textoOpcional(
+          valor.geo_name ?? valor.location_name ?? valor.region_name ?? valor.display_name ?? valor.name
+        );
+        if (key && nome) {
+          locaisEncontrados.push({
+            key,
+            nome,
+            tipo: textoOpcional(valor.geo_type ?? valor.location_type ?? valor.level ?? valor.type),
+            pais: textoOpcional(
+              valor.country_code ?? valor.country_region_code ?? valor.parent_country_code ?? valor.pais
+            ),
+            caminho: textoOpcional(
+              valor.full_name ?? valor.path_name ?? valor.parent_name ?? valor.region_path
+            )
+          });
+        }
 
-      Object.values(valor).forEach(percorrerResposta);
+        Object.values(valor).forEach(percorrerResposta);
+      };
+      percorrerResposta(payload);
+      return locaisEncontrados;
     };
-    percorrerResposta(resposta.data?.data ?? resposta.data);
 
     const rotulosTipo: Record<string, string> = {
       COUNTRY: "País",
@@ -12125,27 +12089,98 @@ app.post("/tiktok/direcionamento/localizacao", authMiddleware, async (c) => {
       DMA: "Área metropolitana",
       ZIP_CODE: "CEP"
     };
-    const localidadesUnicas = new Map<string, any>();
-    for (const local of locaisEncontrados) {
-      if (!usouBuscaNativa && !removerAcentos(`${local.nome} ${local.caminho}`).includes(termoBusca)) {
-        continue;
+    const formatarLocalidades = (payload: any, confiarNaRelevancia = false) => {
+      const localidadesUnicas = new Map<string, any>();
+      for (const local of extrairLocalidades(payload)) {
+        const corresponde = removerAcentos(`${local.nome} ${local.caminho}`).includes(termoBusca);
+        if (!confiarNaRelevancia && !corresponde) continue;
+        if (local.pais && local.pais.length === 2 && local.pais.toUpperCase() !== codigoPais) {
+          continue;
+        }
+        const tipoNormalizado = local.tipo.toUpperCase();
+        localidadesUnicas.set(local.key, {
+          key: local.key,
+          nome: local.nome,
+          tipo: tipoNormalizado,
+          pais: local.pais || codigoPais,
+          detalhe: [rotulosTipo[tipoNormalizado] || local.tipo, local.caminho]
+            .filter(Boolean)
+            .join(" · ")
+        });
       }
-      if (local.pais && local.pais.length === 2 && local.pais.toUpperCase() !== codigoPais) {
-        continue;
-      }
-      const tipoNormalizado = local.tipo.toUpperCase();
-      localidadesUnicas.set(local.key, {
-        key: local.key,
-        nome: local.nome,
-        tipo: tipoNormalizado,
-        pais: local.pais || codigoPais,
-        detalhe: [rotulosTipo[tipoNormalizado] || local.tipo, local.caminho]
-          .filter(Boolean)
-          .join(" · ")
-      });
+      return Array.from(localidadesUnicas.values()).slice(0, 15);
+    };
+
+    let data: any[] = [];
+    let houveRespostaValida = false;
+    let ultimoErro: string | null = null;
+    let ultimoDetalhe: any = null;
+
+    // 1) Lista de localidades liberadas especificamente para o anunciante.
+    // É o endpoint mais compatível e não depende do objetivo da campanha.
+    const paramsLista = new URLSearchParams({
+      advertiser_id: conexao.advertiserId,
+      language: "en"
+    });
+    const respostaLista = await tiktokFetch(`/search/region/?${paramsLista}`, conexao.token);
+    if (respostaLista.ok) {
+      houveRespostaValida = true;
+      data = formatarLocalidades(respostaLista.data?.data ?? respostaLista.data);
+    } else {
+      ultimoErro = respostaLista.error;
+      ultimoDetalhe = respostaLista.data;
     }
 
-    const data = Array.from(localidadesUnicas.values()).slice(0, 15);
+    // 2) Se a lista não trouxe correspondências, usa o typeahead oficial.
+    // Algumas contas devolvem code=0 e lista vazia em um dos mecanismos, por
+    // isso o fallback considera tanto erro quanto resultado vazio.
+    if (!data.length) {
+      const respostaBusca = await tiktokFetch("/tool/targeting/search/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          placements: ["PLACEMENT_TIKTOK"],
+          objective_type: "LEAD_GENERATION",
+          promotion_type: promotionType,
+          search_type: "FUZZY_SEARCH",
+          keywords: [termo],
+          geo_types: ["COUNTRY", "PROVINCE", "CITY", "DISTRICT"],
+          region_codes: [codigoPais]
+        }
+      });
+      if (respostaBusca.ok) {
+        houveRespostaValida = true;
+        data = formatarLocalidades(respostaBusca.data?.data ?? respostaBusca.data, true);
+      } else {
+        ultimoErro = respostaBusca.error;
+        ultimoDetalhe = respostaBusca.data;
+      }
+    }
+
+    // 3) Última compatibilidade: árvore por objetivo/placement.
+    if (!data.length) {
+      const paramsArvore = new URLSearchParams({
+        advertiser_id: conexao.advertiserId,
+        placements: JSON.stringify(["PLACEMENT_TIKTOK"]),
+        objective_type: "LEAD_GENERATION",
+        level_range: "TO_CITY"
+      });
+      const respostaArvore = await tiktokFetch(`/tool/region/?${paramsArvore}`, conexao.token);
+      if (respostaArvore.ok) {
+        houveRespostaValida = true;
+        data = formatarLocalidades(respostaArvore.data?.data ?? respostaArvore.data);
+      } else {
+        ultimoErro = respostaArvore.error;
+        ultimoDetalhe = respostaArvore.data;
+      }
+    }
+
+    if (!houveRespostaValida) {
+      return c.json({
+        error: ultimoErro || "Erro ao buscar localizações na TikTok",
+        detalhe: ultimoDetalhe
+      }, 400);
+    }
 
     return c.json({ data });
   } catch (err) {
