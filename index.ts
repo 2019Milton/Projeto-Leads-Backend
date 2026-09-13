@@ -23911,6 +23911,11 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         status: campanha.status,
         origem: campanha.origem,
         plataforma: campanha.plataforma || "meta",
+        // Identifica as pernas da mesma publicação multiplataforma. O frontend
+        // usa este valor para montar um único card com botões separados para
+        // Facebook, Instagram, Google e TikTok, inclusive quando uma das
+        // pernas ainda é apenas um rascunho local.
+        publicacao_grupo_id: campanha.publicacao_grupo_id || null,
         campaign_id: campanha.campaign_id,
         adset_id: campanha.adset_id,
         ad_id: campanha.ad_id,
