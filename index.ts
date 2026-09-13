@@ -7028,7 +7028,7 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       const campaignId = String(campanha.id);
 
       const existe = await client.query(
-        `SELECT id FROM campanhas
+        `SELECT id, origem FROM campanhas
          WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
            AND conta_anuncios_id = $3
          LIMIT 1`,
@@ -7036,11 +7036,17 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       );
 
       if (existe.rows.length > 0) {
+        // Campanhas nativas recebem um sufixo técnico no nome remoto para
+        // satisfazer a unicidade exigida pelo Google. A sincronização deve
+        // atualizar o status, mas preservar o nome limpo escolhido no produto.
+        const nomeSincronizado = campanhaTemOrigemNativa(existe.rows[0].origem)
+          ? null
+          : campanha.name;
         await client.query(
           `UPDATE campanhas
-           SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
+           SET nome = COALESCE($1, nome), status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
            WHERE id = $4`,
-          [campanha.name, campanha.status, String(customerId), existe.rows[0].id]
+          [nomeSincronizado, campanha.status, String(customerId), existe.rows[0].id]
         );
       } else {
         if (statusCampanhaRemotaExcluida(campanha.status)) {
@@ -7084,7 +7090,8 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       const leadId = String(dadosLead.id);
 
       const jaExiste = await client.query(
-        `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+        `SELECT id FROM leads
+         WHERE lead_id = $1 AND usuario_id = $2 AND plataforma = 'google'`,
         [leadId, usuarioId]
       );
       if (jaExiste.rows.length > 0) continue;
@@ -7184,8 +7191,8 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
 
 /* =========================
    🔴 GOOGLE ADS — PUBLICACAO
-   Pesquisa e Display com destino em Lead Form ou site; Pesquisa tambem pode
-   receber Business Message Asset nativo do WhatsApp. O numero vem da conexao
+   Pesquisa com destino em Lead Form, site ou Business Message/WhatsApp;
+   Display com destino no site. O numero vem da conexao
    do WhatsApp Bot do proprio usuario, sem ser aceito livremente no payload.
 ========================= */
 
@@ -7778,9 +7785,9 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     const mensagemWhatsapp = textoOpcional(mensagem_whatsapp);
     const formularioExistente = textoOpcional(form_id);
 
-    if (tipoCampanhaGoogle === "display" && destinoGoogle === "whatsapp") {
+    if (tipoCampanhaGoogle === "display" && destinoGoogle !== "site") {
       return c.json({
-        error: "O botão de WhatsApp está disponível somente em campanhas de Pesquisa. Em Display, escolha endereço do site ou formulário de leads."
+        error: "Campanhas de Display usam endereço do site. Para formulário de leads ou WhatsApp, crie uma campanha de Pesquisa."
       }, 400);
     }
     if (!urlDestino) {
@@ -7883,9 +7890,9 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       {
         create: {
           name: nomeCampanhaGoogle,
-          // Pesquisa oferece site, Lead Form e WhatsApp. Display oferece site e
-          // Lead Form (sujeito aos requisitos de elegibilidade da conta); o recurso
-          // nativo de WhatsApp é exclusivo de Pesquisa.
+          // Pesquisa oferece site, Lead Form e WhatsApp. Neste fluxo, Display
+          // oferece site; Lead Forms atuais são suportados em Pesquisa/PMax e o
+          // recurso nativo de WhatsApp também é exclusivo de Pesquisa.
           advertisingChannelType: tipoCampanhaGoogle === "display" ? "DISPLAY" : "SEARCH",
           status: "PAUSED",
           campaignBudget: budgetResourceName,
@@ -8807,8 +8814,8 @@ async function tentarHabilitarMetaFormularioGoogle(
 }
 
 // Cria o anúncio permitido para o tipo escolhido. Pesquisa aceita site, Lead Form
-// ou Business Message/WhatsApp; Display aceita site ou Lead Form, sujeito à
-// elegibilidade definida pelo Google. A linha local recebe adset_id/ad_id/form_id.
+// ou Business Message/WhatsApp; Display usa o endereço do site. A linha local
+// recebe adset_id/ad_id/form_id.
 app.post("/google/anuncio", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -8851,9 +8858,9 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     if (!campaign_id) return c.json({ error: "campaign_id não enviado" }, 400);
     if (!adgroup_id) return c.json({ error: "adgroup_id não enviado" }, 400);
-    if (tipoCampanha === "display" && destinoGoogle === "whatsapp") {
+    if (tipoCampanha === "display" && destinoGoogle !== "site") {
       return c.json({
-        error: "O botão de WhatsApp está disponível somente em campanhas de Pesquisa. Em Display, escolha endereço do site ou formulário de leads."
+        error: "Campanhas de Display usam endereço do site. Para formulário de leads ou WhatsApp, crie uma campanha de Pesquisa."
       }, 400);
     }
     if (destinoGoogle === "lead_ads" && !form_id) {
@@ -9199,7 +9206,8 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
 
     const campanhaLocalRes = campanha_local_id
       ? await client.query(
-          `SELECT id, campaign_id, adset_id, ad_id, origem, plataforma
+          `SELECT id, campaign_id, adset_id, ad_id, origem, plataforma,
+                  configuracoes_avancadas
            FROM campanhas WHERE id = $1 AND usuario_id = $2 LIMIT 1`,
           [campanha_local_id, usuarioId]
         )
@@ -9223,7 +9231,14 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
     // Campanha ainda nao publicada no Google Ads (duplicada ou rascunho): so
     // salva localmente, sem nenhuma chamada externa — mesma logica do Meta.
     if (ehRascunhoLocal) {
-      const avancadas = configuracoes_avancadas || {};
+      const avancadas = {
+        ...(campanhaLocal?.configuracoes_avancadas || {}),
+        ...(configuracoes_avancadas || {}),
+        plataforma: "google",
+        plataformas: ["google"],
+        rascunho_plataforma_adicional:
+          campanhaLocal?.configuracoes_avancadas?.rascunho_plataforma_adicional === true
+      };
       if (Array.isArray(titulos)) avancadas.titulos = titulos.map(textoOpcional).filter(Boolean);
       if (Array.isArray(descricoes)) avancadas.descricoes = descricoes.map(textoOpcional).filter(Boolean);
       if (titulo_longo !== undefined) avancadas.titulo_longo = textoOpcional(titulo_longo);
@@ -9359,9 +9374,18 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
           if (!listaDescricoes.length) throw new Error("Informe ao menos 1 descrição para o anúncio de Display");
         }
 
-        const imagemPaisagem = textoOpcional(imagem_paisagem_asset) || textoOpcional(cfgBanco.imagem_paisagem_asset);
-        const imagemQuadrada = textoOpcional(imagem_quadrada_asset) || textoOpcional(cfgBanco.imagem_quadrada_asset);
-        if (tipoCampanhaBanco === "display" && (!imagemPaisagem || !imagemQuadrada)) {
+        const imagensPaisagem = [
+          ...(Array.isArray(cfgBanco.imagens_paisagem_assets) ? cfgBanco.imagens_paisagem_assets : []),
+          imagem_paisagem_asset,
+          cfgBanco.imagem_paisagem_asset,
+        ].map(textoOpcional).filter(Boolean).filter((item, indice, todos) => todos.indexOf(item) === indice).slice(0, 10);
+        const imagensQuadradas = [
+          ...(Array.isArray(cfgBanco.imagens_quadradas_assets) ? cfgBanco.imagens_quadradas_assets : []),
+          imagem_quadrada_asset,
+          cfgBanco.imagem_quadrada_asset,
+        ].map(textoOpcional).filter(Boolean).filter((item, indice, todos) => todos.indexOf(item) === indice).slice(0, 10);
+        const youtubeVideoAsset = textoOpcional(cfgBanco.youtube_video_asset);
+        if (tipoCampanhaBanco === "display" && (!imagensPaisagem.length || !imagensQuadradas.length)) {
           throw new Error("Imagem do anúncio de Display não encontrada — reenvie a imagem para trocar o texto");
         }
 
@@ -9377,12 +9401,13 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
           : {
               finalUrls: [urlFinal],
               responsiveDisplayAd: {
-                marketingImages: [{ asset: imagemPaisagem }],
-                squareMarketingImages: [{ asset: imagemQuadrada }],
+                marketingImages: imagensPaisagem.map(asset => ({ asset })),
+                squareMarketingImages: imagensQuadradas.map(asset => ({ asset })),
                 headlines: listaTitulos.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 30) })),
                 longHeadline: { text: truncarSemCortarPalavra(tituloLongoNovo, 90) },
                 descriptions: listaDescricoes.slice(0, 5).map(text => ({ text: truncarSemCortarPalavra(text, 90) })),
                 ...(nomeAnuncianteNovo ? { businessName: truncarSemCortarPalavra(nomeAnuncianteNovo, 25) } : {}),
+                ...(youtubeVideoAsset ? { youtubeVideos: [{ asset: youtubeVideoAsset }] } : {}),
               },
             };
 
