@@ -7741,12 +7741,33 @@ app.post("/google/campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const {
-      usuario_id, nome, orcamento, publicacao_grupo_id, tipo_campanha,
-      destino, mensagem_whatsapp, url_destino, privacidade_url, form_id, titulos
+      usuario_id, campanha_local_id, nome, orcamento, publicacao_grupo_id, tipo_campanha,
+      destino, mensagem_whatsapp, url_destino, privacidade_url, form_id, titulos,
+      configuracoes_avancadas
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
+
+    const rascunhoLocalRes = campanha_local_id
+      ? await client.query(
+          `SELECT id, campaign_id, plataforma, publicacao_grupo_id, nicho_id
+           FROM campanhas
+           WHERE id = $1 AND usuario_id = $2
+           LIMIT 1`,
+          [Number(campanha_local_id), usuarioId]
+        )
+      : { rows: [] as any[] };
+    const rascunhoLocal = rascunhoLocalRes.rows[0] || null;
+    if (campanha_local_id && !rascunhoLocal) {
+      return c.json({ error: "Rascunho Google Ads não encontrado" }, 404);
+    }
+    if (rascunhoLocal && String(rascunhoLocal.plataforma || "").toLowerCase() !== "google") {
+      return c.json({ error: "O rascunho selecionado pertence a outra plataforma" }, 409);
+    }
+    if (rascunhoLocal?.campaign_id) {
+      return c.json({ error: "Esta campanha Google Ads já foi publicada" }, 409);
+    }
 
     const tipoCampanhaGoogle = String(tipo_campanha || "").toLowerCase() === "display" ? "display" : "search";
     const destinoInformado = String(destino || "").toLowerCase();
@@ -7912,29 +7933,56 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       console.warn("AVISO: falha ao aplicar targeting geo/idioma na campanha Google Ads (não bloqueante):", err);
     }
 
-    await client.query(
-      `INSERT INTO campanhas (
-        usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
-        configuracoes_avancadas, plataforma, publicacao_grupo_id
-      )
-      VALUES ($1,$2,$3,$4,'PAUSED','plataforma',$5,'google',$6)`,
-      [
-        usuarioId,
-        campaignId,
-        conexao.customerId,
-        nomeCampanha,
-        JSON.stringify({
-          campaign_budget_resource_name: budgetResourceName,
-          tipo_campanha: tipoCampanhaGoogle,
-          destino: destinoGoogle,
-          url_destino: urlDestino,
-          estrategia_lance: destinoGoogle === "site" ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS"
-        }),
-        textoOpcional(publicacao_grupo_id) || null,
-      ]
-    );
+    const configuracoesPersistidas = {
+      ...(configuracoes_avancadas || {}),
+      campaign_budget_resource_name: budgetResourceName,
+      tipo_campanha: tipoCampanhaGoogle,
+      destino: destinoGoogle,
+      url_destino: urlDestino,
+      estrategia_lance: destinoGoogle === "site" ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS"
+    };
 
-    return c.json({ id: campaignId, campaign_id: campaignId });
+    if (rascunhoLocal) {
+      await client.query(
+        `UPDATE campanhas
+         SET campaign_id = $1,
+             conta_anuncios_id = $2,
+             nome = $3,
+             status = 'PAUSED',
+             origem = 'plataforma',
+             configuracoes_avancadas = $4,
+             publicacao_grupo_id = COALESCE(publicacao_grupo_id, $5),
+             atualizado_em = NOW()
+         WHERE id = $6 AND usuario_id = $7 AND plataforma = 'google'`,
+        [
+          campaignId,
+          conexao.customerId,
+          nomeCampanha,
+          JSON.stringify(configuracoesPersistidas),
+          textoOpcional(publicacao_grupo_id) || null,
+          rascunhoLocal.id,
+          usuarioId
+        ]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO campanhas (
+          usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
+          configuracoes_avancadas, plataforma, publicacao_grupo_id
+        )
+        VALUES ($1,$2,$3,$4,'PAUSED','plataforma',$5,'google',$6)`,
+        [
+          usuarioId,
+          campaignId,
+          conexao.customerId,
+          nomeCampanha,
+          JSON.stringify(configuracoesPersistidas),
+          textoOpcional(publicacao_grupo_id) || null,
+        ]
+      );
+    }
+
+    return c.json({ id: campaignId, campaign_id: campaignId, campanha_local_id: rascunhoLocal?.id || null });
   } catch (err: any) {
     console.error("ERRO /google/campanha:", err);
     return c.json({ error: err.message || "Erro ao criar campanha Google Ads" }, 500);
@@ -9053,6 +9101,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
+      rascunho_plataforma_adicional: false,
       plataformas: ["google"],
       tipo_campanha: tipoCampanha,
       titulos: listaTitulos,
@@ -12244,6 +12293,7 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     const entrada = await c.req.json();
     const {
       usuario_id,
+      campanha_local_id,
       nome,
       configuracoes_avancadas,
       nicho_id,
@@ -12255,6 +12305,26 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) {
       return negarAcessoConta(c);
+    }
+
+    const rascunhoLocalRes = campanha_local_id
+      ? await client.query(
+          `SELECT id, campaign_id, plataforma, publicacao_grupo_id, nicho_id
+           FROM campanhas
+           WHERE id = $1 AND usuario_id = $2
+           LIMIT 1`,
+          [Number(campanha_local_id), usuarioId]
+        )
+      : { rows: [] as any[] };
+    const rascunhoLocal = rascunhoLocalRes.rows[0] || null;
+    if (campanha_local_id && !rascunhoLocal) {
+      return c.json({ error: "Rascunho TikTok não encontrado" }, 404);
+    }
+    if (rascunhoLocal && String(rascunhoLocal.plataforma || "").toLowerCase() !== "tiktok") {
+      return c.json({ error: "O rascunho selecionado pertence a outra plataforma" }, 409);
+    }
+    if (rascunhoLocal?.campaign_id) {
+      return c.json({ error: "Esta campanha TikTok já foi publicada" }, 409);
     }
 
     const preflight = await executarPreflightPublicacaoTikTok(usuarioId, entrada);
@@ -12314,28 +12384,55 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
       destino: destinoResolvido
     };
 
-    await client.query(
-      `INSERT INTO campanhas (
-        usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
-        configuracoes_avancadas, nicho_id, plataforma, publicacao_grupo_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'tiktok',$9)`,
-      [
-        usuarioId,
-        campaignId,
-        conexao.advertiserId,
-        nome || "Campanha Plataforma",
-        "PAUSED",
-        "plataforma",
-        JSON.stringify(configuracoesPersistidas),
-        nicho_id ?? null,
-        textoOpcional(publicacao_grupo_id) || null
-      ]
-    );
+    if (rascunhoLocal) {
+      await client.query(
+        `UPDATE campanhas
+         SET campaign_id = $1,
+             conta_anuncios_id = $2,
+             nome = $3,
+             status = 'PAUSED',
+             origem = 'plataforma',
+             configuracoes_avancadas = $4,
+             nicho_id = COALESCE($5, nicho_id),
+             publicacao_grupo_id = COALESCE(publicacao_grupo_id, $6),
+             atualizado_em = NOW()
+         WHERE id = $7 AND usuario_id = $8 AND plataforma = 'tiktok'`,
+        [
+          campaignId,
+          conexao.advertiserId,
+          nome || "Campanha Plataforma",
+          JSON.stringify(configuracoesPersistidas),
+          nicho_id ?? null,
+          textoOpcional(publicacao_grupo_id) || null,
+          rascunhoLocal.id,
+          usuarioId
+        ]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO campanhas (
+          usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
+          configuracoes_avancadas, nicho_id, plataforma, publicacao_grupo_id
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'tiktok',$9)`,
+        [
+          usuarioId,
+          campaignId,
+          conexao.advertiserId,
+          nome || "Campanha Plataforma",
+          "PAUSED",
+          "plataforma",
+          JSON.stringify(configuracoesPersistidas),
+          nicho_id ?? null,
+          textoOpcional(publicacao_grupo_id) || null
+        ]
+      );
+    }
 
     return c.json({
       id: campaignId,
       campaign_id: campaignId,
+      campanha_local_id: rascunhoLocal?.id || null,
       preflight: true,
       avisos: preflight.avisos
     });
@@ -12654,6 +12751,7 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
     // linhas TikTok, já que não existe Página do Facebook aqui; identity/form vão no JSONB)
     const configuracoesPersistidas = {
       ...avancadas,
+      rascunho_plataforma_adicional: false,
       texto,
       cta,
       destino: destinoResolvido,
@@ -33645,6 +33743,175 @@ app.patch("/campanhas/:id/grupo", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO PATCH /campanhas/:id/grupo:", err);
     return c.json({ error: "Erro ao vincular campanha a um grupo de publicação" }, 500);
+  }
+});
+
+// Salva novas pernas de uma campanha multiplataforma sem publicar nada nas
+// redes. Cada perna vira uma campanha local independente, ligada pelo mesmo
+// publicacao_grupo_id. A publicação remota acontece somente quando o usuário
+// clicar em "Publicar" no card da plataforma correspondente.
+app.post("/campanhas/:id/rascunhos-plataformas", authMiddleware, async (c) => {
+  const db = await client.connect();
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    const entrada = await c.req.json();
+    const rascunhos = Array.isArray(entrada?.rascunhos) ? entrada.rascunhos : [];
+
+    if (!Number.isFinite(campanhaId) || campanhaId <= 0) {
+      return c.json({ error: "Campanha inválida" }, 400);
+    }
+    if (!rascunhos.length || rascunhos.length > 4) {
+      return c.json({ error: "Informe ao menos uma plataforma válida" }, 400);
+    }
+
+    await db.query("BEGIN");
+    const origemRes = await db.query(
+      `SELECT c.*, n.slug AS nicho_slug
+       FROM campanhas c
+       LEFT JOIN nichos n ON n.id = c.nicho_id
+       WHERE c.id = $1 AND c.usuario_id = $2
+       FOR UPDATE OF c`,
+      [campanhaId, user.id]
+    );
+    const origem = origemRes.rows[0];
+    if (!origem) {
+      await db.query("ROLLBACK");
+      return c.json({ error: "Campanha não encontrada" }, 404);
+    }
+
+    const grupoId = textoOpcional(origem.publicacao_grupo_id) ||
+      `grp_${Date.now()}_${randomBytes(8).toString("hex")}`;
+    if (!origem.publicacao_grupo_id) {
+      await db.query(
+        `UPDATE campanhas SET publicacao_grupo_id = $1, atualizado_em = NOW() WHERE id = $2`,
+        [grupoId, origem.id]
+      );
+    }
+
+    const permitidas = new Set(["facebook", "instagram", "google", "tiktok"]);
+    const resultados: any[] = [];
+
+    for (const item of rascunhos) {
+      const plataforma = String(item?.plataforma || "").trim().toLowerCase();
+      if (!permitidas.has(plataforma)) {
+        throw new Error(`Plataforma inválida: ${plataforma || "não informada"}`);
+      }
+
+      const configuracoesRecebidas =
+        item?.configuracoes_avancadas && typeof item.configuracoes_avancadas === "object"
+          ? item.configuracoes_avancadas
+          : {};
+      const configuracoes = {
+        ...configuracoesRecebidas,
+        plataforma,
+        publicacao_grupo_id: grupoId,
+        rascunho_plataforma_adicional: true,
+        campanha_origem_local_id: origem.id
+      };
+      const nome = textoOpcional(item?.nome) || origem.nome || "Campanha sem nome";
+      const dailyBudget = numeroOpcional(item?.daily_budget);
+
+      const existenteRes = await db.query(
+        `SELECT id, campaign_id
+         FROM campanhas
+         WHERE usuario_id = $1
+           AND publicacao_grupo_id = $2
+           AND LOWER(COALESCE(plataforma, 'meta')) = $3
+         ORDER BY id ASC
+         LIMIT 1
+         FOR UPDATE`,
+        [user.id, grupoId, plataforma]
+      );
+      const existente = existenteRes.rows[0];
+
+      if (existente?.campaign_id) {
+        resultados.push({ plataforma, id: existente.id, existente: true, publicada: true });
+        continue;
+      }
+
+      if (existente) {
+        await db.query(
+          `UPDATE campanhas
+           SET nome = $1,
+               status = 'PAUSED',
+               origem = 'manual',
+               nicho_id = $2,
+               daily_budget = $3,
+               configuracoes_avancadas = $4,
+               campaign_id = NULL,
+               adset_id = NULL,
+               ad_id = NULL,
+               form_id = NULL,
+               conta_anuncios_id = NULL,
+               atualizado_em = NOW()
+           WHERE id = $5 AND usuario_id = $6`,
+          [nome, origem.nicho_id ?? null, dailyBudget, JSON.stringify(configuracoes), existente.id, user.id]
+        );
+        resultados.push({ plataforma, id: existente.id, existente: true, publicada: false });
+        continue;
+      }
+
+      const novoRes = await db.query(
+        `INSERT INTO campanhas (
+           usuario_id, nome, status, origem, nicho_id, daily_budget,
+           configuracoes_avancadas, plataforma, publicacao_grupo_id,
+           campaign_id, adset_id, ad_id, form_id, conta_anuncios_id,
+           criado_em, atualizado_em
+         )
+         VALUES ($1,$2,'PAUSED','manual',$3,$4,$5,$6,$7,NULL,NULL,NULL,NULL,NULL,NOW(),NOW())
+         RETURNING id`,
+        [user.id, nome, origem.nicho_id ?? null, dailyBudget, JSON.stringify(configuracoes), plataforma, grupoId]
+      );
+      const novoId = Number(novoRes.rows[0].id);
+      await copiarDadosNichoCampanha(db, origem.id, novoId, origem.nicho_slug || null);
+      resultados.push({ plataforma, id: novoId, existente: false, publicada: false });
+    }
+
+    await db.query("COMMIT");
+    return c.json({ ok: true, publicacao_grupo_id: grupoId, rascunhos: resultados });
+  } catch (err: any) {
+    await db.query("ROLLBACK").catch(() => null);
+    console.error("ERRO POST /campanhas/:id/rascunhos-plataformas:", err);
+    return c.json({ error: err?.message || "Erro ao salvar rascunhos das plataformas" }, 500);
+  } finally {
+    db.release();
+  }
+});
+
+// Se a criação remota de uma perna recém-salva falhar depois de gerar o ID da
+// campanha na rede, a limpeza remota pode marcar a linha como excluída. Esta
+// rota devolve somente esse tipo de linha ao estado de rascunho local para que
+// o usuário possa corrigir os dados e tentar novamente pelo card.
+app.post("/campanhas/:id/reverter-publicacao-rascunho", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    const atual = await client.query(
+      `SELECT id, configuracoes_avancadas
+       FROM campanhas
+       WHERE id = $1 AND usuario_id = $2
+       LIMIT 1`,
+      [campanhaId, user.id]
+    );
+    const linha = atual.rows[0];
+    if (!linha) return c.json({ error: "Campanha não encontrada" }, 404);
+    if (linha.configuracoes_avancadas?.rascunho_plataforma_adicional !== true) {
+      return c.json({ error: "Esta campanha não é um rascunho de plataforma adicional" }, 409);
+    }
+
+    await client.query(
+      `UPDATE campanhas
+       SET campaign_id = NULL, adset_id = NULL, ad_id = NULL, form_id = NULL,
+           conta_anuncios_id = NULL, status = 'PAUSED', origem = 'manual',
+           atualizado_em = NOW()
+       WHERE id = $1 AND usuario_id = $2`,
+      [campanhaId, user.id]
+    );
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("ERRO POST /campanhas/:id/reverter-publicacao-rascunho:", err);
+    return c.json({ error: "Erro ao restaurar o rascunho local" }, 500);
   }
 });
 
