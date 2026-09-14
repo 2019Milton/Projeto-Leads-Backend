@@ -7742,7 +7742,15 @@ function googleAdsExtrairExencoesPolitica(
   return exencoes;
 }
 
-// Cria orcamento + campanha de Pesquisa (PAUSED) + targeting geo/idioma (nao bloqueante).
+// Google Ads exige data pura (YYYY-MM-DD) pra start_date/end_date — o campo
+// vem do formulario como datetime local (ex: "2026-08-31T00:00"), entao so
+// corta a parte da data.
+function dataGoogleAds(valor: unknown): string | null {
+  const texto = textoOpcional(valor);
+  return /^\d{4}-\d{2}-\d{2}/.test(texto) ? texto.slice(0, 10) : null;
+}
+
+// Cria orcamento + campanha de Pesquisa (ENABLED) + targeting geo/idioma (nao bloqueante).
 // Equivalente ao /meta/campanha e /tiktok/campanha.
 app.post("/google/campanha", authMiddleware, async (c) => {
   try {
@@ -7870,6 +7878,8 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     // repetiu entre tentativas. O nome exibido na nossa plataforma (banco) continua
     // limpo; so o nome enviado pra Google ganha um sufixo unico.
     const nomeCampanhaGoogle = `${nomeCampanha} - ${Date.now()}`;
+    const dataInicioGoogle = dataGoogleAds(configuracoes_avancadas?.inicio);
+    const dataFimGoogle = dataGoogleAds(configuracoes_avancadas?.fim);
 
     const budgetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignBudgets", [
       {
@@ -7896,6 +7906,8 @@ app.post("/google/campanha", authMiddleware, async (c) => {
           advertisingChannelType: tipoCampanhaGoogle === "display" ? "DISPLAY" : "SEARCH",
           status: "ENABLED",
           campaignBudget: budgetResourceName,
+          ...(dataInicioGoogle ? { startDate: dataInicioGoogle } : {}),
+          ...(dataFimGoogle ? { endDate: dataFimGoogle } : {}),
           // Formulários e mensagens são metas de conversão no Google. Site puro
           // continua em CPC manual; os dois destinos de lead usam a estratégia
           // recomendada pelo Google para otimizar conversões.
@@ -9337,6 +9349,17 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
         } else {
           console.warn("EDITAR CAMPANHA GOOGLE: sem campaign_budget_resource_name salvo, orçamento não atualizado — campanha", campaign_id);
         }
+      }
+
+      // Só a data de término é editável aqui de propósito — a Google Ads API
+      // rejeita alterar start_date depois que a campanha já começou a veicular,
+      // então mexer nela numa campanha publicada só criaria um erro confuso
+      // sem necessidade (quem quiser outra data de início duplica a campanha).
+      const dataFimGoogle = dataGoogleAds(configuracoes_avancadas?.fim);
+      if (dataFimGoogle && dataFimGoogle !== dataGoogleAds(cfgBanco.fim)) {
+        await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
+          { update: { resourceName: campaignResourceName, endDate: dataFimGoogle }, updateMask: "end_date" },
+        ]);
       }
     } catch (err: any) {
       console.error("ERRO /google/editar-campanha (nome/orcamento):", err);
