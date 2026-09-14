@@ -7894,7 +7894,7 @@ app.post("/google/campanha", authMiddleware, async (c) => {
           // oferece site; Lead Forms atuais são suportados em Pesquisa/PMax e o
           // recurso nativo de WhatsApp também é exclusivo de Pesquisa.
           advertisingChannelType: tipoCampanhaGoogle === "display" ? "DISPLAY" : "SEARCH",
-          status: "PAUSED",
+          status: "ENABLED",
           campaignBudget: budgetResourceName,
           // Formulários e mensagens são metas de conversão no Google. Site puro
           // continua em CPC manual; os dois destinos de lead usam a estratégia
@@ -8979,7 +8979,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
         };
 
     const adResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "adGroupAds", [
-      { create: { adGroup: adGroupResourceName, status: "PAUSED", ad: adCreate } },
+      { create: { adGroup: adGroupResourceName, status: "ENABLED", ad: adCreate } },
     ]);
 
     const adResourceName = adResults[0]?.resourceName;
@@ -12376,7 +12376,7 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
       campaign_name: nome || "Campanha Leads Plataforma",
       objective_type: "LEAD_GENERATION",
       budget_mode: "BUDGET_MODE_INFINITE",
-      operation_status: "DISABLE"
+      operation_status: "ENABLE"
     };
 
     const resposta = await tiktokFetch("/campaign/create/", conexao.token, {
@@ -12565,7 +12565,7 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
       schedule_start_time: formatarDataHoraTikTok(
         inicio ? new Date(inicio) : new Date(Date.now() + 60000)
       ),
-      operation_status: "DISABLE"
+      operation_status: "ENABLE"
     };
 
     if (fim) {
@@ -13834,7 +13834,7 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
           ]
         }
       },
-      status: "PAUSED",
+      status: "ACTIVE",
     };
 
     const resposta = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns`, conexao.accessToken, {
@@ -14228,7 +14228,7 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
       campaign: `urn:li:sponsoredCampaign:${adgroup_id}`,
       type: "SPONSORED_UPDATES",
       content: { reference: postUrn },
-      status: "PAUSED",
+      status: "ACTIVE",
     };
 
     if (destinoResolvido !== "whatsapp") {
@@ -15227,7 +15227,7 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
     const payloadCampanha: any = {
       name: nome || "Campanha Leads Plataforma",
       objective: montarObjetivoCampanhaMeta(destino, objetivo),
-      status: "PAUSED",
+      status: "ACTIVE",
       special_ad_categories: specialAdCategories,
       is_adset_budget_sharing_enabled: false,
       access_token: token
@@ -15446,7 +15446,7 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
       targeting,
 
-      status: "PAUSED",
+      status: "ACTIVE",
 
       access_token: token
     };
@@ -16471,7 +16471,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
             creative_id: creative.id
           },
 
-          status: "PAUSED",
+          status: "ACTIVE",
 
           access_token: token
         })
