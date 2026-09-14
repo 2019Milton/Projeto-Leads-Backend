@@ -33344,7 +33344,14 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
     const orig = origRes.rows[0];
     const plataformaOrigem = String(orig.plataforma || "meta").toLowerCase();
 
-    if (!["meta", "facebook", "instagram"].includes(plataformaOrigem)) {
+    // A duplicação em si não fala com nenhuma API de anúncios — só copia a
+    // linha local (configuracoes_avancadas, orçamento, nicho) pra um rascunho
+    // novo, sem herdar campaign_id/adset_id/ad_id. Por isso funciona pra
+    // qualquer plataforma cujo fluxo de publicação normal (Criar Campanha)
+    // já sabe reconstruir a campanha a partir desses mesmos campos — que é o
+    // caso de Meta, Google e TikTok. LinkedIn e Kwai continuam de fora porque
+    // o botão nem aparece pra eles (ver CAPACIDADES_PLATAFORMA no frontend).
+    if (!["meta", "facebook", "instagram", "google", "tiktok"].includes(plataformaOrigem)) {
       return c.json({
         error: `Duplicação ainda não está disponível para ${plataformaOrigem}. Crie uma nova campanha nessa plataforma para garantir que todos os campos necessários sejam preenchidos.`
       }, 409);
