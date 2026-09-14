@@ -7742,12 +7742,16 @@ function googleAdsExtrairExencoesPolitica(
   return exencoes;
 }
 
-// Google Ads exige data pura (YYYY-MM-DD) pra start_date/end_date — o campo
-// vem do formulario como datetime local (ex: "2026-08-31T00:00"), entao so
-// corta a parte da data.
-function dataGoogleAds(valor: unknown): string | null {
+// A partir da v23 a Google Ads API trocou start_date/end_date (so data) por
+// start_date_time/end_date_time (data + hora, "yyyy-MM-dd HH:mm:ss") — este
+// backend usa v24, entao precisa do campo novo. Confirmado no diff oficial
+// v22->v23: start usa 00:00:00, fim usa 23:59:59 pra granularidade diaria.
+// O campo vem do formulario como datetime local (ex: "2026-08-31T00:00"),
+// entao so aproveita a data e fixa a hora certa.
+function dataHoraGoogleAds(valor: unknown, tipo: "inicio" | "fim"): string | null {
   const texto = textoOpcional(valor);
-  return /^\d{4}-\d{2}-\d{2}/.test(texto) ? texto.slice(0, 10) : null;
+  if (!/^\d{4}-\d{2}-\d{2}/.test(texto)) return null;
+  return `${texto.slice(0, 10)} ${tipo === "inicio" ? "00:00:00" : "23:59:59"}`;
 }
 
 // Cria orcamento + campanha de Pesquisa (ENABLED) + targeting geo/idioma (nao bloqueante).
@@ -7878,8 +7882,8 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     // repetiu entre tentativas. O nome exibido na nossa plataforma (banco) continua
     // limpo; so o nome enviado pra Google ganha um sufixo unico.
     const nomeCampanhaGoogle = `${nomeCampanha} - ${Date.now()}`;
-    const dataInicioGoogle = dataGoogleAds(configuracoes_avancadas?.inicio);
-    const dataFimGoogle = dataGoogleAds(configuracoes_avancadas?.fim);
+    const dataInicioGoogle = dataHoraGoogleAds(configuracoes_avancadas?.inicio, "inicio");
+    const dataFimGoogle = dataHoraGoogleAds(configuracoes_avancadas?.fim, "fim");
 
     const budgetResults = await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignBudgets", [
       {
@@ -7906,8 +7910,8 @@ app.post("/google/campanha", authMiddleware, async (c) => {
           advertisingChannelType: tipoCampanhaGoogle === "display" ? "DISPLAY" : "SEARCH",
           status: "ENABLED",
           campaignBudget: budgetResourceName,
-          ...(dataInicioGoogle ? { startDate: dataInicioGoogle } : {}),
-          ...(dataFimGoogle ? { endDate: dataFimGoogle } : {}),
+          ...(dataInicioGoogle ? { startDateTime: dataInicioGoogle } : {}),
+          ...(dataFimGoogle ? { endDateTime: dataFimGoogle } : {}),
           // Formulários e mensagens são metas de conversão no Google. Site puro
           // continua em CPC manual; os dois destinos de lead usam a estratégia
           // recomendada pelo Google para otimizar conversões.
@@ -9352,13 +9356,23 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
       }
 
       // Só a data de término é editável aqui de propósito — a Google Ads API
-      // rejeita alterar start_date depois que a campanha já começou a veicular,
-      // então mexer nela numa campanha publicada só criaria um erro confuso
-      // sem necessidade (quem quiser outra data de início duplica a campanha).
-      const dataFimGoogle = dataGoogleAds(configuracoes_avancadas?.fim);
-      if (dataFimGoogle && dataFimGoogle !== dataGoogleAds(cfgBanco.fim)) {
+      // rejeita alterar start_date_time depois que a campanha já começou a
+      // veicular, então mexer nela numa campanha publicada só criaria um erro
+      // confuso sem necessidade (quem quiser outra data de início duplica a
+      // campanha). Mandar update sem endDateTime mas com o campo no
+      // updateMask é como a Google limpa a data — assim a campanha volta a
+      // rodar indefinidamente se o usuário apagar o campo.
+      const dataFimGoogleAnterior = dataHoraGoogleAds(cfgBanco.fim, "fim");
+      const dataFimGoogleNova = dataHoraGoogleAds(configuracoes_avancadas?.fim, "fim");
+      if (dataFimGoogleNova !== dataFimGoogleAnterior) {
         await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaigns", [
-          { update: { resourceName: campaignResourceName, endDate: dataFimGoogle }, updateMask: "end_date" },
+          {
+            update: {
+              resourceName: campaignResourceName,
+              ...(dataFimGoogleNova ? { endDateTime: dataFimGoogleNova } : {}),
+            },
+            updateMask: "end_date_time",
+          },
         ]);
       }
     } catch (err: any) {
