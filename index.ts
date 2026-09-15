@@ -7028,7 +7028,7 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       const campaignId = String(campanha.id);
 
       const existe = await client.query(
-        `SELECT id, origem FROM campanhas
+        `SELECT id, origem, configuracoes_avancadas FROM campanhas
          WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
            AND conta_anuncios_id = $3
          LIMIT 1`,
@@ -7036,18 +7036,40 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
       );
 
       if (existe.rows.length > 0) {
+        const linhaExistente = existe.rows[0];
         // Campanhas nativas recebem um sufixo técnico no nome remoto para
         // satisfazer a unicidade exigida pelo Google. A sincronização deve
         // atualizar o status, mas preservar o nome limpo escolhido no produto.
-        const nomeSincronizado = campanhaTemOrigemNativa(existe.rows[0].origem)
+        const nomeSincronizado = campanhaTemOrigemNativa(linhaExistente.origem)
           ? null
           : campanha.name;
         await client.query(
           `UPDATE campanhas
            SET nome = COALESCE($1, nome), status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
            WHERE id = $4`,
-          [nomeSincronizado, campanha.status, String(customerId), existe.rows[0].id]
+          [nomeSincronizado, campanha.status, String(customerId), linhaExistente.id]
         );
+
+        // Na criação do anúncio (POST /google/anuncio), a meta de conversão
+        // "Submit lead form" só existe depois que o Google aprova o asset do
+        // formulário — se a aprovação ainda não tinha saído naquele momento,
+        // a campanha ficava travada pra sempre em "Elegível (com restrições)"
+        // / "acompanhamento de conversões incompleto", porque nada tentava de
+        // novo depois. A sincronização é o lugar certo pra reprocessar isso.
+        const cfgExistente = linhaExistente.configuracoes_avancadas || {};
+        if (cfgExistente.destino === "lead_ads" && cfgExistente.lead_form_goal !== "BIDDABLE") {
+          const habilitou = await tentarHabilitarMetaFormularioGoogle(
+            customerId, campaignId, accessToken, loginCustomerId
+          );
+          if (habilitou) {
+            await client.query(
+              `UPDATE campanhas
+               SET configuracoes_avancadas = configuracoes_avancadas || $1::jsonb, atualizado_em = NOW()
+               WHERE id = $2`,
+              [JSON.stringify({ lead_form_goal: "BIDDABLE", lead_form_goal_configured: true }), linhaExistente.id]
+            );
+          }
+        }
       } else {
         if (statusCampanhaRemotaExcluida(campanha.status)) {
           continue;
