@@ -30457,7 +30457,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     campanha_google_descricao_1: ["google_descricao_1"],
     campanha_google_descricao_2: ["google_descricao_2"],
     campanha_google_nome_anunciante: ["google_nome_anunciante"],
-    campanha_google_whatsapp_mensagem: ["google_mensagem_whatsapp"]
+    campanha_google_whatsapp_mensagem: ["google_mensagem_whatsapp"],
+    campanha_google_palavras_chave: ["google_palavras_chave"]
   };
   const chavesPermitidasComplemento = new Set(
     camposFaltantesLista.flatMap(campo => camposRespostaPorCampoFormulario[campo] || [])
@@ -31060,7 +31061,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `As alternativas podem variar apenas a melhor forma de preencher as lacunas; nao reescreva o que ja existe. ` +
       `Inclua em cada objeto TODAS as chaves autorizadas e nenhuma outra. ` +
       `E proibido retornar nome_campanha, URLs, IDs, contas, paginas, perfis, identidades, formularios ou localizacoes inventadas. ` +
-      `Respeite os limites: google_titulo_1/2/3 ate 30 caracteres, google_titulo_longo e google_descricao_1/2 ate 90, google_nome_anunciante ate 25 e google_mensagem_whatsapp ate 200.\n\n` +
+      `Respeite os limites: google_titulo_1/2/3 ate 30 caracteres, google_titulo_longo e google_descricao_1/2 ate 90, google_nome_anunciante ate 25 e google_mensagem_whatsapp ate 200. ` +
+      `Se google_palavras_chave estiver entre as chaves autorizadas, retorne de 5 a 8 termos de busca REAIS separados por virgula (o que um cliente digitaria no Google pra encontrar esse negocio) — nunca repita os titulos/frases do anuncio, pois titulo e frase publicitaria e palavra-chave e termo de busca.\n\n` +
       `Retorne SOMENTE JSON valido, sem texto antes ou depois:\n` +
       `{"v1":{...somente chaves autorizadas...},"v2":{...somente chaves autorizadas...},"v3":{...somente chaves autorizadas...}}`;
 
