@@ -7057,12 +7057,13 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
         // / "acompanhamento de conversões incompleto", porque nada tentava de
         // novo depois. A sincronização é o lugar certo pra reprocessar isso.
         const cfgExistente = linhaExistente.configuracoes_avancadas || {};
-        // 🔎 DIAGNOSTICO TEMPORARIO (remover junto com o log em
-        // tentarHabilitarMetaFormularioGoogle).
-        console.log("[lead-form-goal] verificando", campaignId, "destino:", cfgExistente.destino, "lead_form_goal:", cfgExistente.lead_form_goal);
-        if (cfgExistente.destino === "lead_ads" && cfgExistente.lead_form_goal !== "BIDDABLE") {
-          const habilitou = await tentarHabilitarMetaFormularioGoogle(
-            customerId, campaignId, accessToken, loginCustomerId
+        const categoriaMetaGoogle =
+          cfgExistente.destino === "lead_ads" ? "SUBMIT_LEAD_FORM"
+          : cfgExistente.destino === "whatsapp" ? "CONTACT"
+          : null;
+        if (categoriaMetaGoogle && cfgExistente.lead_form_goal !== "BIDDABLE") {
+          const habilitou = await tentarHabilitarMetaConversaoGoogle(
+            customerId, campaignId, accessToken, loginCustomerId, categoriaMetaGoogle
           );
           if (habilitou) {
             await client.query(
@@ -8809,11 +8810,21 @@ async function salvarEstruturaNichoCampanhaGoogle(
   }
 }
 
-async function tentarHabilitarMetaFormularioGoogle(
+// Habilita (biddable=true) a meta de conversão "Google Hosted" da campanha —
+// a mesma mecânica serve pro Lead Form nativo (category SUBMIT_LEAD_FORM,
+// destino lead_ads) e pro clique-para-WhatsApp/Business Message (category
+// CONTACT, destino whatsapp; confirmado no enum oficial ConversionAction.category
+// da API v24 — "A call, SMS, email, chat or other type of contact"). As duas
+// metas só existem depois que o Google aprova o asset (formulário ou número
+// de WhatsApp) — se a aprovação ainda não tinha saído na criação do anúncio,
+// quem chama isso de novo mais tarde (ver sincronizarGoogleAdsUsuario) precisa
+// saber qual categoria checar pra cada campanha, por isso o parâmetro.
+async function tentarHabilitarMetaConversaoGoogle(
   customerId: string,
   campaignId: string,
   accessToken: string,
-  loginCustomerId: string | null
+  loginCustomerId: string | null,
+  categoria: "SUBMIT_LEAD_FORM" | "CONTACT"
 ): Promise<boolean> {
   try {
     const campaignIdSeguro = String(campaignId || "").replace(/\D/g, "");
@@ -8825,13 +8836,10 @@ async function tentarHabilitarMetaFormularioGoogle(
               campaign_conversion_goal.biddable
        FROM campaign_conversion_goal
        WHERE campaign.id = ${campaignIdSeguro}
-         AND campaign_conversion_goal.category = 'SUBMIT_LEAD_FORM'
+         AND campaign_conversion_goal.category = '${categoria}'
          AND campaign_conversion_goal.origin = 'GOOGLE_HOSTED'`,
       loginCustomerId
     );
-    // 🔎 DIAGNOSTICO TEMPORARIO (remover depois de confirmar o comportamento
-    // real em producao — campanha 1789394446636 travada em "restricoes").
-    console.log("[lead-form-goal]", campaignIdSeguro, JSON.stringify(resultados));
     const meta = (resultados[0] as any)?.campaignConversionGoal ??
       (resultados[0] as any)?.campaign_conversion_goal;
     const resourceName = meta?.resourceName ?? meta?.resource_name;
@@ -8852,7 +8860,7 @@ async function tentarHabilitarMetaFormularioGoogle(
   } catch (err: any) {
     // A meta Google Hosted pode surgir apenas após a aprovação do asset. Nesse
     // intervalo o anúncio continua válido e o Google cria a meta automaticamente.
-    console.warn("AVISO GOOGLE LEAD FORM: meta de conversão ainda indisponível:", err?.message);
+    console.warn(`AVISO GOOGLE ${categoria}: meta de conversão ainda indisponível:`, err?.message);
     return false;
   }
 }
@@ -9118,17 +9126,18 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     }
 
     const formIdFinal = destinoGoogle === "lead_ads" ? textoOpcional(form_id) : "";
-    let metaFormularioOtimizada = false;
+    let metaConversaoOtimizada = false;
 
     if (destinoGoogle === "lead_ads") {
       await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignAssets", [
         { create: { campaign: campaignResourceName, asset: formIdFinal, fieldType: "LEAD_FORM" } },
       ], conexao.loginCustomerId);
-      metaFormularioOtimizada = await tentarHabilitarMetaFormularioGoogle(
+      metaConversaoOtimizada = await tentarHabilitarMetaConversaoGoogle(
         conexao.customerId,
         String(campaign_id),
         conexao.accessToken,
-        conexao.loginCustomerId
+        conexao.loginCustomerId,
+        "SUBMIT_LEAD_FORM"
       );
     }
 
@@ -9148,6 +9157,18 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
         console.error("ERRO /google/anuncio (vínculo Business Message WhatsApp):", errBusinessMessage);
         return c.json({ error: mensagemErroBusinessMessageGoogle(errBusinessMessage) }, 400);
       }
+      // Mesma mecânica do Lead Form: a meta de conversão "CONTACT" nativa do
+      // clique-para-WhatsApp só existe depois que o Google aprova o asset de
+      // Business Message. Sem isso, a campanha (bid strategy Maximizar as
+      // conversões) fica presa em "Elegível (com restrições)" — descoberto
+      // ao vivo numa campanha real que nunca teve essa meta habilitada.
+      metaConversaoOtimizada = await tentarHabilitarMetaConversaoGoogle(
+        conexao.customerId,
+        String(campaign_id),
+        conexao.accessToken,
+        conexao.loginCustomerId,
+        "CONTACT"
+      );
     }
 
     const configuracoesPersistidas = {
@@ -9170,8 +9191,12 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
         youtube_upload_resource_name: youtubeUploadResourceName,
         video_id: youtubeVideoId,
       } : {}),
-      ...(destinoGoogle === "lead_ads" ? {
-        lead_form_goal: metaFormularioOtimizada ? "BIDDABLE" : "AGUARDANDO_APROVACAO_GOOGLE",
+      ...(destinoGoogle === "lead_ads" || destinoGoogle === "whatsapp" ? {
+        // Chave compartilhada entre lead_ads (meta SUBMIT_LEAD_FORM) e
+        // whatsapp (meta CONTACT) — o nome ficou de quando só existia o
+        // Lead Form, mas guarda o mesmo status "meta de conversão Google
+        // Hosted biddable" pras duas categorias.
+        lead_form_goal: metaConversaoOtimizada ? "BIDDABLE" : "AGUARDANDO_APROVACAO_GOOGLE",
       } : {}),
       ...(destinoGoogle === "whatsapp" ? {
         mensagem_whatsapp: mensagemWhatsapp,
