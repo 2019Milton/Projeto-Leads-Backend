@@ -8873,7 +8873,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     const user: any = c.get("user");
     const {
       usuario_id, campaign_id, adgroup_id, form_id,
-      titulos, descricoes, nome_anunciante, url_destino,
+      titulos, descricoes, nome_anunciante, url_destino, palavras_chave,
       daily_budget, configuracoes_avancadas,
       tipo_campanha, titulo_longo, destino, mensagem_whatsapp,
       imagem_paisagem_asset, imagem_quadrada_asset,
@@ -8924,6 +8924,11 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
     const listaDescricoes = (Array.isArray(descricoes) ? descricoes : []).map(textoOpcional).filter(Boolean);
+    const listaPalavrasChave = (Array.isArray(palavras_chave) ? palavras_chave : [])
+      .map(sanitizarPalavraChaveGoogle)
+      .filter(Boolean)
+      .filter((item, indice, todos) => todos.indexOf(item) === indice)
+      .slice(0, 20);
     const nomeAnunciante = textoOpcional(nome_anunciante);
     const url = urlOpcional(url_destino, "");
     const tituloLongo = textoOpcional(titulo_longo);
@@ -9084,16 +9089,17 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     if (tipoCampanha === "search") {
       // Campanha de Pesquisa exige palavras-chave pra veicular (sem elas o anuncio nunca
-      // aparece) — reaproveita os proprios titulos do anuncio como palavras-chave em
-      // correspondencia ampla, ja que sao textos curtos e relevantes ao nicho gerados
-      // pela IA/usuario, sem precisar de um campo novo so pra isso. Sanitiza pontuacao
-      // de chamada (!, ?, etc — valida num titulo de anuncio, invalida numa keyword).
+      // aparece). Prioriza as palavras-chave reais informadas pelo usuario/IA (termos de
+      // busca de verdade); so cai de volta pros titulos do anuncio quando nenhuma
+      // palavra-chave foi informada (compatibilidade com campanhas antigas e chamadas
+      // sem o campo novo). Reaproveitar titulos como keyword gera pouca ou nenhuma
+      // exibicao, ja que titulo de anuncio e frase publicitaria, nao termo de busca —
+      // descoberto ao vivo numa campanha real que ficou zerada. Sanitiza pontuacao de
+      // chamada (!, ?, etc — valida num titulo de anuncio, invalida numa keyword).
       // Display nao usa palavras-chave (segmentacao e por audiencia/publico, nao existe
       // esse conceito no formulario atual, entao esta etapa e pulada inteira).
-      const keywordOps: any[] = listaTitulos
-        .map(sanitizarPalavraChaveGoogle)
-        .filter(Boolean)
-        .slice(0, 10)
+      const keywordOps: any[] = (listaPalavrasChave.length ? listaPalavrasChave : listaTitulos.map(sanitizarPalavraChaveGoogle).filter(Boolean))
+        .slice(0, 20)
         .map(texto => ({
           create: {
             adGroup: adGroupResourceName,
@@ -9178,6 +9184,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       tipo_campanha: tipoCampanha,
       titulos: listaTitulos,
       descricoes: listaDescricoes,
+      palavras_chave: listaPalavrasChave,
       nome_anunciante: nomeAnunciante,
       url_destino: url,
       destino: destinoGoogle,
@@ -30777,6 +30784,12 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       google_mensagem_whatsapp: incluirGoogle && campanhaEntrada.google?.destino === "whatsapp"
         ? truncarSemCortarPalavra(`Olá! Gostaria de saber mais sobre ${topico}.`, 200)
         : "",
+      // Sem fallback derivado do titulo/texto aqui de proposito — diferente dos outros
+      // campos google_*, inventar uma "palavra-chave" a partir do titulo do anuncio e
+      // exatamente o bug que causou campanhas zeradas (titulo e frase publicitaria, nao
+      // termo de busca). Se a IA nao mandar nada, fica vazio e o backend de publicacao
+      // cai no comportamento anterior (deriva dos titulos) em vez de um heuristico ruim.
+      google_palavras_chave: "",
       google_url_destino: incluirGoogle ? urlExistente : "",
       tiktok_url_destino: incluirTikTok ? urlExistente : ""
       };
@@ -30850,6 +30863,12 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         : "",
       google_mensagem_whatsapp: incluirGoogle && campanhaEntrada.google?.destino === "whatsapp"
         ? googleFallback(v?.google_mensagem_whatsapp, `Olá! Gostaria de saber mais sobre ${topico}.`, 200)
+        : "",
+      // Sem fallback derivado do titulo — ver comentario em fallbackVariacoes() acima.
+      // Aceita tanto string "kw1, kw2" (formato pedido no prompt) quanto array, caso o
+      // modelo devolva lista.
+      google_palavras_chave: incluirGoogle
+        ? (Array.isArray(v?.google_palavras_chave) ? v.google_palavras_chave.join(", ") : String(v?.google_palavras_chave || alternativa.google_palavras_chave || ""))
         : "",
       // URLs vêm exclusivamente da campanha original. Mesmo que o modelo
       // devolva uma URL, ela é ignorada para não criar um destino inexistente.
@@ -31018,7 +31037,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
           `google_titulo_longo (versao mais completa do titulo, no maximo 90 caracteres),\n` +
           `google_descricao_1, google_descricao_2 (2 descricoes curtas e DIFERENTES entre si, cada uma com no maximo 90 caracteres),\n` +
           `google_nome_anunciante (nome curto do negocio/anunciante, no maximo 25 caracteres),\n` +
-          `google_mensagem_whatsapp (max 200 caracteres, somente se o destino Google for WhatsApp).\n` +
+          `google_mensagem_whatsapp (max 200 caracteres, somente se o destino Google for WhatsApp),\n` +
+          `google_palavras_chave (5 a 8 termos de busca REAIS separados por virgula — o que um cliente digitaria no Google pra encontrar esse negocio, ex: "crm para corretores, plataforma de leads para imobiliaria". NUNCA repita os titulos/frases do anuncio aqui: titulo e frase publicitaria, palavra-chave e termo de busca — sao coisas diferentes e usar o titulo como palavra-chave faz a campanha nao aparecer pra ninguem).\n` +
           `Nao retorne URLs inventadas; google_url_destino e tiktok_url_destino sao preservadas exclusivamente pelo servidor.\n\n`
         : "") +
       `Retorne SOMENTE JSON valido sem texto antes ou depois:\n` +
