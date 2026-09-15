@@ -7057,6 +7057,9 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
         // / "acompanhamento de conversões incompleto", porque nada tentava de
         // novo depois. A sincronização é o lugar certo pra reprocessar isso.
         const cfgExistente = linhaExistente.configuracoes_avancadas || {};
+        // 🔎 DIAGNOSTICO TEMPORARIO (remover junto com o log em
+        // tentarHabilitarMetaFormularioGoogle).
+        console.log("[lead-form-goal] verificando", campaignId, "destino:", cfgExistente.destino, "lead_form_goal:", cfgExistente.lead_form_goal);
         if (cfgExistente.destino === "lead_ads" && cfgExistente.lead_form_goal !== "BIDDABLE") {
           const habilitou = await tentarHabilitarMetaFormularioGoogle(
             customerId, campaignId, accessToken, loginCustomerId
@@ -8826,6 +8829,9 @@ async function tentarHabilitarMetaFormularioGoogle(
          AND campaign_conversion_goal.origin = 'GOOGLE_HOSTED'`,
       loginCustomerId
     );
+    // 🔎 DIAGNOSTICO TEMPORARIO (remover depois de confirmar o comportamento
+    // real em producao — campanha 1789394446636 travada em "restricoes").
+    console.log("[lead-form-goal]", campaignIdSeguro, JSON.stringify(resultados));
     const meta = (resultados[0] as any)?.campaignConversionGoal ??
       (resultados[0] as any)?.campaign_conversion_goal;
     const resourceName = meta?.resourceName ?? meta?.resource_name;
