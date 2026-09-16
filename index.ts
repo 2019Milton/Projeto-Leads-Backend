@@ -7800,6 +7800,20 @@ async function validarBusinessMessageWhatsappGoogle(
   );
 }
 
+// Mesma ideia de montarLinkWhatsappLinkedIn (tag [LI-<id>]) aplicada ao Google:
+// o botao de WhatsApp do Google Ads tambem so oferece uma mensagem inicial
+// PRE-PREENCHIDA (o cliente aperta enviar ou edita antes) — a Google nao manda
+// nenhum equivalente ao referral da Meta pra identificar o anuncio na mensagem
+// recebida. Embutir "[GA-<campaign_id>]" no fim da mensagem e a unica forma de
+// descobrir depois de qual campanha/nicho veio o contato (ver
+// criarLeadDeConversaGoogle e resolverNichoConversaWhatsApp). Reserva espaco
+// pra tag ANTES de truncar o texto do usuario pros 200 caracteres do Google,
+// senao a truncagem poderia cortar a propria tag no fim.
+function montarMensagemWhatsappComTagGoogle(mensagem: string, campaignId: string | number): string {
+  const tag = ` [GA-${campaignId}]`;
+  return truncarSemCortarPalavra(mensagem, 200 - tag.length) + tag;
+}
+
 async function obterOuCriarBusinessMessageWhatsappGoogle(
   customerId: string,
   accessToken: string,
@@ -9168,7 +9182,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
           conexao.accessToken,
           conexao.loginCustomerId,
           numeroWhatsapp,
-          mensagemWhatsapp
+          montarMensagemWhatsappComTagGoogle(mensagemWhatsapp, campaign_id)
         );
       } catch (errBusinessMessage: any) {
         console.error("ERRO /google/anuncio (Business Message WhatsApp):", errBusinessMessage);
@@ -20766,6 +20780,76 @@ async function criarLeadDeConversaLinkedIn(
   return novoLeadId;
 }
 
+// Equivalente Google de criarLeadDeConversaLinkedIn — o Google Ads tambem nao
+// manda nenhum referral/click id junto da primeira mensagem (diferente da
+// Meta), entao a atribuicao usa a mesma estrategia de tag embutida na mensagem
+// pre-preenchida do botao de WhatsApp (ver montarMensagemWhatsappComTagGoogle
+// em /google/anuncio), procurada aqui na primeira mensagem recebida. Chamado
+// em processarEventoWhatsApp como fallback so quando nem CTWA (Meta) nem a tag
+// do LinkedIn acharem nada.
+async function criarLeadDeConversaGoogle(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  nomeContato?: string | null
+): Promise<number | null> {
+  const match = String(textoMensagem || "").match(/\[GA-(\d+)\]/);
+  if (!match) {
+    return null;
+  }
+  const campaignId = match[1];
+
+  // Mesma proteção contra corrida que criarLeadDeConversaCTWA usa.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const campRow = await client.query(
+    `SELECT id, nome, nicho_id, conta_anuncios_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google' LIMIT 1`,
+    [campaignId, usuarioId]
+  );
+  // Tag presente mas sem campanha correspondente (apagada, ou mensagem
+  // forjada por outro motivo) — não cria lead com atribuição inventada.
+  if (!campRow.rows.length) {
+    return null;
+  }
+
+  const { id: campanhaId, nome: nomeCampanhaRow, nicho_id: nichoId, conta_anuncios_id: contaAnunciosId } = campRow.rows[0];
+  const nomeCampanha = nomeCampanhaRow || "Campanha Google Ads";
+
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, nome, email, telefone,
+      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+    )
+    VALUES ($1, NULL, $2, NULL, $3, 'google', 'whatsapp', 'novo', $4, $5, $6, $7, NOW())
+    RETURNING id
+    `,
+    [usuarioId, nomeContato || "Lead WhatsApp (Google Ads)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: nomeContato || "Lead WhatsApp (Google Ads)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (Google wa):", e));
+
+  return novoLeadId;
+}
+
 // Resolve o nicho pra escolher o roteiro do bot (ver avancarBotWhatsApp),
 // priorizando o clique de anúncio desta própria mensagem sobre o nicho do
 // lead já vinculado. Sem essa prioridade, um telefone que já é lead de um
@@ -20798,6 +20882,15 @@ async function resolverNichoConversaWhatsApp(
     const campRow = await client.query(
       `SELECT nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
       [matchLinkedIn[1], usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
+  }
+
+  const matchGoogle = String(textoMensagem || "").match(/\[GA-(\d+)\]/);
+  if (matchGoogle) {
+    const campRow = await client.query(
+      `SELECT nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google' LIMIT 1`,
+      [matchGoogle[1], usuarioId]
     ).catch(() => ({ rows: [] as any[] }));
     if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
   }
@@ -20976,6 +21069,12 @@ async function processarEventoWhatsApp(value: any) {
     if (!leadIdVinculado) {
       leadIdVinculado = await criarLeadDeConversaLinkedIn(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
         .catch(e => { console.error("ERRO criarLeadDeConversaLinkedIn:", e); return null; });
+    }
+
+    // Idem pra tag do Google Ads (ver montarMensagemWhatsappComTagGoogle).
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaGoogle(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
+        .catch(e => { console.error("ERRO criarLeadDeConversaGoogle:", e); return null; });
     }
 
     if (leadIdVinculado) {
