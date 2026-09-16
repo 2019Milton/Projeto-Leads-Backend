@@ -369,7 +369,21 @@ function compararAssinatura(
   );
 }
 
-function criarTokenUsuario(user: any) {
+type ContextoAcessoUsuario = "conta" | "painel" | "gestor";
+
+function normalizarContextoAcesso(
+  contexto: unknown
+): ContextoAcessoUsuario {
+  return contexto === "painel" || contexto === "gestor"
+    ? contexto
+    : "conta";
+}
+
+function criarTokenUsuario(
+  user: any,
+  contexto: ContextoAcessoUsuario = "conta",
+  gestorId: number | null = null
+) {
   const expiraEm =
     Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
 
@@ -380,6 +394,8 @@ function criarTokenUsuario(user: any) {
     user.nome || "",
     user.sobrenome || "",
     normalizarPlano(user.plano),
+    normalizarContextoAcesso(contexto),
+    gestorId || "",
     expiraEm
   ].map(limparCampoToken).join(":");
 
@@ -402,8 +418,11 @@ function decodificarTokenUsuario(token: string) {
     return null;
   }
 
+  const tokenAssinadoContextual =
+    partes.length >= 10;
+
   const tokenAssinadoNovo =
-    partes.length >= 8;
+    partes.length >= 8 && !tokenAssinadoContextual;
 
   const tokenAssinadoLegado =
     partes.length >= 7;
@@ -412,11 +431,17 @@ function decodificarTokenUsuario(token: string) {
     return null;
   }
 
-  const indiceExpiracao =
-    tokenAssinadoNovo ? 6 : 5;
+  const indiceExpiracao = tokenAssinadoContextual
+    ? 8
+    : tokenAssinadoNovo
+      ? 6
+      : 5;
 
-  const indiceAssinatura =
-    tokenAssinadoNovo ? 7 : 6;
+  const indiceAssinatura = tokenAssinadoContextual
+    ? 9
+    : tokenAssinadoNovo
+      ? 7
+      : 6;
 
   const payload =
     partes.slice(0, indiceExpiracao + 1).join(":");
@@ -446,9 +471,15 @@ function decodificarTokenUsuario(token: string) {
     tipo,
     nome: partes[3] || "",
     sobrenome: partes[4] || "",
-    plano: tokenAssinadoNovo
+    plano: tokenAssinadoContextual || tokenAssinadoNovo
       ? normalizarPlano(partes[5])
-      : "bronze"
+      : "bronze",
+    contexto_acesso: tokenAssinadoContextual
+      ? normalizarContextoAcesso(partes[6])
+      : "conta",
+    gestor_id: tokenAssinadoContextual && partes[7]
+      ? Number(partes[7])
+      : null
   };
 }
 
@@ -508,6 +539,17 @@ function obterFrontendUrl() {
     Bun.env.FRONTEND_URL ||
     "https://plataformadeleads.com.br"
   ).replace(/\/+$/g, "");
+}
+
+function gerarPainelSlug() {
+  return base64Url(randomBytes(24));
+}
+
+function montarPainelClienteUrl(slug: unknown) {
+  const slugSeguro = textoOpcional(slug);
+  return slugSeguro
+    ? `${obterFrontendUrl()}/?painel=${encodeURIComponent(slugSeguro)}`
+    : null;
 }
 
 function textoOpcional(value: unknown) {
@@ -4522,6 +4564,60 @@ app.use("/*", cors({
 
 app.get("/", (c) => c.text("API OK 🚀"));
 
+async function tokenPodeOperarContaCompleta(user: any) {
+  if (!user?.id) return false;
+
+  const alvoResult = await client.query(
+    `
+    SELECT
+      id,
+      admin_id,
+      COALESCE(ativo, true) AS ativo,
+      COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado
+    FROM usuarios
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [Number(user.id)]
+  );
+  const alvo = alvoResult.rows[0];
+
+  if (!alvo?.ativo) return false;
+
+  const contexto = normalizarContextoAcesso(user.contexto_acesso);
+
+  if (contexto === "painel") return false;
+
+  if (contexto === "gestor") {
+    const gestorId = Number(user.gestor_id);
+    if (!Number.isInteger(gestorId) || gestorId <= 0) return false;
+
+    const gestorResult = await client.query(
+      `
+      SELECT id, tipo, COALESCE(ativo, true) AS ativo
+      FROM usuarios
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [gestorId]
+    );
+    const gestor = gestorResult.rows[0];
+
+    return Boolean(
+      gestor?.ativo &&
+      (
+        ["super_admin", "master"].includes(gestor.tipo) ||
+        (
+          gestor.tipo === "admin_corretor" &&
+          Number(alvo.admin_id) === gestorId
+        )
+      )
+    );
+  }
+
+  return true;
+}
+
 
 // 🔐 middleware (token simples)
 const authMiddleware = async (c: any, next: any) => {
@@ -4558,6 +4654,8 @@ const authMiddleware = async (c: any, next: any) => {
         COALESCE(u.ia_provider, 'auto') AS ia_provider,
         COALESCE(u.ativo, true) AS ativo,
         COALESCE(u.is_parceiro, false) AS is_parceiro,
+        COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+        u.painel_slug,
         COALESCE(
           (
             SELECT json_agg(json_build_object(
@@ -4586,9 +4684,75 @@ const authMiddleware = async (c: any, next: any) => {
       return c.json({ error: "Usuário inativo ou não encontrado" }, 401);
     }
 
+    const modoAcesso: ContextoAcessoUsuario =
+      normalizarContextoAcesso(user.contexto_acesso);
+    let gestorAutenticado: any = null;
+
+    if (modoAcesso === "gestor") {
+      const gestorId = Number(user.gestor_id);
+
+      if (!Number.isInteger(gestorId) || gestorId <= 0) {
+        return c.json({ error: "Acesso do gestor inválido" }, 401);
+      }
+
+      const gestorResult = await client.query(
+        `
+        SELECT id, email, tipo, nome, sobrenome, COALESCE(ativo, true) AS ativo
+        FROM usuarios
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [gestorId]
+      );
+
+      gestorAutenticado = gestorResult.rows[0];
+
+      const gestorElevado =
+        ["super_admin", "master"].includes(gestorAutenticado?.tipo);
+      const gestorVinculado =
+        gestorAutenticado?.tipo === "admin_corretor" &&
+        Number(userBanco.admin_id) === gestorId;
+
+      if (
+        !gestorAutenticado?.ativo ||
+        (!gestorElevado && !gestorVinculado)
+      ) {
+        return c.json({ error: "Gestor não autorizado para esta conta" }, 403);
+      }
+    } else if (modoAcesso === "painel") {
+      if (!userBanco.painel_cliente_habilitado) {
+        return c.json({ error: "Painel do cliente desabilitado" }, 403);
+      }
+    }
+
+    if (modoAcesso === "painel") {
+      const rota = c.req.path;
+      const metodo = c.req.method;
+      const permitido = metodo === "GET" && (
+        rota === "/usuarios/me" ||
+        rota === "/painel-cliente/resumo"
+      );
+
+      if (!permitido) {
+        return c.json({
+          error: "Este acesso permite somente acompanhar os resultados"
+        }, 403);
+      }
+    }
+
     const userAutenticado = {
       ...user,
       ...userBanco,
+      contexto_acesso: modoAcesso,
+      modo_acesso: modoAcesso,
+      gestor: gestorAutenticado
+        ? {
+            id: gestorAutenticado.id,
+            nome: gestorAutenticado.nome,
+            sobrenome: gestorAutenticado.sobrenome,
+            email: gestorAutenticado.email
+          }
+        : null,
       plano: normalizarPlano(userBanco.plano),
       recursos: obterRecursosPlano(
         userBanco.plano
@@ -5910,8 +6074,8 @@ app.get("/auth/meta/login", async (c) => {
   const usuario =
     decodificarTokenUsuario(token);
 
-  if (!usuario?.id) {
-    return c.text("Token invalido ou expirado", 401);
+  if (!usuario?.id || !(await tokenPodeOperarContaCompleta(usuario))) {
+    return c.text("Token invalido, expirado ou sem permissao operacional", 401);
   }
 
   const clientId = Bun.env.META_APP_ID;
@@ -6226,7 +6390,9 @@ app.get("/auth/:plataforma/login", async (c) => {
     if (!token) return c.text("Token nao enviado", 400);
 
     const usuario = decodificarTokenUsuario(token);
-    if (!usuario?.id) return c.text("Token invalido ou expirado", 401);
+    if (!usuario?.id || !(await tokenPodeOperarContaCompleta(usuario))) {
+      return c.text("Token invalido, expirado ou sem permissao operacional", 401);
+    }
 
     const clientId    = Bun.env[cfg.clientIdEnv];
     const redirectUri = Bun.env[cfg.redirectUriEnv];
@@ -14884,8 +15050,8 @@ app.get("/auth/meta/instagram/login", async (c) => {
   const usuario =
     decodificarTokenUsuario(token);
 
-  if (!usuario?.id) {
-    return c.text("Token invalido ou expirado", 401);
+  if (!usuario?.id || !(await tokenPodeOperarContaCompleta(usuario))) {
+    return c.text("Token invalido, expirado ou sem permissao operacional", 401);
   }
 
   const clientId = Bun.env.INSTAGRAM_APP_ID;
@@ -21215,7 +21381,31 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     ADD COLUMN IF NOT EXISTS is_parceiro BOOLEAN DEFAULT false,
     ADD COLUMN IF NOT EXISTS parceiro_id INTEGER,
-    ADD COLUMN IF NOT EXISTS resumo_semanal_enviado_em TIMESTAMP;
+    ADD COLUMN IF NOT EXISTS resumo_semanal_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS painel_cliente_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS painel_slug TEXT,
+    ADD COLUMN IF NOT EXISTS painel_atualizado_em TIMESTAMP;
+`);
+
+await client.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_painel_slug
+    ON usuarios(painel_slug)
+    WHERE painel_slug IS NOT NULL;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS gestor_acessos (
+    id SERIAL PRIMARY KEY,
+    gestor_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    cliente_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_gestor_acessos_gestor
+    ON gestor_acessos(gestor_id, criado_em DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_gestor_acessos_cliente
+    ON gestor_acessos(cliente_id, criado_em DESC);
 `);
 
 await client.query(`
@@ -22419,6 +22609,7 @@ app.post("/login-test", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const email = body.email;
     const senha = body.senha;
+    const painelSlug = textoOpcional(body.painel_slug);
 
     if (!email || !senha) {
       return c.json({ error: "Email e senha obrigatórios" }, 400);
@@ -22426,7 +22617,10 @@ app.post("/login-test", async (c) => {
 
     const result = await client.query(
       `
-      SELECT id, email, senha, tipo, nome, sobrenome, plano
+      SELECT
+        id, email, senha, tipo, nome, sobrenome, plano,
+        COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+        painel_slug
       FROM usuarios
       WHERE email=$1
       AND COALESCE(ativo, true) = true
@@ -22436,7 +22630,17 @@ app.post("/login-test", async (c) => {
 
     const user = result.rows[0];
 
-    if (!user || !(await senhaConfere(senha, user.senha))) {
+    if (
+      !user ||
+      !(await senhaConfere(senha, user.senha)) ||
+      (
+        painelSlug &&
+        (
+          !user.painel_cliente_habilitado ||
+          user.painel_slug !== painelSlug
+        )
+      )
+    ) {
       return c.json({ error: "Login inválido" }, 401);
     }
 
@@ -22446,7 +22650,10 @@ app.post("/login-test", async (c) => {
       user.senha
     );
 
-    const token = criarTokenUsuario(user);
+    const token = criarTokenUsuario(
+      user,
+      painelSlug ? "painel" : "conta"
+    );
 
     return c.json({
       message: "Login OK",
@@ -22465,11 +22672,15 @@ app.post("/login", async (c) => {
 
   if (limite) return limite;
 
-  const { email, senha } = await c.req.json();
+  const { email, senha, painel_slug } = await c.req.json();
+  const painelSlug = textoOpcional(painel_slug);
 
   const result = await client.query(
     `
-    SELECT id, email, senha, tipo, nome, sobrenome, plano
+    SELECT
+      id, email, senha, tipo, nome, sobrenome, plano,
+      COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      painel_slug
     FROM usuarios
     WHERE email=$1
     AND COALESCE(ativo, true) = true
@@ -22479,7 +22690,17 @@ app.post("/login", async (c) => {
 
   const user = result.rows[0];
 
-  if (!user || !(await senhaConfere(senha, user.senha))) {
+  if (
+    !user ||
+    !(await senhaConfere(senha, user.senha)) ||
+    (
+      painelSlug &&
+      (
+        !user.painel_cliente_habilitado ||
+        user.painel_slug !== painelSlug
+      )
+    )
+  ) {
     return c.json({ error: "Login inválido" }, 401);
   }
 
@@ -22489,7 +22710,10 @@ app.post("/login", async (c) => {
     user.senha
   );
 
-  const token = criarTokenUsuario(user);
+  const token = criarTokenUsuario(
+    user,
+    painelSlug ? "painel" : "conta"
+  );
 
   return c.json({
     message: "Login OK",
@@ -22507,7 +22731,15 @@ app.get("/usuarios/me", authMiddleware, async (c) => {
     sobrenome:            user.sobrenome,
     whatsapp:             user.whatsapp || null,
     notif_whatsapp_lead:  user.notif_whatsapp_lead !== false,
-    tipo:                 user.tipo
+    tipo:                 user.tipo,
+    modo_acesso:          user.modo_acesso || "conta",
+    gestor_id:            user.gestor?.id || null,
+    gestor:               user.gestor || null,
+    painel_cliente_habilitado:
+      user.painel_cliente_habilitado === true,
+    painel_url: user.painel_cliente_habilitado
+      ? montarPainelClienteUrl(user.painel_slug)
+      : null
   });
 });
 
@@ -22537,6 +22769,542 @@ app.get("/usuarios/me/plano", authMiddleware, async (c) => {
       limite_mensal: Number(user.ia_limite_mensal || 300),
       custo_limite_mensal: Number(user.ia_custo_limite_mensal || 120)
     }
+  });
+});
+
+function usuarioPodeGerenciarClientes(user: any) {
+  return ["admin_corretor", "super_admin", "master"].includes(
+    String(user?.tipo || "")
+  );
+}
+
+function usuarioGestorElevado(user: any) {
+  return ["super_admin", "master"].includes(String(user?.tipo || ""));
+}
+
+async function buscarClienteGerenciado(
+  gestor: any,
+  clienteId: number
+) {
+  if (!usuarioPodeGerenciarClientes(gestor)) return null;
+
+  const parametros: any[] = [clienteId];
+  let filtroVinculo = "";
+
+  if (!usuarioGestorElevado(gestor)) {
+    parametros.push(Number(gestor.id));
+    filtroVinculo = `AND u.admin_id = $${parametros.length}`;
+  }
+
+  const result = await client.query(
+    `
+    SELECT
+      u.id,
+      u.email,
+      u.senha,
+      u.tipo,
+      u.nome,
+      u.sobrenome,
+      u.plano,
+      u.admin_id,
+      COALESCE(u.ativo, true) AS ativo,
+      COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      u.painel_slug,
+      u.criado_em
+    FROM usuarios u
+    WHERE u.id = $1
+      AND u.tipo IN ('corretor', 'corretor_receptor')
+      ${filtroVinculo}
+    LIMIT 1
+    `,
+    parametros
+  );
+
+  return result.rows[0] || null;
+}
+
+function formatarClienteGerenciado(row: any) {
+  return {
+    id: Number(row.id),
+    nome: row.nome || "",
+    sobrenome: row.sobrenome || "",
+    nome_completo: `${row.nome || ""} ${row.sobrenome || ""}`.trim(),
+    email: row.email,
+    tipo: row.tipo,
+    plano: normalizarPlano(row.plano),
+    ativo: row.ativo !== false,
+    painel_cliente_habilitado:
+      row.painel_cliente_habilitado === true,
+    painel_url: row.painel_cliente_habilitado
+      ? montarPainelClienteUrl(row.painel_slug)
+      : null,
+    criado_em: row.criado_em || null,
+    campanhas_total: Number(row.campanhas_total || 0),
+    campanhas_ativas: Number(row.campanhas_ativas || 0),
+    leads_total: Number(row.leads_total || 0),
+    leads_ultimos_7_dias: Number(row.leads_ultimos_7_dias || 0),
+    meta_conectado: row.meta_conectado === true,
+    whatsapp_conectado: row.whatsapp_conectado === true,
+    plataformas_conectadas: Array.isArray(row.plataformas_conectadas)
+      ? row.plataformas_conectadas
+      : []
+  };
+}
+
+app.get("/gestor/clientes", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+
+  if (!usuarioPodeGerenciarClientes(gestor) || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Acesso restrito ao gestor de tráfego" }, 403);
+  }
+
+  const parametros: any[] = [];
+  let filtroVinculo = "";
+
+  if (!usuarioGestorElevado(gestor)) {
+    parametros.push(Number(gestor.id));
+    filtroVinculo = `AND u.admin_id = $${parametros.length}`;
+  }
+
+  const result = await client.query(
+    `
+    SELECT
+      u.id,
+      u.email,
+      u.tipo,
+      u.nome,
+      u.sobrenome,
+      u.plano,
+      u.admin_id,
+      u.criado_em,
+      COALESCE(u.ativo, true) AS ativo,
+      COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      u.painel_slug,
+      (SELECT COUNT(*)::int FROM campanhas c WHERE c.usuario_id = u.id) AS campanhas_total,
+      (
+        SELECT COUNT(*)::int
+        FROM campanhas c
+        WHERE c.usuario_id = u.id
+          AND UPPER(COALESCE(c.status, '')) IN ('ACTIVE', 'ATIVA', 'ENABLED')
+      ) AS campanhas_ativas,
+      (SELECT COUNT(*)::int FROM leads l WHERE l.usuario_id = u.id) AS leads_total,
+      (
+        SELECT COUNT(*)::int
+        FROM leads l
+        WHERE l.usuario_id = u.id
+          AND l.criado_em >= NOW() - INTERVAL '7 days'
+      ) AS leads_ultimos_7_dias,
+      EXISTS(
+        SELECT 1 FROM meta_conexoes mc
+        WHERE mc.usuario_id = u.id AND mc.access_token IS NOT NULL
+      ) AS meta_conectado,
+      EXISTS(
+        SELECT 1 FROM plataforma_conexoes pc
+        WHERE pc.usuario_id = u.id
+          AND pc.plataforma = 'whatsapp'
+          AND pc.status = 'conectado'
+      ) AS whatsapp_conectado,
+      COALESCE(
+        (
+          SELECT json_agg(
+            json_build_object(
+              'plataforma', pc.plataforma,
+              'status', pc.status
+            )
+            ORDER BY pc.plataforma
+          )
+          FROM plataforma_conexoes pc
+          WHERE pc.usuario_id = u.id
+        ),
+        '[]'::json
+      ) AS plataformas_conectadas
+    FROM usuarios u
+    WHERE u.tipo IN ('corretor', 'corretor_receptor')
+      ${filtroVinculo}
+    ORDER BY COALESCE(u.nome, ''), COALESCE(u.sobrenome, ''), u.email
+    `,
+    parametros
+  );
+
+  return c.json(result.rows.map(formatarClienteGerenciado));
+});
+
+app.post("/gestor/clientes", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+
+  if (!usuarioPodeGerenciarClientes(gestor) || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Acesso restrito ao gestor de tráfego" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const nome = textoOpcional(body.nome);
+  const sobrenome = textoOpcional(body.sobrenome);
+  const email = textoOpcional(body.email).toLowerCase();
+  const senha = String(body.senha || "");
+  const senhaForte =
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
+
+  if (!nome || !email || !senha) {
+    return c.json({ error: "Nome, email e senha são obrigatórios" }, 400);
+  }
+
+  if (!/^\S+@\S+\.\S+$/.test(email)) {
+    return c.json({ error: "Informe um email válido" }, 400);
+  }
+
+  if (!senhaForte.test(senha)) {
+    return c.json({
+      error: "A senha precisa ter no mínimo 8 caracteres, letra maiúscula, minúscula, número e símbolo."
+    }, 400);
+  }
+
+  try {
+    const slug = gerarPainelSlug();
+    const result = await client.query(
+      `
+      INSERT INTO usuarios (
+        nome,
+        sobrenome,
+        email,
+        senha,
+        tipo,
+        admin_id,
+        ativo,
+        painel_cliente_habilitado,
+        painel_slug,
+        painel_atualizado_em
+      )
+      VALUES ($1, $2, $3, $4, 'corretor', $5, true, true, $6, NOW())
+      RETURNING
+        id, email, tipo, nome, sobrenome, plano, admin_id, ativo,
+        painel_cliente_habilitado, painel_slug, criado_em
+      `,
+      [
+        nome,
+        sobrenome || null,
+        email,
+        await gerarHashSenha(senha),
+        Number(gestor.id),
+        slug
+      ]
+    );
+
+    return c.json({
+      sucesso: true,
+      cliente: formatarClienteGerenciado(result.rows[0])
+    }, 201);
+  } catch (err: any) {
+    if (err?.code === "23505") {
+      return c.json({ error: "Este email já está cadastrado" }, 409);
+    }
+
+    console.error("GESTOR CRIAR CLIENTE ERROR:", err);
+    return c.json({ error: "Não foi possível criar o corretor" }, 500);
+  }
+});
+
+app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const cliente = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!cliente || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const atualizacoes: string[] = [];
+  const valores: any[] = [];
+
+  const adicionar = (sql: string, valor: any) => {
+    valores.push(valor);
+    atualizacoes.push(`${sql} = $${valores.length}`);
+  };
+
+  if (Object.prototype.hasOwnProperty.call(body, "nome")) {
+    const nome = textoOpcional(body.nome);
+    if (!nome) return c.json({ error: "O nome é obrigatório" }, 400);
+    adicionar("nome", nome);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "sobrenome")) {
+    adicionar("sobrenome", textoOpcional(body.sobrenome) || null);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "email")) {
+    const email = textoOpcional(body.email).toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      return c.json({ error: "Informe um email válido" }, 400);
+    }
+    adicionar("email", email);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "painel_cliente_habilitado")) {
+    const habilitado = body.painel_cliente_habilitado === true;
+    adicionar("painel_cliente_habilitado", habilitado);
+
+    if (habilitado && !cliente.painel_slug) {
+      adicionar("painel_slug", gerarPainelSlug());
+    }
+
+    atualizacoes.push("painel_atualizado_em = NOW()");
+  }
+
+  if (!atualizacoes.length) {
+    return c.json({ error: "Nenhuma alteração informada" }, 400);
+  }
+
+  valores.push(clienteId);
+
+  try {
+    const result = await client.query(
+      `
+      UPDATE usuarios
+      SET ${atualizacoes.join(", ")}
+      WHERE id = $${valores.length}
+      RETURNING
+        id, email, tipo, nome, sobrenome, plano, admin_id, ativo,
+        painel_cliente_habilitado, painel_slug, criado_em
+      `,
+      valores
+    );
+
+    return c.json({
+      sucesso: true,
+      cliente: formatarClienteGerenciado(result.rows[0])
+    });
+  } catch (err: any) {
+    if (err?.code === "23505") {
+      return c.json({ error: "Este email já está cadastrado" }, 409);
+    }
+
+    console.error("GESTOR ATUALIZAR CLIENTE ERROR:", err);
+    return c.json({ error: "Não foi possível atualizar o corretor" }, 500);
+  }
+});
+
+app.put("/gestor/clientes/:id/senha", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const cliente = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!cliente || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const novaSenha = String(body.nova_senha || "");
+  const senhaForte =
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
+
+  if (!senhaForte.test(novaSenha)) {
+    return c.json({
+      error: "A senha precisa ter no mínimo 8 caracteres, letra maiúscula, minúscula, número e símbolo."
+    }, 400);
+  }
+
+  if (await senhaJaFoiUsadaRecentemente(clienteId, novaSenha)) {
+    return c.json({
+      error: "Esta senha já foi usada recentemente. Escolha outra senha."
+    }, 400);
+  }
+
+  const conn = await client.connect();
+
+  try {
+    await conn.query("BEGIN");
+    await registrarSenhaAnterior(conn, clienteId, cliente.senha);
+    await conn.query(
+      "UPDATE usuarios SET senha = $1 WHERE id = $2",
+      [await gerarHashSenha(novaSenha), clienteId]
+    );
+    await conn.query("COMMIT");
+
+    return c.json({
+      sucesso: true,
+      message: "Senha redefinida. A senha anterior não é exibida nem recuperada."
+    });
+  } catch (err) {
+    await conn.query("ROLLBACK").catch(() => {});
+    console.error("GESTOR RESET SENHA ERROR:", err);
+    return c.json({ error: "Não foi possível redefinir a senha" }, 500);
+  } finally {
+    conn.release();
+  }
+});
+
+app.post("/gestor/clientes/:id/acessar", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const cliente = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!cliente || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  if (!cliente.ativo) {
+    return c.json({ error: "A conta deste corretor está inativa" }, 403);
+  }
+
+  const token = criarTokenUsuario(cliente, "gestor", Number(gestor.id));
+
+  await client.query(
+    `
+    INSERT INTO gestor_acessos (gestor_id, cliente_id)
+    VALUES ($1, $2)
+    `,
+    [Number(gestor.id), clienteId]
+  );
+
+  return c.json({
+    sucesso: true,
+    token,
+    cliente: formatarClienteGerenciado(cliente)
+  });
+});
+
+app.get("/painel-cliente/resumo", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+
+  if (user.modo_acesso !== "painel") {
+    return c.json({ error: "Esta rota é exclusiva do painel do cliente" }, 403);
+  }
+
+  const usuarioId = Number(user.id);
+
+  const [campanhas, campanhasRecentes, campanhasPlataforma, leads, leadsStatus, conexoes, bot] =
+    await Promise.all([
+      client.query(
+        `
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (
+            WHERE UPPER(COALESCE(status, '')) IN ('ACTIVE', 'ATIVA', 'ENABLED')
+          )::int AS ativas,
+          COUNT(*) FILTER (
+            WHERE UPPER(COALESCE(status, '')) IN ('PAUSED', 'PAUSADA')
+          )::int AS pausadas,
+          MAX(COALESCE(atualizado_em, criado_em)) AS ultima_atualizacao
+        FROM campanhas
+        WHERE usuario_id = $1
+        `,
+        [usuarioId]
+      ),
+      client.query(
+        `
+        SELECT id, nome, status, origem, criado_em, atualizado_em
+        FROM campanhas
+        WHERE usuario_id = $1
+        ORDER BY COALESCE(atualizado_em, criado_em) DESC NULLS LAST, id DESC
+        LIMIT 8
+        `,
+        [usuarioId]
+      ),
+      client.query(
+        `
+        SELECT LOWER(COALESCE(origem, 'plataforma')) AS plataforma, COUNT(*)::int AS total
+        FROM campanhas
+        WHERE usuario_id = $1
+        GROUP BY LOWER(COALESCE(origem, 'plataforma'))
+        ORDER BY total DESC, plataforma
+        `,
+        [usuarioId]
+      ),
+      client.query(
+        `
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE status = 'fechado')::int AS fechados,
+          COUNT(*) FILTER (WHERE status = 'perdido')::int AS perdidos,
+          COUNT(*) FILTER (WHERE criado_em >= NOW() - INTERVAL '7 days')::int AS ultimos_7_dias,
+          COUNT(*) FILTER (WHERE criado_em >= date_trunc('month', NOW()))::int AS no_mes,
+          MAX(criado_em) AS ultimo_lead_em
+        FROM leads
+        WHERE usuario_id = $1
+        `,
+        [usuarioId]
+      ),
+      client.query(
+        `
+        SELECT COALESCE(status, 'novo') AS status, COUNT(*)::int AS total
+        FROM leads
+        WHERE usuario_id = $1
+        GROUP BY COALESCE(status, 'novo')
+        ORDER BY total DESC, status
+        `,
+        [usuarioId]
+      ),
+      client.query(
+        `
+        SELECT plataforma, status, atualizado_em
+        FROM plataforma_conexoes
+        WHERE usuario_id = $1
+
+        UNION ALL
+
+        SELECT
+          'meta' AS plataforma,
+          CASE WHEN access_token IS NOT NULL THEN 'conectado' ELSE 'desconectado' END AS status,
+          COALESCE(ultimo_sync, criado_em) AS atualizado_em
+        FROM meta_conexoes
+        WHERE usuario_id = $1
+        ORDER BY plataforma
+        `,
+        [usuarioId]
+      ),
+      client.query(
+        `
+        SELECT
+          COUNT(*) FILTER (WHERE ativo = true)::int AS roteiros_ativos,
+          COUNT(*)::int AS roteiros_total,
+          MAX(atualizado_em) AS ultima_atualizacao
+        FROM whatsapp_bot_config
+        WHERE usuario_id = $1
+        `,
+        [usuarioId]
+      )
+    ]);
+
+  const resumoCampanhas = campanhas.rows[0] || {};
+  const resumoLeads = leads.rows[0] || {};
+  const resumoBot = bot.rows[0] || {};
+
+  return c.json({
+    atualizado_em: new Date().toISOString(),
+    cliente: {
+      nome: `${user.nome || ""} ${user.sobrenome || ""}`.trim(),
+      email: user.email
+    },
+    campanhas: {
+      total: Number(resumoCampanhas.total || 0),
+      ativas: Number(resumoCampanhas.ativas || 0),
+      pausadas: Number(resumoCampanhas.pausadas || 0),
+      ultima_atualizacao: resumoCampanhas.ultima_atualizacao || null,
+      por_plataforma: campanhasPlataforma.rows,
+      recentes: campanhasRecentes.rows
+    },
+    leads: {
+      total: Number(resumoLeads.total || 0),
+      fechados: Number(resumoLeads.fechados || 0),
+      perdidos: Number(resumoLeads.perdidos || 0),
+      ultimos_7_dias: Number(resumoLeads.ultimos_7_dias || 0),
+      no_mes: Number(resumoLeads.no_mes || 0),
+      ultimo_lead_em: resumoLeads.ultimo_lead_em || null,
+      por_status: leadsStatus.rows
+    },
+    conexoes: conexoes.rows,
+    whatsapp_bot: {
+      roteiros_ativos: Number(resumoBot.roteiros_ativos || 0),
+      roteiros_total: Number(resumoBot.roteiros_total || 0),
+      ultima_atualizacao: resumoBot.ultima_atualizacao || null
+    },
+    ia: {
+      ativa: user.ia_ativo !== false,
+      mensagem: user.ia_ativo !== false
+        ? "A IA auxilia o gestor na criação, análise e otimização das campanhas."
+        : "A IA está desativada nesta conta."
+    },
+    somente_leitura: true
   });
 });
 
