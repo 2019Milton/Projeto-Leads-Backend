@@ -20600,6 +20600,48 @@ async function criarLeadDeConversaLinkedIn(
   return novoLeadId;
 }
 
+// Resolve o nicho pra escolher o roteiro do bot (ver avancarBotWhatsApp),
+// priorizando o clique de anúncio desta própria mensagem sobre o nicho do
+// lead já vinculado. Sem essa prioridade, um telefone que já é lead de um
+// nicho antigo (Lead Ads de anos atrás, conversa anterior etc.) mas clicou
+// AGORA num anúncio de outro nicho ficaria preso no roteiro do nicho velho —
+// porque vincularConversaAoLead reaproveita o lead existente sem olhar pro
+// clique novo (decisão certa pra não duplicar o CRM, mas errada pra escolher
+// roteiro). Não mexe em qual lead fica vinculado nem no nicho_id gravado
+// nele — só decide qual roteiro roda pra ESSA mensagem.
+async function resolverNichoConversaWhatsApp(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  leadIdVinculado: number | null
+): Promise<number | null> {
+  const referral = conversa?.referral;
+  if (referral?.source_type === "ad" && referral?.source_id) {
+    const campRow = await client.query(
+      `SELECT nicho_id FROM campanhas
+       WHERE ad_id = $1 AND usuario_id = $2
+         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+       LIMIT 1`,
+      [String(referral.source_id), usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
+  }
+
+  const matchLinkedIn = String(textoMensagem || "").match(/\[LI-(\d+)\]/);
+  if (matchLinkedIn) {
+    const campRow = await client.query(
+      `SELECT nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
+      [matchLinkedIn[1], usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
+  }
+
+  if (!leadIdVinculado) return null;
+  const leadNicho = await client.query(`SELECT nicho_id FROM leads WHERE id = $1`, [leadIdVinculado])
+    .catch(() => ({ rows: [] as any[] }));
+  return leadNicho.rows[0]?.nicho_id ?? null;
+}
+
 // Preenche nicho_slug/nicho_nome + o transcript de mensagens do WhatsApp
 // (direcao IN 'entrada'/'echo' — fala do cliente e fala real do corretor pelo
 // próprio app; 'saida' fica de fora porque é texto fixo do roteiro do bot,
@@ -20732,13 +20774,18 @@ async function processarEventoWhatsApp(value: any) {
     }
 
     // Guarda cru o referral (anúncio "clique para WhatsApp" que originou a
-    // conversa), se vier e ainda não tiver sido guardado — usado por
-    // criarLeadDeConversaCTWA logo abaixo pra decidir se cria lead novo.
-    // Atualiza também o objeto em memória (não só o banco): essa é a MESMA
-    // mensagem que carrega o referral (só vem no primeiro contato), então sem
-    // isso conversa.referral ficaria desatualizado até a próxima mensagem —
-    // tarde demais, o ctwa_clid só aparece uma vez.
-    if (msg.referral && !conversa.referral) {
+    // conversa) sempre que a mensagem trouxer um — usado por
+    // criarLeadDeConversaCTWA pra decidir se cria lead novo e por
+    // resolverNichoConversaWhatsApp (mais abaixo) pra escolher o roteiro do
+    // nicho certo. SEMPRE sobrescreve, não só na primeira vez: um telefone que
+    // já é conhecido (lead antigo de outro nicho, ou conversa anterior) pode
+    // clicar num anúncio novo depois — sem sobrescrever, esse clique novo
+    // nunca seria considerado pra nada, preso atrás do referral antigo pra
+    // sempre. Atualiza também o objeto em memória (não só o banco): essa é a
+    // MESMA mensagem que carrega o referral (só vem na mensagem do clique),
+    // então sem isso conversa.referral ficaria desatualizado até a próxima
+    // mensagem — tarde demais, o ctwa_clid só aparece uma vez.
+    if (msg.referral) {
       await client.query(
         `UPDATE whatsapp_conversas SET referral = $1 WHERE id = $2`,
         [JSON.stringify(msg.referral), conversa.id]
@@ -20780,15 +20827,8 @@ async function processarEventoWhatsApp(value: any) {
 
     if (conversa.status === "humano" || conversa.status === "encerrada") continue;
 
-    // Resolve o nicho da conversa pelo lead recem vinculado/criado acima, pra
-    // avancarBotWhatsApp escolher o roteiro certo (ver comentario la). So
-    // consulta quando ha lead — sem lead nao ha nicho pra descobrir mesmo.
-    let nichoIdConversa: number | null = null;
-    if (leadIdVinculado) {
-      const leadNicho = await client.query(`SELECT nicho_id FROM leads WHERE id = $1`, [leadIdVinculado])
-        .catch(() => ({ rows: [] as any[] }));
-      nichoIdConversa = leadNicho.rows[0]?.nicho_id ?? null;
-    }
+    const nichoIdConversa = await resolverNichoConversaWhatsApp(conversa, usuarioId, msg.text?.body || "", leadIdVinculado)
+      .catch(e => { console.error("ERRO resolverNichoConversaWhatsApp:", e); return null; });
 
     await avancarBotWhatsApp(conversa, phoneNumberId, nichoIdConversa);
   }
