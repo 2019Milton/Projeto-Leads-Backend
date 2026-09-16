@@ -18599,7 +18599,7 @@ app.get("/whatsapp/diagnostico", authMiddleware, async (c) => {
 
 // Valida o nicho informado pro roteiro do bot contra os nichos habilitados do
 // corretor (mesmo padrao de /google/anuncio). Retorna o id valido, null quando
-// nenhum foi informado (roteiro "Geral", ver avancarBotWhatsApp), ou false
+// nenhum foi informado (roteiro sem nicho, ver avancarBotWhatsApp), ou false
 // quando o id informado nao pertence ao usuario.
 async function resolverNichoRoteiroWhatsapp(usuarioId: number, nichoIdBruto: unknown): Promise<number | null | false> {
   const nichoIdInformado = Number(nichoIdBruto);
@@ -18632,17 +18632,30 @@ function validarPassosRoteiro(passos: any[]) {
   return null;
 }
 
+// Corte fixo do dia em que o fallback universal "Geral" foi removido — decisao
+// do corretor via texto (nao mais um wildcard automatico): dai pra frente, um
+// roteiro sem nicho selecionado nao responde a NENHUMA conversa (fica "sem
+// nada" ate o corretor escolher um nicho). Os roteiros que ja estavam sem
+// nicho ANTES desse corte continuam respondendo a tudo, exatamente como
+// respondiam antes dessa mudanca (evita apagar o bot de corretores que ja
+// tinham um rodando em producao sem aviso). Precisa ser uma data fixa, nunca
+// `new Date()` calculado no boot — cada deploy reinicia o processo, e um
+// corte que anda pra frente a cada restart voltaria a "perdoar" roteiro novo
+// sem nicho criado entre dois deploys. Ver avancarBotWhatsApp.
+const CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO = new Date("2026-09-16T00:00:00Z");
+
 app.get("/whatsapp/bot", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const rows = await client.query(
       `SELECT wbc.id, wbc.nome, wbc.ativo, wbc.passos, wbc.atualizado_em, wbc.nicho_id,
-              n.nome AS nicho_nome, n.slug AS nicho_slug, n.cor AS nicho_cor
+              n.nome AS nicho_nome, n.slug AS nicho_slug, n.cor AS nicho_cor,
+              (wbc.nicho_id IS NULL AND wbc.criado_em < $2) AS legado_sem_nicho
        FROM whatsapp_bot_config wbc
        LEFT JOIN nichos n ON n.id = wbc.nicho_id
        WHERE wbc.usuario_id = $1
        ORDER BY wbc.atualizado_em DESC`,
-      [user.id]
+      [user.id, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
     );
     return c.json({ roteiros: rows.rows });
   } catch (err) {
@@ -19331,7 +19344,7 @@ app.post("/ia/whatsapp-bot/gerar", authMiddleware, async (c) => {
       return c.json({ error: "Descreva o negócio antes de gerar." }, 400);
     }
 
-    // Nicho e opcional aqui (roteiro "Geral" nao tem um) — mas quando informado
+    // Nicho e opcional aqui (roteiro sem nicho nao tem um) — mas quando informado
     // precisa pertencer ao usuario, senao a IA geraria em cima do nome de um
     // nicho que nao e dele.
     let nichoNome: string | null = null;
@@ -20269,17 +20282,18 @@ async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: 
 async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId: number | null = null) {
   if (conversa.status === "humano" || conversa.status === "encerrada") return;
 
-  // Prioriza o roteiro ativo do nicho da conversa (resolvido via o lead
-  // vinculado, ver a chamada em processarMensagensWhatsApp); sem nicho
-  // identificado ou sem roteiro ativo pra esse nicho especifico, cai pro
-  // roteiro "Geral" (nicho_id NULL) — ORDER BY garante essa prioridade mesmo
-  // se os dois estiverem ativos ao mesmo tempo.
+  // Roteiro do nicho exato da conversa tem prioridade; sem isso, so cai pra um
+  // roteiro sem nicho se ele for de antes de CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO
+  // (legado, ver comentario na declaracao da constante). Roteiro sem nicho
+  // criado depois do corte nunca e escolhido aqui — fica so salvo, sem rodar,
+  // ate o corretor escolher um nicho (decisao explicita dele).
   const configRes = await client.query(
     `SELECT id, passos FROM whatsapp_bot_config
-     WHERE usuario_id = $1 AND ativo = TRUE AND (nicho_id = $2 OR nicho_id IS NULL)
+     WHERE usuario_id = $1 AND ativo = TRUE
+       AND (nicho_id = $2 OR (nicho_id IS NULL AND criado_em < $3))
      ORDER BY nicho_id NULLS LAST
      LIMIT 1`,
-    [conversa.usuario_id, nichoId]
+    [conversa.usuario_id, nichoId, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
   );
   const roteiroAtivo = configRes.rows[0];
   const passos: any[] = roteiroAtivo?.passos || [];
@@ -21698,15 +21712,18 @@ await client.query(`
 
   -- Cada roteiro pode ser dedicado a um nicho do corretor (ex: um pra Saude,
   -- outro pra Suplementos) — a campanha usa o roteiro do nicho dela. NULL
-  -- marca o roteiro "Geral", usado quando a conversa nao tem nicho identificado
-  -- (contato organico, sem clique de anuncio rastreado) ou nenhum roteiro do
-  -- nicho especifico esta ativo. Ver avancarBotWhatsApp.
+  -- significa "nenhum nicho escolhido" — decisao do corretor, nao um wildcard
+  -- automatico: um roteiro assim so continua respondendo a tudo se ja existia
+  -- antes de CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO (compatibilidade); criado
+  -- depois disso, fica sem rodar ate o corretor escolher um nicho. Ver
+  -- avancarBotWhatsApp.
   ALTER TABLE whatsapp_bot_config ADD COLUMN IF NOT EXISTS nicho_id INTEGER REFERENCES nichos(id) ON DELETE SET NULL;
 
   -- Substitui o indice antigo (um ativo por usuario) por um por (usuario, nicho)
   -- — agora e permitido ter varios roteiros ativos ao mesmo tempo, um por nicho.
-  -- COALESCE(nicho_id, 0) normaliza o "Geral" (NULL) pra um bucket unico, ja que
-  -- UNIQUE trata cada NULL como distinto e deixaria ativar varios "Geral" juntos.
+  -- COALESCE(nicho_id, 0) normaliza "sem nicho" (NULL) pra um bucket unico, ja
+  -- que UNIQUE trata cada NULL como distinto e deixaria ativar mais de um
+  -- roteiro sem nicho ao mesmo tempo.
   DROP INDEX IF EXISTS idx_whatsapp_bot_config_usuario_ativo;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bot_config_usuario_nicho_ativo
     ON whatsapp_bot_config(usuario_id, COALESCE(nicho_id, 0)) WHERE ativo = true;
