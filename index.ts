@@ -18597,6 +18597,26 @@ app.get("/whatsapp/diagnostico", authMiddleware, async (c) => {
   }
 });
 
+// Valida o nicho informado pro roteiro do bot contra os nichos habilitados do
+// corretor (mesmo padrao de /google/anuncio). Retorna o id valido, null quando
+// nenhum foi informado (roteiro "Geral", ver avancarBotWhatsApp), ou false
+// quando o id informado nao pertence ao usuario.
+async function resolverNichoRoteiroWhatsapp(usuarioId: number, nichoIdBruto: unknown): Promise<number | null | false> {
+  const nichoIdInformado = Number(nichoIdBruto);
+  if (!Number.isInteger(nichoIdInformado) || nichoIdInformado <= 0) return null;
+
+  const nichoPermitido = await client.query(
+    `SELECT n.id
+     FROM usuario_nichos un
+     INNER JOIN nichos n ON n.id = un.nicho_id
+     WHERE un.usuario_id = $1 AND n.id = $2
+     LIMIT 1`,
+    [usuarioId, nichoIdInformado]
+  );
+  if (!nichoPermitido.rows.length) return false;
+  return nichoPermitido.rows[0].id;
+}
+
 function validarPassosRoteiro(passos: any[]) {
   for (const passo of passos) {
     if (!passo || !["mensagem", "pergunta", "imagem", "audio"].includes(passo.tipo)) {
@@ -18616,8 +18636,12 @@ app.get("/whatsapp/bot", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const rows = await client.query(
-      `SELECT id, nome, ativo, passos, atualizado_em FROM whatsapp_bot_config
-       WHERE usuario_id = $1 ORDER BY atualizado_em DESC`,
+      `SELECT wbc.id, wbc.nome, wbc.ativo, wbc.passos, wbc.atualizado_em, wbc.nicho_id,
+              n.nome AS nicho_nome, n.slug AS nicho_slug, n.cor AS nicho_cor
+       FROM whatsapp_bot_config wbc
+       LEFT JOIN nichos n ON n.id = wbc.nicho_id
+       WHERE wbc.usuario_id = $1
+       ORDER BY wbc.atualizado_em DESC`,
       [user.id]
     );
     return c.json({ roteiros: rows.rows });
@@ -18637,11 +18661,14 @@ app.post("/whatsapp/bot", authMiddleware, async (c) => {
     const erro = validarPassosRoteiro(passos);
     if (erro) return c.json({ error: erro }, 400);
 
+    const nichoId = await resolverNichoRoteiroWhatsapp(user.id, body.nicho_id);
+    if (nichoId === false) return c.json({ error: "O nicho selecionado não está habilitado para este usuário" }, 403);
+
     const row = await client.query(
-      `INSERT INTO whatsapp_bot_config (usuario_id, nome, ativo, passos, atualizado_em)
-       VALUES ($1, $2, false, $3, NOW())
-       RETURNING id, nome, ativo, passos, atualizado_em`,
-      [user.id, nome, JSON.stringify(passos)]
+      `INSERT INTO whatsapp_bot_config (usuario_id, nome, ativo, passos, nicho_id, atualizado_em)
+       VALUES ($1, $2, false, $3, $4, NOW())
+       RETURNING id, nome, ativo, passos, nicho_id, atualizado_em`,
+      [user.id, nome, JSON.stringify(passos), nichoId]
     );
 
     return c.json({ roteiro: row.rows[0] });
@@ -18662,11 +18689,14 @@ app.put("/whatsapp/bot/:id", authMiddleware, async (c) => {
     const erro = validarPassosRoteiro(passos);
     if (erro) return c.json({ error: erro }, 400);
 
+    const nichoId = await resolverNichoRoteiroWhatsapp(user.id, body.nicho_id);
+    if (nichoId === false) return c.json({ error: "O nicho selecionado não está habilitado para este usuário" }, 403);
+
     const row = await client.query(
-      `UPDATE whatsapp_bot_config SET nome = $1, passos = $2, atualizado_em = NOW()
-       WHERE id = $3 AND usuario_id = $4
-       RETURNING id, nome, ativo, passos, atualizado_em`,
-      [nome, JSON.stringify(passos), id, user.id]
+      `UPDATE whatsapp_bot_config SET nome = $1, passos = $2, nicho_id = $3, atualizado_em = NOW()
+       WHERE id = $4 AND usuario_id = $5
+       RETURNING id, nome, ativo, passos, nicho_id, atualizado_em`,
+      [nome, JSON.stringify(passos), nichoId, id, user.id]
     );
     if (!row.rows.length) return c.json({ error: "Roteiro não encontrado" }, 404);
 
@@ -18690,7 +18720,21 @@ app.post("/whatsapp/bot/:id/ativar", authMiddleware, async (c) => {
       return c.json({ error: "Conecte seu WhatsApp antes de ativar o bot." }, 400);
     }
 
-    await client.query(`UPDATE whatsapp_bot_config SET ativo = false WHERE usuario_id = $1`, [user.id]);
+    const alvo = await client.query(
+      `SELECT nicho_id FROM whatsapp_bot_config WHERE id = $1 AND usuario_id = $2`,
+      [id, user.id]
+    );
+    if (!alvo.rows.length) return c.json({ error: "Roteiro não encontrado" }, 404);
+    const nichoAlvo = alvo.rows[0].nicho_id;
+
+    // So desativa outros roteiros do MESMO nicho (ou outros "Geral", se o alvo
+    // for Geral) — permite um roteiro ativo por nicho ao mesmo tempo. Ver
+    // avancarBotWhatsApp e o indice idx_whatsapp_bot_config_usuario_nicho_ativo.
+    await client.query(
+      `UPDATE whatsapp_bot_config SET ativo = false
+       WHERE usuario_id = $1 AND nicho_id IS NOT DISTINCT FROM $2`,
+      [user.id, nichoAlvo]
+    );
     const row = await client.query(
       `UPDATE whatsapp_bot_config SET ativo = true WHERE id = $1 AND usuario_id = $2 RETURNING id`,
       [id, user.id]
@@ -19282,9 +19326,29 @@ app.post("/ia/whatsapp-bot/gerar", authMiddleware, async (c) => {
     const bloqueio = await motivoBloqueioIA(user);
     if (bloqueio) return c.json({ error: bloqueio }, 403);
 
-    const { contexto } = await c.req.json();
+    const { contexto, nicho_id } = await c.req.json();
     if (!String(contexto || "").trim()) {
       return c.json({ error: "Descreva o negócio antes de gerar." }, 400);
+    }
+
+    // Nicho e opcional aqui (roteiro "Geral" nao tem um) — mas quando informado
+    // precisa pertencer ao usuario, senao a IA geraria em cima do nome de um
+    // nicho que nao e dele.
+    let nichoNome: string | null = null;
+    const nichoIdInformado = Number(nicho_id);
+    if (Number.isInteger(nichoIdInformado) && nichoIdInformado > 0) {
+      const nichoPermitido = await client.query(
+        `SELECT n.nome
+         FROM usuario_nichos un
+         INNER JOIN nichos n ON n.id = un.nicho_id
+         WHERE un.usuario_id = $1 AND n.id = $2
+         LIMIT 1`,
+        [user.id, nichoIdInformado]
+      );
+      if (!nichoPermitido.rows.length) {
+        return c.json({ error: "O nicho selecionado não está habilitado para este usuário" }, 403);
+      }
+      nichoNome = nichoPermitido.rows[0].nome;
     }
 
     const openaiKey = Bun.env.OPENAI_API_KEY;
@@ -19293,12 +19357,13 @@ app.post("/ia/whatsapp-bot/gerar", authMiddleware, async (c) => {
     }
 
     const systemMsg =
-      "Você é um especialista em atendimento via WhatsApp para corretores de seguros e imóveis no Brasil. " +
+      `Você é um especialista em atendimento via WhatsApp para corretores${nichoNome ? ` de ${nichoNome}` : " de seguros e imóveis"} no Brasil. ` +
       "Crie roteiros curtos de bot de primeiro atendimento. Retorne SOMENTE JSON valido no formato " +
       `{"passos":[{"tipo":"mensagem"|"pergunta","texto":"...","handoff_apos":boolean}]}, sem nenhum texto fora do JSON.`;
     const prompt =
+      (nichoNome ? `Nicho deste roteiro: ${nichoNome}\n` : "") +
       `Negócio/contexto informado pelo corretor: "${String(contexto).trim()}"\n\n` +
-      `Crie um roteiro de 3 a 6 passos. Passos "mensagem" só informam algo e seguem sozinhos; ` +
+      `Crie um roteiro de 3 a 6 passos${nichoNome ? `, com perguntas e linguagem relevantes especificamente para o nicho de ${nichoNome}` : ""}. Passos "mensagem" só informam algo e seguem sozinhos; ` +
       `passos "pergunta" perguntam algo e esperam a resposta do cliente antes de seguir. ` +
       `O ultimo passo deve ter handoff_apos:true, indicando que a conversa deve ser transferida para o corretor humano.`;
 
@@ -20201,12 +20266,20 @@ async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: 
   }
 }
 
-async function avancarBotWhatsApp(conversa: any, phoneNumberId: string) {
+async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId: number | null = null) {
   if (conversa.status === "humano" || conversa.status === "encerrada") return;
 
+  // Prioriza o roteiro ativo do nicho da conversa (resolvido via o lead
+  // vinculado, ver a chamada em processarMensagensWhatsApp); sem nicho
+  // identificado ou sem roteiro ativo pra esse nicho especifico, cai pro
+  // roteiro "Geral" (nicho_id NULL) — ORDER BY garante essa prioridade mesmo
+  // se os dois estiverem ativos ao mesmo tempo.
   const configRes = await client.query(
-    `SELECT id, passos FROM whatsapp_bot_config WHERE usuario_id = $1 AND ativo = TRUE`,
-    [conversa.usuario_id]
+    `SELECT id, passos FROM whatsapp_bot_config
+     WHERE usuario_id = $1 AND ativo = TRUE AND (nicho_id = $2 OR nicho_id IS NULL)
+     ORDER BY nicho_id NULLS LAST
+     LIMIT 1`,
+    [conversa.usuario_id, nichoId]
   );
   const roteiroAtivo = configRes.rows[0];
   const passos: any[] = roteiroAtivo?.passos || [];
@@ -20693,7 +20766,17 @@ async function processarEventoWhatsApp(value: any) {
 
     if (conversa.status === "humano" || conversa.status === "encerrada") continue;
 
-    await avancarBotWhatsApp(conversa, phoneNumberId);
+    // Resolve o nicho da conversa pelo lead recem vinculado/criado acima, pra
+    // avancarBotWhatsApp escolher o roteiro certo (ver comentario la). So
+    // consulta quando ha lead — sem lead nao ha nicho pra descobrir mesmo.
+    let nichoIdConversa: number | null = null;
+    if (leadIdVinculado) {
+      const leadNicho = await client.query(`SELECT nicho_id FROM leads WHERE id = $1`, [leadIdVinculado])
+        .catch(() => ({ rows: [] as any[] }));
+      nichoIdConversa = leadNicho.rows[0]?.nicho_id ?? null;
+    }
+
+    await avancarBotWhatsApp(conversa, phoneNumberId, nichoIdConversa);
   }
 }
 
@@ -21612,8 +21695,21 @@ await client.query(`
   -- garante que, mesmo com varias linhas, no maximo uma fica ativa por vez.
   ALTER TABLE whatsapp_bot_config DROP CONSTRAINT IF EXISTS whatsapp_bot_config_usuario_id_key;
   ALTER TABLE whatsapp_bot_config ADD COLUMN IF NOT EXISTS nome TEXT NOT NULL DEFAULT 'Roteiro padrão';
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bot_config_usuario_ativo
-    ON whatsapp_bot_config(usuario_id) WHERE ativo = true;
+
+  -- Cada roteiro pode ser dedicado a um nicho do corretor (ex: um pra Saude,
+  -- outro pra Suplementos) — a campanha usa o roteiro do nicho dela. NULL
+  -- marca o roteiro "Geral", usado quando a conversa nao tem nicho identificado
+  -- (contato organico, sem clique de anuncio rastreado) ou nenhum roteiro do
+  -- nicho especifico esta ativo. Ver avancarBotWhatsApp.
+  ALTER TABLE whatsapp_bot_config ADD COLUMN IF NOT EXISTS nicho_id INTEGER REFERENCES nichos(id) ON DELETE SET NULL;
+
+  -- Substitui o indice antigo (um ativo por usuario) por um por (usuario, nicho)
+  -- — agora e permitido ter varios roteiros ativos ao mesmo tempo, um por nicho.
+  -- COALESCE(nicho_id, 0) normaliza o "Geral" (NULL) pra um bucket unico, ja que
+  -- UNIQUE trata cada NULL como distinto e deixaria ativar varios "Geral" juntos.
+  DROP INDEX IF EXISTS idx_whatsapp_bot_config_usuario_ativo;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bot_config_usuario_nicho_ativo
+    ON whatsapp_bot_config(usuario_id, COALESCE(nicho_id, 0)) WHERE ativo = true;
 
   -- Guarda o arquivo (imagem/audio) anexado num passo do roteiro do bot. Fica no
   -- Postgres mesmo (sem S3/Cloudinary) — arquivo de passo de bot é pequeno, e a
