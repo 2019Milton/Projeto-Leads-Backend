@@ -7640,7 +7640,11 @@ async function enviarEventoGoogleAdsConversionLeads(
     if (emailNormalizado) userIdentifiers.push({ emailAddress: hashSha256(emailNormalizado) });
     if (telefoneE164) userIdentifiers.push({ phoneNumber: hashSha256(telefoneE164) });
 
-    const evento: any = { eventTimestamp: new Date().toISOString() };
+    // eventSource e obrigatorio (a documentacao da Data Manager API sugere
+    // que seria opcional, mas a API rejeita com REQUIRED_FIELD_MISSING sem
+    // ele — confirmado ao vivo em 17/09/2026). "WEB" e o valor generico pra
+    // conversao que nao veio de loja fisica.
+    const evento: any = { eventTimestamp: new Date().toISOString(), eventSource: "WEB" };
     if (lead?.gclid) evento.adIdentifiers = { gclid: lead.gclid };
     if (userIdentifiers.length) evento.userData = { userIdentifiers };
 
