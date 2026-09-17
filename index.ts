@@ -1242,7 +1242,10 @@ async function avaliarEEnviarQualificacaoGoogle(
 ) {
   try {
 
-    if (!leadRow?.gclid) {
+    // gclid OU e-mail/telefone (Enhanced Conversions for Leads via Data
+    // Manager API) — ver enviarEventoGoogleAdsConversionLeads. Sem nenhum
+    // dos tres nao ha como identificar o lead pro Google de jeito nenhum.
+    if (!leadRow?.gclid && !leadRow?.email && !leadRow?.telefone) {
       return;
     }
 
@@ -6305,7 +6308,11 @@ const OAUTH_PROVEDORES: Record<string, {
   google: {
     authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
     tokenUrl: "https://oauth2.googleapis.com/token",
-    scope: "https://www.googleapis.com/auth/adwords",
+    // datamanager: necessario pra enviar eventos de qualificacao/fechamento
+    // de lead via Data Manager API (ver enviarEventoGoogleAdsConversionLeads)
+    // — contas conectadas antes de 16/09/2026 nao tem esse escopo no
+    // refresh_token e precisam reconectar pra ganhar ele.
+    scope: "https://www.googleapis.com/auth/adwords https://www.googleapis.com/auth/datamanager",
     clientIdEnv: "GOOGLE_ADS_CLIENT_ID",
     clientSecretEnv: "GOOGLE_ADS_CLIENT_SECRET",
     redirectUriEnv: "GOOGLE_ADS_REDIRECT_URI",
@@ -6593,6 +6600,12 @@ const googleSyncEmAndamento = new Set<number>();
 
 const GOOGLE_ADS_API_VERSION = "v24";
 const GOOGLE_ADS_API = `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}`;
+// A partir de 15/06/2026 o Google bloqueou uploadClickConversions (Google Ads
+// API) pra contas novas — confirmado ao vivo em 16/09/2026, erro
+// CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE apontando pra essa API. Eventos
+// de conversao (qualificado/fechado) agora vao por aqui, ver
+// enviarEventoGoogleAdsConversionLeads.
+const DATA_MANAGER_API = "https://datamanager.googleapis.com/v1";
 const googleLoginCustomerIdPorToken = new Map<string, string>();
 
 async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
@@ -7465,13 +7478,17 @@ async function resolverNumeroWhatsappGoogle(
   };
 }
 
-// Cria (ou reaproveita) a Conversion Action do Google Ads usada como alvo do
-// uploadClickConversions — equivalente ao dataset/pixel da Meta
-// (obterOuCriarDatasetMetaUsuario), mas o Google exige uma Conversion Action
-// dedicada por TIPO de evento, nao um nome de evento livre por chamada. O
-// resource name criado fica salvo em plataforma_conexoes.dados_conta (chave
-// "conversion_action_qualified_id"/"conversion_action_closed_id") pra nao
-// recriar a cada envio.
+// Cria (ou reaproveita) a Conversion Action do Google Ads usada como
+// productDestinationId no envio via Data Manager API (ver
+// enviarEventoGoogleAdsConversionLeads) — equivalente ao dataset/pixel da
+// Meta (obterOuCriarDatasetMetaUsuario), mas o Google exige uma Conversion
+// Action dedicada por TIPO de evento, nao um nome de evento livre por
+// chamada. Continua sendo criada via Google Ads API normal
+// (conversionActions:mutate) — só o UPLOAD do evento em si migrou pra Data
+// Manager API, gerenciar a acao de conversao nao foi afetado pelo bloqueio.
+// O resource name criado fica salvo em plataforma_conexoes.dados_conta
+// (chave "conversion_action_qualified_id"/"conversion_action_closed_id")
+// pra nao recriar a cada envio.
 async function obterOuCriarConversionActionGoogle(
   usuarioId: number,
   customerId: string,
@@ -7507,7 +7524,13 @@ async function obterOuCriarConversionActionGoogle(
           create: {
             name: `Plataforma de Leads - ${nomeEvento}`,
             type: "UPLOAD_CLICKS",
-            category: "LEAD",
+            // "LEAD" nao existe no enum ConversionActionCategory (a Google Ads
+            // API rejeita com ENUM_VALUE_NOT_PERMITTED) e "IMPORTED_LEAD" —
+            // apesar de existir e ser semanticamente o correto — tambem foi
+            // rejeitado ao vivo nessa mesma conta (16/09/2026, mesmo erro).
+            // "DEFAULT" e a unica testada que a API aceitou de fato pra criar
+            // uma acao UPLOAD_CLICKS nova nessa conta.
+            category: "DEFAULT",
             status: "ENABLED",
           },
         },
@@ -7530,26 +7553,62 @@ async function obterOuCriarConversionActionGoogle(
   }
 }
 
+// Normaliza e-mail pro padrao de hashing exigido pelo Google antes de mandar
+// como identificador (Enhanced Conversions for Leads): minusculo, sem
+// espacos e, especificamente pra gmail.com/googlemail.com, remove pontos e
+// qualquer coisa depois de "+" no nome de usuario — a Google trata essas
+// variacoes como a mesma caixa de entrada e exige a forma canonica pro hash
+// bater com o que ela mesma calcula do lado dela.
+function normalizarEmailGoogleEnhancedConversions(email: string): string {
+  const limpo = String(email || "").trim().toLowerCase();
+  const [usuario, dominio] = limpo.split("@");
+  if (!usuario || !dominio) return limpo;
+  if (dominio === "gmail.com" || dominio === "googlemail.com") {
+    const semPlus = usuario.split("+")[0];
+    const semPontos = semPlus.replace(/\./g, "");
+    return `${semPontos}@${dominio}`;
+  }
+  return limpo;
+}
+
+// Formato E.164 (+55...) exigido pelo Google antes do hash — reaproveita a
+// mesma normalizacao de normalizarTelefoneWhatsApp (garante DDI 55) e so
+// acrescenta o "+" na frente.
+function normalizarTelefoneE164Google(telefone: string): string {
+  const digitos = normalizarTelefoneWhatsApp(telefone);
+  return digitos ? `+${digitos}` : "";
+}
+
 // Equivalente Google Ads de enviarEventoMetaConversionLeads — reporta de
-// volta pro Google Ads que um lead capturado por um Lead Form virou um lead
-// qualificado ou fechado, usando o gclid capturado na sincronizacao (ver
-// /google/sincronizar-campanhas). Sem gclid nao ha como casar o evento com
-// o clique original — leads sincronizados antes desta mudanca nao tem esse
-// campo preenchido e ficam sem poder mandar o evento.
-// ⚠️ ASSUMPTION: uploadClickConversions e conversionDateTime no formato
-// "yyyy-MM-dd HH:mm:ss+00:00" conferidos contra a documentacao oficial da
-// Google Ads API em 14/08/2026, mas ainda nao testados contra um gclid real
-// — mesmo padrao de risco que as outras integracoes Google Ads desta
-// plataforma tiveram no inicio (erros especificos so aparecem com trafego
-// real, corrigir conforme necessario).
+// volta pro Google Ads que um lead virou qualificado ou fechado. Migrado de
+// uploadClickConversions (Google Ads API) pra events:ingest (Data Manager
+// API) em 16/09/2026: a Google bloqueou uploadClickConversions pra contas
+// novas a partir de 15/06/2026 (erro CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE,
+// confirmado ao vivo contra essa mesma conta) e aponta explicitamente pra
+// Data Manager API na propria mensagem de erro. A Conversion Action em si
+// continua sendo criada pela Google Ads API normal (obterOuCriarConversionActionGoogle)
+// — só o upload do evento mudou de API.
+// Aceita gclid OU e-mail/telefone hasheados (Enhanced Conversions for Leads,
+// sem gclid) — cobre leads de WhatsApp (criarLeadDeConversaGoogle), que nunca
+// tem gclid por natureza (a tag [GA-...] identifica a campanha, nao o clique).
+// ⚠️ ASSUMPTION: formato do payload (destinations/events/userData) conferido
+// contra a documentacao oficial da Data Manager API em 16/09/2026, e a URL/
+// metodo/erro de allowlist FORAM confirmados ao vivo — mas o corpo da
+// requisicao ainda nao pode ser validado de ponta a ponta porque a conta de
+// teste usada só tinha o escopo OAuth "adwords", nao "datamanager" (exige
+// reconectar a conta pra emitir um refresh_token novo com os dois escopos).
+// Testar contra um envio real assim que isso acontecer.
 async function enviarEventoGoogleAdsConversionLeads(
   usuarioId: number,
   lead: any,
   eventName: "Qualified Lead" | "Closed Won"
 ): Promise<{ ok: boolean; erro?: string }> {
 
-  if (!lead?.gclid) {
-    return { ok: false, erro: "Lead sem gclid do Google Ads" };
+  const emailNormalizado = lead?.email ? normalizarEmailGoogleEnhancedConversions(lead.email) : "";
+  const telefoneE164 = lead?.telefone ? normalizarTelefoneE164Google(lead.telefone) : "";
+
+  if (!lead?.gclid && !emailNormalizado && !telefoneE164) {
+    return { ok: false, erro: "Lead sem gclid, e-mail ou telefone para identificar no Google Ads" };
   }
 
   const conexao = await resolverConexaoGoogleAds(usuarioId);
@@ -7572,40 +7631,47 @@ async function enviarEventoGoogleAdsConversionLeads(
       return { ok: false, erro: "Não foi possível criar a ação de conversão no Google Ads" };
     }
 
-    const conversionDateTime =
-      new Date().toISOString().slice(0, 19).replace("T", " ") + "+00:00";
+    // productDestinationId e o ID numerico puro da Conversion Action, nao o
+    // resource name inteiro que a Google Ads API usa — ver
+    // developers.google.com/data-manager/api/devguides/events/google-ads/offline/upgrade/field-mappings
+    const conversionActionId = conversionActionResourceName.split("/").pop();
 
-    const res = await fetch(
-      `${GOOGLE_ADS_API}/customers/${conexao.customerId}:uploadClickConversions`,
-      {
-        method: "POST",
-        headers: googleAdsHeaders(conexao.accessToken, conexao.loginCustomerId),
-        body: JSON.stringify({
-          conversions: [
-            {
-              gclid: lead.gclid,
-              conversionAction: conversionActionResourceName,
-              conversionDateTime,
+    const userIdentifiers: any[] = [];
+    if (emailNormalizado) userIdentifiers.push({ emailAddress: hashSha256(emailNormalizado) });
+    if (telefoneE164) userIdentifiers.push({ phoneNumber: hashSha256(telefoneE164) });
+
+    const evento: any = { eventTimestamp: new Date().toISOString() };
+    if (lead?.gclid) evento.adIdentifiers = { gclid: lead.gclid };
+    if (userIdentifiers.length) evento.userData = { userIdentifiers };
+
+    const res = await fetch(`${DATA_MANAGER_API}/events:ingest`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${conexao.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        destinations: [
+          {
+            operatingAccount: { accountType: "GOOGLE_ADS", accountId: conexao.customerId },
+            loginAccount: {
+              accountType: "GOOGLE_ADS",
+              accountId: conexao.loginCustomerId || conexao.customerId,
             },
-          ],
-          partialFailure: true,
-        }),
-      }
-    );
+            productDestinationId: conversionActionId,
+          },
+        ],
+        encoding: "HEX",
+        events: [evento],
+      }),
+    });
 
     const data = await res.json() as any;
 
-    if (!res.ok) {
-      const erro = data?.error?.message || "Erro ao enviar conversão para o Google Ads";
+    if (!res.ok || data?.error) {
+      const erro = data?.error?.message || "Erro ao enviar conversão para o Google Ads (Data Manager API)";
       console.error(`CONVERSION LEADS GOOGLE (${eventName}) erro:`, JSON.stringify(data));
       return { ok: false, erro };
-    }
-
-    const falhaParcial = data?.partialFailureError;
-
-    if (falhaParcial) {
-      console.error(`CONVERSION LEADS GOOGLE (${eventName}) falha parcial:`, JSON.stringify(falhaParcial));
-      return { ok: false, erro: falhaParcial.message || "Google Ads rejeitou a conversão" };
     }
 
     return { ok: true };
