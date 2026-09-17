@@ -18207,6 +18207,288 @@ const PLATAFORMAS_DISPONIVEIS = [
   "formulario",
 ] as const;
 
+const ASSISTENTE_CONTAS_PLATAFORMAS = ["meta", "google", "tiktok"] as const;
+const assistenteGoogleCriacaoEmAndamento = new Set<number>();
+
+function limparTextoAssistente(valor: unknown, limite: number): string {
+  return String(valor ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, limite);
+}
+
+function sanitizarRascunhoAssistente(body: any) {
+  const plataformasRecebidas = Array.isArray(body?.plataformas) ? body.plataformas : [];
+  const plataformas = [...new Set(
+    plataformasRecebidas.filter((item: unknown) =>
+      ASSISTENTE_CONTAS_PLATAFORMAS.includes(String(item) as any)
+    )
+  )].slice(0, ASSISTENTE_CONTAS_PLATAFORMAS.length);
+  const origem = body?.dados && typeof body.dados === "object" ? body.dados : {};
+  const dados = {
+    nome_legal: limparTextoAssistente(origem.nome_legal, 180),
+    nome_comercial: limparTextoAssistente(origem.nome_comercial, 120),
+    documento: limparTextoAssistente(origem.documento, 30),
+    segmento: limparTextoAssistente(origem.segmento, 120),
+    email: limparTextoAssistente(origem.email, 180),
+    telefone: limparTextoAssistente(origem.telefone, 40),
+    site: limparTextoAssistente(origem.site, 500),
+    endereco: limparTextoAssistente(origem.endereco, 300),
+    pais: limparTextoAssistente(origem.pais, 2) || "BR",
+    moeda: limparTextoAssistente(origem.moeda, 3) || "BRL",
+    fuso: limparTextoAssistente(origem.fuso, 80) || "America/Sao_Paulo",
+  };
+  return {
+    etapa: Math.min(3, Math.max(1, Number(body?.etapa) || 1)),
+    plataformas: plataformas.length ? plataformas : ["meta"],
+    dados,
+  };
+}
+
+app.get("/assistente-contas-anuncios", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const result = await client.query(
+      `SELECT etapa, plataformas, dados, atualizado_em
+       FROM assistente_contas_anuncios WHERE usuario_id = $1 LIMIT 1`,
+      [user.id]
+    );
+    const salvo = result.rows[0] || null;
+    return c.json({
+      rascunho: salvo ? {
+        etapa: Number(salvo.etapa),
+        plataformas: Array.isArray(salvo.plataformas) ? salvo.plataformas : ["meta"],
+        dados: salvo.dados || {},
+        atualizado_em: salvo.atualizado_em,
+      } : null,
+    });
+  } catch (err) {
+    console.error("ERRO GET /assistente-contas-anuncios:", err);
+    return c.json({ error: "Erro ao carregar o assistente" }, 500);
+  }
+});
+
+app.put("/assistente-contas-anuncios", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const rascunho = sanitizarRascunhoAssistente(await c.req.json());
+    const result = await client.query(
+      `INSERT INTO assistente_contas_anuncios
+         (usuario_id, etapa, plataformas, dados, criado_em, atualizado_em)
+       VALUES ($1, $2, $3::jsonb, $4::jsonb, NOW(), NOW())
+       ON CONFLICT (usuario_id) DO UPDATE
+       SET etapa = EXCLUDED.etapa,
+           plataformas = EXCLUDED.plataformas,
+           dados = EXCLUDED.dados,
+           atualizado_em = NOW()
+       RETURNING atualizado_em`,
+      [user.id, rascunho.etapa, JSON.stringify(rascunho.plataformas), JSON.stringify(rascunho.dados)]
+    );
+    return c.json({ sucesso: true, atualizado_em: result.rows[0]?.atualizado_em || null });
+  } catch (err) {
+    console.error("ERRO PUT /assistente-contas-anuncios:", err);
+    return c.json({ error: "Erro ao salvar o assistente" }, 500);
+  }
+});
+
+// Informa o que pode realmente ser automatizado com as autorizações atuais.
+// Uma conexão simples não é tratada como permissão de criação: Google exige
+// MCC; Meta e TikTok exigem produtos/permissões empresariais específicos.
+app.get("/assistente-contas-anuncios/capacidades", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const capacidades: Record<string, any> = {
+    meta: {
+      conectado: false,
+      automatico: false,
+      modo: "oficial",
+      titulo: "Criação acompanhada na Meta",
+      detalhe: "A Meta exige confirmações do titular, vínculo ao portfólio empresarial e configuração de pagamento na página oficial.",
+    },
+    google: {
+      conectado: false,
+      automatico: false,
+      modo: "oficial",
+      gerenciadoras: [],
+      titulo: "Conecte o Google Ads",
+      detalhe: "Depois da autorização, verificaremos se existe uma conta de administrador apta a criar a conta automaticamente.",
+    },
+    tiktok: {
+      conectado: false,
+      automatico: false,
+      modo: "oficial",
+      business_centers: [],
+      titulo: "Criação acompanhada no TikTok",
+      detalhe: "O TikTok exige Business Center e a permissão empresarial Create Ad Account, liberada pelo próprio TikTok para o aplicativo.",
+    },
+  };
+
+  try {
+    const [metaResult, outrasResult] = await Promise.all([
+      client.query(
+        `SELECT conta_anuncios_id FROM meta_conexoes
+         WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+        [user.id]
+      ),
+      client.query(
+        `SELECT plataforma, status, access_token, refresh_token, dados_conta
+         FROM plataforma_conexoes
+         WHERE usuario_id = $1 AND plataforma IN ('google', 'tiktok')`,
+        [user.id]
+      ),
+    ]);
+
+    capacidades.meta.conectado = Boolean(metaResult.rows.length);
+    const google = outrasResult.rows.find((row: any) => row.plataforma === "google");
+    const tiktok = outrasResult.rows.find((row: any) => row.plataforma === "tiktok");
+
+    if (google?.status === "conectado" && google.refresh_token) {
+      capacidades.google.conectado = true;
+      if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+        capacidades.google.titulo = "Criação automática indisponível";
+        capacidades.google.detalhe = "A integração ainda não possui o token de desenvolvedor necessário; continue pelo Google Ads.";
+      } else {
+        try {
+          const token = await obterAccessTokenGoogle(google.refresh_token);
+          const contas = (await listarContasGoogleAds(token)).contas;
+          const gerenciadoras = contas
+            .filter(conta => conta.gerenciadora)
+            .map(conta => ({ customer_id: conta.customer_id, nome: conta.nome }));
+          capacidades.google.gerenciadoras = gerenciadoras;
+          if (gerenciadoras.length) {
+            capacidades.google.automatico = true;
+            capacidades.google.modo = "automatico";
+            capacidades.google.titulo = "Criação automática disponível";
+            capacidades.google.detalhe = "A conta será criada como cliente da conta de administrador escolhida. Pagamento e eventuais verificações continuam no Google Ads.";
+          } else {
+            capacidades.google.titulo = "Conta de administrador necessária";
+            capacidades.google.detalhe = "A conta conectada não é uma MCC. Crie ou conecte uma conta de administrador para liberar a criação automática.";
+          }
+        } catch (errGoogle: any) {
+          capacidades.google.titulo = "Não foi possível validar a permissão";
+          capacidades.google.detalhe = errGoogle?.message || "Reconecte o Google Ads ou continue pela página oficial.";
+        }
+      }
+    }
+
+    if (tiktok?.status === "conectado" && tiktok.access_token) {
+      capacidades.tiktok.conectado = true;
+      try {
+        const respostaBc = await tiktokFetch("/bc/get/?page=1&page_size=50", tiktok.access_token);
+        const lista = respostaBc.ok
+          ? (respostaBc.data?.data?.list || respostaBc.data?.data?.bc_list || [])
+          : [];
+        capacidades.tiktok.business_centers = Array.isArray(lista)
+          ? lista.map((bc: any) => ({
+              bc_id: String(bc.bc_id || bc.id || ""),
+              nome: bc.name || bc.bc_name || bc.bc_id || bc.id || "Business Center",
+            })).filter((bc: any) => bc.bc_id)
+          : [];
+        if (capacidades.tiktok.business_centers.length) {
+          capacidades.tiktok.titulo = "Business Center encontrado";
+          capacidades.tiktok.detalhe = "O acesso ao Business Center foi confirmado. A criação permanece acompanhada até o TikTok liberar Create Ad Account para o aplicativo.";
+        } else if (!respostaBc.ok) {
+          capacidades.tiktok.titulo = "Permissão empresarial ainda não liberada";
+          capacidades.tiktok.detalhe = "A conexão anuncia normalmente, mas não possui acesso ao Business Center necessário para criar novas contas.";
+        }
+      } catch (_) {}
+    }
+
+    return c.json({ capacidades });
+  } catch (err) {
+    console.error("ERRO /assistente-contas-anuncios/capacidades:", err);
+    return c.json({ capacidades, aviso: "Não foi possível concluir todas as verificações." });
+  }
+});
+
+app.post("/assistente-contas-anuncios/google/criar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  if (assistenteGoogleCriacaoEmAndamento.has(Number(user.id))) {
+    return c.json({ error: "A criação desta conta já está em andamento" }, 409);
+  }
+
+  assistenteGoogleCriacaoEmAndamento.add(Number(user.id));
+  try {
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ error: "Developer token do Google Ads não configurado" }, 503);
+    }
+
+    const body = await c.req.json();
+    const nome = limparTextoAssistente(body?.nome, 120);
+    const moeda = limparTextoAssistente(body?.moeda, 3).toUpperCase();
+    const fuso = limparTextoAssistente(body?.fuso, 80);
+    const managerCustomerId = limparTextoAssistente(body?.manager_customer_id, 30).replace(/\D/g, "");
+    if (!nome || !managerCustomerId) {
+      return c.json({ error: "Nome da conta e conta de administrador são obrigatórios" }, 400);
+    }
+    if (!["BRL", "USD"].includes(moeda)) return c.json({ error: "Moeda inválida" }, 400);
+    if (!["America/Sao_Paulo", "America/Manaus", "America/Rio_Branco"].includes(fuso)) {
+      return c.json({ error: "Fuso horário inválido" }, 400);
+    }
+
+    const conn = await client.query(
+      `SELECT refresh_token FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' AND status = 'conectado' LIMIT 1`,
+      [user.id]
+    );
+    if (!conn.rows[0]?.refresh_token) return c.json({ error: "Google Ads não conectado" }, 400);
+
+    const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
+    const contas = (await listarContasGoogleAds(accessToken)).contas;
+    const gerenciadora = contas.find(
+      conta => conta.gerenciadora && conta.customer_id === managerCustomerId
+    );
+    if (!gerenciadora) {
+      return c.json({ error: "A conta de administrador escolhida não está acessível nesta conexão" }, 403);
+    }
+
+    const resposta = await fetch(
+      `${GOOGLE_ADS_API}/customers/${managerCustomerId}:createCustomerClient`,
+      {
+        method: "POST",
+        headers: googleAdsHeaders(accessToken, managerCustomerId),
+        body: JSON.stringify({
+          customerClient: {
+            descriptiveName: nome,
+            currencyCode: moeda,
+            timeZone: fuso,
+          },
+        }),
+      }
+    );
+    const data = await resposta.json() as any;
+    if (!resposta.ok || !data?.resourceName) {
+      const detalhe = data?.error?.details?.[0]?.errors?.[0]?.message
+        || data?.error?.message
+        || "O Google Ads recusou a criação da conta";
+      return c.json({ error: detalhe }, resposta.status >= 400 && resposta.status < 500 ? 400 : 502);
+    }
+
+    const customerId = String(data.resourceName).split("/").pop()?.replace(/\D/g, "");
+    if (!customerId) return c.json({ error: "O Google criou a conta, mas não retornou um identificador válido" }, 502);
+
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
+             'customer_id', $1::text,
+             'login_customer_id', $2::text,
+             'criada_pelo_assistente', true
+           ),
+           atualizado_em = NOW()
+       WHERE usuario_id = $3 AND plataforma = 'google'`,
+      [customerId, managerCustomerId, user.id]
+    );
+
+    return c.json({
+      sucesso: true,
+      customer_id: customerId,
+      manager_customer_id: managerCustomerId,
+      aviso: "Conta criada e selecionada. Configure o pagamento no Google Ads antes de publicar.",
+    });
+  } catch (err: any) {
+    console.error("ERRO /assistente-contas-anuncios/google/criar:", err);
+    return c.json({ error: err?.message || "Erro ao criar a conta do Google Ads" }, 500);
+  } finally {
+    assistenteGoogleCriacaoEmAndamento.delete(Number(user.id));
+  }
+});
+
 app.get("/conexoes", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -22089,6 +22371,20 @@ await client.query(`
   );
   CREATE INDEX IF NOT EXISTS idx_plataforma_conexoes_usuario
     ON plataforma_conexoes(usuario_id);
+`);
+
+// Rascunho do assistente de criação/configuração de contas de anúncios.
+// Guarda somente dados cadastrais reutilizáveis; credenciais, códigos de
+// segurança, CAPTCHA e dados de pagamento nunca passam por esta tabela.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS assistente_contas_anuncios (
+    usuario_id     INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    etapa          SMALLINT NOT NULL DEFAULT 1 CHECK (etapa BETWEEN 1 AND 3),
+    plataformas    JSONB NOT NULL DEFAULT '["meta"]'::jsonb,
+    dados           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    criado_em       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 await client.query(`
