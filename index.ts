@@ -18209,6 +18209,8 @@ const PLATAFORMAS_DISPONIVEIS = [
 
 const ASSISTENTE_CONTAS_PLATAFORMAS = ["meta", "google", "tiktok"] as const;
 const assistenteGoogleCriacaoEmAndamento = new Set<number>();
+const assistenteAnaliseTelaEmAndamento = new Set<number>();
+const assistenteAnaliseTelaUltima = new Map<number, number>();
 
 function limparTextoAssistente(valor: unknown, limite: number): string {
   return String(valor ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, limite);
@@ -18486,6 +18488,162 @@ app.post("/assistente-contas-anuncios/google/criar", authMiddleware, async (c) =
     return c.json({ error: err?.message || "Erro ao criar a conta do Google Ads" }, 500);
   } finally {
     assistenteGoogleCriacaoEmAndamento.delete(Number(user.id));
+  }
+});
+
+app.post("/assistente-contas-anuncios/analisar-tela", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const usuarioId = Number(user.id);
+  const agora = Date.now();
+  const ultimaAnalise = assistenteAnaliseTelaUltima.get(usuarioId) || 0;
+
+  if (assistenteAnaliseTelaEmAndamento.has(usuarioId)) {
+    return c.json({ error: "A análise anterior ainda está em andamento" }, 409);
+  }
+  if (agora - ultimaAnalise < 7000) {
+    return c.json({ error: "Aguarde alguns segundos antes de analisar novamente" }, 429);
+  }
+
+  assistenteAnaliseTelaEmAndamento.add(usuarioId);
+  try {
+    const openaiKey = Bun.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return c.json({ error: "A análise visual ainda não está configurada" }, 503);
+    }
+
+    const body = await c.req.json();
+    const plataforma = limparTextoAssistente(body?.plataforma, 20).toLowerCase();
+    if (!ASSISTENTE_CONTAS_PLATAFORMAS.includes(plataforma as any)) {
+      return c.json({ error: "Plataforma inválida" }, 400);
+    }
+
+    const imagem = String(body?.imagem || "");
+    if (imagem.length > 2_600_000) {
+      return c.json({ error: "A imagem da tela ultrapassou o limite permitido" }, 413);
+    }
+    const imagemValida = /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(imagem);
+    if (!imagemValida) return c.json({ error: "Imagem da tela inválida" }, 400);
+
+    const contextoAnterior = limparTextoAssistente(body?.contexto_anterior, 1200);
+    const modeloConfigurado = textoOpcional(Bun.env.OPENAI_VISION_MODEL)
+      || textoOpcional(Bun.env.OPENAI_MODEL);
+    const modelo = modeloConfigurado && /^(gpt-4o|gpt-4\.1|gpt-5|gpt-6)/i.test(modeloConfigurado)
+      ? modeloConfigurado
+      : "gpt-5-mini";
+    const requisitosReferencia: Record<string, string[]> = {
+      meta: [
+        "portfólio empresarial", "dados legais da empresa", "conta de anúncios",
+        "Página do Facebook", "Instagram profissional", "permissões do usuário",
+        "moeda e fuso horário", "forma de pagamento", "termos e verificações"
+      ],
+      google: [
+        "tipo de conta e administrador", "nome da empresa", "país de faturamento",
+        "moeda e fuso horário", "dados de contato", "pagamento", "verificação do anunciante",
+        "termos do Google Ads e termos de Lead Form quando aplicáveis"
+      ],
+      tiktok: [
+        "Business Center", "verificação da empresa", "conta do anunciante",
+        "nome e setor", "país ou região", "moeda e fuso horário", "permissões",
+        "forma de pagamento e termos"
+      ]
+    };
+
+    const schema = {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "plataforma", "pagina", "etapa", "resumo", "proxima_acao",
+        "campos", "alertas", "concluido", "sensivel", "confianca"
+      ],
+      properties: {
+        plataforma: { type: "string", enum: ["meta", "google", "tiktok"] },
+        pagina: { type: "string" },
+        etapa: { type: "string" },
+        resumo: { type: "string" },
+        proxima_acao: { type: "string" },
+        campos: {
+          type: "array",
+          maxItems: 12,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["nome", "status", "orientacao"],
+            properties: {
+              nome: { type: "string" },
+              status: {
+                type: "string",
+                enum: ["preenchido", "faltando", "atencao", "nao_aplicavel"]
+              },
+              orientacao: { type: "string" }
+            }
+          }
+        },
+        alertas: { type: "array", maxItems: 8, items: { type: "string" } },
+        concluido: { type: "boolean" },
+        sensivel: { type: "boolean" },
+        confianca: { type: "number", minimum: 0, maximum: 1 }
+      }
+    };
+
+    assistenteAnaliseTelaUltima.set(usuarioId, Date.now());
+    const resposta = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      signal: AbortSignal.timeout(40000),
+      headers: {
+        "Authorization": `Bearer ${openaiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: modelo,
+        store: false,
+        instructions:
+          "Você é o verificador visual da Plataforma de Leads. Analise exclusivamente a tela compartilhada da página oficial de criação/configuração de conta de anúncios da rede informada. " +
+          "Identifique a página e a etapa, confira cada rótulo visível, marque o que está preenchido, faltando ou exige atenção e indique exatamente a próxima ação segura em português do Brasil. " +
+          "Nunca invente elementos fora da imagem. Nunca transcreva nem repita senhas, códigos de autenticação, CAPTCHA, números de cartão, documentos, e-mails, telefones, tokens ou outros valores pessoais: cite somente o nome do campo e seu estado. " +
+          "Se houver login, senha, pagamento, documento, CAPTCHA ou código de segurança visível, defina sensivel=true e instrua o usuário a pausar o compartilhamento e concluir essa etapa pessoalmente. " +
+          "Não diga que clicou ou preencheu algo; você apenas verifica e orienta. Considere a configuração concluída somente quando houver confirmação visual inequívoca.",
+        input: [{
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                `Plataforma esperada: ${plataforma}.\n` +
+                `Contexto da análise anterior: ${contextoAnterior || "primeira verificação"}.\n` +
+                `Itens de referência para acompanhar ao longo do fluxo: ${requisitosReferencia[plataforma].join(", ")}.\n` +
+                "Revise a tela atual campo por campo e devolva o checklist estruturado. Não marque como faltando um item de referência que ainda não deveria aparecer nesta etapa."
+            },
+            { type: "input_image", image_url: imagem, detail: "high" }
+          ]
+        }],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "verificacao_tela_conta_anuncios",
+            strict: true,
+            schema
+          }
+        },
+        max_output_tokens: 1200,
+        safety_identifier: `assistente-contas-${usuarioId}`
+      })
+    });
+    const data: any = await resposta.json();
+    if (!resposta.ok) {
+      console.error("ASSISTENTE CONTAS ANALISE VISUAL:", data?.error?.message || resposta.status);
+      return c.json({ error: "A análise visual não respondeu agora. Tente novamente em instantes." }, 502);
+    }
+
+    const texto = extrairTextoRespostaOpenAI(data);
+    if (!texto) return c.json({ error: "A análise visual voltou sem resultado" }, 502);
+    const analise = JSON.parse(texto);
+    analise.plataforma = plataforma;
+    return c.json({ analise, modelo, atualizado_em: new Date().toISOString() });
+  } catch (err) {
+    console.error("ERRO /assistente-contas-anuncios/analisar-tela:", err);
+    return c.json({ error: "Não foi possível analisar a tela compartilhada" }, 500);
+  } finally {
+    assistenteAnaliseTelaEmAndamento.delete(usuarioId);
   }
 });
 
