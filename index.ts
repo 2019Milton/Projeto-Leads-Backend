@@ -7591,13 +7591,11 @@ function normalizarTelefoneE164Google(telefone: string): string {
 // Aceita gclid OU e-mail/telefone hasheados (Enhanced Conversions for Leads,
 // sem gclid) — cobre leads de WhatsApp (criarLeadDeConversaGoogle), que nunca
 // tem gclid por natureza (a tag [GA-...] identifica a campanha, nao o clique).
-// ⚠️ ASSUMPTION: formato do payload (destinations/events/userData) conferido
-// contra a documentacao oficial da Data Manager API em 16/09/2026, e a URL/
-// metodo/erro de allowlist FORAM confirmados ao vivo — mas o corpo da
-// requisicao ainda nao pode ser validado de ponta a ponta porque a conta de
-// teste usada só tinha o escopo OAuth "adwords", nao "datamanager" (exige
-// reconectar a conta pra emitir um refresh_token novo com os dois escopos).
-// Testar contra um envio real assim que isso acontecer.
+// Testado ao vivo e confirmado end-to-end em 17/09/2026 (validateOnly e
+// envio real, ambos com requestId de sucesso) contra uma conta real depois
+// de reconectada com o escopo "datamanager" — nao e mais so uma suposicao
+// baseada em documentacao. Unico ajuste que a doc nao deixava claro:
+// eventSource e obrigatorio (ver comentario mais abaixo).
 async function enviarEventoGoogleAdsConversionLeads(
   usuarioId: number,
   lead: any,
@@ -22372,9 +22370,10 @@ await client.query(`
 
 // Mesmo rastreio de envio, agora para Google Ads e TikTok (ver
 // avaliarEEnviarQualificacaoLead). gclid vem do lead_form_submission_data do
-// Google (capturado na sincronizacao) e e o identificador exigido pelo
-// uploadClickConversions — sem ele nao ha como reportar qualidade do lead
-// de volta pro Google.
+// Google (capturado na sincronizacao) e identifica o clique original; na
+// falta dele, enviarEventoGoogleAdsConversionLeads cai pra e-mail/telefone
+// com hash (Enhanced Conversions for Leads via Data Manager API) — cobre os
+// leads de WhatsApp do Google, que nunca tem gclid por natureza.
 await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS gclid TEXT,
