@@ -19604,16 +19604,17 @@ app.post("/whatsapp-bot/midia", authMiddleware, async (c) => {
       return c.json({ error: "Arquivo muito grande (máximo 15MB)" }, 400);
     }
 
+    const token = randomBytes(24).toString("base64url");
     const row = await client.query(
-      `INSERT INTO whatsapp_bot_midias (usuario_id, tipo, mime_type, dados)
-       VALUES ($1, $2, $3, $4) RETURNING id`,
-      [user.id, tipo, mimeType, Buffer.from(bytes)]
+      `INSERT INTO whatsapp_bot_midias (usuario_id, tipo, mime_type, dados, token)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [user.id, tipo, mimeType, Buffer.from(bytes), token]
     );
 
     const id = row.rows[0].id;
     return c.json({
       id,
-      url: `${URL_BACKEND_PUBLICA}/whatsapp-bot/midia/${id}`,
+      url: `${URL_BACKEND_PUBLICA}/whatsapp-bot/midia/${token}`,
       tipo,
       mime_type: mimeType
     });
@@ -19624,17 +19625,20 @@ app.post("/whatsapp-bot/midia", authMiddleware, async (c) => {
 });
 
 // Sem authMiddleware de proposito: quem busca esse link e o servidor da Meta,
-// na hora de entregar a mensagem — nao o navegador do corretor logado.
-app.get("/whatsapp-bot/midia/:id", async (c) => {
+// na hora de entregar a mensagem — nao o navegador do corretor logado. Por
+// isso o identificador é um token opaco aleatório (nao o id sequencial do
+// banco) — ver backfillWhatsappBotMidiaTokens: sem isso qualquer um podia
+// enumerar /1, /2, /3... e baixar mídia de bot de outro corretor.
+app.get("/whatsapp-bot/midia/:token", async (c) => {
   try {
-    const id = Number(c.req.param("id"));
-    if (!Number.isFinite(id)) {
+    const token = c.req.param("token");
+    if (!token) {
       return c.text("Não encontrado", 404);
     }
 
     const row = await client.query(
-      `SELECT mime_type, dados FROM whatsapp_bot_midias WHERE id = $1`,
-      [id]
+      `SELECT mime_type, dados FROM whatsapp_bot_midias WHERE token = $1`,
+      [token]
     );
     if (!row.rows.length) {
       return c.text("Não encontrado", 404);
@@ -19646,7 +19650,7 @@ app.get("/whatsapp-bot/midia/:id", async (c) => {
       "Cache-Control": "public, max-age=31536000, immutable"
     });
   } catch (err) {
-    console.error("ERRO GET /whatsapp-bot/midia/:id:", err);
+    console.error("ERRO GET /whatsapp-bot/midia/:token:", err);
     return c.text("Erro ao carregar mídia", 500);
   }
 });
@@ -22654,6 +22658,15 @@ await client.query(`
     dados         BYTEA NOT NULL,
     criado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+  -- Auditoria de segurança (2026-09): a rota GET /whatsapp-bot/midia/:id era
+  -- pública (precisa ser, quem busca é o servidor da Meta) usando o id
+  -- SERIAL como identificador — sequencial e global entre todos os usuários,
+  -- então dava pra enumerar (/1, /2, /3...) e baixar mídia de bot de QUALQUER
+  -- corretor. Substituído por um token opaco aleatório (ver
+  -- backfillWhatsappBotMidiaTokens abaixo pra linhas já existentes).
+  ALTER TABLE whatsapp_bot_midias ADD COLUMN IF NOT EXISTS token TEXT;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bot_midias_token
+    ON whatsapp_bot_midias(token) WHERE token IS NOT NULL;
 
   -- Painel Financeiro: um lancamento = a cobranca de um usuario num mes.
   -- Arquivo pequeno (comprovante/NF) guardado direto como BYTEA, mesmo
@@ -22704,6 +22717,71 @@ await client.query(`
     criado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 `);
+
+// Preenche o token opaco (ver coluna adicionada acima) de qualquer mídia de
+// bot de WhatsApp que ainda não tenha um, e reescreve o midia_url salvo em
+// whatsapp_bot_config.passos que ainda aponte pro formato antigo baseado no
+// id sequencial — sem isso, um roteiro de bot já configurado pararia de
+// enviar a imagem/áudio depois da troca de rota. Idempotente: roda a cada
+// start do servidor, mas só toca linha que ainda não migrou.
+async function backfillWhatsappBotMidiaTokens() {
+  const semToken = await client.query(
+    `SELECT id FROM whatsapp_bot_midias WHERE token IS NULL`
+  );
+  for (const row of semToken.rows) {
+    await client.query(
+      `UPDATE whatsapp_bot_midias SET token = $1 WHERE id = $2`,
+      [randomBytes(24).toString("base64url"), row.id]
+    );
+  }
+
+  const configs = await client.query(
+    `SELECT id, passos FROM whatsapp_bot_config`
+  );
+  for (const cfg of configs.rows) {
+    let passos = cfg.passos;
+    if (typeof passos === "string") {
+      try { passos = JSON.parse(passos); } catch { continue; }
+    }
+    if (!Array.isArray(passos)) continue;
+
+    let mudou = false;
+    for (const passo of passos) {
+      if (
+        !["imagem", "audio"].includes(passo?.tipo) ||
+        typeof passo?.midia_url !== "string"
+      ) {
+        continue;
+      }
+      const match = passo.midia_url.match(/\/whatsapp-bot\/midia\/(\d+)(?:[/?#]|$)/);
+      if (!match) continue;
+
+      const midiaId = Number(match[1]);
+      const midiaRow = await client.query(
+        `SELECT token FROM whatsapp_bot_midias WHERE id = $1`,
+        [midiaId]
+      );
+      const token = midiaRow.rows[0]?.token;
+      if (token) {
+        passo.midia_url = passo.midia_url.replace(
+          `/whatsapp-bot/midia/${midiaId}`,
+          `/whatsapp-bot/midia/${token}`
+        );
+        mudou = true;
+      }
+    }
+
+    if (mudou) {
+      await client.query(
+        `UPDATE whatsapp_bot_config SET passos = $1 WHERE id = $2`,
+        [JSON.stringify(passos), cfg.id]
+      );
+    }
+  }
+}
+await backfillWhatsappBotMidiaTokens().catch((err) =>
+  console.error("ERRO backfillWhatsappBotMidiaTokens:", err)
+);
 
 // Histórico do antigo fluxo que perguntava pro corretor no WhatsApp pessoal
 // (via Z-API) o status de um lead parado — substituído pelo classificador
