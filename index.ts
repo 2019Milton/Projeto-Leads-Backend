@@ -6428,9 +6428,10 @@ const OAUTH_PROVEDORES: Record<string, {
   linkedin: {
     authUrl: "https://www.linkedin.com/oauth/v2/authorization",
     tokenUrl: "https://www.linkedin.com/oauth/v2/accessToken",
-    // r_marketing_leadgen_automation adicionado pra Lead Gen Forms API (ver
-    // secao LINKEDIN ADS) — sem ele /linkedin/formulario e a sincronizacao de
-    // respostas de formulario sao rejeitadas mesmo com rw_ads concedido.
+    // Solicite apenas escopos que o aplicativo realmente possui. O LinkedIn
+    // rejeita toda a autorizacao quando um unico escopo nao aprovado aparece
+    // na URL. r_marketing_leadgen_automation deve voltar para esta lista apenas
+    // depois que a Lead Sync API for aprovada para o aplicativo.
     // w_organization_social adicionado pra /linkedin/anuncio: a criacao do
     // anuncio publica um Post em nome da organizacao (POST /posts) antes de
     // vira-lo Creative patrocinado — esse endpoint pertence a API de Posts/
@@ -6438,7 +6439,7 @@ const OAUTH_PROVEDORES: Record<string, {
     // esse escopo separado mesmo com rw_ads concedido (bug confirmado nesta
     // auditoria: campanha/adgroup/imagem/formulario podiam ser criados com
     // sucesso e só o anuncio final falhar com 403 por falta desse escopo).
-    scope: "r_ads r_ads_reporting rw_ads r_marketing_leadgen_automation w_organization_social",
+    scope: "r_ads r_ads_reporting rw_ads w_organization_social",
     clientIdEnv: "LINKEDIN_ADS_CLIENT_ID",
     clientSecretEnv: "LINKEDIN_ADS_CLIENT_SECRET",
     redirectUriEnv: "LINKEDIN_ADS_REDIRECT_URI",
@@ -6559,6 +6560,11 @@ app.get("/auth/:plataforma/callback", async (c) => {
   try {
     // TikTok devolve o codigo de autorizacao como "auth_code" no redirect,
     // nao "code" (padrao OAuth2 usado pelas outras plataformas).
+    const oauthError = c.req.query("error");
+    if (oauthError) {
+      const descricao = c.req.query("error_description") || oauthError;
+      return c.text(`Autorização de ${plataforma} não concluída: ${descricao}`, 400);
+    }
     const code  = c.req.query(plataforma === "tiktok" ? "auth_code" : "code");
     const state = c.req.query("state");
     if (!state) return c.text("State nao recebido", 400);
