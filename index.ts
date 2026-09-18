@@ -27667,9 +27667,6 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
 
     syncEmAndamento.add(user.id);
 
-    console.log("USER LOGADO:", user);
-
-
     // 🔐 TOKEN META
     const conn = await client.query(
       `
@@ -27681,8 +27678,6 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
       `,
       [user.id]
     );
-
-    console.log("CONN:", conn.rows);
 
     if (conn.rows.length === 0) {
 
