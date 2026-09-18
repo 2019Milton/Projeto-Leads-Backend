@@ -296,6 +296,40 @@ function validarAssinaturaMetaWebhook(
   );
 }
 
+// Mesmo padrão de validarAssinaturaMetaWebhook, mas para as integrações que
+// usam um token fixo (Bearer/header) em vez de assinatura HMAC do corpo
+// (TikTok, Z-API, Kwai). Auditoria de segurança (2026-09): antes, se o secret
+// da env var não estivesse configurado, o webhook aceitava QUALQUER
+// requisição sem nenhuma validação de origem — em produção, agora rejeita.
+function validarTokenFixoWebhook(
+  secret: string | undefined,
+  tokenRecebido: string | null | undefined,
+  nomeIntegracao: string
+): boolean {
+  if (!secret) {
+    if (EXECUCAO_PRODUCAO) {
+      console.error(
+        `${nomeIntegracao}_WEBHOOK_SECRET nao configurado; webhook ${nomeIntegracao} rejeitado.`
+      );
+      return false;
+    }
+    console.warn(
+      `${nomeIntegracao}_WEBHOOK_SECRET nao configurado; webhook ${nomeIntegracao} aceito apenas fora de producao.`
+    );
+    return true;
+  }
+
+  if (!tokenRecebido) return false;
+
+  const recebidaBuffer = Buffer.from(tokenRecebido);
+  const secretBuffer = Buffer.from(secret);
+
+  return (
+    recebidaBuffer.length === secretBuffer.length &&
+    timingSafeEqual(recebidaBuffer, secretBuffer)
+  );
+}
+
 if (TOKEN_SECRET === DEFAULT_TOKEN_SECRET && EXECUCAO_PRODUCAO) {
   throw new Error(
     "JWT_SECRET nao configurado em producao. Defina uma chave forte no Railway."
@@ -2310,36 +2344,21 @@ async function enviarEmailResetSenha(
   }
 }
 
+// Auditoria de segurança (2026-09): removido o fallback que comparava senha em
+// texto puro (senhaInformada === senhaSalva) para contas sem hash bcrypt.
+// Confirmado antes de remover: as 12 contas em produção já estavam 100% em
+// bcrypt, então não há risco de bloquear login de ninguém. Uma senha que não
+// bate o formato bcrypt agora é tratada como credencial inválida, não como
+// "compare em texto puro".
 async function senhaConfere(
   senhaInformada: string,
   senhaSalva: string | null | undefined
 ) {
-  if (!senhaSalva) {
+  if (!senhaSalva || !senhaPareceHash(senhaSalva)) {
     return false;
   }
 
-  if (senhaPareceHash(senhaSalva)) {
-    return bcrypt.compare(senhaInformada, senhaSalva);
-  }
-
-  return senhaInformada === senhaSalva;
-}
-
-async function atualizarSenhaLegadaSePreciso(
-  usuarioId: number,
-  senhaInformada: string,
-  senhaSalva: string | null | undefined
-) {
-  if (
-    senhaSalva &&
-    !senhaPareceHash(senhaSalva) &&
-    senhaInformada === senhaSalva
-  ) {
-    await client.query(
-      "UPDATE usuarios SET senha = $1 WHERE id = $2",
-      [await gerarHashSenha(senhaInformada), usuarioId]
-    );
-  }
+  return bcrypt.compare(senhaInformada, senhaSalva);
 }
 
 async function senhaJaFoiUsadaRecentemente(
@@ -20187,18 +20206,11 @@ app.get("/webhook/tiktok", async (c) => {
 });
 
 app.post("/webhook/tiktok", async (c) => {
-  // Validate webhook secret if configured (TikTok sends Authorization header)
-  const tiktokSecret = Bun.env.TIKTOK_WEBHOOK_SECRET;
-  if (tiktokSecret) {
-    const auth = c.req.header("authorization") || "";
-    const provided = auth.replace(/^Bearer\s+/i, "").trim();
-    if (
-      !provided ||
-      provided.length !== tiktokSecret.length ||
-      !timingSafeEqual(Buffer.from(provided), Buffer.from(tiktokSecret))
-    ) {
-      return c.json({ error: "Unauthorized" }, 401);
-    }
+  // TikTok manda o secret no header Authorization (Bearer).
+  const auth = c.req.header("authorization") || "";
+  const provided = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!validarTokenFixoWebhook(Bun.env.TIKTOK_WEBHOOK_SECRET, provided, "TIKTOK")) {
+    return c.json({ error: "Unauthorized" }, 401);
   }
 
   try {
@@ -20399,19 +20411,11 @@ app.get("/webhook/kwai", async (c) => {
 });
 
 app.post("/webhook/kwai", async (c) => {
-  // Validação do segredo, se configurado (mesmo padrão do /webhook/tiktok) —
-  // opcional e sem efeito nenhum enquanto KWAI_WEBHOOK_SECRET não for setado.
-  const kwaiSecret = Bun.env.KWAI_WEBHOOK_SECRET;
-  if (kwaiSecret) {
-    const auth = c.req.header("authorization") || "";
-    const provided = auth.replace(/^Bearer\s+/i, "").trim();
-    if (
-      !provided ||
-      provided.length !== kwaiSecret.length ||
-      !timingSafeEqual(Buffer.from(provided), Buffer.from(kwaiSecret))
-    ) {
-      return c.json({ error: "Unauthorized" }, 401);
-    }
+  // Mesmo padrão do /webhook/tiktok.
+  const auth = c.req.header("authorization") || "";
+  const provided = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!validarTokenFixoWebhook(Bun.env.KWAI_WEBHOOK_SECRET, provided, "KWAI")) {
+    return c.json({ error: "Unauthorized" }, 401);
   }
 
   try {
@@ -20629,13 +20633,10 @@ async function classificarStatusLeadPorConversa(
 // 🔥 WEBHOOK Z-API — eventos de conexão/desconexão do WhatsApp pessoal do
 // corretor usado pra notificações (novo lead, lembretes)
 app.post("/webhook/zapi", async (c) => {
-  // Validate shared secret if configured
-  const zapiSecret = Bun.env.ZAPI_WEBHOOK_SECRET;
-  if (zapiSecret) {
-    const headerToken = c.req.header("x-webhook-token") || c.req.header("authorization")?.replace("Bearer ", "");
-    if (!headerToken || !timingSafeEqual(Buffer.from(headerToken), Buffer.from(zapiSecret))) {
-      return c.json({ error: "Unauthorized" }, 401);
-    }
+  // Z-API manda o secret no header x-webhook-token (ou Authorization Bearer).
+  const headerToken = c.req.header("x-webhook-token") || c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!validarTokenFixoWebhook(Bun.env.ZAPI_WEBHOOK_SECRET, headerToken, "ZAPI")) {
+    return c.json({ error: "Unauthorized" }, 401);
   }
 
   try {
@@ -23328,12 +23329,6 @@ app.post("/login-test", async (c) => {
       return c.json({ error: "Login inválido" }, 401);
     }
 
-    await atualizarSenhaLegadaSePreciso(
-      user.id,
-      senha,
-      user.senha
-    );
-
     const token = criarTokenUsuario(
       user,
       painelSlug ? "painel" : "conta"
@@ -23387,12 +23382,6 @@ app.post("/login", async (c) => {
   ) {
     return c.json({ error: "Login inválido" }, 401);
   }
-
-  await atualizarSenhaLegadaSePreciso(
-    user.id,
-    senha,
-    user.senha
-  );
 
   const token = criarTokenUsuario(
     user,
