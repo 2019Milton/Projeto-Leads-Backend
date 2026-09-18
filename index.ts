@@ -4740,6 +4740,11 @@ const authMiddleware = async (c: any, next: any) => {
         COALESCE(u.ativo, true) AS ativo,
         COALESCE(u.is_parceiro, false) AS is_parceiro,
         COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+        COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
+        COALESCE(u.voip_habilitado, false) AS voip_habilitado,
+        COALESCE(u.voip_status, 'desativado') AS voip_status,
+        u.voip_provedor,
+        u.voip_numero,
         u.painel_slug,
         COALESCE(
           (
@@ -4813,14 +4818,25 @@ const authMiddleware = async (c: any, next: any) => {
     if (modoAcesso === "painel") {
       const rota = c.req.path;
       const metodo = c.req.method;
-      const permitido = metodo === "GET" && (
+      const permitidoBasico = metodo === "GET" && (
         rota === "/usuarios/me" ||
         rota === "/painel-cliente/resumo"
       );
+      const permitidoWhatsapp = userBanco.atendimento_whatsapp_habilitado === true && (
+        (metodo === "GET" && rota === "/painel-cliente/whatsapp/conversas") ||
+        (metodo === "GET" && /^\/painel-cliente\/whatsapp\/conversas\/\d+\/mensagens$/.test(rota)) ||
+        (metodo === "POST" && /^\/painel-cliente\/whatsapp\/conversas\/\d+\/mensagens$/.test(rota)) ||
+        (metodo === "PATCH" && /^\/painel-cliente\/whatsapp\/conversas\/\d+\/status$/.test(rota))
+      );
+      const permitidoVoip = userBanco.voip_habilitado === true && metodo === "GET" && (
+        rota === "/painel-cliente/voip/configuracao" ||
+        rota === "/painel-cliente/voip/chamadas"
+      );
+      const permitido = permitidoBasico || permitidoWhatsapp || permitidoVoip;
 
       if (!permitido) {
         return c.json({
-          error: "Este acesso permite somente acompanhar os resultados"
+          error: "Este recurso não está habilitado para o painel do corretor"
         }, 403);
       }
     }
@@ -22058,7 +22074,13 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS resumo_semanal_enviado_em TIMESTAMP,
     ADD COLUMN IF NOT EXISTS painel_cliente_habilitado BOOLEAN DEFAULT false,
     ADD COLUMN IF NOT EXISTS painel_slug TEXT,
-    ADD COLUMN IF NOT EXISTS painel_atualizado_em TIMESTAMP;
+    ADD COLUMN IF NOT EXISTS painel_atualizado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS atendimento_whatsapp_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS voip_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS voip_status TEXT DEFAULT 'desativado',
+    ADD COLUMN IF NOT EXISTS voip_provedor TEXT,
+    ADD COLUMN IF NOT EXISTS voip_numero TEXT,
+    ADD COLUMN IF NOT EXISTS voip_atualizado_em TIMESTAMP;
 `);
 
 await client.query(`
@@ -22080,6 +22102,30 @@ await client.query(`
 
   CREATE INDEX IF NOT EXISTS idx_gestor_acessos_cliente
     ON gestor_acessos(cliente_id, criado_em DESC);
+`);
+
+// Estrutura de telefonia preparada sem contratar operadora ou reservar número.
+// Enquanto `voip_status` não for "ativo", nenhuma chamada externa é iniciada.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS voip_chamadas (
+    id                 SERIAL PRIMARY KEY,
+    usuario_id         INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    lead_id            INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+    provedor           TEXT,
+    chamada_externa_id TEXT,
+    direcao            TEXT NOT NULL DEFAULT 'saida'
+                         CHECK (direcao IN ('entrada','saida')),
+    telefone           TEXT,
+    status             TEXT NOT NULL DEFAULT 'preparando',
+    duracao_segundos   INTEGER NOT NULL DEFAULT 0,
+    iniciada_em        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atendida_em        TIMESTAMP,
+    encerrada_em       TIMESTAMP,
+    criado_em          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_voip_chamadas_usuario
+    ON voip_chamadas(usuario_id, iniciada_em DESC);
 `);
 
 await client.query(`
@@ -22842,7 +22888,10 @@ await client.query(`
 // pergunta que pode não ter nada a ver. Ver avancarBotWhatsApp.
 await client.query(`
   ALTER TABLE whatsapp_conversas
-    ADD COLUMN IF NOT EXISTS roteiro_id INTEGER REFERENCES whatsapp_bot_config(id) ON DELETE SET NULL;
+    ADD COLUMN IF NOT EXISTS roteiro_id INTEGER REFERENCES whatsapp_bot_config(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS atendimento_lido_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS assumida_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS encerrada_em TIMESTAMP;
 `);
 
 await client.query(`
@@ -23490,7 +23539,15 @@ app.get("/usuarios/me", authMiddleware, async (c) => {
       user.painel_cliente_habilitado === true,
     painel_url: user.painel_cliente_habilitado
       ? montarPainelClienteUrl(user.painel_slug)
-      : null
+      : null,
+    atendimento_whatsapp_habilitado:
+      user.atendimento_whatsapp_habilitado === true,
+    voip_habilitado: user.voip_habilitado === true,
+    voip_status: user.voip_habilitado === true
+      ? (user.voip_status || "aguardando_configuracao")
+      : "desativado",
+    voip_provedor: user.voip_provedor || null,
+    voip_numero: user.voip_numero || null
   });
 });
 
@@ -23560,8 +23617,19 @@ async function buscarClienteGerenciado(
       u.admin_id,
       COALESCE(u.ativo, true) AS ativo,
       COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
+      COALESCE(u.voip_habilitado, false) AS voip_habilitado,
+      COALESCE(u.voip_status, 'desativado') AS voip_status,
+      u.voip_provedor,
+      u.voip_numero,
       u.painel_slug,
-      u.criado_em
+      u.criado_em,
+      EXISTS(
+        SELECT 1 FROM plataforma_conexoes pc
+        WHERE pc.usuario_id = u.id
+          AND pc.plataforma = 'whatsapp'
+          AND pc.status = 'conectado'
+      ) AS whatsapp_conectado
     FROM usuarios u
     WHERE u.id = $1
       AND u.tipo IN ('corretor', 'corretor_receptor')
@@ -23589,6 +23657,20 @@ function formatarClienteGerenciado(row: any) {
     painel_url: row.painel_cliente_habilitado
       ? montarPainelClienteUrl(row.painel_slug)
       : null,
+    atendimento_whatsapp_habilitado:
+      row.atendimento_whatsapp_habilitado === true,
+    atendimento_whatsapp_status:
+      row.atendimento_whatsapp_habilitado !== true
+        ? "desativado"
+        : row.whatsapp_conectado === true
+          ? "ativo"
+          : "aguardando_conexao",
+    voip_habilitado: row.voip_habilitado === true,
+    voip_status: row.voip_habilitado === true
+      ? (row.voip_status || "aguardando_configuracao")
+      : "desativado",
+    voip_provedor: row.voip_provedor || null,
+    voip_numero: row.voip_numero || null,
     criado_em: row.criado_em || null,
     campanhas_total: Number(row.campanhas_total || 0),
     campanhas_ativas: Number(row.campanhas_ativas || 0),
@@ -23630,6 +23712,11 @@ app.get("/gestor/clientes", authMiddleware, async (c) => {
       u.criado_em,
       COALESCE(u.ativo, true) AS ativo,
       COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
+      COALESCE(u.voip_habilitado, false) AS voip_habilitado,
+      COALESCE(u.voip_status, 'desativado') AS voip_status,
+      u.voip_provedor,
+      u.voip_numero,
       u.painel_slug,
       (SELECT COUNT(*)::int FROM campanhas c WHERE c.usuario_id = u.id) AS campanhas_total,
       (
@@ -23722,13 +23809,18 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
         admin_id,
         ativo,
         painel_cliente_habilitado,
+        atendimento_whatsapp_habilitado,
+        voip_habilitado,
+        voip_status,
         painel_slug,
         painel_atualizado_em
       )
-      VALUES ($1, $2, $3, $4, 'corretor', $5, true, true, $6, NOW())
+      VALUES ($1, $2, $3, $4, 'corretor', $5, true, true, false, false, 'desativado', $6, NOW())
       RETURNING
         id, email, tipo, nome, sobrenome, plano, admin_id, ativo,
-        painel_cliente_habilitado, painel_slug, criado_em
+        painel_cliente_habilitado, atendimento_whatsapp_habilitado,
+        voip_habilitado, voip_status, voip_provedor, voip_numero,
+        painel_slug, criado_em
       `,
       [
         nome,
@@ -23766,10 +23858,20 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const atualizacoes: string[] = [];
   const valores: any[] = [];
+  const posicoesColunas = new Map<string, number>();
 
   const adicionar = (sql: string, valor: any) => {
+    const posicaoExistente = posicoesColunas.get(sql);
+    if (posicaoExistente) {
+      valores[posicaoExistente - 1] = valor;
+      return;
+    }
     valores.push(valor);
+    posicoesColunas.set(sql, valores.length);
     atualizacoes.push(`${sql} = $${valores.length}`);
+  };
+  const adicionarExpressao = (sql: string) => {
+    if (!atualizacoes.includes(sql)) atualizacoes.push(sql);
   };
 
   if (Object.prototype.hasOwnProperty.call(body, "nome")) {
@@ -23798,7 +23900,40 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
       adicionar("painel_slug", gerarPainelSlug());
     }
 
-    atualizacoes.push("painel_atualizado_em = NOW()");
+    adicionarExpressao("painel_atualizado_em = NOW()");
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "atendimento_whatsapp_habilitado")) {
+    const habilitado = body.atendimento_whatsapp_habilitado === true;
+    adicionar("atendimento_whatsapp_habilitado", habilitado);
+
+    if (habilitado && !cliente.painel_cliente_habilitado &&
+        !Object.prototype.hasOwnProperty.call(body, "painel_cliente_habilitado")) {
+      adicionar("painel_cliente_habilitado", true);
+      if (!cliente.painel_slug) adicionar("painel_slug", gerarPainelSlug());
+    }
+
+    adicionarExpressao("painel_atualizado_em = NOW()");
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "voip_habilitado")) {
+    const habilitado = body.voip_habilitado === true;
+    adicionar("voip_habilitado", habilitado);
+    adicionar(
+      "voip_status",
+      habilitado
+        ? (cliente.voip_provedor ? "ativo" : "aguardando_configuracao")
+        : "desativado"
+    );
+
+    if (habilitado && !cliente.painel_cliente_habilitado &&
+        !Object.prototype.hasOwnProperty.call(body, "painel_cliente_habilitado")) {
+      adicionar("painel_cliente_habilitado", true);
+      if (!cliente.painel_slug) adicionar("painel_slug", gerarPainelSlug());
+    }
+
+    adicionarExpressao("voip_atualizado_em = NOW()");
+    adicionarExpressao("painel_atualizado_em = NOW()");
   }
 
   if (!atualizacoes.length) {
@@ -23815,14 +23950,18 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
       WHERE id = $${valores.length}
       RETURNING
         id, email, tipo, nome, sobrenome, plano, admin_id, ativo,
-        painel_cliente_habilitado, painel_slug, criado_em
+        painel_cliente_habilitado, atendimento_whatsapp_habilitado,
+        voip_habilitado, voip_status, voip_provedor, voip_numero,
+        painel_slug, criado_em
       `,
       valores
     );
 
+    const clienteAtualizado = await buscarClienteGerenciado(gestor, clienteId);
+
     return c.json({
       sucesso: true,
-      cliente: formatarClienteGerenciado(result.rows[0])
+      cliente: formatarClienteGerenciado(clienteAtualizado || result.rows[0])
     });
   } catch (err: any) {
     if (err?.code === "23505") {
@@ -23912,6 +24051,315 @@ app.post("/gestor/clientes/:id/acessar", authMiddleware, async (c) => {
     token,
     cliente: formatarClienteGerenciado(cliente)
   });
+});
+
+function garantirRecursoPainel(user: any, recurso: "whatsapp" | "voip") {
+  if (user?.modo_acesso !== "painel") {
+    return "Esta rota é exclusiva do painel do corretor";
+  }
+
+  if (recurso === "whatsapp" && user.atendimento_whatsapp_habilitado !== true) {
+    return "O atendimento pelo WhatsApp não está habilitado para este corretor";
+  }
+
+  if (recurso === "voip" && user.voip_habilitado !== true) {
+    return "A telefonia não está habilitada para este corretor";
+  }
+
+  return null;
+}
+
+app.get("/painel-cliente/whatsapp/conversas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "whatsapp");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const statusInformado = textoOpcional(c.req.query("status"));
+  const statusPermitidos = new Set(["bot", "aguardando_resposta", "humano", "encerrada"]);
+  const status = statusPermitidos.has(statusInformado) ? statusInformado : null;
+
+  const result = await client.query(
+    `
+    SELECT
+      wc.id,
+      wc.telefone_cliente,
+      wc.status,
+      wc.lead_id,
+      wc.iniciado_em,
+      wc.atualizado_em,
+      wc.ultima_mensagem_em,
+      l.nome AS lead_nome,
+      l.status AS lead_status,
+      c.nome AS campanha_nome,
+      ultima.conteudo AS ultima_mensagem,
+      ultima.direcao AS ultima_direcao,
+      ultima.criado_em AS ultima_mensagem_criada_em,
+      (
+        SELECT COUNT(*)::int
+        FROM whatsapp_mensagens_log nao_lida
+        WHERE nao_lida.conversa_id = wc.id
+          AND nao_lida.direcao = 'entrada'
+          AND nao_lida.criado_em > COALESCE(wc.atendimento_lido_em, TIMESTAMP '1970-01-01')
+      ) AS nao_lidas,
+      EXISTS(
+        SELECT 1
+        FROM whatsapp_mensagens_log recente
+        WHERE recente.conversa_id = wc.id
+          AND recente.direcao = 'entrada'
+          AND recente.criado_em >= NOW() - INTERVAL '24 hours'
+      ) AS janela_atendimento_aberta
+    FROM whatsapp_conversas wc
+    LEFT JOIN leads l ON l.id = wc.lead_id AND l.usuario_id = wc.usuario_id
+    LEFT JOIN campanhas c ON c.id = l.campanha_id
+    LEFT JOIN LATERAL (
+      SELECT conteudo, direcao, criado_em
+      FROM whatsapp_mensagens_log
+      WHERE conversa_id = wc.id
+      ORDER BY criado_em DESC, id DESC
+      LIMIT 1
+    ) ultima ON true
+    WHERE wc.usuario_id = $1
+      AND ($2::text IS NULL OR wc.status = $2)
+    ORDER BY COALESCE(ultima.criado_em, wc.ultima_mensagem_em, wc.atualizado_em) DESC NULLS LAST
+    LIMIT 150
+    `,
+    [Number(user.id), status]
+  );
+
+  return c.json({ conversas: result.rows });
+});
+
+app.get("/painel-cliente/whatsapp/conversas/:id/mensagens", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "whatsapp");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const conversaId = Number(c.req.param("id"));
+  if (!Number.isInteger(conversaId) || conversaId <= 0) {
+    return c.json({ error: "Conversa inválida" }, 400);
+  }
+
+  const conversaResult = await client.query(
+    `
+    SELECT
+      wc.id,
+      wc.telefone_cliente,
+      wc.status,
+      wc.lead_id,
+      wc.iniciado_em,
+      wc.atualizado_em,
+      l.nome AS lead_nome,
+      l.email AS lead_email,
+      l.status AS lead_status,
+      c.nome AS campanha_nome,
+      EXISTS(
+        SELECT 1
+        FROM whatsapp_mensagens_log recente
+        WHERE recente.conversa_id = wc.id
+          AND recente.direcao = 'entrada'
+          AND recente.criado_em >= NOW() - INTERVAL '24 hours'
+      ) AS janela_atendimento_aberta
+    FROM whatsapp_conversas wc
+    LEFT JOIN leads l ON l.id = wc.lead_id AND l.usuario_id = wc.usuario_id
+    LEFT JOIN campanhas c ON c.id = l.campanha_id
+    WHERE wc.id = $1 AND wc.usuario_id = $2
+    LIMIT 1
+    `,
+    [conversaId, Number(user.id)]
+  );
+
+  const conversa = conversaResult.rows[0];
+  if (!conversa) return c.json({ error: "Conversa não encontrada" }, 404);
+
+  const mensagens = await client.query(
+    `
+    SELECT id, wamid, direcao, conteudo, criado_em
+    FROM whatsapp_mensagens_log
+    WHERE conversa_id = $1
+    ORDER BY criado_em ASC, id ASC
+    LIMIT 500
+    `,
+    [conversaId]
+  );
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET atendimento_lido_em = NOW() WHERE id = $1 AND usuario_id = $2`,
+    [conversaId, Number(user.id)]
+  );
+
+  return c.json({ conversa, mensagens: mensagens.rows });
+});
+
+app.post("/painel-cliente/whatsapp/conversas/:id/mensagens", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "whatsapp");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const limite = limitarRequisicao(c, `painel-whatsapp-enviar-${user.id}`, 30, 60 * 1000);
+  if (limite) return limite;
+
+  const conversaId = Number(c.req.param("id"));
+  const body = await c.req.json().catch(() => ({}));
+  const mensagem = textoOpcional(body.mensagem);
+
+  if (!Number.isInteger(conversaId) || conversaId <= 0) {
+    return c.json({ error: "Conversa inválida" }, 400);
+  }
+  if (!mensagem) return c.json({ error: "Digite uma mensagem" }, 400);
+  if (mensagem.length > 4096) {
+    return c.json({ error: "A mensagem pode ter no máximo 4.096 caracteres" }, 400);
+  }
+
+  const conversaResult = await client.query(
+    `
+    SELECT
+      wc.id,
+      wc.telefone_cliente,
+      wc.status,
+      pc.dados_conta->>'phone_number_id' AS phone_number_id,
+      EXISTS(
+        SELECT 1
+        FROM whatsapp_mensagens_log recente
+        WHERE recente.conversa_id = wc.id
+          AND recente.direcao = 'entrada'
+          AND recente.criado_em >= NOW() - INTERVAL '24 hours'
+      ) AS janela_atendimento_aberta
+    FROM whatsapp_conversas wc
+    LEFT JOIN LATERAL (
+      SELECT dados_conta
+      FROM plataforma_conexoes
+      WHERE usuario_id = wc.usuario_id
+        AND plataforma = 'whatsapp'
+        AND status = 'conectado'
+      ORDER BY atualizado_em DESC NULLS LAST, id DESC
+      LIMIT 1
+    ) pc ON true
+    WHERE wc.id = $1 AND wc.usuario_id = $2
+    LIMIT 1
+    `,
+    [conversaId, Number(user.id)]
+  );
+  const conversa = conversaResult.rows[0];
+
+  if (!conversa) return c.json({ error: "Conversa não encontrada" }, 404);
+  if (!conversa.phone_number_id) {
+    return c.json({ error: "O WhatsApp oficial ainda não está conectado nesta conta" }, 409);
+  }
+  if (!conversa.janela_atendimento_aberta) {
+    return c.json({
+      error: "A janela de atendimento de 24 horas terminou. Para retomar, será necessário usar um modelo aprovado pela Meta."
+    }, 409);
+  }
+
+  const wamid = await enviarMensagemWhatsAppOficial(
+    Number(user.id),
+    String(conversa.phone_number_id),
+    String(conversa.telefone_cliente),
+    mensagem
+  );
+
+  if (!wamid) {
+    return c.json({ error: "A Meta não confirmou o envio da mensagem" }, 502);
+  }
+
+  const log = await client.query(
+    `
+    INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo)
+    VALUES ($1, $2, 'echo', $3)
+    ON CONFLICT (wamid) DO UPDATE SET conteudo = EXCLUDED.conteudo
+    RETURNING id, wamid, direcao, conteudo, criado_em
+    `,
+    [conversaId, wamid, mensagem]
+  );
+
+  await client.query(
+    `
+    UPDATE whatsapp_conversas
+    SET status = 'humano', assumida_em = COALESCE(assumida_em, NOW()),
+        atualizado_em = NOW(), ultima_mensagem_em = NOW(), atendimento_lido_em = NOW(),
+        encerrada_em = NULL
+    WHERE id = $1 AND usuario_id = $2
+    `,
+    [conversaId, Number(user.id)]
+  );
+
+  return c.json({ sucesso: true, mensagem: log.rows[0] });
+});
+
+app.patch("/painel-cliente/whatsapp/conversas/:id/status", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "whatsapp");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const conversaId = Number(c.req.param("id"));
+  const body = await c.req.json().catch(() => ({}));
+  const status = textoOpcional(body.status);
+
+  if (!Number.isInteger(conversaId) || conversaId <= 0) {
+    return c.json({ error: "Conversa inválida" }, 400);
+  }
+  if (!new Set(["humano", "bot", "encerrada"]).has(status)) {
+    return c.json({ error: "Status de atendimento inválido" }, 400);
+  }
+
+  const result = await client.query(
+    `
+    UPDATE whatsapp_conversas
+    SET status = $1,
+        passo_atual = CASE WHEN $1 = 'bot' THEN 0 ELSE passo_atual END,
+        roteiro_id = CASE WHEN $1 = 'bot' THEN NULL ELSE roteiro_id END,
+        assumida_em = CASE WHEN $1 = 'humano' THEN COALESCE(assumida_em, NOW()) ELSE assumida_em END,
+        encerrada_em = CASE WHEN $1 = 'encerrada' THEN NOW() ELSE NULL END,
+        atendimento_lido_em = NOW(),
+        atualizado_em = NOW()
+    WHERE id = $2 AND usuario_id = $3
+    RETURNING id, status, atualizado_em
+    `,
+    [status, conversaId, Number(user.id)]
+  );
+
+  if (!result.rows[0]) return c.json({ error: "Conversa não encontrada" }, 404);
+  return c.json({ sucesso: true, conversa: result.rows[0] });
+});
+
+app.get("/painel-cliente/voip/configuracao", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "voip");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  return c.json({
+    habilitado: true,
+    status: user.voip_status || "aguardando_configuracao",
+    provedor: user.voip_provedor || null,
+    numero: user.voip_numero || null,
+    gera_cobranca: false,
+    mensagem: user.voip_status === "ativo"
+      ? "Telefonia configurada para esta conta."
+      : "A estrutura está habilitada, mas nenhuma operadora ou número foi contratado."
+  });
+});
+
+app.get("/painel-cliente/voip/chamadas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "voip");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const result = await client.query(
+    `
+    SELECT
+      vc.id, vc.lead_id, vc.direcao, vc.telefone, vc.status,
+      vc.duracao_segundos, vc.iniciada_em, vc.atendida_em, vc.encerrada_em,
+      l.nome AS lead_nome
+    FROM voip_chamadas vc
+    LEFT JOIN leads l ON l.id = vc.lead_id AND l.usuario_id = vc.usuario_id
+    WHERE vc.usuario_id = $1
+    ORDER BY vc.iniciada_em DESC, vc.id DESC
+    LIMIT 100
+    `,
+    [Number(user.id)]
+  );
+
+  return c.json({ chamadas: result.rows });
 });
 
 app.get("/painel-cliente/resumo", authMiddleware, async (c) => {
@@ -24055,7 +24503,20 @@ app.get("/painel-cliente/resumo", authMiddleware, async (c) => {
         ? "A IA auxilia o gestor na criação, análise e otimização das campanhas."
         : "A IA está desativada nesta conta."
     },
-    somente_leitura: true
+    recursos: {
+      atendimento_whatsapp: {
+        habilitado: user.atendimento_whatsapp_habilitado === true
+      },
+      voip: {
+        habilitado: user.voip_habilitado === true,
+        status: user.voip_habilitado === true
+          ? (user.voip_status || "aguardando_configuracao")
+          : "desativado",
+        provedor: user.voip_provedor || null,
+        numero: user.voip_numero || null
+      }
+    },
+    somente_leitura: user.atendimento_whatsapp_habilitado !== true
   });
 });
 
