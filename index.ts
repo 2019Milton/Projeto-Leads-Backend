@@ -1870,17 +1870,80 @@ async function limparErroPublicacaoCampanha(campanhaId: number) {
   );
 }
 
+import { lookup } from "node:dns/promises";
+
+// Bloqueia SSRF nos endpoints que buscam uma URL fornecida pelo corretor
+// (upload de imagem/vídeo por link, "reaproveitar imagem/vídeo já publicado"):
+// sem isso, dava pra usar imagem_url/video_url pra fazer o servidor requisitar
+// a rede interna do Railway (ex.: 169.254.169.254, localhost, 10.x). Resolve o
+// hostname de verdade via DNS (não só olha a string da URL) pra também cobrir
+// DNS rebinding, onde um domínio comum resolve pra um IP interno.
+async function validarUrlSeguraParaFetch(
+  urlTexto: string
+): Promise<{ ok: true; url: URL } | { ok: false; erro: string }> {
+  let url: URL;
+  try {
+    url = new URL(urlTexto);
+  } catch {
+    return { ok: false, erro: "A URL informada é inválida" };
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    return { ok: false, erro: "A URL precisa começar com http:// ou https://" };
+  }
+
+  let enderecos: { address: string }[];
+  try {
+    enderecos = await lookup(url.hostname, { all: true });
+  } catch {
+    return { ok: false, erro: "Não foi possível resolver o endereço da URL" };
+  }
+
+  for (const { address } of enderecos) {
+    if (enderecoIpEhPrivadoOuReservado(address)) {
+      return { ok: false, erro: "Essa URL aponta para um endereço de rede não permitido" };
+    }
+  }
+
+  return { ok: true, url };
+}
+
+function enderecoIpEhPrivadoOuReservado(ip: string): boolean {
+  const partesV4 = ip.split(".").map(Number);
+  if (partesV4.length === 4 && partesV4.every(n => Number.isInteger(n) && n >= 0 && n <= 255)) {
+    const [a, b] = partesV4;
+    if (a === 10) return true;                       // 10.0.0.0/8
+    if (a === 127) return true;                       // 127.0.0.0/8 (loopback)
+    if (a === 0) return true;                          // 0.0.0.0/8
+    if (a === 169 && b === 254) return true;            // 169.254.0.0/16 (link-local / metadata de nuvem)
+    if (a === 172 && b >= 16 && b <= 31) return true;    // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;             // 192.168.0.0/16
+    if (a === 100 && b >= 64 && b <= 127) return true;    // 100.64.0.0/10 (CGNAT)
+    return false;
+  }
+  const ipv6 = ip.toLowerCase();
+  if (ipv6 === "::1" || ipv6 === "::") return true;       // loopback / unspecified
+  if (/^fe[89ab][0-9a-f]:/.test(ipv6)) return true;        // fe80::/10 (link-local)
+  if (ipv6.startsWith("fc") || ipv6.startsWith("fd")) return true; // fc00::/7 (unique local)
+  if (ipv6.startsWith("::ffff:")) return enderecoIpEhPrivadoOuReservado(ipv6.slice(7));
+  return false;
+}
+
 async function enviarImagemMetaPorUrl(
   token: string,
   adAccountId: string,
   urlImagem: string
 ) {
+  const validacao = await validarUrlSeguraParaFetch(urlImagem);
+  if (!validacao.ok) {
+    return { hash: null, resposta: { error: { message: validacao.erro } } };
+  }
+
   // Não usamos o parâmetro "url" do /adimages (que manda a própria Meta buscar a
   // imagem): para links do CDN da Meta (scontent-*.fbcdn.net) — que é o que fica salvo
   // em configuracoes_avancadas depois de qualquer publicação — isso sempre falha com
   // "(#3) Application does not have the capability to make this API call". Em vez
   // disso baixamos os bytes aqui (como um navegador faria) e mandamos via "bytes".
-  const imagemRes = await fetch(urlImagem);
+  const imagemRes = await fetch(validacao.url);
   if (!imagemRes.ok) {
     return {
       hash: null,
@@ -8671,7 +8734,10 @@ async function cortarImagemGoogleDisplay(bytes: ArrayBuffer, tipo: string) {
 // upload-imagem abaixo). Servidor-servidor não tem restrição de CORS,
 // diferente de tentar isso no navegador contra o CDN de outra rede.
 async function baixarImagemDeUrl(url: string): Promise<{ bytes: ArrayBuffer } | { erro: string }> {
-  const res = await fetch(url);
+  const validacao = await validarUrlSeguraParaFetch(url);
+  if (!validacao.ok) return { erro: validacao.erro };
+
+  const res = await fetch(validacao.url);
   if (!res.ok) {
     return { erro: `Falha ao baixar a imagem original (HTTP ${res.status})` };
   }
@@ -8681,13 +8747,9 @@ async function baixarImagemDeUrl(url: string): Promise<{ bytes: ArrayBuffer } | 
 const VIDEO_REAPROVEITADO_MAX_BYTES = 200 * 1024 * 1024;
 
 async function baixarVideoDeUrl(url: string): Promise<{ arquivo: File } | { erro: string }> {
-  let destino: URL;
-  try {
-    destino = new URL(url);
-    if (!["http:", "https:"].includes(destino.protocol)) throw new Error("protocolo inválido");
-  } catch (_) {
-    return { erro: "A URL do vídeo original é inválida" };
-  }
+  const validacao = await validarUrlSeguraParaFetch(url);
+  if (!validacao.ok) return { erro: validacao.erro };
+  const destino = validacao.url;
 
   const res = await fetch(destino.toString());
   if (!res.ok) return { erro: `Falha ao baixar o vídeo original (HTTP ${res.status})` };
@@ -24211,8 +24273,6 @@ app.get("/campanhas", authMiddleware, async (c) => {
       [user.id, contaAnunciosId ?? null, nichoSlug ?? null, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn, contaAnunciosIdKwai]
     );
 
-    console.log("CAMPANHAS:", campanhas.rows);
-
     return c.json(campanhas.rows);
 
   } catch (err) {
@@ -26745,8 +26805,6 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
   const user: any = c.get("user");
 
   try {
-
-    console.log("USER AUTH:", user);
 
     if (syncEmAndamento.has(user.id)) {
       return c.json({
@@ -29860,8 +29918,6 @@ app.get("/leads", authMiddleware, async (c) => {
   try {
 
     const user: any = c.get("user");
-
-    console.log("USER AUTH:", user);
 
     const contaAnunciosId =
       await obterContaAnunciosSelecionadaIdUsuario(
