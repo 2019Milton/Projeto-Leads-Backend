@@ -4820,7 +4820,8 @@ const authMiddleware = async (c: any, next: any) => {
       const metodo = c.req.method;
       const permitidoBasico = metodo === "GET" && (
         rota === "/usuarios/me" ||
-        rota === "/painel-cliente/resumo"
+        rota === "/painel-cliente/resumo" ||
+        rota === "/painel-cliente/financeiro"
       );
       const permitidoWhatsapp = userBanco.atendimento_whatsapp_habilitado === true && (
         (metodo === "GET" && rota === "/painel-cliente/whatsapp/conversas") ||
@@ -22104,6 +22105,33 @@ await client.query(`
     ON gestor_acessos(cliente_id, criado_em DESC);
 `);
 
+// Configuração comercial exclusiva dos clientes atendidos pelo gestor de tráfego.
+// Os adicionais começam zerados e só entram no total quando o recurso correspondente
+// estiver efetivamente ativo, evitando cobranças antecipadas.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS cliente_financeiro_config (
+    usuario_id                    INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    plano_nome                    TEXT NOT NULL DEFAULT 'Plano Gestão de Tráfego',
+    valor_plano_mensal            NUMERIC(12, 2) NOT NULL DEFAULT 800,
+    dia_vencimento                INTEGER NOT NULL DEFAULT 10 CHECK (dia_vencimento BETWEEN 1 AND 28),
+    valor_voip_mensal             NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    valor_whatsapp_mensal         NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    valor_ia_extra_mensal         NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    valor_gravacao_mensal         NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    outros_descricao              TEXT,
+    valor_outros_mensal           NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    observacoes                   TEXT,
+    criado_em                     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (valor_plano_mensal >= 0),
+    CHECK (valor_voip_mensal >= 0),
+    CHECK (valor_whatsapp_mensal >= 0),
+    CHECK (valor_ia_extra_mensal >= 0),
+    CHECK (valor_gravacao_mensal >= 0),
+    CHECK (valor_outros_mensal >= 0)
+  );
+`);
+
 // Estrutura de telefonia preparada sem contratar operadora ou reservar número.
 // Enquanto `voip_status` não for "ativo", nenhuma chamada externa é iniciada.
 await client.query(`
@@ -24053,6 +24081,157 @@ app.post("/gestor/clientes/:id/acessar", authMiddleware, async (c) => {
   });
 });
 
+function numeroFinanceiro(valor: unknown) {
+  if (typeof valor === "number") return Number.isFinite(valor) ? valor : null;
+  const texto = String(valor ?? "").trim();
+  if (!texto) return null;
+  const normalizado = texto.includes(",")
+    ? texto.replace(/\./g, "").replace(",", ".")
+    : texto;
+  const numero = Number(normalizado);
+  return Number.isFinite(numero) ? numero : null;
+}
+
+async function obterConfigFinanceiroCliente(usuarioId: number) {
+  await client.query(
+    `
+    INSERT INTO cliente_financeiro_config (usuario_id)
+    VALUES ($1)
+    ON CONFLICT (usuario_id) DO NOTHING
+    `,
+    [usuarioId]
+  );
+
+  const result = await client.query(
+    `
+    SELECT
+      usuario_id, plano_nome, valor_plano_mensal, dia_vencimento,
+      valor_voip_mensal, valor_whatsapp_mensal, valor_ia_extra_mensal,
+      valor_gravacao_mensal, outros_descricao, valor_outros_mensal,
+      observacoes, atualizado_em
+    FROM cliente_financeiro_config
+    WHERE usuario_id = $1
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+
+  const row = result.rows[0] || {};
+  return {
+    usuario_id: Number(usuarioId),
+    plano_nome: row.plano_nome || "Plano Gestão de Tráfego",
+    valor_plano_mensal: Number(row.valor_plano_mensal ?? 800),
+    dia_vencimento: Number(row.dia_vencimento || 10),
+    valor_voip_mensal: Number(row.valor_voip_mensal || 0),
+    valor_whatsapp_mensal: Number(row.valor_whatsapp_mensal || 0),
+    valor_ia_extra_mensal: Number(row.valor_ia_extra_mensal || 0),
+    valor_gravacao_mensal: Number(row.valor_gravacao_mensal || 0),
+    outros_descricao: row.outros_descricao || "",
+    valor_outros_mensal: Number(row.valor_outros_mensal || 0),
+    observacoes: row.observacoes || "",
+    atualizado_em: row.atualizado_em || null
+  };
+}
+
+app.get("/gestor/clientes/:id/financeiro", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const clienteGerenciado = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!clienteGerenciado || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  return c.json({
+    configuracao: await obterConfigFinanceiroCliente(clienteId),
+    recursos: {
+      whatsapp_habilitado: clienteGerenciado.atendimento_whatsapp_habilitado === true,
+      voip_habilitado: clienteGerenciado.voip_habilitado === true,
+      voip_status: clienteGerenciado.voip_habilitado === true
+        ? (clienteGerenciado.voip_status || "aguardando_configuracao")
+        : "desativado",
+      voip_numero: clienteGerenciado.voip_numero || null
+    }
+  });
+});
+
+app.patch("/gestor/clientes/:id/financeiro", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const clienteGerenciado = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!clienteGerenciado || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const camposMonetarios = [
+    "valor_plano_mensal", "valor_voip_mensal", "valor_whatsapp_mensal",
+    "valor_ia_extra_mensal", "valor_gravacao_mensal", "valor_outros_mensal"
+  ];
+  const valoresNormalizados: Record<string, number> = {};
+
+  for (const campo of camposMonetarios) {
+    if (!Object.prototype.hasOwnProperty.call(body, campo)) continue;
+    const valor = numeroFinanceiro(body[campo]);
+    if (valor === null || valor < 0 || valor > 1000000) {
+      return c.json({ error: `Valor inválido para ${campo}` }, 400);
+    }
+    valoresNormalizados[campo] = Number(valor.toFixed(2));
+  }
+
+  const diaVencimento = Object.prototype.hasOwnProperty.call(body, "dia_vencimento")
+    ? Number(body.dia_vencimento)
+    : null;
+  if (diaVencimento !== null && (!Number.isInteger(diaVencimento) || diaVencimento < 1 || diaVencimento > 28)) {
+    return c.json({ error: "O vencimento deve ser entre os dias 1 e 28" }, 400);
+  }
+
+  const planoNome = Object.prototype.hasOwnProperty.call(body, "plano_nome")
+    ? textoOpcional(body.plano_nome).slice(0, 80)
+    : null;
+  if (Object.prototype.hasOwnProperty.call(body, "plano_nome") && !planoNome) {
+    return c.json({ error: "Informe o nome do plano" }, 400);
+  }
+
+  const outrosDescricao = Object.prototype.hasOwnProperty.call(body, "outros_descricao")
+    ? textoOpcional(body.outros_descricao).slice(0, 100)
+    : null;
+  const observacoes = Object.prototype.hasOwnProperty.call(body, "observacoes")
+    ? textoOpcional(body.observacoes).slice(0, 500)
+    : null;
+
+  await obterConfigFinanceiroCliente(clienteId);
+  const atualizacoes: string[] = [];
+  const parametros: any[] = [];
+  const adicionar = (coluna: string, valor: any) => {
+    parametros.push(valor);
+    atualizacoes.push(`${coluna} = $${parametros.length}`);
+  };
+
+  if (planoNome !== null) adicionar("plano_nome", planoNome);
+  if (diaVencimento !== null) adicionar("dia_vencimento", diaVencimento);
+  if (outrosDescricao !== null) adicionar("outros_descricao", outrosDescricao || null);
+  if (observacoes !== null) adicionar("observacoes", observacoes || null);
+  for (const [campo, valor] of Object.entries(valoresNormalizados)) adicionar(campo, valor);
+
+  if (!atualizacoes.length) return c.json({ error: "Nenhuma alteração financeira informada" }, 400);
+  atualizacoes.push("atualizado_em = NOW()");
+  parametros.push(clienteId);
+
+  await client.query(
+    `UPDATE cliente_financeiro_config
+     SET ${atualizacoes.join(", ")}
+     WHERE usuario_id = $${parametros.length}`,
+    parametros
+  );
+
+  return c.json({
+    sucesso: true,
+    configuracao: await obterConfigFinanceiroCliente(clienteId)
+  });
+});
+
 function garantirRecursoPainel(user: any, recurso: "whatsapp" | "voip") {
   if (user?.modo_acesso !== "painel") {
     return "Esta rota é exclusiva do painel do corretor";
@@ -24360,6 +24539,137 @@ app.get("/painel-cliente/voip/chamadas", authMiddleware, async (c) => {
   );
 
   return c.json({ chamadas: result.rows });
+});
+
+app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+
+  if (user.modo_acesso !== "painel") {
+    return c.json({ error: "Esta rota é exclusiva do painel do corretor" }, 403);
+  }
+
+  const usuarioId = Number(user.id);
+  const configuracao = await obterConfigFinanceiroCliente(usuarioId);
+  const voipAtivo = user.voip_habilitado === true &&
+    user.voip_status === "ativo" && Boolean(user.voip_numero);
+  const whatsappAtivo = user.atendimento_whatsapp_habilitado === true;
+
+  const itens: any[] = [
+    {
+      codigo: "plano_gestao",
+      descricao: configuracao.plano_nome,
+      periodicidade: "mensal",
+      status: "ativo",
+      valor: configuracao.valor_plano_mensal
+    },
+    {
+      codigo: "voip_numero",
+      descricao: voipAtivo && user.voip_numero
+        ? `VoIP — ${user.voip_numero}`
+        : "Número e telefonia VoIP",
+      periodicidade: "mensal",
+      status: voipAtivo ? "ativo" : (user.voip_habilitado ? "aguardando_configuracao" : "desativado"),
+      valor: voipAtivo ? configuracao.valor_voip_mensal : 0,
+      valor_apos_ativacao: configuracao.valor_voip_mensal
+    },
+    {
+      codigo: "whatsapp_oficial",
+      descricao: "Uso do WhatsApp Business oficial",
+      periodicidade: "mensal",
+      status: whatsappAtivo && configuracao.valor_whatsapp_mensal > 0 ? "ativo" : "nao_cobrado",
+      valor: whatsappAtivo ? configuracao.valor_whatsapp_mensal : 0
+    },
+    {
+      codigo: "ia_extra",
+      descricao: "Créditos adicionais de inteligência artificial",
+      periodicidade: "mensal",
+      status: configuracao.valor_ia_extra_mensal > 0 ? "ativo" : "nao_cobrado",
+      valor: configuracao.valor_ia_extra_mensal
+    },
+    {
+      codigo: "gravacao",
+      descricao: "Gravação, transcrição e armazenamento de ligações",
+      periodicidade: "mensal",
+      status: voipAtivo && configuracao.valor_gravacao_mensal > 0 ? "ativo" : "nao_cobrado",
+      valor: voipAtivo ? configuracao.valor_gravacao_mensal : 0
+    }
+  ];
+
+  if (configuracao.outros_descricao || configuracao.valor_outros_mensal > 0) {
+    itens.push({
+      codigo: "outros",
+      descricao: configuracao.outros_descricao || "Serviços adicionais",
+      periodicidade: "mensal",
+      status: configuracao.valor_outros_mensal > 0 ? "ativo" : "nao_cobrado",
+      valor: configuracao.valor_outros_mensal
+    });
+  }
+
+  const totalMensal = itens.reduce(
+    (total, item) => total + (item.status === "ativo" ? Number(item.valor || 0) : 0),
+    0
+  );
+
+  const historico = await client.query(
+    `
+    SELECT id, usuario_id, mes_referencia, valor, status,
+           comprovante_enviado_em, nf_enviada_em, observacao,
+           pix_chave, pix_tipo, criado_em,
+           (comprovante_dados IS NOT NULL) AS tem_comprovante,
+           (nf_dados IS NOT NULL) AS tem_nf
+    FROM financeiro_lancamentos
+    WHERE usuario_id = $1
+    ORDER BY mes_referencia DESC
+    LIMIT 12
+    `,
+    [usuarioId]
+  );
+
+  return c.json({
+    plano: {
+      nome: configuracao.plano_nome,
+      valor_mensal: configuracao.valor_plano_mensal,
+      dia_vencimento: configuracao.dia_vencimento,
+      investimento_anuncios_incluso: false
+    },
+    voip: {
+      habilitado: user.voip_habilitado === true,
+      ativo: voipAtivo,
+      status: user.voip_habilitado === true
+        ? (user.voip_status || "aguardando_configuracao")
+        : "desativado",
+      numero: voipAtivo ? user.voip_numero : null,
+      valor_mensal: voipAtivo ? configuracao.valor_voip_mensal : 0,
+      valor_apos_ativacao: configuracao.valor_voip_mensal
+    },
+    itens,
+    total_mensal: Number(totalMensal.toFixed(2)),
+    investimento_anuncios: {
+      incluso: false,
+      mensagem: "A verba de anúncios é definida separadamente e paga às plataformas de publicidade."
+    },
+    custos_variaveis: [
+      "Minutos de ligações VoIP",
+      "Modelos e conversas cobradas pelo WhatsApp/Meta",
+      "Gravação, transcrição e armazenamento de chamadas",
+      "Créditos adicionais de inteligência artificial",
+      "Taxas de ativação, portabilidade ou serviços personalizados"
+    ],
+    historico: historico.rows.map((linha: any) => ({
+      id: Number(linha.id),
+      mes_referencia: linha.mes_referencia,
+      valor: Number(linha.valor || 0),
+      status: linha.status,
+      tem_comprovante: linha.tem_comprovante === true,
+      comprovante_enviado_em: linha.comprovante_enviado_em,
+      tem_nf: linha.tem_nf === true,
+      nf_enviada_em: linha.nf_enviada_em,
+      observacao: linha.observacao,
+      criado_em: linha.criado_em
+    })),
+    observacoes: configuracao.observacoes || null,
+    atualizado_em: configuracao.atualizado_em || new Date().toISOString()
+  });
 });
 
 app.get("/painel-cliente/resumo", authMiddleware, async (c) => {
