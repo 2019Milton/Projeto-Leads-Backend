@@ -6439,7 +6439,15 @@ const OAUTH_PROVEDORES: Record<string, {
     // esse escopo separado mesmo com rw_ads concedido (bug confirmado nesta
     // auditoria: campanha/adgroup/imagem/formulario podiam ser criados com
     // sucesso e só o anuncio final falhar com 403 por falta desse escopo).
-    scope: "r_ads r_ads_reporting rw_ads w_organization_social",
+    scope: [
+      "r_ads",
+      "r_ads_reporting",
+      "rw_ads",
+      "w_organization_social",
+      ...(Bun.env.LINKEDIN_LEAD_SYNC_ENABLED === "true"
+        ? ["r_marketing_leadgen_automation"]
+        : []),
+    ].join(" "),
     clientIdEnv: "LINKEDIN_ADS_CLIENT_ID",
     clientSecretEnv: "LINKEDIN_ADS_CLIENT_SECRET",
     redirectUriEnv: "LINKEDIN_ADS_REDIRECT_URI",
@@ -13823,6 +13831,7 @@ app.post("/kwai/anuncio", authMiddleware, async (c) => {
 ========================= */
 
 const linkedinSyncEmAndamento = new Set<number>();
+const LINKEDIN_LEAD_SYNC_HABILITADO = Bun.env.LINKEDIN_LEAD_SYNC_ENABLED === "true";
 
 const LINKEDIN_API_VERSION = "202601"; // YYYYMM — LinkedIn versiona por mês, revisar ~1x/ano
 const LINKEDIN_API = "https://api.linkedin.com/rest";
@@ -13962,7 +13971,118 @@ async function resolverConexaoLinkedIn(
   };
 }
 
-// Lista as contas de anúncio (Ad Accounts) que o token consegue administrar.
+type ContaLinkedInDisponivel = {
+  id: string;
+  nome: string;
+  status: string | null;
+  moeda: string | null;
+  org_urn: string | null;
+  organization_nome: string | null;
+  organization_vanity_name: string | null;
+  papel: string | null;
+  pode_gerenciar: boolean;
+  serving_statuses: string[];
+  tipo: string | null;
+  teste: boolean;
+};
+
+function normalizarOrganizationUrnLinkedInPainel(valor: unknown): string | null {
+  if (valor && typeof valor === "object") {
+    const objeto = valor as Record<string, unknown>;
+    valor = objeto.organization ?? objeto.organizationUrn ?? objeto.urn ?? objeto.id;
+  }
+  const texto = textoOpcional(valor);
+  if (!texto) return null;
+  if (/^urn:li:organization:\d+$/.test(texto)) return texto;
+  if (/^\d+$/.test(texto)) return `urn:li:organization:${texto}`;
+  return null;
+}
+
+function papelLinkedInPermiteGerenciar(papel: string | null): boolean {
+  return Boolean(papel && papel !== "VIEWER");
+}
+
+async function listarContasLinkedInDisponiveis(token: string): Promise<ContaLinkedInDisponivel[]> {
+  const elementos: any[] = [];
+  let pageToken = "";
+
+  for (let pagina = 0; pagina < 20; pagina++) {
+    const params = new URLSearchParams({ q: "search", pageSize: "1000" });
+    if (pageToken) params.set("pageToken", pageToken);
+    const resposta = await linkedinFetch(`/adAccounts?${params.toString()}`, token);
+    if (!resposta.ok) throw new Error(resposta.error || "Erro ao listar contas do LinkedIn Ads");
+    elementos.push(...(resposta.data?.elements || []));
+    pageToken = textoOpcional(resposta.data?.metadata?.nextPageToken);
+    if (!pageToken) break;
+  }
+
+  const papeis = new Map<string, string>();
+  const quantidade = 500;
+  for (let start = 0; start < 10_000; start += quantidade) {
+    const params = new URLSearchParams({
+      q: "authenticatedUser",
+      count: String(quantidade),
+      start: String(start),
+    });
+    const resposta = await linkedinFetch(`/adAccountUsers?${params.toString()}`, token);
+    if (!resposta.ok) {
+      throw new Error(resposta.error || "Não foi possível verificar seu papel nas contas do LinkedIn Ads");
+    }
+    const pagina = resposta.data?.elements || [];
+    for (const item of pagina) {
+      const id = String(item.account || "").split(":").pop() || "";
+      if (id) papeis.set(id, textoOpcional(item.role).toUpperCase());
+    }
+    const total = Number(resposta.data?.paging?.total || 0);
+    if (pagina.length < quantidade || (total > 0 && start + pagina.length >= total)) break;
+  }
+
+  const contas: ContaLinkedInDisponivel[] = elementos.map((conta: any) => {
+    const id = String(conta.id);
+    const papel = papeis.get(id) || null;
+    return {
+      id,
+      nome: conta.name || `Conta ${conta.id}`,
+      status: textoOpcional(conta.status) || null,
+      moeda: textoOpcional(conta.currency) || null,
+      org_urn: normalizarOrganizationUrnLinkedInPainel(conta.reference),
+      organization_nome: null,
+      organization_vanity_name: null,
+      papel,
+      pode_gerenciar: papelLinkedInPermiteGerenciar(papel),
+      serving_statuses: Array.isArray(conta.servingStatuses)
+        ? conta.servingStatuses.map(String)
+        : [],
+      tipo: textoOpcional(conta.type) || null,
+      teste: Boolean(conta.test),
+    };
+  });
+
+  const idsOrganizacoes = Array.from(new Set(
+    contas.map(conta => conta.org_urn?.split(":").pop()).filter(Boolean)
+  ));
+  if (idsOrganizacoes.length) {
+    const resposta = await linkedinFetch(
+      `/organizationsLookup?ids=List(${idsOrganizacoes.join(",")})`,
+      token
+    );
+    if (resposta.ok) {
+      const resultados = resposta.data?.results || {};
+      for (const conta of contas) {
+        const id = conta.org_urn?.split(":").pop() || "";
+        const organizacao = resultados[id] || resultados[String(id)] || null;
+        if (organizacao) {
+          conta.organization_nome = textoOpcional(organizacao.localizedName) || null;
+          conta.organization_vanity_name = textoOpcional(organizacao.vanityName) || null;
+        }
+      }
+    }
+  }
+
+  return contas;
+}
+
+// Lista as contas de anúncio (Ad Accounts) e o papel real do usuário em cada uma.
 app.get("/linkedin/contas", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
@@ -13972,32 +14092,10 @@ app.get("/linkedin/contas", authMiddleware, async (c) => {
     );
     if (!conn.rows[0]?.access_token) return c.json({ error: "LinkedIn Ads não conectado" }, 400);
     const token = await obterAccessTokenLinkedInValido(user.id, conn.rows[0].access_token, conn.rows[0].refresh_token);
-
-    // ASSUMPTION: q=search sem filtro devolve as contas às quais o usuário
-    // do token tem acesso — conferir contra a Ad Accounts API oficial na
-    // primeira conexão real.
-    const resposta = await linkedinFetch(`/adAccounts?q=search`, token);
-    if (!resposta.ok) {
-      return c.json({
-        error: resposta.error || "Erro ao listar contas do LinkedIn Ads",
-        detalhe: resposta.data
-      }, 400);
-    }
-
-    const contas = (resposta.data?.elements || []).map((conta: any) => ({
-      id: String(conta.id),
-      nome: conta.name || `Conta ${conta.id}`,
-      status: conta.status,
-      moeda: conta.currency || "BRL",
-      // Contas do tipo BUSINESS trazem a organização vinculada em "reference"
-      // — é essa organização que vira a "página" do Direct Sponsored Content.
-      org_urn: conta.reference || null,
-    }));
-
-    return c.json({ contas });
+    return c.json({ contas: await listarContasLinkedInDisponiveis(token) });
   } catch (err: any) {
     console.error("ERRO /linkedin/contas:", err);
-    return c.json({ error: "Erro interno" }, 500);
+    return c.json({ error: err?.message || "Erro ao listar contas do LinkedIn Ads" }, 500);
   }
 });
 
@@ -14006,39 +14104,161 @@ app.get("/linkedin/contas", authMiddleware, async (c) => {
 app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
-    const { ad_account_id, org_urn, moeda, conversion_rule_qualified_urn, conversion_rule_closed_urn } = await c.req.json();
+    const { ad_account_id, conversion_rule_qualified_urn, conversion_rule_closed_urn } = await c.req.json();
     const contaId = textoOpcional(ad_account_id);
     if (!contaId) return c.json({ error: "ad_account_id obrigatório" }, 400);
 
-    await client.query(
-      `UPDATE plataforma_conexoes
-       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
-             'ad_account_id', $1::text,
-             'org_urn', $2::text,
-             'moeda', $3::text,
-             'conversion_rule_qualified_urn', COALESCE($4::text, dados_conta->>'conversion_rule_qualified_urn'),
-             'conversion_rule_closed_urn', COALESCE($5::text, dados_conta->>'conversion_rule_closed_urn')
-           ),
-           atualizado_em = NOW()
-       WHERE usuario_id = $6 AND plataforma = 'linkedin'`,
-      [
-        contaId,
-        textoOpcional(org_urn),
-        textoOpcional(moeda) || "BRL",
-        // null real (não textoOpcional, que devolveria "") — o COALESCE do
-        // SQL acima só preserva o valor já salvo quando o parâmetro chega
-        // NULL; "" não é NULL e sobrescreveria a Conversion Rule já
-        // configurada toda vez que a conta fosse apenas reselecionada sem
-        // reenviar os dois campos junto (bug confirmado nesta auditoria).
-        textoOpcional(conversion_rule_qualified_urn) || null,
-        textoOpcional(conversion_rule_closed_urn) || null,
-        user.id
-      ]
+    const conn = await client.query(
+      `SELECT access_token, refresh_token FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [user.id]
     );
-    return c.json({ sucesso: true });
+    if (!conn.rows[0]?.access_token) return c.json({ error: "LinkedIn Ads não conectado" }, 400);
+    const token = await obterAccessTokenLinkedInValido(
+      user.id, conn.rows[0].access_token, conn.rows[0].refresh_token
+    );
+    const contas = await listarContasLinkedInDisponiveis(token);
+    const conta = contas.find(item => item.id === contaId);
+    if (!conta) return c.json({ error: "Essa conta não está acessível pelo usuário autenticado no LinkedIn" }, 403);
+    if (!conta.pode_gerenciar) {
+      return c.json({ error: `Seu papel (${conta.papel || "não identificado"}) não permite gerenciar campanhas.` }, 403);
+    }
+    if (!conta.org_urn) {
+      return c.json({ error: "A conta selecionada ainda não está vinculada a uma Company Page do LinkedIn" }, 409);
+    }
+    if (!conta.moeda) {
+      return c.json({ error: "O LinkedIn não informou a moeda desta conta. Confira a configuração no Campaign Manager." }, 409);
+    }
+
+    const dadosSelecionados: Record<string, any> = {
+      ad_account_id: conta.id,
+      ad_account_name: conta.nome,
+      ad_account_status: conta.status,
+      ad_account_role: conta.papel,
+      serving_statuses: conta.serving_statuses,
+      org_urn: conta.org_urn,
+      organization_name: conta.organization_nome,
+      organization_vanity_name: conta.organization_vanity_name,
+      moeda: conta.moeda,
+    };
+    if (conversion_rule_qualified_urn !== undefined) {
+      dadosSelecionados.conversion_rule_qualified_urn = textoOpcional(conversion_rule_qualified_urn);
+    }
+    if (conversion_rule_closed_urn !== undefined) {
+      dadosSelecionados.conversion_rule_closed_urn = textoOpcional(conversion_rule_closed_urn);
+    }
+
+    const atualizado = await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || $1::jsonb,
+           atualizado_em = NOW()
+       WHERE usuario_id = $2 AND plataforma = 'linkedin'`,
+      [JSON.stringify(dadosSelecionados), user.id]
+    );
+    if (!atualizado.rowCount) return c.json({ error: "Conexão do LinkedIn não encontrada" }, 404);
+    return c.json({ sucesso: true, conta });
   } catch (err: any) {
     console.error("ERRO /linkedin/selecionar-conta:", err);
-    return c.json({ error: "Erro interno" }, 500);
+    return c.json({ error: err?.message || "Erro ao selecionar a conta do LinkedIn Ads" }, 500);
+  }
+});
+
+app.get("/linkedin/status-completo", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const resultado = await client.query(
+      `SELECT access_token, refresh_token, token_expira_em, dados_conta, conectado_em, atualizado_em
+       FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [user.id]
+    );
+    const conexao = resultado.rows[0];
+    if (!conexao?.access_token) return c.json({ conectado: false });
+
+    const token = await obterAccessTokenLinkedInValido(user.id, conexao.access_token, conexao.refresh_token);
+    const contas = await listarContasLinkedInDisponiveis(token);
+    const adAccountId = textoOpcional(conexao.dados_conta?.ad_account_id);
+    const conta = contas.find(item => item.id === adAccountId) || null;
+
+    const [campanhasResult, leadsResult] = await Promise.all([
+      client.query(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'ACTIVE')::int AS ativas
+         FROM campanhas WHERE usuario_id = $1 AND plataforma = 'linkedin'
+           AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')`,
+        [user.id]
+      ),
+      client.query(
+        `SELECT COUNT(*)::int AS total FROM leads
+         WHERE usuario_id = $1 AND (plataforma = 'linkedin' OR origem = 'linkedin')
+           AND criado_em >= CURRENT_DATE`,
+        [user.id]
+      ),
+    ]);
+
+    let gastoHoje: number | null = null;
+    if (adAccountId) {
+      const hoje = new Date();
+      const amanha = new Date(hoje);
+      amanha.setUTCDate(amanha.getUTCDate() + 1);
+      const params = new URLSearchParams({
+        q: "analytics",
+        pivot: "ACCOUNT",
+        accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
+        timeGranularity: "DAILY",
+        fields: "dateRange,impressions,clicks,costInLocalCurrency",
+      });
+      params.set(
+        "dateRange",
+        `(start:(year:${hoje.getUTCFullYear()},month:${hoje.getUTCMonth() + 1},day:${hoje.getUTCDate()}),end:(year:${amanha.getUTCFullYear()},month:${amanha.getUTCMonth() + 1},day:${amanha.getUTCDate()}))`
+      );
+      const analytics = await linkedinFetch(`/adAnalytics?${params.toString()}`, token);
+      if (analytics.ok) {
+        gastoHoje = (analytics.data?.elements || []).reduce(
+          (total: number, item: any) => total + Number(item.costInLocalCurrency || 0),
+          0
+        );
+      }
+    }
+
+    const servingStatuses = conta?.serving_statuses || [];
+    const billingHold = servingStatuses.includes("BILLING_HOLD");
+    const runnable = servingStatuses.includes("RUNNABLE");
+    const orgId = conta?.org_urn?.split(":").pop() || null;
+    const campanhas = campanhasResult.rows[0] || {};
+
+    return c.json({
+      conectado: true,
+      contas_total: contas.length,
+      selecao_conta_anuncios_pendente: !adAccountId,
+      ad_account_id: adAccountId || null,
+      conta,
+      company_page: conta?.org_urn ? {
+        id: orgId,
+        urn: conta.org_urn,
+        nome: conta.organization_nome,
+        vanity_name: conta.organization_vanity_name,
+        url: orgId ? `https://www.linkedin.com/company/${orgId}/` : null,
+      } : null,
+      campanhas_total: Number(campanhas.total || 0),
+      campanhas_ativas: Number(campanhas.ativas || 0),
+      leads_hoje: Number(leadsResult.rows[0]?.total || 0),
+      gasto_hoje: gastoHoje,
+      ultimo_sync: conexao.atualizado_em,
+      conectado_em: conexao.conectado_em,
+      token_expira_em: conexao.token_expira_em,
+      veiculacao: {
+        status: billingHold ? "BILLING_HOLD" : runnable ? "RUNNABLE" : servingStatuses[0] || conta?.status || null,
+        apta: runnable && !billingHold,
+        motivos: servingStatuses,
+      },
+      lead_sync: {
+        disponivel: LINKEDIN_LEAD_SYNC_HABILITADO,
+        status: LINKEDIN_LEAD_SYNC_HABILITADO ? "Disponível" : "Aguardando aprovação do LinkedIn",
+      },
+    });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/status-completo:", err);
+    return c.json({ error: err?.message || "Erro ao carregar o status do LinkedIn Ads" }, 500);
   }
 });
 
@@ -15120,21 +15340,22 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
   // fazia uma chamada idêntica por formulário e atribuía TODO lead
   // retornado ao formulário do loop atual, o que corrompia a atribuição de
   // campanha em qualquer conta com mais de um Lead Gen Form).
-  const trintaDiasAtras = Date.now() - 30 * 24 * 60 * 60 * 1000;
   let totalLeads = 0;
+  if (LINKEDIN_LEAD_SYNC_HABILITADO) {
+    const trintaDiasAtras = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const leadsRes = await linkedinFetch(
+      `/leadGenFormResponses?q=leadType&owner=(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})&leadType=SPONSORED&submittedAtAfter=${trintaDiasAtras}`,
+      token
+    );
 
-  const leadsRes = await linkedinFetch(
-    `/leadGenFormResponses?q=leadType&owner=(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})&leadType=SPONSORED&submittedAtAfter=${trintaDiasAtras}`,
-    token
-  );
-
-  if (!leadsRes.ok) {
-    console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
-  } else {
-    const leadsList = leadsRes.data?.elements ?? [];
-    for (const lead of leadsList) {
-      const inserido = await processarLeadGenFormResponseLinkedIn(usuarioId, String(adAccountId), lead);
-      if (inserido) totalLeads++;
+    if (!leadsRes.ok) {
+      console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
+    } else {
+      const leadsList = leadsRes.data?.elements ?? [];
+      for (const lead of leadsList) {
+        const inserido = await processarLeadGenFormResponseLinkedIn(usuarioId, String(adAccountId), lead);
+        if (inserido) totalLeads++;
+      }
     }
   }
 
@@ -15143,7 +15364,15 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
     [usuarioId]
   );
 
-  return { sucesso: true, campanhas: campanhas.length, leads_novos: totalLeads };
+  return {
+    sucesso: true,
+    campanhas: campanhas.length,
+    leads_novos: totalLeads,
+    lead_sync_disponivel: LINKEDIN_LEAD_SYNC_HABILITADO,
+    aviso: LINKEDIN_LEAD_SYNC_HABILITADO
+      ? null
+      : "Campanhas sincronizadas. A importação de leads aguarda aprovação da Lead Sync API pelo LinkedIn.",
+  };
 }
 
 app.post("/linkedin/sincronizar-campanhas", authMiddleware, async (c) => {
