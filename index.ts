@@ -20637,10 +20637,25 @@ async function classificarStatusLeadPorConversa(
 // 🔥 WEBHOOK Z-API — eventos de conexão/desconexão do WhatsApp pessoal do
 // corretor usado pra notificações (novo lead, lembretes)
 app.post("/webhook/zapi", async (c) => {
-  // Z-API manda o secret no header x-webhook-token (ou Authorization Bearer).
-  const headerToken = c.req.header("x-webhook-token") || c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-  if (!validarTokenFixoWebhook(Bun.env.ZAPI_WEBHOOK_SECRET, headerToken, "ZAPI")) {
-    return c.json({ error: "Unauthorized" }, 401);
+  // ⚠️ Diferente de TikTok/Kwai/Meta: confirmado contra a documentação oficial
+  // do Z-API que NÃO existe nenhum mecanismo pra configurar um token/header
+  // customizado nas chamadas de webhook que ele mesmo faz (o endpoint de
+  // configuração de webhook só aceita a URL, nada de autenticação) — não tem
+  // "o outro lado" pra configurar. Por isso este endpoint continua com
+  // validação opcional (nunca recusa em produção só por falta de secret,
+  // diferente de validarTokenFixoWebhook): o pior caso de abuso é alguém
+  // forjar um alerta falso de "WhatsApp desconectado" por e-mail — impacto
+  // baixo — enquanto travar de verdade quebraria o alerta real pra sempre.
+  const zapiSecret = Bun.env.ZAPI_WEBHOOK_SECRET;
+  if (zapiSecret) {
+    const headerToken = c.req.header("x-webhook-token") || c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (
+      !headerToken ||
+      headerToken.length !== zapiSecret.length ||
+      !timingSafeEqual(Buffer.from(headerToken), Buffer.from(zapiSecret))
+    ) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
   }
 
   try {
