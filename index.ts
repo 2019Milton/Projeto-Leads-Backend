@@ -13980,6 +13980,8 @@ type ContaLinkedInDisponivel = {
   organization_nome: string | null;
   organization_vanity_name: string | null;
   papel: string | null;
+  papeis: string[];
+  billing_admin: boolean;
   pode_gerenciar: boolean;
   serving_statuses: string[];
   tipo: string | null;
@@ -13999,7 +14001,7 @@ function normalizarOrganizationUrnLinkedInPainel(valor: unknown): string | null 
 }
 
 function papelLinkedInPermiteGerenciar(papel: string | null): boolean {
-  return Boolean(papel && papel !== "VIEWER");
+  return papel === "ACCOUNT_MANAGER" || papel === "CAMPAIGN_MANAGER";
 }
 
 async function listarContasLinkedInDisponiveis(token: string): Promise<ContaLinkedInDisponivel[]> {
@@ -14016,7 +14018,7 @@ async function listarContasLinkedInDisponiveis(token: string): Promise<ContaLink
     if (!pageToken) break;
   }
 
-  const papeis = new Map<string, string>();
+  const papeis = new Map<string, Set<string>>();
   const quantidade = 500;
   for (let start = 0; start < 10_000; start += quantidade) {
     const params = new URLSearchParams({
@@ -14031,7 +14033,11 @@ async function listarContasLinkedInDisponiveis(token: string): Promise<ContaLink
     const pagina = resposta.data?.elements || [];
     for (const item of pagina) {
       const id = String(item.account || "").split(":").pop() || "";
-      if (id) papeis.set(id, textoOpcional(item.role).toUpperCase());
+      const papel = textoOpcional(item.role).toUpperCase();
+      if (id && papel) {
+        if (!papeis.has(id)) papeis.set(id, new Set());
+        papeis.get(id)!.add(papel);
+      }
     }
     const total = Number(resposta.data?.paging?.total || 0);
     if (pagina.length < quantidade || (total > 0 && start + pagina.length >= total)) break;
@@ -14039,7 +14045,9 @@ async function listarContasLinkedInDisponiveis(token: string): Promise<ContaLink
 
   const contas: ContaLinkedInDisponivel[] = elementos.map((conta: any) => {
     const id = String(conta.id);
-    const papel = papeis.get(id) || null;
+    const papeisConta = Array.from(papeis.get(id) || []);
+    const papel = ["ACCOUNT_MANAGER", "CAMPAIGN_MANAGER", "CREATIVE_MANAGER", "VIEWER"]
+      .find(item => papeisConta.includes(item)) || papeisConta[0] || null;
     return {
       id,
       nome: conta.name || `Conta ${conta.id}`,
@@ -14049,6 +14057,8 @@ async function listarContasLinkedInDisponiveis(token: string): Promise<ContaLink
       organization_nome: null,
       organization_vanity_name: null,
       papel,
+      papeis: papeisConta,
+      billing_admin: papeisConta.includes("ACCOUNT_BILLING_ADMIN"),
       pode_gerenciar: papelLinkedInPermiteGerenciar(papel),
       serving_statuses: Array.isArray(conta.servingStatuses)
         ? conta.servingStatuses.map(String)
