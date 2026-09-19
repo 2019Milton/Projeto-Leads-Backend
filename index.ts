@@ -6628,6 +6628,7 @@ app.get("/auth/:plataforma/callback", async (c) => {
     // da TikTok acima ate termos a documentacao oficial de parceiro.
     let access_token: string;
     let refresh_token: string | null = null;
+    let tokenExpiraEm: Date | null = null;
     let dadosConta: Record<string, any> = {};
 
     if (plataforma === "tiktok") {
@@ -6647,6 +6648,9 @@ app.get("/auth/:plataforma/callback", async (c) => {
       }
       access_token = tokenData.data.access_token;
       refresh_token = tokenData.data.refresh_token ?? null;
+      if (Number(tokenData.data.expires_in) > 0) {
+        tokenExpiraEm = new Date(Date.now() + Number(tokenData.data.expires_in) * 1000);
+      }
       const advertiserIds: string[] = tokenData.data.advertiser_ids ?? [];
       dadosConta = { advertiser_ids: advertiserIds };
     } else {
@@ -6668,6 +6672,9 @@ app.get("/auth/:plataforma/callback", async (c) => {
       }
       access_token = tokenData.access_token;
       refresh_token = tokenData.refresh_token ?? null;
+      if (Number(tokenData.expires_in) > 0) {
+        tokenExpiraEm = new Date(Date.now() + Number(tokenData.expires_in) * 1000);
+      }
     }
 
     if (!usuarioId) {
@@ -6676,12 +6683,12 @@ app.get("/auth/:plataforma/callback", async (c) => {
 
     await client.query(
       `INSERT INTO plataforma_conexoes
-         (usuario_id, plataforma, status, access_token, refresh_token, dados_conta, conectado_em, atualizado_em)
-       VALUES ($1, $2, 'conectado', $3, $4, $5, NOW(), NOW())
+         (usuario_id, plataforma, status, access_token, refresh_token, token_expira_em, dados_conta, conectado_em, atualizado_em)
+       VALUES ($1, $2, 'conectado', $3, $4, $5, $6, NOW(), NOW())
        ON CONFLICT (usuario_id, plataforma)
        DO UPDATE SET status = 'conectado', access_token = $3, refresh_token = $4,
-                     dados_conta = $5, atualizado_em = NOW()`,
-      [usuarioId, plataforma, access_token, refresh_token, JSON.stringify(dadosConta)]
+                     token_expira_em = $5, dados_conta = $6, atualizado_em = NOW()`,
+      [usuarioId, plataforma, access_token, refresh_token, tokenExpiraEm, JSON.stringify(dadosConta)]
     );
 
     return c.html(`
@@ -13833,7 +13840,7 @@ app.post("/kwai/anuncio", authMiddleware, async (c) => {
 const linkedinSyncEmAndamento = new Set<number>();
 const LINKEDIN_LEAD_SYNC_HABILITADO = Bun.env.LINKEDIN_LEAD_SYNC_ENABLED === "true";
 
-const LINKEDIN_API_VERSION = "202601"; // YYYYMM — LinkedIn versiona por mês, revisar ~1x/ano
+const LINKEDIN_API_VERSION = "202608"; // YYYYMM — LinkedIn versiona por mês, revisar ~1x/ano
 const LINKEDIN_API = "https://api.linkedin.com/rest";
 
 // Geo padrão (Brasil) usada como alvo de segmentação quando a campanha não
@@ -13922,9 +13929,15 @@ async function obterAccessTokenLinkedInValido(
     }
     await client.query(
       `UPDATE plataforma_conexoes
-       SET access_token = $1, refresh_token = COALESCE($2, refresh_token), atualizado_em = NOW()
-       WHERE usuario_id = $3 AND plataforma = 'linkedin'`,
-      [data.access_token, data.refresh_token || null, usuarioId]
+       SET access_token = $1,
+           refresh_token = COALESCE($2, refresh_token),
+           token_expira_em = CASE
+             WHEN $3::bigint > 0 THEN NOW() + ($3::text || ' seconds')::interval
+             ELSE token_expira_em
+           END,
+           atualizado_em = NOW()
+       WHERE usuario_id = $4 AND plataforma = 'linkedin'`,
+      [data.access_token, data.refresh_token || null, Number(data.expires_in) || 0, usuarioId]
     );
     return data.access_token;
   } catch (err) {
@@ -14500,10 +14513,16 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
     const payloadCampaign: any = {
       account: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
       campaignGroup: `urn:li:sponsoredCampaignGroup:${campaign_id}`,
+      associatedEntity: conexao.orgUrn,
       name: `Campaign Leads ${Date.now()}`,
       type: "SPONSORED_UPDATES",
-      objectiveType: destinoResolvido === "whatsapp" ? "WEBSITE_VISITS" : "LEAD_GENERATION",
+      objectiveType: destinoResolvido === "whatsapp" ? "WEBSITE_VISIT" : "LEAD_GENERATION",
       costType: "CPC",
+      audienceExpansionEnabled: false,
+      connectedTelevisionOnly: false,
+      creativeSelection: "OPTIMIZED",
+      offsiteDeliveryEnabled: false,
+      politicalIntent: "NOT_POLITICAL",
       unitCost: { amount: lanceCpc.toFixed(2), currencyCode: conexao.moeda },
       dailyBudget: { amount: orcamento.toFixed(2), currencyCode: conexao.moeda },
       locale: { country: "BR", language: "pt" },
@@ -14515,7 +14534,7 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
           ]
         }
       },
-      status: "ACTIVE",
+      status: "DRAFT",
     };
 
     const resposta = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns`, conexao.accessToken, {
@@ -14530,6 +14549,14 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
         detalhe: resposta.data
       }, 400);
     }
+
+    await client.query(
+      `UPDATE campanhas
+       SET adset_id = $1, daily_budget = $2, atualizado_em = NOW()
+       WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'linkedin'
+         AND conta_anuncios_id = $5`,
+      [String(resposta.id), orcamento, String(campaign_id), usuarioId, conexao.adAccountId]
+    );
 
     return c.json({ adgroup_id: resposta.id });
   } catch (err: any) {
@@ -14723,7 +14750,7 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
     const user: any = c.get("user");
     const {
       usuario_id, nome_negocio, headline, descricao,
-      obrigado_titulo, obrigado_texto, privacidade_url, perguntas
+      campaign_id, obrigado_titulo, obrigado_texto, privacidade_url, perguntas
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -14733,46 +14760,92 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
 
     // Perguntas qualificadoras customizadas (mesmo campo "perguntas" que Meta/
-    // Google usam) — o LinkedIn documenta no máximo 3 perguntas CUSTOM por
-    // Lead Gen Form, além dos campos PREFILL. ASSUMPTION: shape do objeto
-    // (questionType/question/responseFormat) conferido só contra a
-    // documentação pública, não testado ainda — ver aviso maior da seção
-    // logo acima sobre o form inteiro não ter sido testado contra a API real.
+    // Google usam) — o LinkedIn documenta no máximo 3 perguntas customizadas,
+    // além dos campos de preenchimento automático.
     const perguntasCustom = (Array.isArray(perguntas) ? perguntas : [])
       .map(textoOpcional)
       .filter(Boolean)
       .slice(0, 3);
 
-    // Limites de caracteres do LinkedIn Lead Gen Form (headline 60,
-    // descrição 160, nome do formulário 256) — truncados pra não derrubar a
-    // criação inteira com um texto vindo da IA/usuário passando do limite.
+    const locale = "pt_BR";
+    const politicaPrivacidade = urlOpcional(
+      privacidade_url,
+      "https://plataformadeleads.com.br/privacy-policy"
+    );
+
+    // Formato atual da Lead Forms API. O estado inicial DRAFT garante que a
+    // criação técnica não publique o formulário nem o torne elegível para
+    // veiculação antes de uma confirmação posterior do anunciante.
     const payloadFormulario: any = {
-      account: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
-      name: truncarSemCortarPalavra(textoOpcional(nome_negocio) || "Formulário Plataforma de Leads", 256),
-      headline: truncarSemCortarPalavra(textoOpcional(headline) || "Receba mais informações", 60),
-      description: truncarSemCortarPalavra(textoOpcional(descricao) || "Deixe seus dados e entraremos em contato.", 160),
-      privacyPolicy: {
-        privacyPolicyUrl: urlOpcional(privacidade_url, "https://plataformadeleads.com.br/privacidade"),
+      owner: {
+        sponsoredAccount: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
       },
-      locale: { country: "BR", language: "pt" },
-      questions: [
-        { questionType: "PREFILL", predefinedField: "FIRST_NAME" },
-        { questionType: "PREFILL", predefinedField: "LAST_NAME" },
-        { questionType: "PREFILL", predefinedField: "EMAIL_ADDRESS" },
-        { questionType: "PREFILL", predefinedField: "PHONE_NUMBER" },
-        ...perguntasCustom.map(pergunta => ({
-          questionType: "CUSTOM",
-          question: truncarSemCortarPalavra(pergunta, 200),
-          responseFormat: "SINGLE_LINE_TEXT",
-        })),
-      ],
-      confirmationMessage: {
-        headline: truncarSemCortarPalavra(textoOpcional(obrigado_titulo) || "Obrigado!", 60),
-        detailMessage: truncarSemCortarPalavra(textoOpcional(obrigado_texto) || "Recebemos seus dados. Em breve entraremos em contato.", 160),
+      hiddenFields: [],
+      creationLocale: { country: "BR", language: "pt" },
+      name: truncarSemCortarPalavra(textoOpcional(nome_negocio) || "Formulário Plataforma de Leads", 256),
+      state: "DRAFT",
+      content: {
+        headline: {
+          localized: {
+            [locale]: truncarSemCortarPalavra(textoOpcional(headline) || "Receba mais informações", 60),
+          },
+        },
+        description: {
+          localized: {
+            [locale]: truncarSemCortarPalavra(textoOpcional(descricao) || "Deixe seus dados e entraremos em contato.", 160),
+          },
+        },
+        questions: [
+          ["firstName", "Primeiro nome", "FIRST_NAME"],
+          ["lastName", "Sobrenome", "LAST_NAME"],
+          ["emailAddress", "E-mail", "EMAIL"],
+          ["phoneNumber", "Telefone", "PHONE_NUMBER"],
+        ].map(([name, question, predefinedField]) => ({
+          name,
+          question: { localized: { [locale]: question } },
+          questionDetails: { textQuestionDetails: {} },
+          predefinedField,
+          responseEditable: true,
+          responseRequired: true,
+        })).concat(perguntasCustom.map((pergunta, indice) => ({
+          name: `customQuestion${indice + 1}`,
+          question: {
+            localized: {
+              [locale]: truncarSemCortarPalavra(pergunta, 200),
+            },
+          },
+          questionDetails: {
+            textQuestionDetails: { maxResponseLength: 300 },
+          },
+          responseRequired: true,
+        }))),
+        legalInfo: {
+          consents: [],
+          privacyPolicyUrl: politicaPrivacidade,
+          legalDisclaimer: {
+            localized: {
+              [locale]: "Ao enviar, você concorda com o tratamento dos dados conforme a Política de Privacidade.",
+            },
+          },
+        },
+        postSubmissionInfo: {
+          message: {
+            localized: {
+              [locale]: truncarSemCortarPalavra(
+                textoOpcional(obrigado_texto) || textoOpcional(obrigado_titulo) || "Obrigado! Recebemos seus dados.",
+                160
+              ),
+            },
+          },
+          callToAction: {
+            callToActionTarget: { landingPageUrl: politicaPrivacidade },
+            callToActionLabel: "VISIT_COMPANY_WEBSITE",
+          },
+        },
       },
     };
 
-    const resposta = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/leadGenForms`, conexao.accessToken, {
+    const resposta = await linkedinFetch(`/leadForms`, conexao.accessToken, {
       method: "POST",
       body: payloadFormulario
     });
@@ -14783,6 +14856,15 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
         error: resposta.error || "Erro ao criar formulário no LinkedIn",
         detalhe: resposta.data
       }, 400);
+    }
+
+    if (campaign_id) {
+      await client.query(
+        `UPDATE campanhas SET form_id = $1, atualizado_em = NOW()
+         WHERE campaign_id = $2 AND usuario_id = $3 AND plataforma = 'linkedin'
+           AND conta_anuncios_id = $4`,
+        [String(resposta.id), String(campaign_id), usuarioId, conexao.adAccountId]
+      );
     }
 
     return c.json({ resource_name: resposta.id, form_id: resposta.id });
@@ -14805,6 +14887,25 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
 function montarLinkWhatsappLinkedIn(numero: string, campaignGroupId: string, textoAnuncio?: string): string {
   const mensagem = `${textoOpcional(textoAnuncio) || "Olá! Vi o anúncio no LinkedIn e quero saber mais."} [LI-${campaignGroupId}]`;
   return `https://wa.me/${numero}?text=${encodeURIComponent(mensagem)}`;
+}
+
+function normalizarLeadFormUrnLinkedIn(valor: unknown): string | null {
+  const id = textoOpcional(valor);
+  if (!id) return null;
+  if (/^urn:li:leadGenForm:\d+$/.test(id)) return id;
+  if (/^\d+$/.test(id)) return `urn:li:leadGenForm:${id}`;
+  return null;
+}
+
+function normalizarCtaLinkedIn(valor: unknown): string {
+  const cta = textoOpcional(valor).toUpperCase();
+  if (cta === "APPLY_NOW") return "APPLY";
+  const permitidos = new Set([
+    "APPLY", "DOWNLOAD", "VIEW_QUOTE", "LEARN_MORE", "SIGN_UP",
+    "SUBSCRIBE", "REGISTER", "REQUEST_DEMO", "JOIN", "ATTEND",
+    "UNLOCK_FULL_DOCUMENT",
+  ]);
+  return permitidos.has(cta) ? cta : "LEARN_MORE";
 }
 
 app.post("/linkedin/anuncio", authMiddleware, async (c) => {
@@ -14855,6 +14956,11 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
     // pro link wa.me, em vez de mídia própria — content aceita só UM dos
     // dois (media OU article), não os dois juntos.
     const payloadPost: any = {
+      adContext: {
+        dscAdAccount: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
+        dscStatus: "ACTIVE",
+        dscName: truncarSemCortarPalavra(textoOpcional(titulo) || texto || "Rascunho Plataforma de Leads", 100),
+      },
       author: conexao.orgUrn,
       commentary: texto || "Quer mais clientes? 🚀",
       visibility: "PUBLIC",
@@ -14907,15 +15013,19 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
     // clique já vai direto pro link do post (article.source).
     const payloadCreative: any = {
       campaign: `urn:li:sponsoredCampaign:${adgroup_id}`,
-      type: "SPONSORED_UPDATES",
       content: { reference: postUrn },
-      status: "ACTIVE",
+      intendedStatus: "DRAFT",
+      name: truncarSemCortarPalavra(textoOpcional(titulo) || texto || "Rascunho Plataforma de Leads", 100),
     };
 
     if (destinoResolvido !== "whatsapp") {
+      const formUrn = normalizarLeadFormUrnLinkedIn(form_id);
+      if (!formUrn) {
+        return c.json({ error: "Identificador do Lead Gen Form inválido" }, 400);
+      }
       payloadCreative.leadgenCallToAction = {
-        destination: `urn:li:leadGenForm:${form_id}`,
-        label: cta || "Saiba mais",
+        destination: formUrn,
+        label: normalizarCtaLinkedIn(cta),
       };
     }
 
@@ -14926,6 +15036,9 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
 
     if (!respostaCreative.ok || !respostaCreative.id) {
       console.error("ERRO CREATIVE LINKEDIN:", respostaCreative.data);
+      await linkedinFetch(`/posts/${encodeURIComponent(postUrn)}`, conexao.accessToken, {
+        method: "DELETE",
+      }).catch(() => null);
       return c.json({
         error: respostaCreative.error || "Erro ao criar o anúncio (creative) no LinkedIn",
         detalhe: respostaCreative.data
@@ -14989,7 +15102,7 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
 
     const campanhaBanco = await client.query(
-      `SELECT id, adset_id FROM campanhas
+      `SELECT id, adset_id, ad_id FROM campanhas
        WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'
          AND conta_anuncios_id = $3
        LIMIT 1`,
@@ -14998,7 +15111,7 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
     if (!campanhaBanco.rows.length) {
       return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
     }
-    const { adset_id } = campanhaBanco.rows[0];
+    const { adset_id, ad_id } = campanhaBanco.rows[0];
 
     const statusLinkedIn = status === "ACTIVE" ? "ACTIVE" : "PAUSED";
 
@@ -15009,22 +15122,66 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
     // Rest.li do LinkedIn (não testado ainda contra tráfego real).
     const headersPartialUpdate = { "X-RestLi-Method": "PARTIAL_UPDATE" };
 
-    const grupoRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`, conexao.accessToken, {
-      method: "POST",
-      headers: headersPartialUpdate,
-      body: { patch: { $set: { status: statusLinkedIn } } }
-    });
-    if (!grupoRes.ok) {
-      return c.json({ error: grupoRes.error || "Erro ao alterar campanha no LinkedIn" }, 400);
-    }
-
-    if (adset_id) {
-      const campanhaRes = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns/${adset_id}`, conexao.accessToken, {
+    const atualizarGrupo = () => linkedinFetch(
+      `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`,
+      conexao.accessToken,
+      {
         method: "POST",
         headers: headersPartialUpdate,
         body: { patch: { $set: { status: statusLinkedIn } } }
-      });
-      console.log("TOGGLE CAMPAIGN LINKEDIN:", campanhaRes);
+      }
+    );
+    const atualizarCampanha = () => adset_id
+      ? linkedinFetch(
+          `/adAccounts/${conexao.adAccountId}/adCampaigns/${adset_id}`,
+          conexao.accessToken,
+          {
+            method: "POST",
+            headers: headersPartialUpdate,
+            body: { patch: { $set: { status: statusLinkedIn } } }
+          }
+        )
+      : Promise.resolve({ ok: false, error: "O Campaign do LinkedIn ainda não foi criado" } as any);
+    const atualizarCriativo = () => ad_id
+      ? linkedinFetch(
+          `/adAccounts/${conexao.adAccountId}/creatives/${encodeURIComponent(String(ad_id))}`,
+          conexao.accessToken,
+          {
+            method: "POST",
+            headers: headersPartialUpdate,
+            body: { patch: { $set: { intendedStatus: statusLinkedIn } } }
+          }
+        )
+      : Promise.resolve({ ok: false, error: "O anúncio (creative) do LinkedIn ainda não foi criado" } as any);
+
+    const avisos: string[] = [];
+    if (statusLinkedIn === "ACTIVE") {
+      // Ativa de baixo para cima. Assim o Campaign Group, que libera a
+      // veiculação, só fica ACTIVE depois de Creative e Campaign válidos.
+      const criativoRes = await atualizarCriativo();
+      if (!criativoRes.ok) {
+        return c.json({ error: criativoRes.error || "Erro ao ativar o anúncio no LinkedIn" }, 400);
+      }
+      const campanhaRes = await atualizarCampanha();
+      if (!campanhaRes.ok) {
+        return c.json({ error: campanhaRes.error || "Erro ao ativar o Campaign no LinkedIn" }, 400);
+      }
+      const grupoRes = await atualizarGrupo();
+      if (!grupoRes.ok) {
+        return c.json({ error: grupoRes.error || "Erro ao ativar o Campaign Group no LinkedIn" }, 400);
+      }
+    } else {
+      // Pausa de cima para baixo: o grupo interrompe a veiculação antes de
+      // qualquer tentativa de atualizar os filhos. Um creative em revisão
+      // pode rejeitar PAUSED, mas continuará efetivamente pausado pelo pai.
+      const grupoRes = await atualizarGrupo();
+      if (!grupoRes.ok) {
+        return c.json({ error: grupoRes.error || "Erro ao pausar o Campaign Group no LinkedIn" }, 400);
+      }
+      const campanhaRes = await atualizarCampanha();
+      if (!campanhaRes.ok) avisos.push(campanhaRes.error || "O Campaign filho não pôde ser pausado");
+      const criativoRes = await atualizarCriativo();
+      if (!criativoRes.ok) avisos.push(criativoRes.error || "O creative não pôde ser pausado");
     }
 
     await client.query(
@@ -15032,7 +15189,7 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
       [status, campanhaBanco.rows[0].id]
     );
 
-    return c.json({ sucesso: true });
+    return c.json({ sucesso: true, avisos });
   } catch (err: any) {
     console.error("ERRO /linkedin/toggle-campanha:", err);
     return c.json({ error: "Erro ao alterar campanha" }, 500);
@@ -15146,7 +15303,7 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
     }
 
     const campanha = await client.query(
-      `SELECT id FROM campanhas
+      `SELECT id, adset_id, ad_id, form_id, configuracoes_avancadas FROM campanhas
        WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin'
          AND conta_anuncios_id = $3
        LIMIT 1`,
@@ -15156,6 +15313,51 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
       return c.json({ error: erroCampanhaOutraConta("LinkedIn Ads") }, 409);
     }
 
+    const registro = campanha.rows[0];
+    const avisos: string[] = [];
+    const recursoJaAusente = (resposta: any) => {
+      const msg = String(resposta?.error || "").toLowerCase();
+      return resposta?.status === 404 || resposta?.status === 410 ||
+        msg.includes("not found") || msg.includes("does not exist") ||
+        msg.includes("already deleted");
+    };
+
+    // A exclusão precisa respeitar a hierarquia do LinkedIn: Creative,
+    // Campaign e só então Campaign Group. Todos são criados como DRAFT.
+    if (registro.ad_id) {
+      const delCreative = await linkedinFetch(
+        `/adAccounts/${conexao.adAccountId}/creatives/${encodeURIComponent(String(registro.ad_id))}`,
+        conexao.accessToken,
+        { method: "DELETE", headers: { "X-RestLi-Method": "DELETE" } }
+      );
+      if (!delCreative.ok && !recursoJaAusente(delCreative)) {
+        return c.json({ error: delCreative.error || "O LinkedIn não permitiu excluir o creative em rascunho" }, 400);
+      }
+    }
+
+    const postUrn = textoOpcional(registro.configuracoes_avancadas?.post_urn);
+    if (postUrn) {
+      const delPost = await linkedinFetch(
+        `/posts/${encodeURIComponent(postUrn)}`,
+        conexao.accessToken,
+        { method: "DELETE" }
+      );
+      if (!delPost.ok && !recursoJaAusente(delPost)) {
+        avisos.push("O conteúdo Direct Sponsored Content não pôde ser removido automaticamente.");
+      }
+    }
+
+    if (registro.adset_id) {
+      const delCampaign = await linkedinFetch(
+        `/adAccounts/${conexao.adAccountId}/adCampaigns/${registro.adset_id}`,
+        conexao.accessToken,
+        { method: "DELETE" }
+      );
+      if (!delCampaign.ok && !recursoJaAusente(delCampaign)) {
+        return c.json({ error: delCampaign.error || "O LinkedIn não permitiu excluir o Campaign em rascunho" }, 400);
+      }
+    }
+
     const del = await linkedinFetch(
       `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`,
       conexao.accessToken,
@@ -15163,15 +15365,7 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
     );
 
     if (!del.ok) {
-      const msg = String(del.error || "").toLowerCase();
-      const naoPertenceMaisLinkedIn =
-        del.status === 404 ||
-        del.status === 410 ||
-        msg.includes("not found") ||
-        msg.includes("does not exist") ||
-        msg.includes("already deleted");
-
-      if (!naoPertenceMaisLinkedIn) {
+      if (!recursoJaAusente(del)) {
         return c.json({
           error: del.error || "O LinkedIn não permitiu excluir a campanha"
         }, 400);
@@ -15185,7 +15379,11 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
       [campanha.rows[0].id]
     );
 
-    return c.json({ sucesso: true });
+    if (registro.form_id) {
+      avisos.push("O Lead Gen Form permanece como DRAFT no LinkedIn, pois a API atual não documenta exclusão desse recurso.");
+    }
+
+    return c.json({ sucesso: true, avisos });
   } catch (err: any) {
     console.error("ERRO /linkedin/excluir-campanha:", err);
     return c.json({ error: "Erro ao excluir campanha LinkedIn" }, 500);
@@ -15206,15 +15404,66 @@ app.post("/linkedin/excluir-campanha", authMiddleware, async (c) => {
 // de parsing/inserção. Idempotente: se o lead_id já existir pra esse
 // usuário, não insere de novo (importante pro webhook, que pode reentregar
 // o mesmo evento) — devolve false nesse caso, true quando inseriu.
+type CampoLeadFormLinkedIn = {
+  nome: string;
+  predefinedField: string;
+  opcoes: Record<string, string>;
+};
+
+const linkedinLeadFormSchemaCache = new Map<string, {
+  expiraEm: number;
+  campos: Record<string, CampoLeadFormLinkedIn>;
+}>();
+
+function primeiroTextoLocalizadoLinkedIn(valor: any): string {
+  const localizado = valor?.localized;
+  if (!localizado || typeof localizado !== "object") return "";
+  return textoOpcional(Object.values(localizado)[0]);
+}
+
+async function obterCamposLeadFormLinkedIn(
+  usuarioId: number,
+  adAccountId: string,
+  formId: string
+): Promise<Record<string, CampoLeadFormLinkedIn>> {
+  const chave = `${adAccountId}:${formId}`;
+  const agora = Date.now();
+  const cache = linkedinLeadFormSchemaCache.get(chave);
+  if (cache && cache.expiraEm > agora) return cache.campos;
+
+  const conexao = await resolverConexaoLinkedIn(usuarioId);
+  if ("erro" in conexao) return {};
+  const resposta = await linkedinFetch(`/leadForms/${encodeURIComponent(formId)}`, conexao.accessToken);
+  if (!resposta.ok) return {};
+
+  const campos: Record<string, CampoLeadFormLinkedIn> = {};
+  for (const pergunta of resposta.data?.content?.questions || []) {
+    const questionId = String(pergunta.questionId ?? "");
+    if (!questionId) continue;
+    const opcoes: Record<string, string> = {};
+    for (const opcao of pergunta.questionDetails?.multipleChoiceQuestionDetails?.options || []) {
+      opcoes[String(opcao.id)] = primeiroTextoLocalizadoLinkedIn(opcao.text);
+    }
+    campos[questionId] = {
+      nome: primeiroTextoLocalizadoLinkedIn(pergunta.question) || textoOpcional(pergunta.name) || questionId,
+      predefinedField: textoOpcional(pergunta.predefinedField).toUpperCase(),
+      opcoes,
+    };
+  }
+  linkedinLeadFormSchemaCache.set(chave, { expiraEm: agora + 15 * 60_000, campos });
+  return campos;
+}
+
 async function processarLeadGenFormResponseLinkedIn(
   usuarioId: number,
   adAccountId: string,
   lead: any
 ): Promise<boolean> {
   const formUrnResposta = String(
-    lead.formResponse?.leadGenFormUrn || lead.leadGenFormUrn || lead.leadGenForm || ""
+    lead.versionedLeadGenFormUrn || lead.leadGenFormUrn || lead.leadGenForm || ""
   );
-  const formIdResposta = formUrnResposta.split(":").pop() || "";
+  const formIdResposta = formUrnResposta.match(/urn:li:leadGenForm:(\d+)/)?.[1] || "";
+  const formUrnBase = formIdResposta ? `urn:li:leadGenForm:${formIdResposta}` : "";
 
   const leadId = String(lead.id ?? `${formIdResposta || "linkedin"}-${lead.submittedAt}`);
 
@@ -15227,9 +15476,10 @@ async function processarLeadGenFormResponseLinkedIn(
   const campanhaEncontrada = formIdResposta
     ? (await client.query(
         `SELECT nome, nicho_id FROM campanhas
-         WHERE usuario_id = $1 AND plataforma = 'linkedin' AND conta_anuncios_id = $2 AND form_id = $3
+         WHERE usuario_id = $1 AND plataforma = 'linkedin' AND conta_anuncios_id = $2
+           AND form_id = ANY($3::text[])
          LIMIT 1`,
-        [usuarioId, adAccountId, formIdResposta]
+        [usuarioId, adAccountId, [formIdResposta, formUrnBase]]
       )).rows[0]
     : null;
   const nomeCampanha = campanhaEncontrada?.nome || "Campanha LinkedIn";
@@ -15239,15 +15489,26 @@ async function processarLeadGenFormResponseLinkedIn(
   let email = "";
   let telefone = "";
   const respostasQualificacao: any[] = [];
+  const camposFormulario = formIdResposta
+    ? await obterCamposLeadFormLinkedIn(usuarioId, adAccountId, formIdResposta)
+    : {};
 
   for (const resposta of lead.formResponse?.answers ?? []) {
-    const campo = String(resposta.questionField?.predefinedField ?? "").toUpperCase();
-    const valor = resposta.answerDetails?.textQuestionAnswer?.answer ?? "";
+    const metadado = camposFormulario[String(resposta.questionId ?? "")] || null;
+    const campo = textoOpcional(metadado?.predefinedField).toUpperCase();
+    const textoResposta = resposta.answerDetails?.textQuestionAnswer?.answer;
+    const opcoesResposta = resposta.answerDetails?.multipleChoiceAnswer?.options;
+    const valor = textoOpcional(textoResposta) || (Array.isArray(opcoesResposta)
+      ? opcoesResposta.map((id: any) => metadado?.opcoes?.[String(id)] || String(id)).join(", ")
+      : "");
     if (campo === "FIRST_NAME") nome = `${valor} ${nome}`.trim();
     else if (campo === "LAST_NAME") nome = `${nome} ${valor}`.trim();
     else if (campo === "EMAIL_ADDRESS") email = valor;
     else if (campo === "PHONE_NUMBER") telefone = valor;
-    else respostasQualificacao.push({ pergunta: campo, resposta: valor });
+    else respostasQualificacao.push({
+      pergunta: metadado?.nome || `Pergunta ${resposta.questionId ?? ""}`.trim(),
+      resposta: valor,
+    });
   }
 
   const leadInseridoLinkedIn = await client.query(
@@ -15343,31 +15604,36 @@ async function sincronizarLinkedInAdsUsuario(usuarioId: number) {
   }
 
   // 🔥 BUSCA LEADS (respostas de Lead Gen Form dos últimos 30 dias)
-  // ASSUMPTION: endpoint/formato de listagem de leadGenFormResponses
-  // conferido só contra a documentação pública — o mais provável de
-  // precisar de ajuste depois do Lead Gen Forms em si. A busca é UMA SÓ
-  // chamada em nível de conta (não por formulário) — cada resposta é
-  // casada com sua campanha via o urn do formulário embutido na própria
-  // resposta, não pela ordem do loop (uma versão anterior desta função
-  // fazia uma chamada idêntica por formulário e atribuía TODO lead
-  // retornado ao formulário do loop atual, o que corrompia a atribuição de
-  // campanha em qualquer conta com mais de um Lead Gen Form).
+  // A Lead Form Responses API usa o finder q=owner e o endpoint singular
+  // /leadFormResponses. A paginação é por start/count.
   let totalLeads = 0;
   if (LINKEDIN_LEAD_SYNC_HABILITADO) {
     const trintaDiasAtras = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    const leadsRes = await linkedinFetch(
-      `/leadGenFormResponses?q=leadType&owner=(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})&leadType=SPONSORED&submittedAtAfter=${trintaDiasAtras}`,
-      token
-    );
+    const agora = Date.now();
+    const count = 100;
+    for (let start = 0; start < 10_000; start += count) {
+      const params = new URLSearchParams({
+        q: "owner",
+        owner: `(sponsoredAccount:urn:li:sponsoredAccount:${adAccountId})`,
+        leadType: "(leadType:SPONSORED)",
+        limitedToTestLeads: "false",
+        submittedAtTimeRange: `(start:${trintaDiasAtras},end:${agora})`,
+        start: String(start),
+        count: String(count),
+      });
+      const leadsRes = await linkedinFetch(`/leadFormResponses?${params.toString()}`, token);
 
-    if (!leadsRes.ok) {
-      console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
-    } else {
+      if (!leadsRes.ok) {
+        console.error("ERRO LEADS LINKEDIN:", leadsRes.data);
+        break;
+      }
       const leadsList = leadsRes.data?.elements ?? [];
       for (const lead of leadsList) {
         const inserido = await processarLeadGenFormResponseLinkedIn(usuarioId, String(adAccountId), lead);
         if (inserido) totalLeads++;
       }
+      const total = Number(leadsRes.data?.paging?.total || 0);
+      if (leadsList.length < count || (total > 0 && start + leadsList.length >= total)) break;
     }
   }
 
