@@ -14001,7 +14001,9 @@ function normalizarOrganizationUrnLinkedInPainel(valor: unknown): string | null 
 }
 
 function papelLinkedInPermiteGerenciar(papel: string | null): boolean {
-  return papel === "ACCOUNT_MANAGER" || papel === "CAMPAIGN_MANAGER";
+  return papel === "ACCOUNT_BILLING_ADMIN"
+    || papel === "ACCOUNT_MANAGER"
+    || papel === "CAMPAIGN_MANAGER";
 }
 
 async function listarContasLinkedInDisponiveis(token: string): Promise<ContaLinkedInDisponivel[]> {
