@@ -14414,6 +14414,7 @@ app.post("/linkedin/campanha", authMiddleware, async (c) => {
       body: {
         account: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
         name: nome || "Campanha Leads Plataforma",
+        runSchedule: { start: Date.now() },
         status: "DRAFT",
       }
     });
