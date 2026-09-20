@@ -14870,11 +14870,28 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
     }
 
     if (campaign_id) {
+      const detalhesFormulario = {
+        titulo: textoOpcional(headline) || textoOpcional(nome_negocio) || null,
+        descricao: textoOpcional(descricao) || null,
+        perguntas: perguntasCustom,
+        privacidade_url: politicaPrivacidade,
+        obrigado_titulo: textoOpcional(obrigado_titulo) || null,
+        obrigado_texto: textoOpcional(obrigado_texto) || null,
+      };
       await client.query(
-        `UPDATE campanhas SET form_id = $1, atualizado_em = NOW()
-         WHERE campaign_id = $2 AND usuario_id = $3 AND plataforma = 'linkedin'
-           AND conta_anuncios_id = $4`,
-        [String(resposta.id), String(campaign_id), usuarioId, conexao.adAccountId]
+        `UPDATE campanhas
+         SET form_id = $1,
+             configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $2::jsonb,
+             atualizado_em = NOW()
+         WHERE campaign_id = $3 AND usuario_id = $4 AND plataforma = 'linkedin'
+           AND conta_anuncios_id = $5`,
+        [
+          String(resposta.id),
+          JSON.stringify(detalhesFormulario),
+          String(campaign_id),
+          usuarioId,
+          conexao.adAccountId,
+        ]
       );
     }
 
@@ -14925,7 +14942,7 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
     const user: any = c.get("user");
     const {
       usuario_id, campaign_id, adgroup_id, form_id,
-      texto, cta, titulo, configuracoes_avancadas, image_urn, video_urn, daily_budget, destino
+      texto, cta, titulo, descricao, configuracoes_avancadas, image_urn, video_urn, daily_budget, destino
     } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
@@ -15062,12 +15079,17 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
     const configuracoesPersistidas = {
       ...avancadas,
       texto,
-      cta,
+      titulo: textoOpcional(titulo) || null,
+      descricao: textoOpcional(descricao) || null,
+      cta: normalizarCtaLinkedIn(cta),
       destino: destinoResolvido,
       form_id: form_id ? String(form_id) : null,
       wa_link: waLink,
       post_urn: postUrn,
       image_urn: image_urn || null,
+      video_urn: video_urn || null,
+      criativo_tipo: video_urn ? "video" : image_urn ? "imagem" : destinoResolvido === "whatsapp" ? "link" : "texto",
+      pais: textoOpcional(avancadas.pais) || "BR",
     };
 
     await client.query(
@@ -26313,20 +26335,20 @@ async function carregarMetricasLinkedInCampanhas(
       pivot: "CAMPAIGN_GROUP",
       accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
       timeGranularity: "DAILY",
-      fields: "campaignGroup,impressions,clicks,costInLocalCurrency,dateRange",
+      fields: "pivotValues,impressions,clicks,costInLocalCurrency,dateRange",
     });
     params.set(
       "dateRange",
       `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
     );
 
-    const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, accessToken);
+    const resposta = await linkedinFetch(`/adAnalytics?${params.toString().replace(/%2C/gi, ",")}`, accessToken);
     if (!resposta.ok) {
       return { disponivel: false, erro: resposta.error || "Métricas indisponíveis no LinkedIn Ads", metricas };
     }
 
     for (const item of resposta.data?.elements ?? []) {
-      const campaignGroupUrn = String(item.campaignGroup || "");
+      const campaignGroupUrn = String(item.pivotValues?.[0] || "");
       const campaignGroupId = campaignGroupUrn.split(":").pop() || "";
       if (!campaignGroupId) continue;
 
@@ -27996,20 +28018,20 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
         pivot: "CAMPAIGN_GROUP",
         accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
         timeGranularity: "DAILY",
-        fields: "campaignGroup,impressions,clicks,costInLocalCurrency,dateRange",
+        fields: "pivotValues,impressions,clicks,costInLocalCurrency,dateRange",
       });
       params.set(
         "dateRange",
         `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
       );
 
-      const resposta = await linkedinFetch(`/adAnalytics?${params.toString()}`, accessToken);
+      const resposta = await linkedinFetch(`/adAnalytics?${params.toString().replace(/%2C/gi, ",")}`, accessToken);
       if (!resposta.ok) {
         return c.json({ error: resposta.error || "Erro ao buscar performance diaria do LinkedIn Ads" }, 400);
       }
 
       for (const item of resposta.data?.elements ?? []) {
-        const campaignGroupUrn = String(item.campaignGroup || "");
+        const campaignGroupUrn = String(item.pivotValues?.[0] || "");
         const campaignGroupId = campaignGroupUrn.split(":").pop() || "";
         if (!campaignGroupId || !campaignIdsUsuario.has(campaignGroupId)) continue;
         const dr = item.dateRange?.start;
