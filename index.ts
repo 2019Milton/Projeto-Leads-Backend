@@ -14893,8 +14893,9 @@ function montarLinkWhatsappLinkedIn(numero: string, campaignGroupId: string, tex
 function normalizarLeadFormUrnLinkedIn(valor: unknown): string | null {
   const id = textoOpcional(valor);
   if (!id) return null;
-  if (/^urn:li:leadGenForm:\d+$/.test(id)) return id;
-  if (/^\d+$/.test(id)) return `urn:li:leadGenForm:${id}`;
+  if (/^urn:li:adForm:\d+$/.test(id)) return id;
+  const idFormulario = id.match(/^urn:li:leadGenForm:(\d+)$/)?.[1] || (/^\d+$/.test(id) ? id : "");
+  if (idFormulario) return `urn:li:adForm:${idFormulario}`;
   return null;
 }
 
