@@ -14593,10 +14593,15 @@ app.post("/linkedin/upload-imagem", authMiddleware, async (c) => {
 
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+    if (!conexao.orgUrn) {
+      return c.json({ error: "Selecione uma Company Page do LinkedIn antes de enviar a imagem" }, 400);
+    }
 
     const init = await linkedinFetch(`/images?action=initializeUpload`, conexao.accessToken, {
       method: "POST",
-      body: { initializeUploadRequest: { owner: `urn:li:sponsoredAccount:${conexao.adAccountId}` } }
+      // O asset precisa pertencer ao mesmo autor usado no /posts. A conta de
+      // anúncios continua vinculada depois por adContext.dscAdAccount.
+      body: { initializeUploadRequest: { owner: conexao.orgUrn } }
     });
 
     const uploadUrl = init.data?.value?.uploadUrl;
@@ -14666,6 +14671,9 @@ app.post("/linkedin/upload-video", authMiddleware, async (c) => {
 
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+    if (!conexao.orgUrn) {
+      return c.json({ error: "Selecione uma Company Page do LinkedIn antes de enviar o vídeo" }, 400);
+    }
 
     const bytes = new Uint8Array(await video.arrayBuffer());
 
@@ -14673,7 +14681,9 @@ app.post("/linkedin/upload-video", authMiddleware, async (c) => {
       method: "POST",
       body: {
         initializeUploadRequest: {
-          owner: `urn:li:sponsoredAccount:${conexao.adAccountId}`,
+          // O vídeo será referenciado por um post cujo autor é a Company Page;
+          // por isso ambos precisam compartilhar o mesmo proprietário.
+          owner: conexao.orgUrn,
           fileSizeBytes: bytes.byteLength,
           uploadCaptions: false,
           uploadThumbnail: false,
