@@ -5,6 +5,19 @@ import bcrypt from "bcryptjs";
 import sharp from "sharp";
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  MINIMO_CONTAS_REDE,
+  MINIMO_LEADS_REDE,
+  PLATAFORMAS_RANKING,
+  VARIACAO_MAXIMA_MERCADO,
+  calcularNotasRede,
+  combinarNotasMercado,
+  extrairDiasDesempenho,
+  extrairNotasMercado,
+  notasBaseDoNicho,
+  type LinhaRedeBruta,
+  type PlataformaRanking,
+} from "./ranking-plataformas";
 
 const app = new Hono();
 
@@ -23060,6 +23073,50 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS nicho_id INTEGER REFERENCES nichos(id);
 `);
 
+// Ranking de plataformas (selos da tela de Integrações): nota de mercado por nicho vinda
+// da pesquisa semanal com IA, log das execuções dessa pesquisa e histórico diário de
+// gasto por conta, usado para calcular o custo por lead da rede de clientes.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ranking_mercado_nicho (
+    nicho_slug    TEXT NOT NULL,
+    plataforma    TEXT NOT NULL,
+    nota          NUMERIC(5, 1) NOT NULL,
+    nota_bruta    NUMERIC(5, 1),
+    motivo        TEXT,
+    fontes        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    modelo        TEXT,
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nicho_slug, plataforma)
+  );
+
+  CREATE TABLE IF NOT EXISTS ranking_mercado_execucoes (
+    id             SERIAL PRIMARY KEY,
+    nicho_slug     TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    modelo         TEXT,
+    tokens_entrada INTEGER DEFAULT 0,
+    tokens_saida   INTEGER DEFAULT 0,
+    custo_estimado NUMERIC(12, 4) DEFAULT 0,
+    erro           TEXT,
+    criado_em      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS desempenho_diario_plataforma (
+    usuario_id    INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    plataforma    TEXT NOT NULL,
+    nicho_id      INTEGER NOT NULL REFERENCES nichos(id) ON DELETE CASCADE,
+    data          DATE NOT NULL,
+    gasto         NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    cliques       INTEGER NOT NULL DEFAULT 0,
+    impressoes    BIGINT NOT NULL DEFAULT 0,
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (usuario_id, plataforma, nicho_id, data)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_desempenho_diario_nicho_data
+    ON desempenho_diario_plataforma(nicho_id, plataforma, data);
+`);
+
 await client.query(`
   CREATE INDEX IF NOT EXISTS idx_campanhas_nicho_id
     ON campanhas(nicho_id);
@@ -27333,6 +27390,533 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
       error: "Erro ao calcular ranking de plataformas",
       detalhe: err?.message || String(err)
     }, 500);
+  }
+});
+
+/* =========================
+   🏅 RANKING DE PLATAFORMAS — pesquisa na web + rede de clientes
+   O selo de cada plataforma combina três fontes: a nota de mercado do nicho (pesquisa
+   semanal com IA, abaixo), o resultado agregado e anônimo de todos os clientes no mesmo
+   nicho (rede) e o histórico da própria conta (calculado no front). A lógica pura e as
+   travas ficam em ranking-plataformas.ts.
+========================= */
+
+const RANKING_MERCADO_INTERVALO_MS = 7 * 24 * 60 * 60 * 1000;
+const RANKING_MERCADO_REPETIR_APOS_ERRO_MS = 6 * 60 * 60 * 1000;
+const RANKING_REDE_PERIODO_DIAS = 30;
+const RANKING_REDE_CACHE_MS = 10 * 60 * 1000;
+const SNAPSHOT_DESEMPENHO_INTERVALO_MS = 20 * 60 * 60 * 1000;
+const SNAPSHOT_DESEMPENHO_REPETIR_APOS_FALHA_MS = 6 * 60 * 60 * 1000;
+const SNAPSHOT_DESEMPENHO_LIMITE_EXECUCAO_MS = 40 * 60 * 1000;
+
+let rankingMercadoEmAndamento = false;
+const rankingMercadoProximaTentativa = new Map<string, number>();
+let rankingRedeCache: { expiraEm: number; dados: any } | null = null;
+let snapshotDesempenhoEmAndamento = false;
+let snapshotDesempenhoUltimaTentativa = 0;
+
+async function registrarExecucaoRankingMercado(
+  nichoSlug: string,
+  status: "ok" | "erro",
+  modelo: string | null,
+  usage: any,
+  erro: string | null
+) {
+  try {
+    await client.query(
+      `INSERT INTO ranking_mercado_execucoes
+         (nicho_slug, status, modelo, tokens_entrada, tokens_saida, custo_estimado, erro)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        nichoSlug,
+        status,
+        modelo,
+        Number(usage?.input_tokens || 0),
+        Number(usage?.output_tokens || 0),
+        status === "ok" ? calcularCustoEstimadoOpenAI(usage) : 0,
+        erro ? erro.slice(0, 500) : null,
+      ]
+    );
+  } catch (err) {
+    console.error("ERRO ao registrar execucao do ranking de mercado:", err);
+  }
+}
+
+// Pesquisa na web como cada plataforma se sai no nicho e grava as notas. A IA recebe as
+// notas anteriores como ponto de partida e, depois da resposta, cada nota ainda passa
+// pela trava de variação (VARIACAO_MAXIMA_MERCADO) antes de ser gravada.
+async function pesquisarNotasMercadoNicho(nicho: { slug: string; nome: string }) {
+  const openaiKey = Bun.env.OPENAI_API_KEY;
+  if (!openaiKey) throw new Error("OPENAI_API_KEY nao configurada");
+
+  const base = notasBaseDoNicho(nicho.slug);
+  const anterioresResult = await client.query(
+    `SELECT plataforma, nota FROM ranking_mercado_nicho WHERE nicho_slug = $1`,
+    [nicho.slug]
+  );
+  const anteriores: Partial<Record<PlataformaRanking, number>> = {};
+  for (const row of anterioresResult.rows) {
+    if ((PLATAFORMAS_RANKING as readonly string[]).includes(row.plataforma)) {
+      anteriores[row.plataforma as PlataformaRanking] = Number(row.nota);
+    }
+  }
+  const referencia = Object.fromEntries(
+    PLATAFORMAS_RANKING.map((p) => [p, anteriores[p] ?? base[p]])
+  );
+
+  const modelo = modeloResponsesCriativo();
+  const response = await fetch(OPENAI_RESPONSES_URL, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(180_000),
+    body: JSON.stringify({
+      model: modelo,
+      instructions:
+        "Você é analista sênior de mídia paga no Brasil. Pesquise na web dados e análises ATUAIS e confiáveis " +
+        "(relatórios de mercado, benchmarks de custo por lead e conversão, estudos de mídia, documentação oficial das plataformas) " +
+        "e estime o quanto cada plataforma é adequada para gerar LEADS qualificados no nicho informado, para anunciantes brasileiros. " +
+        "Dê uma nota de 0 a 100 para cada uma das 8 plataformas, comparáveis entre si (100 = melhor escolha possível para o nicho). " +
+        "Use as notas de referência anteriores como ponto de partida: só se afaste delas com evidência recente e concreta; sem evidência, mantenha-se perto. " +
+        "Não invente números, estudos ou fontes. O motivo deve ter no máximo 220 caracteres e resumir a evidência. " +
+        "Não use nem cite dados de anunciantes específicos. A nota é uma estimativa estratégica, não garantia de resultado.",
+      input: [{
+        role: "user",
+        content: [{
+          type: "input_text",
+          text:
+            `Nicho: ${nicho.nome} (${nicho.slug})\n` +
+            `Plataformas: ${PLATAFORMAS_RANKING.join(", ")}\n` +
+            `Notas de referência anteriores: ${JSON.stringify(referencia)}\n\n` +
+            "Pesquise e devolva a nota e o motivo de cada plataforma."
+        }]
+      }],
+      tools: [{
+        type: "web_search",
+        search_context_size: "medium",
+        user_location: { type: "approximate", country: "BR", timezone: "America/Sao_Paulo" }
+      }],
+      tool_choice: "required",
+      include: ["web_search_call.action.sources"],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "ranking_plataformas_nicho",
+          strict: true,
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["notas"],
+            properties: {
+              notas: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["plataforma", "nota", "motivo"],
+                  properties: {
+                    plataforma: { type: "string", enum: [...PLATAFORMAS_RANKING] },
+                    nota: { type: "number" },
+                    motivo: { type: "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      max_output_tokens: 4000,
+      store: false
+    })
+  });
+
+  const data: any = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || `OpenAI HTTP ${response.status}`);
+
+  let resposta: unknown;
+  try {
+    resposta = JSON.parse(extrairTextoRespostaOpenAI(data) || "{}");
+  } catch (_) {
+    throw new Error("Resposta da IA nao e um JSON valido");
+  }
+
+  const finais = combinarNotasMercado(extrairNotasMercado(resposta), anteriores, base);
+  if (!finais.length) throw new Error("Resposta da IA sem notas confiaveis");
+
+  const fontes = extrairFontesPesquisaCriativo(data);
+  for (const nota of finais) {
+    await client.query(
+      `INSERT INTO ranking_mercado_nicho
+         (nicho_slug, plataforma, nota, nota_bruta, motivo, fontes, modelo, atualizado_em)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW())
+       ON CONFLICT (nicho_slug, plataforma) DO UPDATE SET
+         nota = EXCLUDED.nota,
+         nota_bruta = EXCLUDED.nota_bruta,
+         motivo = EXCLUDED.motivo,
+         fontes = EXCLUDED.fontes,
+         modelo = EXCLUDED.modelo,
+         atualizado_em = NOW()`,
+      [nicho.slug, nota.plataforma, nota.nota, nota.notaBruta, nota.motivo, JSON.stringify(fontes), modelo]
+    );
+  }
+
+  return { atualizadas: finais.length, fontes: fontes.length, modelo, usage: data?.usage };
+}
+
+// Roda a pesquisa para os nichos cuja nota tem mais de 7 dias (ou para um nicho
+// específico, com forcar). Um nicho que falha só é tentado de novo depois de 6 horas.
+async function executarRankingMercado(opcoes: { nichoSlug?: string; forcar?: boolean } = {}) {
+  if (rankingMercadoEmAndamento) return { emAndamento: true, resultados: [] as any[] };
+  rankingMercadoEmAndamento = true;
+  const resultados: Array<{ nicho: string; status: "ok" | "erro"; detalhe: string }> = [];
+
+  try {
+    const nichos = await client.query(
+      `SELECT n.slug, n.nome, MAX(r.atualizado_em) AS ultima
+       FROM nichos n
+       LEFT JOIN ranking_mercado_nicho r ON r.nicho_slug = n.slug
+       WHERE ($1::text IS NULL OR n.slug = $1)
+       GROUP BY n.slug, n.nome
+       ORDER BY n.slug`,
+      [opcoes.nichoSlug || null]
+    );
+
+    for (const nicho of nichos.rows) {
+      const ultima = nicho.ultima ? new Date(nicho.ultima).getTime() : 0;
+      const emDia = Date.now() - ultima < RANKING_MERCADO_INTERVALO_MS;
+      const aguardando = Date.now() < (rankingMercadoProximaTentativa.get(nicho.slug) || 0);
+      if (!opcoes.forcar && (emDia || aguardando)) continue;
+
+      try {
+        const r = await pesquisarNotasMercadoNicho(nicho);
+        rankingMercadoProximaTentativa.delete(nicho.slug);
+        await registrarExecucaoRankingMercado(nicho.slug, "ok", r.modelo, r.usage, null);
+        resultados.push({ nicho: nicho.slug, status: "ok", detalhe: `${r.atualizadas} notas, ${r.fontes} fontes` });
+      } catch (err: any) {
+        const mensagem = err?.message || String(err);
+        rankingMercadoProximaTentativa.set(nicho.slug, Date.now() + RANKING_MERCADO_REPETIR_APOS_ERRO_MS);
+        await registrarExecucaoRankingMercado(nicho.slug, "erro", null, null, mensagem);
+        console.error(`ERRO ranking de mercado (${nicho.slug}):`, mensagem);
+        resultados.push({ nicho: nicho.slug, status: "erro", detalhe: mensagem });
+      }
+      await new Promise((resolver) => setTimeout(resolver, 2000));
+    }
+  } finally {
+    rankingMercadoEmAndamento = false;
+  }
+  return { emAndamento: false, resultados };
+}
+
+// Notas de mercado vindas da pesquisa. O front usa a nota do nicho quando ela existe e
+// cai na tabela fixa dele quando ainda não houve pesquisa (ou quando ela falhou).
+app.get("/plataformas/ranking-mercado", authMiddleware, async (c) => {
+  try {
+    const result = await client.query(
+      `SELECT nicho_slug, plataforma, nota, motivo, fontes, atualizado_em
+       FROM ranking_mercado_nicho`
+    );
+    const nichos: Record<string, any> = {};
+    for (const row of result.rows) {
+      const nicho = (nichos[row.nicho_slug] ||= { atualizado_em: null, fontes: [], plataformas: {} });
+      nicho.plataformas[row.plataforma] = { nota: Number(row.nota), motivo: row.motivo || "" };
+      const quando = new Date(row.atualizado_em).toISOString();
+      if (!nicho.atualizado_em || quando > nicho.atualizado_em) nicho.atualizado_em = quando;
+      if (Array.isArray(row.fontes) && row.fontes.length > nicho.fontes.length) nicho.fontes = row.fontes;
+    }
+    return c.json({ variacao_maxima: VARIACAO_MAXIMA_MERCADO, nichos });
+  } catch (err: any) {
+    console.error("ERRO RANKING DE MERCADO:", err);
+    return c.json({ error: "Erro ao buscar notas de mercado" }, 500);
+  }
+});
+
+// Resultado agregado e anônimo de todos os clientes, por nicho e plataforma. Só entram
+// combinações com contas e leads suficientes (ver ranking-plataformas.ts), e a resposta
+// nunca traz dado de uma conta individual: apenas a nota, o peso e quantas contas e
+// leads sustentam o número.
+app.get("/plataformas/ranking-rede", authMiddleware, async (c) => {
+  try {
+    if (rankingRedeCache && rankingRedeCache.expiraEm > Date.now()) {
+      return c.json(rankingRedeCache.dados);
+    }
+
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - (RANKING_REDE_PERIODO_DIAS - 1));
+    inicio.setHours(0, 0, 0, 0);
+
+    const result = await client.query(
+      `WITH leads_origem AS (
+         SELECT
+           l.usuario_id,
+           l.nicho_id,
+           LOWER(COALESCE(
+             NULLIF(NULLIF(LOWER(NULLIF(l.plataforma, '')), 'whatsapp'), ''),
+             NULLIF(LOWER(NULLIF(l.origem, '')), ''),
+             'formulario'
+           )) AS origem_normalizada,
+           LOWER(COALESCE(l.status, 'novo')) AS status
+         FROM leads l
+         WHERE l.criado_em >= $1 AND l.nicho_id IS NOT NULL
+       ), leads_normalizados AS (
+         SELECT
+           usuario_id,
+           nicho_id,
+           CASE
+             WHEN origem_normalizada IN ('meta', 'facebook', 'instagram') THEN 'meta'
+             WHEN origem_normalizada IN ('google', 'google_ads') THEN 'google'
+             WHEN origem_normalizada IN ('tiktok', 'tiktok_ads') THEN 'tiktok'
+             WHEN origem_normalizada IN ('linkedin', 'linkedin_ads') THEN 'linkedin'
+             WHEN origem_normalizada IN ('kwai', 'kwai_ads') THEN 'kwai'
+             WHEN origem_normalizada IN ('pinterest', 'pinterest_ads') THEN 'pinterest'
+             WHEN origem_normalizada IN ('snapchat', 'snapchat_ads') THEN 'snapchat'
+             WHEN origem_normalizada IN ('microsoft', 'microsoft_ads', 'bing') THEN 'microsoft'
+             ELSE NULL
+           END AS plataforma,
+           status
+         FROM leads_origem
+       ), leads_conta AS (
+         SELECT
+           usuario_id, nicho_id, plataforma,
+           COUNT(*)::int AS leads,
+           COUNT(*) FILTER (WHERE status IN ('em_conversa', 'fechado'))::int AS qualificados,
+           COUNT(*) FILTER (WHERE status = 'fechado')::int AS fechados
+         FROM leads_normalizados
+         WHERE plataforma IS NOT NULL
+         GROUP BY usuario_id, nicho_id, plataforma
+       ), gasto_conta AS (
+         SELECT
+           usuario_id, nicho_id, plataforma,
+           SUM(gasto) AS gasto,
+           SUM(cliques) AS cliques,
+           SUM(impressoes) AS impressoes
+         FROM desempenho_diario_plataforma
+         WHERE data >= $2::date
+         GROUP BY usuario_id, nicho_id, plataforma
+       )
+       SELECT
+         n.slug AS nicho,
+         COALESCE(l.plataforma, g.plataforma) AS plataforma,
+         COUNT(DISTINCT COALESCE(l.usuario_id, g.usuario_id))::int AS contas,
+         COALESCE(SUM(l.leads), 0)::int AS leads,
+         COALESCE(SUM(l.qualificados), 0)::int AS qualificados,
+         COALESCE(SUM(l.fechados), 0)::int AS fechados,
+         COUNT(DISTINCT g.usuario_id) FILTER (WHERE g.gasto > 0)::int AS contas_gasto,
+         COALESCE(SUM(g.gasto) FILTER (WHERE g.gasto > 0), 0)::float AS gasto,
+         COALESCE(SUM(l.leads) FILTER (WHERE g.gasto > 0), 0)::int AS leads_gasto,
+         COALESCE(SUM(g.cliques), 0)::float AS cliques,
+         COALESCE(SUM(g.impressoes), 0)::float AS impressoes
+       FROM leads_conta l
+       FULL OUTER JOIN gasto_conta g
+         ON g.usuario_id = l.usuario_id AND g.nicho_id = l.nicho_id AND g.plataforma = l.plataforma
+       INNER JOIN nichos n ON n.id = COALESCE(l.nicho_id, g.nicho_id)
+       GROUP BY n.slug, COALESCE(l.plataforma, g.plataforma)`,
+      [inicio, inicio.toISOString().slice(0, 10)]
+    );
+
+    const linhas: LinhaRedeBruta[] = result.rows.map((row: any) => ({
+      nicho: String(row.nicho),
+      plataforma: String(row.plataforma),
+      contas: Number(row.contas || 0),
+      leads: Number(row.leads || 0),
+      qualificados: Number(row.qualificados || 0),
+      fechados: Number(row.fechados || 0),
+      contas_gasto: Number(row.contas_gasto || 0),
+      gasto: Number(row.gasto || 0),
+      leads_gasto: Number(row.leads_gasto || 0),
+      cliques: Number(row.cliques || 0),
+      impressoes: Number(row.impressoes || 0),
+    }));
+
+    const dados = {
+      periodo_dias: RANKING_REDE_PERIODO_DIAS,
+      minimo_contas: MINIMO_CONTAS_REDE,
+      minimo_leads: MINIMO_LEADS_REDE,
+      atualizado_em: new Date().toISOString(),
+      nichos: calcularNotasRede(linhas),
+    };
+    rankingRedeCache = { expiraEm: Date.now() + RANKING_REDE_CACHE_MS, dados };
+    return c.json(dados);
+  } catch (err: any) {
+    console.error("ERRO RANKING DA REDE:", err);
+    return c.json({ error: "Erro ao calcular ranking da rede" }, 500);
+  }
+});
+
+// Guarda o gasto, cliques e impressões diários de cada conta por nicho e plataforma. As
+// plataformas só entregam esses números ao vivo, por conta; sem este histórico não
+// existe custo por lead da rede. Reaproveita as rotas /<plataforma>/performance-diaria
+// chamando-as internamente com o token da própria conta, então o filtro por nicho e as
+// regras de cada plataforma continuam sendo exatamente as do painel.
+async function atualizarSnapshotDesempenho(opcoes: { forcar?: boolean } = {}) {
+  if (snapshotDesempenhoEmAndamento) return { ignorado: "em andamento" };
+
+  if (!opcoes.forcar) {
+    if (Date.now() - snapshotDesempenhoUltimaTentativa < SNAPSHOT_DESEMPENHO_REPETIR_APOS_FALHA_MS) {
+      return { ignorado: "tentativa recente" };
+    }
+    const recente = await client.query(
+      `SELECT 1 FROM desempenho_diario_plataforma
+       WHERE atualizado_em > NOW() - ($1::int * INTERVAL '1 millisecond') LIMIT 1`,
+      [SNAPSHOT_DESEMPENHO_INTERVALO_MS]
+    );
+    if (recente.rows.length) return { ignorado: "ja atualizado hoje" };
+  }
+
+  snapshotDesempenhoEmAndamento = true;
+  snapshotDesempenhoUltimaTentativa = Date.now();
+  const inicioExecucao = Date.now();
+  let combinacoes = 0;
+  let gravados = 0;
+  let falhas = 0;
+
+  try {
+    const combos = await client.query(
+      `SELECT DISTINCT
+         c.usuario_id,
+         CASE
+           WHEN LOWER(COALESCE(c.plataforma, '')) IN ('meta', 'facebook', 'instagram') THEN 'meta'
+           WHEN LOWER(COALESCE(c.plataforma, '')) IN ('google', 'google_ads') THEN 'google'
+           WHEN LOWER(COALESCE(c.plataforma, '')) IN ('tiktok', 'tiktok_ads') THEN 'tiktok'
+           WHEN LOWER(COALESCE(c.plataforma, '')) IN ('linkedin', 'linkedin_ads') THEN 'linkedin'
+         END AS plataforma,
+         c.nicho_id
+       FROM campanhas c
+       INNER JOIN usuarios u ON u.id = c.usuario_id AND COALESCE(u.ativo, true) = true
+       WHERE c.usuario_id IS NOT NULL AND c.nicho_id IS NOT NULL
+         AND UPPER(COALESCE(c.status, '')) NOT IN ('DELETED', 'REMOVED')`
+    );
+    const alvos = combos.rows.filter((row: any) => row.plataforma);
+    combinacoes = alvos.length;
+    if (!alvos.length) return { combinacoes, gravados, falhas };
+
+    const jaTemHistorico = new Set(
+      (await client.query(
+        `SELECT DISTINCT usuario_id, plataforma, nicho_id FROM desempenho_diario_plataforma`
+      )).rows.map((row: any) => `${row.usuario_id}|${row.plataforma}|${row.nicho_id}`)
+    );
+
+    const usuariosResult = await client.query(
+      `SELECT id, email, tipo, nome, sobrenome, plano FROM usuarios WHERE id = ANY($1::int[])`,
+      [[...new Set(alvos.map((row: any) => Number(row.usuario_id)))]]
+    );
+    const usuarios = new Map<number, any>(usuariosResult.rows.map((row: any) => [Number(row.id), row]));
+
+    for (const alvo of alvos) {
+      if (Date.now() - inicioExecucao > SNAPSHOT_DESEMPENHO_LIMITE_EXECUCAO_MS) {
+        console.warn("SNAPSHOT DESEMPENHO: tempo limite atingido, o restante fica para a proxima execucao");
+        break;
+      }
+      const usuario = usuarios.get(Number(alvo.usuario_id));
+      if (!usuario) continue;
+
+      // Primeira vez de uma combinação busca 30 dias; depois só a última semana,
+      // que basta para corrigir números que as plataformas ajustam com atraso.
+      const periodo = jaTemHistorico.has(`${alvo.usuario_id}|${alvo.plataforma}|${alvo.nicho_id}`)
+        ? "semanal"
+        : "mensal";
+
+      try {
+        const resp = await app.request(
+          `/${alvo.plataforma}/performance-diaria?periodo=${periodo}&nicho_id=${alvo.nicho_id}`,
+          { headers: { Authorization: `Bearer ${criarTokenUsuario(usuario)}` } }
+        );
+        if (!resp.ok) {
+          falhas++;
+          continue;
+        }
+        const dias = extrairDiasDesempenho(await resp.json());
+        if (dias.length) {
+          await client.query(
+            `INSERT INTO desempenho_diario_plataforma
+               (usuario_id, plataforma, nicho_id, data, gasto, cliques, impressoes, atualizado_em)
+             SELECT $1::int, $2::text, $3::int, t.data, t.gasto, t.cliques, t.impressoes, NOW()
+             FROM unnest($4::date[], $5::numeric[], $6::int[], $7::bigint[])
+               AS t(data, gasto, cliques, impressoes)
+             ON CONFLICT (usuario_id, plataforma, nicho_id, data) DO UPDATE SET
+               gasto = EXCLUDED.gasto,
+               cliques = EXCLUDED.cliques,
+               impressoes = EXCLUDED.impressoes,
+               atualizado_em = NOW()`,
+            [
+              alvo.usuario_id,
+              alvo.plataforma,
+              alvo.nicho_id,
+              dias.map((d) => d.data),
+              dias.map((d) => d.gasto),
+              dias.map((d) => d.cliques),
+              dias.map((d) => d.impressoes),
+            ]
+          );
+          gravados += dias.length;
+        }
+      } catch (err: any) {
+        falhas++;
+        console.warn(`SNAPSHOT DESEMPENHO (${alvo.plataforma}, usuario ${alvo.usuario_id}):`, err?.message || err);
+      }
+      await new Promise((resolver) => setTimeout(resolver, 300));
+    }
+  } finally {
+    snapshotDesempenhoEmAndamento = false;
+    rankingRedeCache = null;
+  }
+
+  console.log(`SNAPSHOT DESEMPENHO: ${combinacoes} combinacoes, ${gravados} dias gravados, ${falhas} falhas`);
+  return { combinacoes, gravados, falhas };
+}
+
+// Só o super admin dispara a atualização na hora (a pesquisa e o histórico levam minutos,
+// então rodam em segundo plano) e acompanha o resultado.
+app.post("/admin/ranking-plataformas/atualizar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
+
+  const body: any = await c.req.json().catch(() => ({}));
+  const nicho = typeof body?.nicho === "string" && body.nicho.trim() ? body.nicho.trim().toLowerCase() : undefined;
+  const fazerMercado = body?.mercado !== false;
+  const fazerSnapshot = body?.snapshot !== false;
+
+  if (fazerMercado && rankingMercadoEmAndamento) {
+    return c.json({ error: "A pesquisa de mercado já está em andamento" }, 409);
+  }
+
+  void (async () => {
+    if (fazerMercado) await executarRankingMercado({ nichoSlug: nicho, forcar: true });
+    if (fazerSnapshot) await atualizarSnapshotDesempenho({ forcar: true });
+    rankingRedeCache = null;
+  })().catch((err) => console.error("ERRO ao atualizar ranking de plataformas:", err));
+
+  return c.json({ iniciado: true, mercado: fazerMercado, snapshot: fazerSnapshot, nicho: nicho || "todos" }, 202);
+});
+
+app.get("/admin/ranking-plataformas/status", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
+
+  try {
+    const [execucoes, mercado, snapshot] = await Promise.all([
+      client.query(
+        `SELECT nicho_slug, status, modelo, tokens_entrada, tokens_saida, custo_estimado, erro, criado_em
+         FROM ranking_mercado_execucoes ORDER BY id DESC LIMIT 30`
+      ),
+      client.query(
+        `SELECT nicho_slug, COUNT(*)::int AS plataformas, MAX(atualizado_em) AS atualizado_em
+         FROM ranking_mercado_nicho GROUP BY nicho_slug ORDER BY nicho_slug`
+      ),
+      client.query(
+        `SELECT COUNT(*)::int AS linhas, COUNT(DISTINCT usuario_id)::int AS contas,
+                MIN(data) AS primeiro_dia, MAX(data) AS ultimo_dia, MAX(atualizado_em) AS atualizado_em
+         FROM desempenho_diario_plataforma`
+      ),
+    ]);
+    return c.json({
+      pesquisa_em_andamento: rankingMercadoEmAndamento,
+      historico_em_andamento: snapshotDesempenhoEmAndamento,
+      mercado: mercado.rows,
+      historico_desempenho: snapshot.rows[0] || null,
+      execucoes: execucoes.rows,
+    });
+  } catch (err: any) {
+    console.error("ERRO STATUS RANKING PLATAFORMAS:", err);
+    return c.json({ error: "Erro ao consultar status do ranking" }, 500);
   }
 });
 
@@ -38609,6 +39193,42 @@ async function verificarAlertasRailway() {
 // Verifica a cada hora
 setInterval(verificarAlertasRailway, 60 * 60 * 1000);
 verificarAlertasRailway();
+
+// Ranking de plataformas: a cada 30 minutos confere se alguma nota de mercado passou de
+// 7 dias (a pesquisa com IA roda só para os nichos vencidos) e, às 4h de Brasília ou
+// quando o histórico de gasto ainda está vazio, grava o desempenho diário das contas.
+// RANKING_PLATAFORMAS_AUTO=0 desliga tudo; o super admin ainda pode disparar à mão.
+function agendarRankingPlataformas() {
+  if (Bun.env.RANKING_PLATAFORMAS_AUTO === "0") return;
+  const HORA_SNAPSHOT_BRT = 4;
+
+  const verificar = async () => {
+    if (Bun.env.OPENAI_API_KEY) {
+      try {
+        await executarRankingMercado();
+      } catch (err) {
+        console.error("ERRO agendador do ranking de mercado:", err);
+      }
+    }
+
+    try {
+      const horaBRT = (new Date().getUTCHours() - 3 + 24) % 24;
+      const historicoVazio =
+        (await client.query(`SELECT 1 FROM desempenho_diario_plataforma LIMIT 1`)).rows.length === 0;
+      if (horaBRT === HORA_SNAPSHOT_BRT || historicoVazio) {
+        await atualizarSnapshotDesempenho();
+      }
+    } catch (err) {
+      console.error("ERRO agendador do historico de desempenho:", err);
+    }
+  };
+
+  setInterval(verificar, 30 * 60 * 1000);
+  // Primeira checagem 2 minutos depois de subir, para o boot não competir com ela.
+  setTimeout(verificar, 2 * 60 * 1000);
+}
+
+agendarRankingPlataformas();
 
 
 /* =========================
