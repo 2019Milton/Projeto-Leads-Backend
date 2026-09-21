@@ -628,6 +628,28 @@ function sanitizarPalavraChaveGoogle(texto: unknown) {
     .trim();
 }
 
+type CorrespondenciaPalavraChaveGoogle = "BROAD" | "PHRASE" | "EXACT";
+
+// Palavra-chave digitada numa linha: [termo] = correspondência exata, "termo" = de frase e
+// sem marcação = ampla (o padrão de sempre). A marcação é lida ANTES da limpeza de
+// pontuação, que removeria os colchetes e as aspas.
+function interpretarPalavraChaveGoogle(
+  bruto: unknown
+): { texto: string; matchType: CorrespondenciaPalavraChaveGoogle } | null {
+  const original = String(bruto ?? "").trim();
+  const matchType: CorrespondenciaPalavraChaveGoogle =
+    /^\[[^\]]*\]$/.test(original) ? "EXACT" : /^"[^"]*"$/.test(original) ? "PHRASE" : "BROAD";
+  const texto = sanitizarPalavraChaveGoogle(original);
+  return texto ? { texto, matchType } : null;
+}
+
+// Volta ao formato digitável, pra a campanha salva manter a correspondência.
+function formatarPalavraChaveGoogleParaSalvar(
+  k: { texto: string; matchType: CorrespondenciaPalavraChaveGoogle }
+): string {
+  return k.matchType === "EXACT" ? `[${k.texto}]` : k.matchType === "PHRASE" ? `"${k.texto}"` : k.texto;
+}
+
 function escaparHtmlEmail(value: unknown) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -9426,11 +9448,15 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 
     const listaTitulos = (Array.isArray(titulos) ? titulos : []).map(textoOpcional).filter(Boolean);
     const listaDescricoes = (Array.isArray(descricoes) ? descricoes : []).map(textoOpcional).filter(Boolean);
-    const listaPalavrasChave = (Array.isArray(palavras_chave) ? palavras_chave : [])
-      .map(sanitizarPalavraChaveGoogle)
-      .filter(Boolean)
-      .filter((item, indice, todos) => todos.indexOf(item) === indice)
+    const palavrasChaveGoogle = (Array.isArray(palavras_chave) ? palavras_chave : [])
+      .map(interpretarPalavraChaveGoogle)
+      .filter((k): k is { texto: string; matchType: CorrespondenciaPalavraChaveGoogle } => k !== null)
+      .filter((item, indice, todos) =>
+        todos.findIndex((o) => o.texto === item.texto && o.matchType === item.matchType) === indice
+      )
       .slice(0, 20);
+    // O que fica salvo na campanha mantém a marcação ([exata], "frase").
+    const listaPalavrasChave = palavrasChaveGoogle.map(formatarPalavraChaveGoogleParaSalvar);
     const nomeAnunciante = textoOpcional(nome_anunciante);
     const url = urlOpcional(url_destino, "");
     const tituloLongo = textoOpcional(titulo_longo);
@@ -9600,13 +9626,20 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       // chamada (!, ?, etc — valida num titulo de anuncio, invalida numa keyword).
       // Display nao usa palavras-chave (segmentacao e por audiencia/publico, nao existe
       // esse conceito no formulario atual, entao esta etapa e pulada inteira).
-      const keywordOps: any[] = (listaPalavrasChave.length ? listaPalavrasChave : listaTitulos.map(sanitizarPalavraChaveGoogle).filter(Boolean))
+      const keywordOps: any[] = (
+        palavrasChaveGoogle.length
+          ? palavrasChaveGoogle
+          : listaTitulos
+              .map(sanitizarPalavraChaveGoogle)
+              .filter(Boolean)
+              .map((texto) => ({ texto, matchType: "BROAD" as CorrespondenciaPalavraChaveGoogle }))
+      )
         .slice(0, 20)
-        .map(texto => ({
+        .map(({ texto, matchType }) => ({
           create: {
             adGroup: adGroupResourceName,
             status: "ENABLED",
-            keyword: { text: texto, matchType: "BROAD" },
+            keyword: { text: texto, matchType },
           },
         }));
 
@@ -10361,7 +10394,7 @@ async function buscarDetalhesCampanhaGoogle(
                 LIMIT 200`)
     ),
     opcional("extensões", () =>
-      consulta(`SELECT campaign_asset.field_type, campaign_asset.status
+      consulta(`SELECT campaign_asset.field_type, campaign_asset.status, campaign_asset.asset
                 FROM campaign_asset
                 WHERE campaign.id = ${id} AND campaign_asset.status != 'REMOVED'`)
     ),
@@ -10475,11 +10508,16 @@ async function buscarDetalhesCampanhaGoogle(
   }).filter((k) => k.texto);
 
   const extensoes: Record<string, number> = {};
+  const formulariosLead: string[] = [];
   for (const item of (ativos ?? []) as any[]) {
     const tipo = String(item.campaignAsset?.fieldType ?? "");
     if (!tipo) continue;
     const rotulo = ROTULOS_EXTENSAO_GOOGLE[tipo] ?? tipo;
     extensoes[rotulo] = (extensoes[rotulo] ?? 0) + 1;
+    // Recurso do Lead Form (o mesmo valor que /google/formularios devolve em resource_name).
+    if (tipo === "LEAD_FORM" && item.campaignAsset?.asset) {
+      formulariosLead.push(String(item.campaignAsset.asset));
+    }
   }
 
   const c0 = (datas?.[0] as any)?.campaign ?? {};
@@ -10523,6 +10561,7 @@ async function buscarDetalhesCampanhaGoogle(
     total_palavras_chave: listaPalavras.length,
     palavras_chave: listaPalavras.slice(0, 30),
     extensoes,
+    formularios_lead: formulariosLead,
     // null = não deu pra ler as extensões (não confundir com "não tem formulário").
     formulario_lead_vinculado: ativos === null ? null : Boolean(extensoes["Formulário de lead"]),
     avisos,
@@ -37926,6 +37965,125 @@ app.post("/campanhas/manual", authMiddleware, async (c) => {
 });
 
 // duplicar uma campanha existente
+function normalizarNomeCampanhaParaComparar(nome: unknown): string {
+  return String(nome ?? "")
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+// Traduz os detalhes lidos do Google (buscarDetalhesCampanhaGoogle) pro rascunho do
+// construtor de campanha da plataforma. O construtor só faz: Pesquisa ou Display, 1 grupo
+// de anúncios + 1 anúncio responsivo, lance "maximizar conversões" sem meta (CPC manual
+// quando o destino é o site) e localização/idioma fixos (Brasil inteiro, português). Tudo
+// que ele não reproduz volta em "naoCopiado" pro usuário ver antes de publicar.
+function montarRascunhoGoogleDeCampanhaImportada(d: any):
+  | { ok: true; configuracoes: Record<string, any>; orcamentoDiario: number | null; copiado: string[]; naoCopiado: string[] }
+  | { ok: false; motivo: string } {
+  if (d?.tipo?.codigo !== "SEARCH") {
+    return {
+      ok: false,
+      motivo: `Campanhas do tipo ${d?.tipo?.label || "desconhecido"} ainda não podem ser copiadas do Google Ads — só as de Pesquisa.`,
+    };
+  }
+
+  const anuncios: any[] = Array.isArray(d.anuncios) ? d.anuncios : [];
+  const comTexto = (a: any) => (a?.titulos?.length ?? 0) >= 3 && (a?.descricoes?.length ?? 0) >= 2;
+  const anuncio =
+    anuncios.find((a) => comTexto(a) && a.status === "Ativa") ||
+    anuncios.find(comTexto) ||
+    anuncios.find((a) => (a?.titulos?.length ?? 0) > 0) ||
+    null;
+
+  const totalTitulos = anuncio?.titulos?.length ?? 0;
+  const totalDescricoes = anuncio?.descricoes?.length ?? 0;
+  const titulos: string[] = (anuncio?.titulos ?? []).slice(0, 3);
+  const descricoes: string[] = (anuncio?.descricoes ?? []).slice(0, 2);
+  const urlDestino: string = (anuncio?.urls ?? [])[0] ?? "";
+
+  // Palavras-chave positivas, mantendo a correspondência: [exata], "frase" ou ampla.
+  const marcar = (k: any) =>
+    k.correspondencia === "exata" ? `[${k.texto}]` : k.correspondencia === "frase" ? `"${k.texto}"` : k.texto;
+  const todasPalavras: any[] = Array.isArray(d.palavras_chave) ? d.palavras_chave : [];
+  const positivas = todasPalavras.filter((k) => !k.negativa && k.texto);
+  const palavrasChave: string[] = [...new Set(positivas.map(marcar))].slice(0, 20);
+
+  const temFormulario = d.formulario_lead_vinculado === true;
+  const formularioId: string | null = temFormulario ? (d.formularios_lead?.[0] ?? null) : null;
+  const destino = temFormulario ? "lead_ads" : "site";
+  const orcamentoDiario = Number(d.orcamento_diario) > 0 ? Number(d.orcamento_diario) : null;
+
+  const configuracoes: Record<string, any> = {
+    plataforma: "google",
+    plataformas: ["google"],
+    tipo_campanha: "search",
+    destino,
+    titulos,
+    descricoes,
+    url_destino: urlDestino,
+    palavras_chave: palavrasChave,
+    ...(formularioId
+      ? { formulario_id: formularioId, formulario_valor: formularioId, form_id: formularioId }
+      : {}),
+    duplicada_de_google: { campaign_id: String(d.campaign_id ?? ""), nome: d.nome ?? null },
+  };
+
+  const copiado: string[] = [];
+  if (orcamentoDiario !== null) copiado.push(`Orçamento diário (R$ ${orcamentoDiario.toFixed(2).replace(".", ",")})`);
+  if (titulos.length) copiado.push(`Títulos (${titulos.length})`);
+  if (descricoes.length) copiado.push(`Descrições (${descricoes.length})`);
+  if (urlDestino) copiado.push("Link de destino");
+  if (palavrasChave.length) copiado.push(`Palavras-chave (${palavrasChave.length}), com correspondência exata, de frase ou ampla`);
+  if (formularioId) copiado.push("Formulário de lead");
+
+  const naoCopiado: string[] = [];
+  if (!titulos.length) {
+    naoCopiado.push("Títulos e descrições (o anúncio não é do tipo responsivo ou não pôde ser lido) — preencha no rascunho");
+  } else if (totalTitulos > 3 || totalDescricoes > 2) {
+    naoCopiado.push("Títulos e descrições além dos 3 e 2 que o formulário aceita");
+  }
+  if ((d.total_anuncios ?? 0) > 1 || (d.total_grupos_anuncios ?? 0) > 1) {
+    naoCopiado.push("Outros anúncios e grupos de anúncios (a cópia terá 1 grupo e 1 anúncio)");
+  }
+  if (todasPalavras.some((k) => k.negativa)) naoCopiado.push("Palavras-chave negativas");
+  if (temFormulario && !formularioId) naoCopiado.push("Formulário de lead (escolha um no rascunho)");
+
+  const locais: any[] = Array.isArray(d.localidades) ? d.localidades : [];
+  const soBrasil = locais.length > 0 && locais.every((l) => l.nome === "Brasil" && !l.excluida);
+  if (!soBrasil) {
+    const nomes = locais.map((l) => (l.excluida ? `${l.nome} (excluída)` : l.nome)).slice(0, 8).join(", ");
+    naoCopiado.push(
+      nomes
+        ? `Localização: a cópia roda no Brasil inteiro (a original segmenta: ${nomes})`
+        : "Localização: a cópia roda no Brasil inteiro (não foi possível ler a da original)"
+    );
+  }
+  const idiomasDiferentes = (Array.isArray(d.idiomas) ? d.idiomas : []).filter((i: any) => i.nome !== "Português");
+  if (idiomasDiferentes.length) {
+    naoCopiado.push(`Idioma: a cópia usa português (a original também usa: ${idiomasDiferentes.map((i: any) => i.nome).join(", ")})`);
+  }
+
+  // Lance do construtor: CPC manual quando o destino é o site; senão, maximizar conversões sem meta.
+  const lanceCopia = destino === "site" ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS";
+  const lanceCopiaRotulo = destino === "site" ? "CPC manual" : "Maximizar conversões (sem meta)";
+  const lanceIgual = d.lance?.codigo === lanceCopia && !d.lance?.meta_cpa && !d.lance?.meta_roas;
+  if (!lanceIgual) {
+    const meta = d.lance?.meta_cpa ? ` com CPA desejado R$ ${Number(d.lance.meta_cpa).toFixed(2).replace(".", ",")}` : "";
+    naoCopiado.push(`Estratégia de lance: a original usa "${d.lance?.label || "não identificada"}"${meta}; a cópia usa "${lanceCopiaRotulo}"`);
+  }
+
+  const outrasExtensoes = Object.entries(d.extensoes ?? {})
+    .filter(([nome]) => nome !== "Formulário de lead")
+    .map(([nome, qtd]) => `${nome}: ${qtd}`);
+  if (outrasExtensoes.length) naoCopiado.push(`Extensões (${outrasExtensoes.join(", ")})`);
+  if (d.data_fim) naoCopiado.push(`Data de término (${String(d.data_fim).split("-").reverse().join("/")})`);
+  naoCopiado.push("Qualquer outra configuração da original (públicos, horários, ajustes por dispositivo etc.)");
+
+  return { ok: true, configuracoes, orcamentoDiario, copiado, naoCopiado };
+}
+
 app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -37962,6 +38120,32 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
 
     const novoNome = body.nome?.trim() || `Cópia de ${orig.nome}`;
 
+    // Google: o nome da cópia precisa ser diferente do da original e de qualquer outra
+    // campanha Google do usuário nessa conta. (O Google exige nome único; a plataforma já
+    // acrescenta um sufixo interno ao publicar, mas o nome que o usuário vê tem que ser distinto.)
+    if (plataformaOrigem === "google") {
+      const nomeNormalizado = normalizarNomeCampanhaParaComparar(novoNome);
+      if (nomeNormalizado === normalizarNomeCampanhaParaComparar(orig.nome)) {
+        return c.json({ error: "O nome da cópia precisa ser diferente do nome da campanha original." }, 409);
+      }
+      const mesmaConta = await client.query(
+        `SELECT nome FROM campanhas
+         WHERE usuario_id = $1 AND plataforma = 'google'
+           AND COALESCE(conta_anuncios_id, '') = COALESCE($2, '')
+           AND UPPER(COALESCE(status, '')) NOT IN ('REMOVED', 'DELETED')
+           AND id <> $3`,
+        [user.id, orig.conta_anuncios_id ?? null, campanhaId]
+      );
+      const conflito = mesmaConta.rows.find(
+        (r: any) => normalizarNomeCampanhaParaComparar(r.nome) === nomeNormalizado
+      );
+      if (conflito) {
+        return c.json({
+          error: `Já existe uma campanha com esse nome nesta conta do Google Ads: "${conflito.nome}". Escolha um nome diferente.`
+        }, 409);
+      }
+    }
+
     // Destino (Lead Ads vs WhatsApp) pode ser trocado no duplicar — é o único
     // jeito de "converter" uma campanha já rodando, já que a Meta não deixa
     // editar destination_type de um Ad Set em atividade. Sem escolha explícita,
@@ -37974,13 +38158,41 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
       destino: destinoEscolhido
     };
 
+    let configuracoesFinais: Record<string, any> = configuracoesNovas;
+    let dailyBudgetFinal = orig.daily_budget ?? null;
+    let copiado: string[] = [];
+    let naoCopiado: string[] = [];
+    let avisoCopia: string | null = null;
+
+    // Campanha do Google criada direto no Google Ads (importada): a plataforma só tem nome,
+    // status e ID, então a cópia sairia vazia. A configuração real é lida do Google (a mesma
+    // do Detalhes) e traduzida pro que o construtor de campanha consegue reproduzir.
+    if (campanhaGoogleImportadaSemEdicaoDireta(orig)) {
+      const detalhes = await obterDetalhesCampanhaGoogleDoUsuario(
+        Number(user.id), String(orig.campaign_id)
+      ).catch(() => null);
+      if (!detalhes || !detalhes.ok) {
+        avisoCopia = "Não foi possível ler a configuração desta campanha no Google Ads agora, então o rascunho foi criado só com o nome. Tente duplicar de novo em instantes.";
+      } else {
+        const montado = montarRascunhoGoogleDeCampanhaImportada(detalhes.dados);
+        if (!montado.ok) {
+          avisoCopia = `${montado.motivo} O rascunho foi criado só com o nome.`;
+        } else {
+          configuracoesFinais = { ...configuracoesNovas, ...montado.configuracoes };
+          dailyBudgetFinal = montado.orcamentoDiario ?? dailyBudgetFinal;
+          copiado = montado.copiado;
+          naoCopiado = montado.naoCopiado;
+        }
+      }
+    }
+
     const novaRes = await client.query(
       `INSERT INTO campanhas
          (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, conta_anuncios_id, plataforma)
        VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, $7)
        RETURNING id`,
-      [user.id, novoNome, orig.nicho_id ?? null, orig.daily_budget ?? null,
-       JSON.stringify(configuracoesNovas), orig.conta_anuncios_id ?? null, orig.plataforma || "meta"]
+      [user.id, novoNome, orig.nicho_id ?? null, dailyBudgetFinal,
+       JSON.stringify(configuracoesFinais), orig.conta_anuncios_id ?? null, orig.plataforma || "meta"]
     );
     const novaId = novaRes.rows[0].id;
 
@@ -37991,7 +38203,18 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
       orig.nicho_slug
     );
 
-    return c.json({ id: novaId });
+    return c.json({
+      id: novaId,
+      ...(copiado.length || naoCopiado.length
+        ? {
+            copiado,
+            nao_copiado: naoCopiado,
+            aviso_publicacao:
+              "Ao publicar, será criada uma campanha NOVA no Google Ads (novo ID, gasto real; o histórico e o aprendizado do lance recomeçam). A campanha original continua rodando — pause-a se não quiser gastar em dobro.",
+          }
+        : {}),
+      ...(avisoCopia ? { aviso: avisoCopia } : {}),
+    });
   } catch (err) {
     console.error("ERRO POST /campanhas/:id/duplicar:", err);
     return c.json({ error: "Erro ao duplicar campanha" }, 500);
