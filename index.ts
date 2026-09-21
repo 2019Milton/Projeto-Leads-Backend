@@ -26151,6 +26151,9 @@ type MetricasCampanhaExterna = {
   gasto_hoje: number;
   cpc: number;
   ctr: number;
+  // Só o Google preenche (conversões principais, ver carregarMetricasGoogleCampanhas).
+  conversoes?: number;
+  valor_conversoes?: number;
   grafico: Array<{
     data: string;
     clicks: number;
@@ -26218,6 +26221,7 @@ async function carregarMetricasGoogleCampanhas(
   disponivel: boolean;
   erro: string | null;
   metricas: Map<string, MetricasCampanhaExterna>;
+  conversoesDisponiveis?: boolean;
 }> {
   const metricas = new Map<string, MetricasCampanhaExterna>();
 
@@ -26299,8 +26303,36 @@ async function carregarMetricasGoogleCampanhas(
       console.warn("AVISO MÉTRICA ALCANCE GOOGLE:", err?.message || err);
     }
 
+    // Conversões do Google Ads (metrics.conversions só soma as ações marcadas
+    // como principais — "incluir em conversões"; as secundárias ficam em
+    // all_conversions e não entram aqui). Consulta separada e best-effort, como
+    // o alcance: se falhar, as demais métricas continuam válidas e
+    // conversoesDisponiveis fica false (o front não mostra o card).
+    let conversoesDisponiveis = false;
+    try {
+      const conversoesResultados = await googleAdsQuery(
+        String(customerId),
+        accessToken,
+        `SELECT campaign.id, metrics.conversions, metrics.conversions_value
+         FROM campaign
+         WHERE segments.date BETWEEN '${inicio}' AND '${fim}'`,
+        loginCustomerId
+      );
+      for (const item of conversoesResultados as any[]) {
+        const campaignId = String(item.campaign?.id || "");
+        if (!campaignId) continue;
+        const atual = metricas.get(campaignId) || metricasCampanhaVazias();
+        atual.conversoes = Number(item.metrics?.conversions || 0);
+        atual.valor_conversoes = Number(item.metrics?.conversionsValue || 0);
+        metricas.set(campaignId, atual);
+      }
+      conversoesDisponiveis = true;
+    } catch (err: any) {
+      console.warn("AVISO MÉTRICA CONVERSÕES GOOGLE:", err?.message || err);
+    }
+
     for (const valor of metricas.values()) finalizarMetricasCampanha(valor);
-    return { disponivel: true, erro: null, metricas };
+    return { disponivel: true, erro: null, metricas, conversoesDisponiveis };
   } catch (err: any) {
     console.error("ERRO MÉTRICAS GOOGLE CAMPANHAS:", err);
     return {
@@ -26891,6 +26923,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       let gastoHojeCampanha = 0;
       let metaDisponivel = false;
       let erroMeta: string | null = null;
+      // Conversões principais do Google Ads (30 dias); null nas outras plataformas
+      // e quando a consulta de conversões falhou.
+      let conversoesGoogle: { conversoes: number; valor: number; custoPorConversao: number | null } | null = null;
 
       const plataformaCampanha = String(campanha.plataforma || "meta").toLowerCase();
 
@@ -26953,6 +26988,14 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           grafico = metrica.grafico;
           gastoHojeCampanha = metrica.gasto_hoje;
           metaDisponivel = true;
+          if (metricasGoogle.conversoesDisponiveis) {
+            const conversoes = Number(metrica.conversoes || 0);
+            conversoesGoogle = {
+              conversoes,
+              valor: Number(metrica.valor_conversoes || 0),
+              custoPorConversao: conversoes > 0 ? metrica.gasto / conversoes : null,
+            };
+          }
         } else {
           erroMeta = metricasGoogle.erro;
         }
@@ -27214,6 +27257,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         gasto_hoje: gastoHojeCampanha,
         cpc: dados.cpc || 0,
         ctr: dados.ctr || 0,
+
+        // Conversões que o Google Ads contabiliza (só ações principais). Não se
+        // somam aos leads abaixo: um lead do formulário pode ser também uma conversão.
+        conversoes_google: conversoesGoogle ? conversoesGoogle.conversoes : null,
+        valor_conversoes_google: conversoesGoogle ? conversoesGoogle.valor : null,
+        custo_por_conversao_google: conversoesGoogle ? conversoesGoogle.custoPorConversao : null,
 
         // 🔥 agora vem da sua plataforma
         leads: totalLeadsBanco,
@@ -28436,6 +28485,42 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
       } catch (_) {}
     }
 
+    // Conversões principais da CONTA INTEIRA (não só das campanhas criadas aqui): o cliente
+    // já tem conversões configuradas no Google Ads antes de conectar. Só quando o painel de
+    // performance pede (?conversoes=1) pra não gastar uma chamada extra na API a cada carga
+    // de ranking/dashboard. metrics.conversions só soma ações marcadas como principais.
+    // Não respeita o filtro de nicho (a conta não tem essa divisão). Best-effort: se falhar,
+    // o resto da performance continua válido.
+    let conversoesConta: {
+      escopo: "conta";
+      conversoes: number;
+      valor: number;
+      gasto: number;
+      custo_por_conversao: number | null;
+    } | null = null;
+    if (c.req.query("conversoes") === "1") {
+      try {
+        const conversoesResultados = await googleAdsQuery(
+          customerId, accessToken,
+          `SELECT metrics.cost_micros, metrics.conversions, metrics.conversions_value
+           FROM customer WHERE segments.date BETWEEN '${since}' AND '${until}'`,
+          loginCustomerId
+        );
+        const metricasConta = (conversoesResultados[0] as any)?.metrics ?? {};
+        const conversoes = Number(metricasConta.conversions || 0);
+        const gastoConta = Number(metricasConta.costMicros || 0) / 1_000_000;
+        conversoesConta = {
+          escopo: "conta",
+          conversoes,
+          valor: Number(metricasConta.conversionsValue || 0),
+          gasto: gastoConta,
+          custo_por_conversao: conversoes > 0 ? gastoConta / conversoes : null,
+        };
+      } catch (errConversoes: any) {
+        console.warn("AVISO CONVERSÕES GOOGLE (performance-diaria):", errConversoes?.message || errConversoes);
+      }
+    }
+
     const leadsBanco = await client.query(
       `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
        FROM leads WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads') AND criado_em >= $2
@@ -28487,6 +28572,7 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
       resumo,
       dias: diasPerformance,
       registros,
+      conversoes_google: conversoesConta,
     });
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA GOOGLE:", err);
