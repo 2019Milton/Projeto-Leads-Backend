@@ -13859,6 +13859,28 @@ function linkedinHeaders(token: string) {
   };
 }
 
+// Query do /adAnalytics no formato Rest.li 2.0: os delimitadores estruturais
+// — ( ) : , — vão literais e só os ":" dentro da URN são codificados
+// (urn%3Ali%3A...). URLSearchParams codifica tudo (%28 %3A ...) e o LinkedIn
+// responde "Invalid query parameters passed to request".
+function montarQueryAdAnalytics(opts: {
+  pivot: string;
+  adAccountId: string | number;
+  inicio: { ano: number; mes: number; dia: number };
+  fim: { ano: number; mes: number; dia: number };
+  fields: string;
+}): string {
+  const { inicio, fim } = opts;
+  return [
+    "q=analytics",
+    `pivot=${opts.pivot}`,
+    "timeGranularity=DAILY",
+    `dateRange=(start:(year:${inicio.ano},month:${inicio.mes},day:${inicio.dia}),end:(year:${fim.ano},month:${fim.mes},day:${fim.dia}))`,
+    `accounts=List(urn%3Ali%3AsponsoredAccount%3A${encodeURIComponent(String(opts.adAccountId))})`,
+    `fields=${opts.fields}`,
+  ].join("&");
+}
+
 // Wrapper fino equivalente ao tiktokFetch — além do envelope de erro,
 // extrai o id do recurso criado. ASSUMPTION: a API REST do LinkedIn (padrão
 // Rest.li) devolve o id no header x-restli-id em criações — algumas versões
@@ -14225,18 +14247,14 @@ app.get("/linkedin/status-completo", authMiddleware, async (c) => {
       const hoje = new Date();
       const amanha = new Date(hoje);
       amanha.setUTCDate(amanha.getUTCDate() + 1);
-      const params = new URLSearchParams({
-        q: "analytics",
+      const query = montarQueryAdAnalytics({
         pivot: "ACCOUNT",
-        accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
-        timeGranularity: "DAILY",
+        adAccountId,
+        inicio: { ano: hoje.getUTCFullYear(), mes: hoje.getUTCMonth() + 1, dia: hoje.getUTCDate() },
+        fim: { ano: amanha.getUTCFullYear(), mes: amanha.getUTCMonth() + 1, dia: amanha.getUTCDate() },
         fields: "dateRange,impressions,clicks,costInLocalCurrency",
       });
-      params.set(
-        "dateRange",
-        `(start:(year:${hoje.getUTCFullYear()},month:${hoje.getUTCMonth() + 1},day:${hoje.getUTCDate()}),end:(year:${amanha.getUTCFullYear()},month:${amanha.getUTCMonth() + 1},day:${amanha.getUTCDate()}))`
-      );
-      const analytics = await linkedinFetch(`/adAnalytics?${params.toString()}`, token);
+      const analytics = await linkedinFetch(`/adAnalytics?${query}`, token);
       if (analytics.ok) {
         gastoHoje = (analytics.data?.elements || []).reduce(
           (total: number, item: any) => total + Number(item.costInLocalCurrency || 0),
@@ -26361,19 +26379,15 @@ async function carregarMetricasLinkedInCampanhas(
     const [anoI, mesI, diaI] = inicio.split("-").map(Number);
     const [anoF, mesF, diaF] = fim.split("-").map(Number);
 
-    const params = new URLSearchParams({
-      q: "analytics",
+    const query = montarQueryAdAnalytics({
       pivot: "CAMPAIGN_GROUP",
-      accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
-      timeGranularity: "DAILY",
+      adAccountId,
+      inicio: { ano: anoI, mes: mesI, dia: diaI },
+      fim: { ano: anoF, mes: mesF, dia: diaF },
       fields: "pivotValues,impressions,clicks,costInLocalCurrency,dateRange",
     });
-    params.set(
-      "dateRange",
-      `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
-    );
 
-    const resposta = await linkedinFetch(`/adAnalytics?${params.toString().replace(/%2C/gi, ",")}`, accessToken);
+    const resposta = await linkedinFetch(`/adAnalytics?${query}`, accessToken);
     if (!resposta.ok) {
       return { disponivel: false, erro: resposta.error || "Métricas indisponíveis no LinkedIn Ads", metricas };
     }
@@ -28044,19 +28058,15 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
     if (campaignIdsUsuario.size > 0) {
       const [anoI, mesI, diaI] = since.split("-").map(Number);
       const [anoF, mesF, diaF] = until.split("-").map(Number);
-      const params = new URLSearchParams({
-        q: "analytics",
+      const query = montarQueryAdAnalytics({
         pivot: "CAMPAIGN_GROUP",
-        accounts: `List(urn:li:sponsoredAccount:${adAccountId})`,
-        timeGranularity: "DAILY",
+        adAccountId,
+        inicio: { ano: anoI, mes: mesI, dia: diaI },
+        fim: { ano: anoF, mes: mesF, dia: diaF },
         fields: "pivotValues,impressions,clicks,costInLocalCurrency,dateRange",
       });
-      params.set(
-        "dateRange",
-        `(start:(year:${anoI},month:${mesI},day:${diaI}),end:(year:${anoF},month:${mesF},day:${diaF}))`
-      );
 
-      const resposta = await linkedinFetch(`/adAnalytics?${params.toString().replace(/%2C/gi, ",")}`, accessToken);
+      const resposta = await linkedinFetch(`/adAnalytics?${query}`, accessToken);
       if (!resposta.ok) {
         return c.json({ error: resposta.error || "Erro ao buscar performance diaria do LinkedIn Ads" }, 400);
       }
