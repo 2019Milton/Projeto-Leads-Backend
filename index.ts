@@ -28968,6 +28968,110 @@ async function buscarConversoesContaGoogle(
   };
 }
 
+// Gasto e conversões de cada campanha da conta no período — base do painel "Onde
+// otimizar" da aba IA & Performance. Campanhas removidas ficam de fora.
+async function buscarCampanhasParaOtimizacaoGoogle(
+  customerId: string,
+  accessToken: string,
+  loginCustomerId: string | null,
+  inicio: string,
+  fim: string
+) {
+  const resultados = await googleAdsQuery(
+    customerId, accessToken,
+    `SELECT campaign.id, campaign.name, campaign.status, metrics.cost_micros, metrics.conversions
+     FROM campaign
+     WHERE segments.date BETWEEN '${inicio}' AND '${fim}'
+       AND campaign.status != 'REMOVED'`,
+    loginCustomerId
+  );
+  return (resultados as any[])
+    .map((item) => ({
+      id: String(item.campaign?.id ?? ""),
+      nome: String(item.campaign?.name ?? ""),
+      status: String(item.campaign?.status ?? ""),
+      gasto: Number(item.metrics?.costMicros || 0) / 1_000_000,
+      conversoes: Number(item.metrics?.conversions || 0),
+    }))
+    .filter((c) => c.id);
+}
+
+// Regras do painel "Onde otimizar": compara o custo por conversão de cada campanha com o
+// da conta. Só campanhas com gasto relevante entram na comparação (as demais não têm dado
+// pra concluir nada). Não olha qualidade de lead — só as conversões que o Google conta.
+const OTIMIZACAO_FATOR_RUIM = 2;     // custo por conversão >= 2x a média da conta
+const OTIMIZACAO_FATOR_BOM = 0.7;    // custo por conversão <= 70% da média da conta
+const OTIMIZACAO_MAX_LINHAS = 12;    // acima disso mostra as 8 piores + as 4 melhores
+
+function classificarCampanhasGoogleParaOtimizacao(
+  linhas: Array<{ id: string; nome: string; status: string; gasto: number; conversoes: number }>,
+  mediaConta: number | null
+) {
+  const comMovimento = linhas.filter((l) => l.gasto > 0 || l.conversoes > 0);
+  const totalGasto = comMovimento.reduce((soma, l) => soma + l.gasto, 0);
+  const totalConversoes = comMovimento.reduce((soma, l) => soma + l.conversoes, 0);
+  const media =
+    mediaConta && mediaConta > 0
+      ? mediaConta
+      : totalConversoes > 0 ? totalGasto / totalConversoes : null;
+  // Abaixo disso a campanha ainda não gastou o bastante pra ser comparada.
+  const gastoMinimo = Math.max(10, totalGasto * 0.01);
+  // Conta sem nenhuma conversão: provavelmente o acompanhamento não está configurado —
+  // marcar todas como "ruins" seria enganoso, então não classifica ninguém.
+  const semConversoesNaConta = totalConversoes === 0;
+
+  type Sinal = "ruim" | "bom" | "neutro" | "sem_conversao";
+  const comparadas: Array<{
+    id: string; nome: string; status: string; pausada: boolean; gasto: number;
+    conversoes: number; custo_por_conversao: number | null; fator_vs_media: number | null; sinal: Sinal;
+  }> = [];
+  let poucoDado = 0;
+
+  for (const l of comMovimento) {
+    if (l.gasto < gastoMinimo) {
+      poucoDado++;
+      continue;
+    }
+    const custo = l.conversoes > 0 ? l.gasto / l.conversoes : null;
+    const fator = custo !== null && media ? custo / media : null;
+    let sinal: Sinal = "neutro";
+    if (!semConversoesNaConta) {
+      if (l.conversoes === 0) sinal = "sem_conversao";
+      else if (fator !== null && fator >= OTIMIZACAO_FATOR_RUIM) sinal = "ruim";
+      else if (fator !== null && fator <= OTIMIZACAO_FATOR_BOM) sinal = "bom";
+    }
+    comparadas.push({
+      id: l.id, nome: l.nome, status: l.status, pausada: l.status === "PAUSED",
+      gasto: l.gasto, conversoes: l.conversoes,
+      custo_por_conversao: custo, fator_vs_media: fator, sinal,
+    });
+  }
+
+  // Do pior pro melhor: sem conversão primeiro (mais gasto primeiro), depois maior custo.
+  comparadas.sort((a, b) => {
+    const aSem = a.custo_por_conversao === null;
+    const bSem = b.custo_por_conversao === null;
+    if (aSem !== bSem) return aSem ? -1 : 1;
+    if (aSem && bSem) return b.gasto - a.gasto;
+    return (b.custo_por_conversao as number) - (a.custo_por_conversao as number);
+  });
+
+  const parcial = comparadas.length > OTIMIZACAO_MAX_LINHAS;
+  const campanhas = parcial
+    ? [...comparadas.slice(0, 8), ...comparadas.slice(-4)]
+    : comparadas;
+
+  return {
+    media_custo_por_conversao: media,
+    sem_conversoes_na_conta: semConversoesNaConta,
+    total_com_gasto: comMovimento.length,
+    total_comparadas: comparadas.length,
+    total_pouco_dado: poucoDado,
+    mostrando_parcial: parcial,
+    campanhas,
+  };
+}
+
 // Resumo de 30 dias exibido na aba IA & Performance, que atualiza a cada 30s:
 // guarda o resultado em memória por alguns minutos pra não chamar a API do Google
 // a cada atualização. Falha também é guardada (por menos tempo) pra uma conta com
@@ -29001,15 +29105,28 @@ async function obterConversoesGoogleResumoComCache(
   const base = { periodo_dias: 30, periodo_inicio: periodo.inicio, periodo_fim: periodo.fim };
   try {
     const accessToken = await obterAccessTokenGoogle(refreshToken);
-    const conversoes = await buscarConversoesContaGoogle(
-      customerId, accessToken, loginCustomerId, periodo.inicio, periodo.fim
-    );
-    const dados = { ...base, conversoes };
+    const [conversoes, linhasCampanhas] = await Promise.all([
+      buscarConversoesContaGoogle(
+        customerId, accessToken, loginCustomerId, periodo.inicio, periodo.fim
+      ),
+      // Best-effort: se só essa consulta falhar, a faixa de conversões continua e o painel
+      // "Onde otimizar" simplesmente não aparece.
+      buscarCampanhasParaOtimizacaoGoogle(
+        customerId, accessToken, loginCustomerId, periodo.inicio, periodo.fim
+      ).catch((errCampanhas: any) => {
+        console.warn("AVISO OTIMIZAÇÃO GOOGLE (campanhas):", errCampanhas?.message || errCampanhas);
+        return null;
+      }),
+    ]);
+    const otimizacao = linhasCampanhas
+      ? classificarCampanhasGoogleParaOtimizacao(linhasCampanhas, conversoes.custo_por_conversao)
+      : null;
+    const dados = { ...base, conversoes, otimizacao };
     cacheConversoesGoogle.set(chave, { expira: agora + CACHE_CONVERSOES_GOOGLE_OK_MS, dados });
     return { ...dados, em_cache: false };
   } catch (err: any) {
     console.warn("AVISO CONVERSÕES GOOGLE (resumo):", err?.message || err);
-    const dados = { ...base, conversoes: null };
+    const dados = { ...base, conversoes: null, otimizacao: null };
     cacheConversoesGoogle.set(chave, { expira: agora + CACHE_CONVERSOES_GOOGLE_FALHA_MS, dados });
     return { ...dados, em_cache: false };
   }
