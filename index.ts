@@ -6399,6 +6399,7 @@ const OAUTH_PROVEDORES: Record<string, {
   authUrl: string;
   tokenUrl: string;
   scope: string;
+  scopeConversoes?: string;
   clientIdEnv: string;
   clientSecretEnv: string;
   redirectUriEnv: string;
@@ -6407,11 +6408,18 @@ const OAUTH_PROVEDORES: Record<string, {
   google: {
     authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
     tokenUrl: "https://oauth2.googleapis.com/token",
-    // datamanager: necessario pra enviar eventos de qualificacao/fechamento
-    // de lead via Data Manager API (ver enviarEventoGoogleAdsConversionLeads)
-    // — contas conectadas antes de 16/09/2026 nao tem esse escopo no
-    // refresh_token e precisam reconectar pra ganhar ele.
-    scope: "https://www.googleapis.com/auth/adwords https://www.googleapis.com/auth/datamanager",
+    // A conexao padrao pede so o adwords (ja aprovado pelo Google). O escopo
+    // datamanager (envio de eventos de qualificacao/fechamento de lead via Data
+    // Manager API — ver enviarEventoGoogleAdsConversionLeads) fica em
+    // scopeConversoes e so entra na URL de login quando
+    // GOOGLE_ADS_PEDIR_DATAMANAGER=1 ou /auth/google/login?conversoes=1.
+    // Motivo: pedir os dois juntos fez o Google bloquear a tela de consentimento
+    // ("Este app esta bloqueado") pra qualquer usuario, porque o datamanager ainda
+    // nao passou pela verificacao do app. Depois que o Google aprovar, definir
+    // GOOGLE_ADS_PEDIR_DATAMANAGER=1 — contas conectadas sem ele precisam
+    // reconectar pra ganhar o escopo.
+    scope: "https://www.googleapis.com/auth/adwords",
+    scopeConversoes: "https://www.googleapis.com/auth/datamanager",
     clientIdEnv: "GOOGLE_ADS_CLIENT_ID",
     clientSecretEnv: "GOOGLE_ADS_CLIENT_SECRET",
     redirectUriEnv: "GOOGLE_ADS_REDIRECT_URI",
@@ -6537,6 +6545,13 @@ app.get("/auth/:plataforma/login", async (c) => {
     // padrao OAuth2 client_id/response_type/scope usado pelas outras
     // plataformas. Ver tambem o branch tiktok no /callback abaixo (token
     // exchange e nome do parametro de retorno tambem sao diferentes).
+    const pedirEscopoConversoes =
+      !!cfg.scopeConversoes &&
+      (Bun.env.GOOGLE_ADS_PEDIR_DATAMANAGER === "1" || c.req.query("conversoes") === "1");
+    const scopeSolicitado = pedirEscopoConversoes
+      ? `${cfg.scope} ${cfg.scopeConversoes}`
+      : cfg.scope;
+
     const params =
       plataforma === "tiktok"
         ? new URLSearchParams({
@@ -6548,7 +6563,7 @@ app.get("/auth/:plataforma/login", async (c) => {
             client_id: clientId,
             redirect_uri: redirectUri,
             response_type: "code",
-            scope: cfg.scope,
+            scope: scopeSolicitado,
             state,
             ...(cfg.extraAuthParams || {}),
           });
@@ -7791,8 +7806,15 @@ async function enviarEventoGoogleAdsConversionLeads(
     const data = await res.json() as any;
 
     if (!res.ok || data?.error) {
-      const erro = data?.error?.message || "Erro ao enviar conversão para o Google Ads (Data Manager API)";
       console.error(`CONVERSION LEADS GOOGLE (${eventName}) erro:`, JSON.stringify(data));
+      // Conexao feita sem o escopo datamanager (ver OAUTH_PROVEDORES.google):
+      // a Google responde 403 "insufficient authentication scopes".
+      const semEscopoDataManager =
+        res.status === 403 &&
+        /insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT/i.test(JSON.stringify(data));
+      const erro = semEscopoDataManager
+        ? "Esta conexão do Google Ads ainda não tem a permissão de envio de conversões (Data Manager). Reconecte o Google Ads para ativá-la."
+        : data?.error?.message || "Erro ao enviar conversão para o Google Ads (Data Manager API)";
       return { ok: false, erro };
     }
 
