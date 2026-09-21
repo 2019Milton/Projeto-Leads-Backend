@@ -27655,6 +27655,9 @@ app.get("/plataformas/ranking-rede", authMiddleware, async (c) => {
            )) AS origem_normalizada,
            LOWER(COALESCE(l.status, 'novo')) AS status
          FROM leads l
+         -- leads.usuario_id não tem chave estrangeira: excluir o usuário deixa os leads
+         -- no banco. O join garante que só contas existentes entram na rede.
+         INNER JOIN usuarios u ON u.id = l.usuario_id
          WHERE l.criado_em >= $1 AND l.nicho_id IS NOT NULL
        ), leads_normalizados AS (
          SELECT
