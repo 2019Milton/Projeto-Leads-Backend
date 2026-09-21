@@ -15242,13 +15242,20 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
 app.post("/linkedin/editar-campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const { usuario_id, campanha_local_id, campaign_id, nome, daily_budget, nicho_id } = await c.req.json();
+    const {
+      usuario_id, campanha_local_id, campaign_id, nome, daily_budget, nicho_id,
+      configuracoes_avancadas,
+    } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
 
     const nomeSolicitado = textoOpcional(nome);
     const dailyBudgetValor = numeroOpcional(daily_budget);
+    const configuracoesPersistidas =
+      configuracoes_avancadas && typeof configuracoes_avancadas === "object"
+        ? configuracoes_avancadas
+        : {};
     if (!nomeSolicitado) return c.json({ error: "Nome da campanha é obrigatório" }, 400);
     if (!dailyBudgetValor || dailyBudgetValor <= 0) return c.json({ error: "Orçamento diário é obrigatório" }, 400);
 
@@ -15272,9 +15279,21 @@ app.post("/linkedin/editar-campanha", authMiddleware, async (c) => {
     // Rascunho local (falhou antes de publicar de verdade) — só atualiza o banco.
     if (!campanhaLocal.campaign_id) {
       await client.query(
-        `UPDATE campanhas SET nome = $1, daily_budget = $2, nicho_id = COALESCE($3, nicho_id), atualizado_em = NOW()
-         WHERE id = $4 AND usuario_id = $5 AND plataforma = 'linkedin'`,
-        [nomeSolicitado, dailyBudgetValor, numeroOpcional(nicho_id), campanhaLocal.id, usuarioId]
+        `UPDATE campanhas
+         SET nome = $1,
+             daily_budget = $2,
+             nicho_id = COALESCE($3, nicho_id),
+             configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $4::jsonb,
+             atualizado_em = NOW()
+         WHERE id = $5 AND usuario_id = $6 AND plataforma = 'linkedin'`,
+        [
+          nomeSolicitado,
+          dailyBudgetValor,
+          numeroOpcional(nicho_id),
+          JSON.stringify(configuracoesPersistidas),
+          campanhaLocal.id,
+          usuarioId,
+        ]
       );
       return c.json({ sucesso: true });
     }
@@ -15309,9 +15328,21 @@ app.post("/linkedin/editar-campanha", authMiddleware, async (c) => {
     }
 
     await client.query(
-      `UPDATE campanhas SET nome = $1, daily_budget = $2, nicho_id = COALESCE($3, nicho_id), atualizado_em = NOW()
-       WHERE id = $4 AND usuario_id = $5 AND plataforma = 'linkedin'`,
-      [nomeSolicitado, dailyBudgetValor, numeroOpcional(nicho_id), campanhaLocal.id, usuarioId]
+      `UPDATE campanhas
+       SET nome = $1,
+           daily_budget = $2,
+           nicho_id = COALESCE($3, nicho_id),
+           configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb) || $4::jsonb,
+           atualizado_em = NOW()
+       WHERE id = $5 AND usuario_id = $6 AND plataforma = 'linkedin'`,
+      [
+        nomeSolicitado,
+        dailyBudgetValor,
+        numeroOpcional(nicho_id),
+        JSON.stringify(configuracoesPersistidas),
+        campanhaLocal.id,
+        usuarioId,
+      ]
     );
 
     return c.json({ sucesso: true });
