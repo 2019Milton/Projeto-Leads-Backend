@@ -4282,6 +4282,49 @@ async function gerarSugestaoComercialOpenAI(
 // independentes da mesma campanha, como dois gestores de tráfego revisando
 // o mesmo painel, para reduzir o risco de uma recomendação de um único
 // modelo passar sem crítica.
+// Resumo enxuto dos detalhes lidos do Google Ads (ver buscarDetalhesCampanhaGoogle)
+// pra caber no prompt da IA: corta listas e textos longos.
+function resumirDetalhesGoogleParaIA(d: any) {
+  const texto = (v: unknown, max = 140) => String(v ?? "").slice(0, max);
+  const lista = (v: unknown, max: number, tamanho = 120) =>
+    Array.isArray(v) ? v.slice(0, max).map((x) => texto(x, tamanho)) : [];
+  return {
+    tipo_campanha: d?.tipo?.label ?? null,
+    estrategia_de_lance: d?.lance?.label ?? null,
+    meta_cpa: d?.lance?.meta_cpa ?? null,
+    meta_roas: d?.lance?.meta_roas ?? null,
+    orcamento_diario: d?.orcamento_diario ?? null,
+    data_inicio: d?.data_inicio ?? null,
+    data_fim: d?.data_fim ?? null,
+    redes: d?.redes ?? null,
+    localidades: Array.isArray(d?.localidades)
+      ? d.localidades.slice(0, 30).map((l: any) =>
+          l?.excluida ? `${texto(l?.nome, 80)} (excluida)` : texto(l?.nome, 80)
+        )
+      : [],
+    idiomas: Array.isArray(d?.idiomas) ? d.idiomas.slice(0, 10).map((i: any) => texto(i?.nome, 40)) : [],
+    grupos_de_anuncios: d?.total_grupos_anuncios ?? null,
+    anuncios: Array.isArray(d?.anuncios)
+      ? d.anuncios.slice(0, 3).map((a: any) => ({
+          tipo: texto(a?.tipo, 60),
+          titulos: lista(a?.titulos, 15, 60),
+          descricoes: lista(a?.descricoes, 4, 120),
+          urls_finais: lista(a?.urls, 3, 160)
+        }))
+      : [],
+    total_anuncios: d?.total_anuncios ?? null,
+    palavras_chave: Array.isArray(d?.palavras_chave)
+      ? d.palavras_chave.slice(0, 30).map((k: any) =>
+          `${texto(k?.texto, 60)} [${texto(k?.correspondencia, 10)}]${k?.negativa ? " (negativa)" : ""}`
+        )
+      : [],
+    total_palavras_chave: d?.total_palavras_chave ?? null,
+    extensoes: d?.extensoes ?? null,
+    formulario_de_lead_vinculado: d?.formulario_lead_vinculado ?? null,
+    secoes_nao_lidas: Array.isArray(d?.avisos) ? d.avisos.slice(0, 10) : []
+  };
+}
+
 function construirContextoCampanhaIA(campanha: any) {
   const cfg = campanha?.configuracoes_avancadas || {};
   const plataformaCampanha = campanha?.plataforma || "meta";
@@ -4312,10 +4355,31 @@ function construirContextoCampanhaIA(campanha: any) {
     conversoesGoogle !== null && conversoesGoogle > 0
       ? Number((gasto / conversoesGoogle).toFixed(2))
       : null;
+  // Configuração real lida agora do Google Ads (campanha criada fora da plataforma,
+  // sem configurações salvas aqui) — ver obterDetalhesCampanhaGoogleDoUsuario. A
+  // rota sempre a busca no servidor e descarta qualquer valor vindo do navegador.
+  const detalhesGoogle =
+    plataformaCampanha === "google" &&
+    campanha?.detalhes_google &&
+    typeof campanha.detalhes_google === "object"
+      ? campanha.detalhes_google
+      : null;
+  const orcamentoGoogle =
+    detalhesGoogle && Number(detalhesGoogle.orcamento_diario) > 0
+      ? Number(detalhesGoogle.orcamento_diario)
+      : null;
   const orcamentoDiario =
-    campanha?.daily_budget ? Number(campanha.daily_budget) / 100 : null;
+    campanha?.daily_budget ? Number(campanha.daily_budget) / 100 : orcamentoGoogle;
 
-  const criadoEm = campanha?.criado_em ? new Date(campanha.criado_em) : null;
+  // criado_em é quando a campanha entrou na plataforma (importação), não o início
+  // real — pra Google usa a data de início lida do próprio Google Ads.
+  const inicioGoogle = detalhesGoogle?.data_inicio
+    ? new Date(`${String(detalhesGoogle.data_inicio).slice(0, 10)}T00:00:00`)
+    : null;
+  const criadoEm =
+    inicioGoogle && !Number.isNaN(inicioGoogle.getTime())
+      ? inicioGoogle
+      : campanha?.criado_em ? new Date(campanha.criado_em) : null;
   const diasAtiva =
     criadoEm && !Number.isNaN(criadoEm.getTime())
       ? Math.max(1, Math.round((Date.now() - criadoEm.getTime()) / 86_400_000))
@@ -4324,9 +4388,13 @@ function construirContextoCampanhaIA(campanha: any) {
   const cpl = leads > 0 ? Number((gasto / leads).toFixed(2)) : null;
   const frequencia =
     alcance > 0 ? Number((impressoes / alcance).toFixed(2)) : null;
+  // O gasto acima é o dos últimos 30 dias: com o início real do Google (campanha que
+  // pode ter anos), o orçamento projetado também precisa ser limitado a 30 dias.
+  const diasParaPacing =
+    detalhesGoogle && diasAtiva !== null ? Math.min(diasAtiva, 30) : diasAtiva;
   const orcamentoProjetado =
-    orcamentoDiario !== null && diasAtiva !== null
-      ? Number((orcamentoDiario * diasAtiva).toFixed(2))
+    orcamentoDiario !== null && diasParaPacing !== null
+      ? Number((orcamentoDiario * diasParaPacing).toFixed(2))
       : null;
   const pacingPercentual =
     orcamentoProjetado && orcamentoProjetado > 0
@@ -4419,7 +4487,10 @@ function construirContextoCampanhaIA(campanha: any) {
     cronograma: {
       inicio: cfg.inicio || null,
       fim: cfg.fim || null
-    }
+    },
+    ...(detalhesGoogle
+      ? { configuracao_no_google_ads: resumirDetalhesGoogleParaIA(detalhesGoogle) }
+      : {})
   };
 }
 
@@ -4461,6 +4532,10 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
     contexto.desempenho_periodo_30d.conversoes_google !== undefined
       ? "Os dados incluem conversoes_google e custo_por_conversao_google: sao conversoes contabilizadas pelo proprio Google Ads (somente acoes de conversao marcadas como principais, como formulario, ligacao ou clique no WhatsApp), e nao pela plataforma. Trate como uma metrica separada dos leads: nunca some conversoes com leads e nao compare os dois como se fossem a mesma coisa (um lead do formulario pode ser tambem uma conversao). Quando a campanha tiver poucos leads salvos na plataforma mas tiver conversoes no Google, use custo_por_conversao_google como a referencia principal de custo por resultado e diga de onde vem o numero; se conversoes_google for 0, avalie se o acompanhamento de conversoes esta configurado antes de concluir que a campanha nao performa. "
       : "";
+  const clausulaConfiguracaoGoogle =
+    contexto.configuracao_no_google_ads !== undefined
+      ? "Os dados incluem configuracao_no_google_ads: e a configuracao REAL da campanha, lida agora direto do Google Ads (a campanha foi criada fora da plataforma, entao nao ha configuracoes salvas aqui). Use isso para auditar tipo de campanha, estrategia de lance e meta, orcamento, localidades, idiomas, anuncios (titulos, descricoes, URLs finais), palavras-chave (correspondencia, excesso de palavras amplas, ausencia de negativas) e extensoes. Nao trate como ausentes a segmentacao, o criativo ou o formulario que aparecem nulos ou vazios nos outros blocos: eles apenas nao estao salvos na plataforma. Se uma informacao nao estiver em configuracao_no_google_ads, nao invente. Em formulario_de_lead_vinculado, false significa que os leads dessa campanha nao chegam a plataforma, so as conversoes contabilizadas pelo Google. "
+      : "";
 
   const systemMsg =
     `IDIOMA OBRIGATORIO: escreva TODA a resposta em portugues do Brasil (pt-BR) — todo texto de todo campo do JSON, sem excecao. Nunca responda em ingles ou em qualquer outro idioma. Siglas do mercado de midia paga (${siglasPermitidas}) podem ser mantidas como estao, mas todas as frases ao redor delas devem ser em portugues. ` +
@@ -4469,6 +4544,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
     "Considere tambem quantos dias a campanha esta ativa e quantos leads/impressoes ja existem: com poucos dias ou poucos dados, deixe claro que e cedo para conclusoes fortes e recomende continuar coletando dados antes de mudancas bruscas, em vez de sugerir uma acao agressiva baseada em amostra pequena. " +
     `De recomendacoes concretas e priorizadas (o que fazer primeiro, o que testar, o que NAO mexer ainda) pensando sempre em gerar mais leads pelo menor custo possivel, considerando tanto as configuracoes atuais quanto os ajustes que poderiam ser feitos e ainda nao foram (ex: reduzir perguntas do formulario, ${clausulaAjusteCbo}testar novo criativo, ampliar ou restringir publico, ajustar orcamento). Use somente os dados reais recebidos, nunca invente metricas, nomes ou configuracoes que nao foram informadas. ` +
     clausulaConversoesGoogle +
+    clausulaConfiguracaoGoogle +
     "Lembrete final: a resposta inteira (titulo, resumo, diagnostico, acao_principal, mensagens, motivos, campos, recomendacoes) deve estar em portugues do Brasil, com linguagem direta e profissional, sem emojis.";
 
   const schemaProperties = {
@@ -9692,6 +9768,19 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
 // ter uma janela sem nenhum anuncio ativo). Espelha /meta/editar-campanha:
 // rascunho local so grava no banco; publicada bloqueia troca de tipo/destino;
 // falha no texto do anuncio nao derruba nome/orcamento (aviso, nao erro).
+// Campanha do Google importada (origem = a própria rede) que ainda não tem grupo de
+// anúncios/anúncio salvos aqui — é o caso de toda campanha vinda só da sincronização.
+function campanhaGoogleImportadaSemEdicaoDireta(campanhaLocal: any): boolean {
+  if (!campanhaLocal) return false;
+  return (
+    String(campanhaLocal.plataforma || "").toLowerCase() === "google" &&
+    !campanhaTemOrigemNativa(campanhaLocal.origem) &&
+    Boolean(campanhaLocal.campaign_id) &&
+    !campanhaLocal.adset_id &&
+    !campanhaLocal.ad_id
+  );
+}
+
 app.post("/google/editar-campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -9719,6 +9808,18 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
     if (campanhaLocal && String(campanhaLocal.plataforma || "").toLowerCase() !== "google") {
       return c.json({
         error: "Esta edição pertence a outra plataforma e não pode ser processada pelo Google Ads"
+      }, 409);
+    }
+
+    // Campanha criada direto no Google Ads e sincronizada pra ca: a sincronizacao so
+    // grava nome/status/IDs, entao adset_id/ad_id ficam vazios — e o teste de rascunho
+    // logo abaixo a trataria como "rascunho local": salvaria so no banco, sem alterar
+    // nada no Google, e zeraria o campaign_id (a proxima sincronizacao duplicaria a
+    // campanha e a copia local viraria um rascunho publicavel). Edicao real de
+    // campanha importada ainda nao existe — o usuario edita no Google Ads.
+    if (campanhaGoogleImportadaSemEdicaoDireta(campanhaLocal)) {
+      return c.json({
+        error: "Esta campanha foi criada direto no Google Ads e ainda não pode ser editada por aqui. Para alterar, use o Google Ads. Os detalhes dela, lidos direto do Google, continuam disponíveis na engrenagem (Detalhes)."
       }, 409);
     }
 
@@ -10075,6 +10176,435 @@ app.post("/google/excluir-campanha", authMiddleware, async (c) => {
 // consulta, nunca cria nem altera nada no Google Ads.
 // ASSUMPTION: assume no máximo 1 grupo de anúncios não removido por campanha — é o que o
 // próprio /google/adgroup sempre produz e o que se espera de campanhas simples de Pesquisa.
+/* =========================
+   🔴 GOOGLE ADS — DETALHES DE CAMPANHA (SOMENTE LEITURA)
+   Campanhas criadas direto no Google Ads e sincronizadas pra cá chegam só com nome,
+   status e ID (sem configurações salvas). Aqui a configuração real é lida do próprio
+   Google Ads — só consultas, nada é alterado lá. Cada seção é independente: se uma
+   consulta falhar, as outras continuam e o nome da seção vai em "avisos".
+========================= */
+
+const ROTULOS_TIPO_CAMPANHA_GOOGLE: Record<string, string> = {
+  SEARCH: "Pesquisa",
+  DISPLAY: "Display",
+  SHOPPING: "Shopping",
+  VIDEO: "Vídeo",
+  PERFORMANCE_MAX: "Performance Max",
+  DEMAND_GEN: "Geração de demanda",
+  SMART: "Inteligente",
+  LOCAL: "Local",
+  LOCAL_SERVICES: "Serviços locais",
+  HOTEL: "Hotel",
+  TRAVEL: "Viagens",
+  MULTI_CHANNEL: "Aplicativo",
+};
+
+const ROTULOS_LANCE_GOOGLE: Record<string, string> = {
+  MAXIMIZE_CONVERSIONS: "Maximizar conversões",
+  MAXIMIZE_CONVERSION_VALUE: "Maximizar valor de conversão",
+  TARGET_CPA: "CPA desejado",
+  TARGET_ROAS: "ROAS desejado",
+  TARGET_SPEND: "Maximizar cliques",
+  MANUAL_CPC: "CPC manual",
+  MANUAL_CPM: "CPM manual",
+  MANUAL_CPV: "CPV manual",
+  TARGET_CPM: "CPM desejado",
+  TARGET_CPV: "CPV desejado",
+  TARGET_IMPRESSION_SHARE: "Parcela de impressões desejada",
+  PERCENT_CPC: "CPC percentual",
+  COMMISSION: "Comissão",
+};
+
+const ROTULOS_STATUS_GOOGLE: Record<string, string> = {
+  ENABLED: "Ativa",
+  PAUSED: "Pausada",
+  REMOVED: "Removida",
+};
+
+const ROTULOS_CORRESPONDENCIA_GOOGLE: Record<string, string> = {
+  EXACT: "exata",
+  PHRASE: "frase",
+  BROAD: "ampla",
+};
+
+const ROTULOS_ANUNCIO_GOOGLE: Record<string, string> = {
+  RESPONSIVE_SEARCH_AD: "Pesquisa responsivo",
+  EXPANDED_TEXT_AD: "Texto expandido",
+  RESPONSIVE_DISPLAY_AD: "Display responsivo",
+  CALL_ONLY_AD: "Somente ligação",
+  IMAGE_AD: "Imagem",
+  VIDEO_RESPONSIVE_AD: "Vídeo responsivo",
+};
+
+const ROTULOS_EXTENSAO_GOOGLE: Record<string, string> = {
+  LEAD_FORM: "Formulário de lead",
+  SITELINK: "Sitelinks",
+  CALLOUT: "Textos de destaque",
+  CALL: "Ligação",
+  STRUCTURED_SNIPPET: "Snippets estruturados",
+  PROMOTION: "Promoções",
+  PRICE: "Preços",
+  IMAGE: "Imagens",
+  BUSINESS_NAME: "Nome da empresa",
+  BUSINESS_LOGO: "Logotipo",
+  MOBILE_APP: "Aplicativo",
+};
+
+// Nomes que dispensam a consulta de tradução (Brasil / idiomas comuns).
+const LOCAIS_GOOGLE_CONHECIDOS: Record<string, string> = {
+  "geoTargetConstants/2076": "Brasil",
+};
+const IDIOMAS_GOOGLE_CONHECIDOS: Record<string, string> = {
+  "languageConstants/1014": "Português",
+  "languageConstants/1000": "Inglês",
+  "languageConstants/1003": "Espanhol",
+};
+
+function rotuloGoogle(mapa: Record<string, string>, codigo: unknown): string | null {
+  const c = String(codigo ?? "").trim();
+  if (!c) return null;
+  return mapa[c] ?? c;
+}
+
+// "2025-11-29 00:00:00" → "2025-11-29". A Google Ads API usa 2037-12-30 como
+// "sem data de término".
+function dataDoGoogle(valor: unknown, ehFim = false): string | null {
+  const m = String(valor ?? "").match(/^\d{4}-\d{2}-\d{2}/);
+  if (!m) return null;
+  if (ehFim && m[0] === "2037-12-30") return null;
+  return m[0];
+}
+
+async function buscarDetalhesCampanhaGoogle(
+  customerId: string,
+  accessToken: string,
+  loginCustomerId: string | null,
+  campaignId: string
+) {
+  const id = String(campaignId).replace(/\D/g, "");
+  if (!id) throw new Error("campaign_id inválido");
+
+  const consulta = (gaql: string) =>
+    googleAdsQuery(customerId, accessToken, gaql, loginCustomerId);
+  const avisos: string[] = [];
+  const opcional = async <T>(secao: string, fn: () => Promise<T>): Promise<T | null> => {
+    try {
+      return await fn();
+    } catch (err: any) {
+      console.warn(`AVISO DETALHES CAMPANHA GOOGLE (${secao}):`, err?.message || err);
+      avisos.push(secao);
+      return null;
+    }
+  };
+
+  // Principal: sem ele não há o que mostrar, então o erro sobe pra quem chamou.
+  const principal = await consulta(
+    `SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type,
+            campaign.bidding_strategy_type, campaign_budget.amount_micros
+     FROM campaign
+     WHERE campaign.id = ${id}`
+  );
+  if (!principal.length) return null;
+  const camp = (principal[0] as any).campaign ?? {};
+  const orcamentoMicros = Number((principal[0] as any).campaignBudget?.amountMicros ?? 0);
+  const tipoCodigo = String(camp.advertisingChannelType ?? "");
+  const lanceCodigo = String(camp.biddingStrategyType ?? "");
+
+  const [datas, redes, metaLance, criterios, grupos, anuncios, palavras, ativos] = await Promise.all([
+    opcional("datas", () =>
+      consulta(`SELECT campaign.start_date_time, campaign.end_date_time
+                FROM campaign WHERE campaign.id = ${id}`)
+    ),
+    opcional("redes", () =>
+      consulta(`SELECT campaign.network_settings.target_google_search,
+                       campaign.network_settings.target_search_network,
+                       campaign.network_settings.target_content_network
+                FROM campaign WHERE campaign.id = ${id}`)
+    ),
+    opcional("meta do lance", () =>
+      consulta(`SELECT campaign.target_cpa.target_cpa_micros,
+                       campaign.maximize_conversions.target_cpa_micros,
+                       campaign.target_roas.target_roas,
+                       campaign.maximize_conversion_value.target_roas
+                FROM campaign WHERE campaign.id = ${id}`)
+    ),
+    opcional("localidades e idiomas", () =>
+      consulta(`SELECT campaign_criterion.type, campaign_criterion.negative,
+                       campaign_criterion.location.geo_target_constant,
+                       campaign_criterion.language.language_constant
+                FROM campaign_criterion
+                WHERE campaign.id = ${id}
+                  AND campaign_criterion.type IN ('LOCATION', 'LANGUAGE')`)
+    ),
+    opcional("grupos de anúncios", () =>
+      consulta(`SELECT ad_group.id, ad_group.name, ad_group.status
+                FROM ad_group
+                WHERE campaign.id = ${id} AND ad_group.status != 'REMOVED'
+                LIMIT 50`)
+    ),
+    opcional("anúncios", () =>
+      consulta(`SELECT ad_group.id, ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status,
+                       ad_group_ad.ad.final_urls,
+                       ad_group_ad.ad.responsive_search_ad.headlines,
+                       ad_group_ad.ad.responsive_search_ad.descriptions
+                FROM ad_group_ad
+                WHERE campaign.id = ${id} AND ad_group_ad.status != 'REMOVED'
+                LIMIT 30`)
+    ),
+    opcional("palavras-chave", () =>
+      consulta(`SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,
+                       ad_group_criterion.negative, ad_group_criterion.status
+                FROM ad_group_criterion
+                WHERE campaign.id = ${id}
+                  AND ad_group_criterion.type = 'KEYWORD'
+                  AND ad_group_criterion.status != 'REMOVED'
+                LIMIT 200`)
+    ),
+    opcional("extensões", () =>
+      consulta(`SELECT campaign_asset.field_type, campaign_asset.status
+                FROM campaign_asset
+                WHERE campaign.id = ${id} AND campaign_asset.status != 'REMOVED'`)
+    ),
+  ]);
+
+  // Display: os textos ficam em outro campo do anúncio.
+  const anunciosDisplay =
+    tipoCodigo === "DISPLAY"
+      ? await opcional("anúncios display", () =>
+          consulta(`SELECT ad_group_ad.ad.id, ad_group_ad.ad.responsive_display_ad.headlines,
+                           ad_group_ad.ad.responsive_display_ad.long_headline,
+                           ad_group_ad.ad.responsive_display_ad.descriptions,
+                           ad_group_ad.ad.responsive_display_ad.business_name
+                    FROM ad_group_ad
+                    WHERE campaign.id = ${id} AND ad_group_ad.status != 'REMOVED'
+                    LIMIT 30`)
+        )
+      : null;
+
+  // Localidades e idiomas: o critério traz só o ID do recurso — os nomes vêm de uma
+  // segunda consulta (também opcional; sem ela cai no nome conhecido ou no ID).
+  const linhasLocal: Array<{ recurso: string; excluida: boolean }> = [];
+  const linhasIdioma: string[] = [];
+  for (const item of (criterios ?? []) as any[]) {
+    const crit = item.campaignCriterion ?? {};
+    if (crit.location?.geoTargetConstant) {
+      linhasLocal.push({ recurso: String(crit.location.geoTargetConstant), excluida: Boolean(crit.negative) });
+    } else if (crit.language?.languageConstant) {
+      linhasIdioma.push(String(crit.language.languageConstant));
+    }
+  }
+
+  const nomesRecursos = new Map<string, string>();
+  const buscarNomes = async (
+    secao: string,
+    recursos: string[],
+    padrao: RegExp,
+    recurso: "geo_target_constant" | "language_constant"
+  ) => {
+    const validos = [...new Set(recursos)].filter((r) => padrao.test(r));
+    if (!validos.length) return;
+    const lista = validos.map((r) => `'${r}'`).join(", ");
+    const linhas = await opcional(secao, () =>
+      consulta(`SELECT ${recurso}.resource_name, ${recurso}.name FROM ${recurso}
+                WHERE ${recurso}.resource_name IN (${lista})`)
+    );
+    for (const l of (linhas ?? []) as any[]) {
+      const dados = recurso === "geo_target_constant" ? l.geoTargetConstant : l.languageConstant;
+      if (dados?.resourceName && dados?.name) nomesRecursos.set(String(dados.resourceName), String(dados.name));
+    }
+  };
+  await Promise.all([
+    buscarNomes(
+      "nomes das localidades",
+      linhasLocal.map((l) => l.recurso).filter((r) => !LOCAIS_GOOGLE_CONHECIDOS[r]),
+      /^geoTargetConstants\/\d+$/,
+      "geo_target_constant"
+    ),
+    buscarNomes(
+      "nomes dos idiomas",
+      linhasIdioma.filter((r) => !IDIOMAS_GOOGLE_CONHECIDOS[r]),
+      /^languageConstants\/\d+$/,
+      "language_constant"
+    ),
+  ]);
+
+  const localidades = linhasLocal.map((l) => ({
+    nome: LOCAIS_GOOGLE_CONHECIDOS[l.recurso] ?? nomesRecursos.get(l.recurso) ?? `Local ${l.recurso.split("/").pop()}`,
+    excluida: l.excluida,
+  }));
+  const idiomas = linhasIdioma.map((r) => ({
+    nome: IDIOMAS_GOOGLE_CONHECIDOS[r] ?? nomesRecursos.get(r) ?? `Idioma ${r.split("/").pop()}`,
+  }));
+
+  // Anúncios: junta os textos de Pesquisa responsivo (e Display, quando houver).
+  const textosDisplay = new Map<string, any>();
+  for (const item of (anunciosDisplay ?? []) as any[]) {
+    const ad = item.adGroupAd?.ad;
+    if (ad?.id) textosDisplay.set(String(ad.id), ad.responsiveDisplayAd ?? {});
+  }
+  const listaAnuncios = ((anuncios ?? []) as any[]).map((item) => {
+    const ad = item.adGroupAd?.ad ?? {};
+    const rsa = ad.responsiveSearchAd ?? {};
+    const rda = textosDisplay.get(String(ad.id)) ?? {};
+    const titulos = [
+      ...(rsa.headlines ?? []).map((h: any) => h?.text),
+      ...(rda.headlines ?? []).map((h: any) => h?.text),
+      rda.longHeadline?.text,
+    ].filter(Boolean);
+    const descricoes = [
+      ...(rsa.descriptions ?? []).map((d: any) => d?.text),
+      ...(rda.descriptions ?? []).map((d: any) => d?.text),
+    ].filter(Boolean);
+    return {
+      grupo_id: item.adGroup?.id ? String(item.adGroup.id) : null,
+      tipo: rotuloGoogle(ROTULOS_ANUNCIO_GOOGLE, ad.type),
+      status: rotuloGoogle(ROTULOS_STATUS_GOOGLE, item.adGroupAd?.status),
+      titulos: titulos.map(String),
+      descricoes: descricoes.map(String),
+      urls: (ad.finalUrls ?? []).map(String),
+    };
+  });
+
+  const listaPalavras = ((palavras ?? []) as any[]).map((item) => {
+    const kw = item.adGroupCriterion ?? {};
+    return {
+      texto: String(kw.keyword?.text ?? ""),
+      correspondencia: rotuloGoogle(ROTULOS_CORRESPONDENCIA_GOOGLE, kw.keyword?.matchType),
+      negativa: Boolean(kw.negative),
+    };
+  }).filter((k) => k.texto);
+
+  const extensoes: Record<string, number> = {};
+  for (const item of (ativos ?? []) as any[]) {
+    const tipo = String(item.campaignAsset?.fieldType ?? "");
+    if (!tipo) continue;
+    const rotulo = ROTULOS_EXTENSAO_GOOGLE[tipo] ?? tipo;
+    extensoes[rotulo] = (extensoes[rotulo] ?? 0) + 1;
+  }
+
+  const c0 = (datas?.[0] as any)?.campaign ?? {};
+  const r0 = (redes?.[0] as any)?.campaign?.networkSettings ?? null;
+  const l0 = (metaLance?.[0] as any)?.campaign ?? {};
+  const metaCpaMicros = Number(l0.targetCpa?.targetCpaMicros ?? l0.maximizeConversions?.targetCpaMicros ?? 0);
+  const metaRoas = Number(l0.targetRoas?.targetRoas ?? l0.maximizeConversionValue?.targetRoas ?? 0);
+
+  return {
+    campaign_id: id,
+    nome: camp.name ?? null,
+    status: camp.status ?? null,
+    status_label: rotuloGoogle(ROTULOS_STATUS_GOOGLE, camp.status),
+    tipo: { codigo: tipoCodigo || null, label: rotuloGoogle(ROTULOS_TIPO_CAMPANHA_GOOGLE, tipoCodigo) },
+    lance: {
+      codigo: lanceCodigo || null,
+      label: rotuloGoogle(ROTULOS_LANCE_GOOGLE, lanceCodigo),
+      meta_cpa: metaCpaMicros > 0 ? metaCpaMicros / 1_000_000 : null,
+      meta_roas: metaRoas > 0 ? metaRoas : null,
+    },
+    orcamento_diario: orcamentoMicros > 0 ? orcamentoMicros / 1_000_000 : null,
+    data_inicio: dataDoGoogle(c0.startDateTime),
+    data_fim: dataDoGoogle(c0.endDateTime, true),
+    redes: r0
+      ? {
+          pesquisa: r0.targetGoogleSearch ?? null,
+          parceiros_pesquisa: r0.targetSearchNetwork ?? null,
+          display: r0.targetContentNetwork ?? null,
+        }
+      : null,
+    localidades,
+    idiomas,
+    total_grupos_anuncios: ((grupos ?? []) as any[]).length,
+    grupos_anuncios: ((grupos ?? []) as any[]).slice(0, 10).map((g) => ({
+      id: g.adGroup?.id ? String(g.adGroup.id) : null,
+      nome: g.adGroup?.name ?? null,
+      status: rotuloGoogle(ROTULOS_STATUS_GOOGLE, g.adGroup?.status),
+    })),
+    total_anuncios: listaAnuncios.length,
+    anuncios: listaAnuncios.slice(0, 5),
+    total_palavras_chave: listaPalavras.length,
+    palavras_chave: listaPalavras.slice(0, 30),
+    extensoes,
+    // null = não deu pra ler as extensões (não confundir com "não tem formulário").
+    formulario_lead_vinculado: ativos === null ? null : Boolean(extensoes["Formulário de lead"]),
+    avisos,
+    lido_em: new Date().toISOString(),
+  };
+}
+
+const CACHE_DETALHES_CAMPANHA_GOOGLE_MS = 5 * 60 * 1000;
+const cacheDetalhesCampanhaGoogle = new Map<string, { expira: number; dados: any }>();
+
+// Detalhes de UMA campanha da conta Google conectada do usuário. Confere que a campanha
+// pertence a ele (mesma regra de /google/campanha-status) e guarda o resultado por
+// poucos minutos — o drawer de Detalhes e a análise por IA usam a mesma leitura.
+async function obterDetalhesCampanhaGoogleDoUsuario(
+  usuarioId: number,
+  campaignId: string
+): Promise<{ ok: true; dados: any } | { ok: false; status: 400 | 404 | 409 | 502; erro: string }> {
+  const idLimpo = String(campaignId ?? "").replace(/\D/g, "");
+  if (!idLimpo) return { ok: false, status: 400, erro: "campaign_id inválido" };
+  if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+    return { ok: false, status: 400, erro: "Google Ads não configurado" };
+  }
+
+  const chave = `${usuarioId}:${idLimpo}`;
+  const emCache = cacheDetalhesCampanhaGoogle.get(chave);
+  if (emCache && emCache.expira > Date.now()) return { ok: true, dados: emCache.dados };
+
+  const conexao = await resolverConexaoGoogleAds(usuarioId);
+  if ("erro" in conexao) return { ok: false, status: 400, erro: conexao.erro };
+
+  const campanhaBanco = await client.query(
+    `SELECT id FROM campanhas
+     WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+       AND conta_anuncios_id = $3
+     LIMIT 1`,
+    [idLimpo, usuarioId, conexao.customerId]
+  );
+  if (!campanhaBanco.rows.length) {
+    return { ok: false, status: 409, erro: erroCampanhaOutraConta("Google Ads") };
+  }
+
+  try {
+    const dados = await buscarDetalhesCampanhaGoogle(
+      conexao.customerId, conexao.accessToken, conexao.loginCustomerId, idLimpo
+    );
+    if (!dados) {
+      return {
+        ok: false,
+        status: 404,
+        erro: "Esta campanha não existe mais nesta conta do Google Ads. Sincronize novamente para atualizar sua lista de campanhas.",
+      };
+    }
+
+    if (cacheDetalhesCampanhaGoogle.size > 500) {
+      const agora = Date.now();
+      for (const [k, v] of cacheDetalhesCampanhaGoogle) {
+        if (v.expira <= agora) cacheDetalhesCampanhaGoogle.delete(k);
+      }
+    }
+    cacheDetalhesCampanhaGoogle.set(chave, { expira: Date.now() + CACHE_DETALHES_CAMPANHA_GOOGLE_MS, dados });
+    return { ok: true, dados };
+  } catch (err: any) {
+    console.error("ERRO DETALHES CAMPANHA GOOGLE:", err?.message || err);
+    return { ok: false, status: 502, erro: "Não foi possível consultar esta campanha no Google Ads agora. Tente novamente em instantes." };
+  }
+}
+
+app.get("/google/campanha-detalhes/:campaign_id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const resultado = await obterDetalhesCampanhaGoogleDoUsuario(
+      Number(user.id),
+      c.req.param("campaign_id")
+    );
+    if (!resultado.ok) return c.json({ error: resultado.erro }, resultado.status);
+    return c.json(resultado.dados);
+  } catch (err: any) {
+    console.error("ERRO /google/campanha-detalhes:", err);
+    return c.json({ error: "Erro ao buscar os detalhes da campanha no Google Ads" }, 500);
+  }
+});
+
 app.get("/google/campanha-status/:campaign_id", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -35659,8 +36189,25 @@ app.post("/ia/campanhas/analise", authMiddleware, async (c) => {
     const campanha =
       body.campanha || {};
 
+    // Campanha do Google (inclusive as criadas direto no Google Ads, sem configuração
+    // salva aqui): a IA recebe também a configuração real lida agora do Google Ads.
+    // Sempre buscada no servidor — qualquer "detalhes_google" vindo do navegador é
+    // descartado, pra ninguém conseguir injetar texto no prompt por esse campo.
+    const campanhaParaIA: any = { ...campanha };
+    delete campanhaParaIA.detalhes_google;
+    if (
+      String(campanha.plataforma || "").toLowerCase() === "google" &&
+      campanha.campaign_id
+    ) {
+      const detalhesGoogle = await obterDetalhesCampanhaGoogleDoUsuario(
+        Number(user.id),
+        String(campanha.campaign_id)
+      ).catch(() => null);
+      if (detalhesGoogle?.ok) campanhaParaIA.detalhes_google = detalhesGoogle.dados;
+    }
+
     const usoIA =
-      await gerarAnaliseTrafegoPagoIA(campanha);
+      await gerarAnaliseTrafegoPagoIA(campanhaParaIA);
 
     for (const resultado of usoIA.resultados) {
       await registrarUsoIA(
