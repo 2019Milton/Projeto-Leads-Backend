@@ -4299,6 +4299,19 @@ function construirContextoCampanhaIA(campanha: any) {
   const cliques = Number(campanha?.cliques || 0);
   const ctr = Number(campanha?.ctr || 0);
   const cpc = Number(campanha?.cpc || 0);
+  // Conversões que o próprio Google Ads contabiliza (só ações principais). Só
+  // Google e só quando a consulta funcionou: null = sem dado, diferente de 0.
+  const conversoesGoogleBruto = campanha?.conversoes_google;
+  const conversoesGoogle =
+    plataformaCampanha === "google" &&
+    conversoesGoogleBruto != null &&
+    Number.isFinite(Number(conversoesGoogleBruto))
+      ? Number(conversoesGoogleBruto)
+      : null;
+  const custoPorConversaoGoogle =
+    conversoesGoogle !== null && conversoesGoogle > 0
+      ? Number((gasto / conversoesGoogle).toFixed(2))
+      : null;
   const orcamentoDiario =
     campanha?.daily_budget ? Number(campanha.daily_budget) / 100 : null;
 
@@ -4348,7 +4361,13 @@ function construirContextoCampanhaIA(campanha: any) {
       cpc,
       frequencia,
       dias_ativa: diasAtiva,
-      pacing_orcamento_percentual: pacingPercentual
+      pacing_orcamento_percentual: pacingPercentual,
+      ...(conversoesGoogle !== null
+        ? {
+            conversoes_google: conversoesGoogle,
+            custo_por_conversao_google: custoPorConversaoGoogle
+          }
+        : {})
     },
     segmentacao: {
       pais: cfg.pais || "BR",
@@ -4438,6 +4457,10 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
     ? "avalie a estrategia de lance/CBO e a janela de atribuicao; "
     : "avalie a estrategia de lance e orcamento configurada; ";
   const clausulaAjusteCbo = ehMetaAnalise ? "ativar/desativar CBO, " : "";
+  const clausulaConversoesGoogle =
+    contexto.desempenho_periodo_30d.conversoes_google !== undefined
+      ? "Os dados incluem conversoes_google e custo_por_conversao_google: sao conversoes contabilizadas pelo proprio Google Ads (somente acoes de conversao marcadas como principais, como formulario, ligacao ou clique no WhatsApp), e nao pela plataforma. Trate como uma metrica separada dos leads: nunca some conversoes com leads e nao compare os dois como se fossem a mesma coisa (um lead do formulario pode ser tambem uma conversao). Quando a campanha tiver poucos leads salvos na plataforma mas tiver conversoes no Google, use custo_por_conversao_google como a referencia principal de custo por resultado e diga de onde vem o numero; se conversoes_google for 0, avalie se o acompanhamento de conversoes esta configurado antes de concluir que a campanha nao performa. "
+      : "";
 
   const systemMsg =
     `IDIOMA OBRIGATORIO: escreva TODA a resposta em portugues do Brasil (pt-BR) — todo texto de todo campo do JSON, sem excecao. Nunca responda em ingles ou em qualquer outro idioma. Siglas do mercado de midia paga (${siglasPermitidas}) podem ser mantidas como estao, mas todas as frases ao redor delas devem ser em portugues. ` +
@@ -4445,6 +4468,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
     `Analise a campanha como faria uma auditoria profissional real: avalie CPL, CTR, CPC e frequencia contra o que e tipico para ${nomePlataformaAnalise} de geracao de leads no Brasil (sem inventar numeros de terceiros, apenas usando seu conhecimento geral de mercado como referencia qualitativa); avalie o pacing do orcamento (gasto real vs. orcamento projetado para os dias ativos); avalie se a segmentacao (idade, genero, interesses, localidades, publicos customizados${segmentacaoAdvantage}) esta ampla ou estreita demais para o volume de dados que ja existe; avalie o criativo (tipo, copy, CTA) e sinais de possivel fadiga (frequencia alta com CTR caindo); ${clausulaLanceOrcamento}avalie a fricção do formulario de leads (quantidade de perguntas, formulario de qualidade). ` +
     "Considere tambem quantos dias a campanha esta ativa e quantos leads/impressoes ja existem: com poucos dias ou poucos dados, deixe claro que e cedo para conclusoes fortes e recomende continuar coletando dados antes de mudancas bruscas, em vez de sugerir uma acao agressiva baseada em amostra pequena. " +
     `De recomendacoes concretas e priorizadas (o que fazer primeiro, o que testar, o que NAO mexer ainda) pensando sempre em gerar mais leads pelo menor custo possivel, considerando tanto as configuracoes atuais quanto os ajustes que poderiam ser feitos e ainda nao foram (ex: reduzir perguntas do formulario, ${clausulaAjusteCbo}testar novo criativo, ampliar ou restringir publico, ajustar orcamento). Use somente os dados reais recebidos, nunca invente metricas, nomes ou configuracoes que nao foram informadas. ` +
+    clausulaConversoesGoogle +
     "Lembrete final: a resposta inteira (titulo, resumo, diagnostico, acao_principal, mensagens, motivos, campos, recomendacoes) deve estar em portugues do Brasil, com linguagem direta e profissional, sem emojis.";
 
   const schemaProperties = {
@@ -28385,6 +28409,113 @@ function montarResumoPerformanceDiaria(diasPerformance: any[], periodo: string) 
 // mostrado é o real, salvo na Central de Leads. Ver conversa com o Milton sobre a confusão que o
 // par "Leads (Meta) / Leads (Plataforma)" causava: pra Google/TikTok, evitamos criar esse mesmo
 // par com um número "reportado pela plataforma" que nem é totalmente confiável pra começo de conversa.
+// Conversões principais da CONTA INTEIRA do Google Ads num período (não só das
+// campanhas criadas aqui). metrics.conversions só soma as ações marcadas como
+// principais ("incluir em conversões"). Lança erro se a consulta falhar — quem
+// chama decide se ignora (best-effort).
+async function buscarConversoesContaGoogle(
+  customerId: string,
+  accessToken: string,
+  loginCustomerId: string | null,
+  inicio: string,
+  fim: string
+) {
+  const resultados = await googleAdsQuery(
+    customerId, accessToken,
+    `SELECT metrics.cost_micros, metrics.conversions, metrics.conversions_value
+     FROM customer WHERE segments.date BETWEEN '${inicio}' AND '${fim}'`,
+    loginCustomerId
+  );
+  const metricasConta = (resultados[0] as any)?.metrics ?? {};
+  const conversoes = Number(metricasConta.conversions || 0);
+  const gasto = Number(metricasConta.costMicros || 0) / 1_000_000;
+  return {
+    escopo: "conta" as const,
+    conversoes,
+    valor: Number(metricasConta.conversionsValue || 0),
+    gasto,
+    custo_por_conversao: conversoes > 0 ? gasto / conversoes : null,
+  };
+}
+
+// Resumo de 30 dias exibido na aba IA & Performance, que atualiza a cada 30s:
+// guarda o resultado em memória por alguns minutos pra não chamar a API do Google
+// a cada atualização. Falha também é guardada (por menos tempo) pra uma conta com
+// problema não ser consultada de 30 em 30 segundos.
+const CACHE_CONVERSOES_GOOGLE_OK_MS = 10 * 60 * 1000;
+const CACHE_CONVERSOES_GOOGLE_FALHA_MS = 60 * 1000;
+const cacheConversoesGoogle = new Map<string, { expira: number; dados: any }>();
+
+async function obterConversoesGoogleResumoComCache(
+  usuarioId: number,
+  customerId: string,
+  refreshToken: string,
+  loginCustomerId: string | null
+) {
+  const periodo = intervaloMetricasCampanhas(30);
+  const chave = `${usuarioId}:${customerId}:${periodo.inicio}`;
+  const agora = Date.now();
+
+  const emCache = cacheConversoesGoogle.get(chave);
+  if (emCache && emCache.expira > agora) {
+    return { ...emCache.dados, em_cache: true };
+  }
+
+  // Limpa entradas vencidas (a chave inclui a data, então o mapa não pode crescer sem fim).
+  if (cacheConversoesGoogle.size > 500) {
+    for (const [k, v] of cacheConversoesGoogle) {
+      if (v.expira <= agora) cacheConversoesGoogle.delete(k);
+    }
+  }
+
+  const base = { periodo_dias: 30, periodo_inicio: periodo.inicio, periodo_fim: periodo.fim };
+  try {
+    const accessToken = await obterAccessTokenGoogle(refreshToken);
+    const conversoes = await buscarConversoesContaGoogle(
+      customerId, accessToken, loginCustomerId, periodo.inicio, periodo.fim
+    );
+    const dados = { ...base, conversoes };
+    cacheConversoesGoogle.set(chave, { expira: agora + CACHE_CONVERSOES_GOOGLE_OK_MS, dados });
+    return { ...dados, em_cache: false };
+  } catch (err: any) {
+    console.warn("AVISO CONVERSÕES GOOGLE (resumo):", err?.message || err);
+    const dados = { ...base, conversoes: null };
+    cacheConversoesGoogle.set(chave, { expira: agora + CACHE_CONVERSOES_GOOGLE_FALHA_MS, dados });
+    return { ...dados, em_cache: false };
+  }
+}
+
+app.get("/google/conversoes-resumo", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ conectado: false, conversoes: null });
+    }
+
+    const conn = await client.query(
+      `SELECT refresh_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    );
+    const row = conn.rows[0];
+    const customerId = row?.dados_conta?.customer_id;
+    const loginCustomerId = row?.dados_conta?.login_customer_id || null;
+
+    if (!row?.refresh_token || !customerId) {
+      return c.json({ conectado: false, conversoes: null });
+    }
+
+    const resumo = await obterConversoesGoogleResumoComCache(
+      Number(user.id), String(customerId), row.refresh_token, loginCustomerId
+    );
+    return c.json({ conectado: true, ...resumo });
+  } catch (err: any) {
+    console.error("ERRO /google/conversoes-resumo:", err);
+    return c.json({ error: "Erro ao buscar conversões do Google Ads" }, 500);
+  }
+});
+
 app.get("/google/performance-diaria", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -28500,22 +28631,9 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
     } | null = null;
     if (c.req.query("conversoes") === "1") {
       try {
-        const conversoesResultados = await googleAdsQuery(
-          customerId, accessToken,
-          `SELECT metrics.cost_micros, metrics.conversions, metrics.conversions_value
-           FROM customer WHERE segments.date BETWEEN '${since}' AND '${until}'`,
-          loginCustomerId
+        conversoesConta = await buscarConversoesContaGoogle(
+          customerId, accessToken, loginCustomerId, since, until
         );
-        const metricasConta = (conversoesResultados[0] as any)?.metrics ?? {};
-        const conversoes = Number(metricasConta.conversions || 0);
-        const gastoConta = Number(metricasConta.costMicros || 0) / 1_000_000;
-        conversoesConta = {
-          escopo: "conta",
-          conversoes,
-          valor: Number(metricasConta.conversionsValue || 0),
-          gasto: gastoConta,
-          custo_por_conversao: conversoes > 0 ? gastoConta / conversoes : null,
-        };
       } catch (errConversoes: any) {
         console.warn("AVISO CONVERSÕES GOOGLE (performance-diaria):", errConversoes?.message || errConversoes);
       }
