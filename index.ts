@@ -35293,7 +35293,9 @@ app.put("/admin/usuarios/:id/tipo", authMiddleware, async (c) => {
   const tiposPermitidos = [
     "admin_corretor",
     "corretor",
-    "corretor_receptor"
+    "corretor_receptor",
+    "suporte",
+    "criador_campanha"
   ];
 
   if (!tiposPermitidos.includes(tipo)) {
