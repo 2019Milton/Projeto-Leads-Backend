@@ -14516,6 +14516,13 @@ const LINKEDIN_API = "https://api.linkedin.com/rest";
 // de targeting inválido, esse é o primeiro lugar a checar.
 const LINKEDIN_GEO_URN_BRASIL = "urn:li:geo:106057199";
 
+// Orçamento diário mínimo aceito pelo LinkedIn em BRL — ASSUMPTION: valor
+// observado no próprio Campaign Manager ("O orçamento diário deve ser no
+// mínimo: R$ 20,00") em 21/09/2026, não documentado publicamente como
+// constante fixa por moeda/objetivo. Validar aqui evita criar/editar uma
+// campanha que o LinkedIn aceita via API mas rejeita ao tentar ativar.
+const LINKEDIN_ORCAMENTO_DIARIO_MINIMO = 20;
+
 function linkedinHeaders(token: string) {
   return {
     "Authorization": `Bearer ${token}`,
@@ -15167,6 +15174,9 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
     const orcamento = numeroOpcional(daily_budget);
     if (!orcamento || orcamento <= 0) {
       return c.json({ error: "Orçamento diário é obrigatório para a campanha LinkedIn" }, 400);
+    }
+    if (orcamento < LINKEDIN_ORCAMENTO_DIARIO_MINIMO) {
+      return c.json({ error: `Orçamento diário mínimo do LinkedIn Ads: R$ ${LINKEDIN_ORCAMENTO_DIARIO_MINIMO.toFixed(2)}` }, 400);
     }
 
     const destinoResolvido = resolverDestinoCampanha(destino);
@@ -15942,6 +15952,9 @@ app.post("/linkedin/editar-campanha", authMiddleware, async (c) => {
         : {};
     if (!nomeSolicitado) return c.json({ error: "Nome da campanha é obrigatório" }, 400);
     if (!dailyBudgetValor || dailyBudgetValor <= 0) return c.json({ error: "Orçamento diário é obrigatório" }, 400);
+    if (dailyBudgetValor < LINKEDIN_ORCAMENTO_DIARIO_MINIMO) {
+      return c.json({ error: `Orçamento diário mínimo do LinkedIn Ads: R$ ${LINKEDIN_ORCAMENTO_DIARIO_MINIMO.toFixed(2)}` }, 400);
+    }
 
     const campanhaLocalRes = campanha_local_id
       ? await client.query(
