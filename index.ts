@@ -15850,13 +15850,23 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
     // Rest.li do LinkedIn (não testado ainda contra tráfego real).
     const headersPartialUpdate = { "X-RestLi-Method": "PARTIAL_UPDATE" };
 
+    // Um rascunho pode ficar dias parado antes de ser ativado — o
+    // runSchedule.start gravado na criação (Date.now() daquele dia) fica no
+    // passado, e o próprio Campaign Manager do LinkedIn recusa isso como
+    // "A data de início deve ser hoje ou uma data futura" ao editar a
+    // agenda. Renovar o start pro momento da ativação evita esse erro sem
+    // mexer na agenda em nenhum outro momento (pausa não toca em runSchedule).
+    const campoStatusOuAgenda: Record<string, any> = statusLinkedIn === "ACTIVE"
+      ? { status: statusLinkedIn, runSchedule: { start: Date.now() } }
+      : { status: statusLinkedIn };
+
     const atualizarGrupo = () => linkedinFetch(
       `/adAccounts/${conexao.adAccountId}/adCampaignGroups/${campaign_id}`,
       conexao.accessToken,
       {
         method: "POST",
         headers: headersPartialUpdate,
-        body: { patch: { $set: { status: statusLinkedIn } } }
+        body: { patch: { $set: campoStatusOuAgenda } }
       }
     );
     const atualizarCampanha = () => adset_id
@@ -15866,7 +15876,7 @@ app.post("/linkedin/toggle-campanha", authMiddleware, async (c) => {
           {
             method: "POST",
             headers: headersPartialUpdate,
-            body: { patch: { $set: { status: statusLinkedIn } } }
+            body: { patch: { $set: campoStatusOuAgenda } }
           }
         )
       : Promise.resolve({ ok: false, error: "O Campaign do LinkedIn ainda não foi criado" } as any);
