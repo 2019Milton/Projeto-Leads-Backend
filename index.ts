@@ -8421,6 +8421,26 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       console.warn("AVISO /google/campanha: falha ao checar se a conta é gerenciadora:", errCheck.message);
     }
 
+    // Localidades e meta de CPA (ver montarRascunhoGoogleDeCampanhaImportada, que preenche
+    // esses campos ao duplicar uma campanha criada direto no Google Ads): chaves próprias
+    // dentro de configuracoes_avancadas, sem UI de segmentação — quando ausentes, o
+    // comportamento continua o de sempre (Brasil inteiro, sem meta de CPA). O recurso é
+    // validado aqui de novo porque o corpo da requisição não é confiável, mesmo vindo de um
+    // campo que a própria plataforma preencheu ao duplicar.
+    const localidadesInformadas = Array.isArray(configuracoes_avancadas?.google_localidades)
+      ? configuracoes_avancadas.google_localidades
+      : [];
+    const localidadesGoogle = localidadesInformadas
+      .map((l: any) => ({ recurso: String(l?.recurso ?? ""), excluida: Boolean(l?.excluida) }))
+      .filter((l: any) => /^geoTargetConstants\/\d+$/.test(l.recurso))
+      .slice(0, 50);
+    // Meta de CPA só faz sentido com a estratégia "maximizar conversões" (lead_ads/
+    // WhatsApp) — o destino site usa CPC manual, que não aceita meta de CPA.
+    const metaCpaGoogle =
+      destinoGoogle !== "site" ? numeroOpcional(configuracoes_avancadas?.google_meta_cpa) : null;
+    const metaCpaMicrosGoogle =
+      metaCpaGoogle && metaCpaGoogle > 0 ? Math.round(metaCpaGoogle * 1_000_000) : null;
+
     const orcamentoNumero = numeroOpcional(orcamento);
     if (!orcamentoNumero || orcamentoNumero <= 0) {
       return c.json({ error: "Orçamento diário é obrigatório para a campanha Google Ads" }, 400);
@@ -8465,8 +8485,11 @@ app.post("/google/campanha", authMiddleware, async (c) => {
           ...(dataFimGoogle ? { endDateTime: dataFimGoogle } : {}),
           // Formulários e mensagens são metas de conversão no Google. Site puro
           // continua em CPC manual; os dois destinos de lead usam a estratégia
-          // recomendada pelo Google para otimizar conversões.
-          ...(destinoGoogle === "site" ? { manualCpc: {} } : { maximizeConversions: {} }),
+          // recomendada pelo Google para otimizar conversões — com meta de CPA
+          // quando informada (ver localidadesGoogle/metaCpaMicrosGoogle acima).
+          ...(destinoGoogle === "site"
+            ? { manualCpc: {} }
+            : { maximizeConversions: metaCpaMicrosGoogle ? { targetCpaMicros: String(metaCpaMicrosGoogle) } : {} }),
           ...(tipoCampanhaGoogle === "search" ? {
             networkSettings: {
               targetGoogleSearch: true,
@@ -8496,11 +8519,22 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       campaignId
     );
 
-    // ASSUMPTION: geoTargetConstants/2076 (Brasil) e languageConstants/1014 (portugues)
-    // fixos no MVP, sem UI de segmentacao — nao bloqueia a criacao da campanha se falhar.
+    // Localidade: Brasil inteiro por padrão (ASSUMPTION original, sem UI de segmentação),
+    // ou as localidades exatas lidas da campanha original quando veio de uma duplicação
+    // (localidadesGoogle acima). Idioma continua fixo em português — fora do escopo desta
+    // extensão. Não bloqueia a criação da campanha se falhar.
     try {
+      const locationOps = localidadesGoogle.length
+        ? localidadesGoogle.map((l: { recurso: string; excluida: boolean }) => ({
+            create: {
+              campaign: campaignResourceName,
+              negative: l.excluida,
+              location: { geoTargetConstant: l.recurso },
+            },
+          }))
+        : [{ create: { campaign: campaignResourceName, location: { geoTargetConstant: "geoTargetConstants/2076" } } }];
       await googleAdsMutate(conexao.customerId, conexao.accessToken, "campaignCriteria", [
-        { create: { campaign: campaignResourceName, location: { geoTargetConstant: "geoTargetConstants/2076" } } },
+        ...locationOps,
         { create: { campaign: campaignResourceName, language: { languageConstant: "languageConstants/1014" } } },
       ]);
     } catch (err) {
@@ -10464,6 +10498,10 @@ async function buscarDetalhesCampanhaGoogle(
   const localidades = linhasLocal.map((l) => ({
     nome: LOCAIS_GOOGLE_CONHECIDOS[l.recurso] ?? nomesRecursos.get(l.recurso) ?? `Local ${l.recurso.split("/").pop()}`,
     excluida: l.excluida,
+    // Resource name original (geoTargetConstants/…) — permite reaplicar exatamente a mesma
+    // localidade ao duplicar a campanha (ver montarRascunhoGoogleDeCampanhaImportada), sem
+    // precisar de uma busca por texto.
+    recurso: l.recurso,
   }));
   const idiomas = linhasIdioma.map((r) => ({
     nome: IDIOMAS_GOOGLE_CONHECIDOS[r] ?? nomesRecursos.get(r) ?? `Idioma ${r.split("/").pop()}`,
@@ -38015,6 +38053,21 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
   const destino = temFormulario ? "lead_ads" : "site";
   const orcamentoDiario = Number(d.orcamento_diario) > 0 ? Number(d.orcamento_diario) : null;
 
+  // Localidades: chave própria (google_localidades), distinta de "localidades" — essa já é
+  // usada pela segmentação da Meta, com um formato totalmente diferente ({key, tipo, nome,
+  // raio}). Guarda o resource name exato lido do Google (ver buscarDetalhesCampanhaGoogle),
+  // então não precisa de busca por texto pra reaplicar na campanha nova.
+  const locais: any[] = Array.isArray(d.localidades) ? d.localidades : [];
+  const leituraLocalidadesFalhou = Array.isArray(d.avisos) && d.avisos.includes("localidades e idiomas");
+  const localidadesGoogle = locais
+    .map((l) => ({ recurso: String(l?.recurso ?? ""), excluida: Boolean(l?.excluida) }))
+    .filter((l) => /^geoTargetConstants\/\d+$/.test(l.recurso));
+
+  // Meta de CPA: só se aplica quando o destino usa "maximizar conversões" (lead_ads/
+  // WhatsApp) — o construtor usa CPC manual pro destino site, que não aceita meta de CPA.
+  const metaCpaOriginal = Number(d.lance?.meta_cpa) > 0 ? Number(d.lance.meta_cpa) : null;
+  const metaCpaAplicavel = destino !== "site" && metaCpaOriginal !== null;
+
   const configuracoes: Record<string, any> = {
     plataforma: "google",
     plataformas: ["google"],
@@ -38027,6 +38080,8 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
     ...(formularioId
       ? { formulario_id: formularioId, formulario_valor: formularioId, form_id: formularioId }
       : {}),
+    ...(localidadesGoogle.length ? { google_localidades: localidadesGoogle } : {}),
+    ...(metaCpaAplicavel ? { google_meta_cpa: metaCpaOriginal } : {}),
     duplicada_de_google: { campaign_id: String(d.campaign_id ?? ""), nome: d.nome ?? null },
   };
 
@@ -38037,6 +38092,14 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
   if (urlDestino) copiado.push("Link de destino");
   if (palavrasChave.length) copiado.push(`Palavras-chave (${palavrasChave.length}), com correspondência exata, de frase ou ampla`);
   if (formularioId) copiado.push("Formulário de lead");
+  if (localidadesGoogle.length) {
+    copiado.push(
+      `Localidades (${localidadesGoogle.length}${localidadesGoogle.some((l) => l.excluida) ? ", com exclusões" : ""})`
+    );
+  }
+  if (metaCpaAplicavel) {
+    copiado.push(`Meta de CPA (${formatarMoedaBRLTexto(metaCpaOriginal)})`);
+  }
 
   const naoCopiado: string[] = [];
   if (!titulos.length) {
@@ -38050,14 +38113,14 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
   if (todasPalavras.some((k) => k.negativa)) naoCopiado.push("Palavras-chave negativas");
   if (temFormulario && !formularioId) naoCopiado.push("Formulário de lead (escolha um no rascunho)");
 
-  const locais: any[] = Array.isArray(d.localidades) ? d.localidades : [];
-  const soBrasil = locais.length > 0 && locais.every((l) => l.nome === "Brasil" && !l.excluida);
-  if (!soBrasil) {
-    const nomes = locais.map((l) => (l.excluida ? `${l.nome} (excluída)` : l.nome)).slice(0, 8).join(", ");
+  // Antes a localização não era copiada; agora só fica de fora se a leitura falhou (a
+  // consulta ao Google não devolveu localidade nenhuma) — sem isso a cópia roda no Brasil
+  // inteiro por padrão, igual a qualquer campanha nova criada do zero.
+  if (!localidadesGoogle.length) {
     naoCopiado.push(
-      nomes
-        ? `Localização: a cópia roda no Brasil inteiro (a original segmenta: ${nomes})`
-        : "Localização: a cópia roda no Brasil inteiro (não foi possível ler a da original)"
+      leituraLocalidadesFalhou
+        ? "Localização (não foi possível ler da original agora) — a cópia roda no Brasil inteiro"
+        : "Localização (a original não tinha nenhuma configurada) — a cópia roda no Brasil inteiro"
     );
   }
   const idiomasDiferentes = (Array.isArray(d.idiomas) ? d.idiomas : []).filter((i: any) => i.nome !== "Português");
@@ -38065,13 +38128,33 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
     naoCopiado.push(`Idioma: a cópia usa português (a original também usa: ${idiomasDiferentes.map((i: any) => i.nome).join(", ")})`);
   }
 
-  // Lance do construtor: CPC manual quando o destino é o site; senão, maximizar conversões sem meta.
+  // Lance do construtor: CPC manual quando o destino é o site; senão, maximizar conversões,
+  // com a meta de CPA aplicada quando existe (metaCpaAplicavel acima).
   const lanceCopia = destino === "site" ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS";
-  const lanceCopiaRotulo = destino === "site" ? "CPC manual" : "Maximizar conversões (sem meta)";
-  const lanceIgual = d.lance?.codigo === lanceCopia && !d.lance?.meta_cpa && !d.lance?.meta_roas;
+  const lanceCopiaRotulo =
+    destino === "site"
+      ? "CPC manual"
+      : metaCpaAplicavel
+      ? `Maximizar conversões com CPA desejado ${formatarMoedaBRLTexto(metaCpaOriginal)}`
+      : "Maximizar conversões (sem meta)";
+  // "Exata" só quando o tipo de estratégia da original já é literalmente MAXIMIZE_CONVERSIONS
+  // (ou nenhuma meta de CPA envolvida) — uma original do tipo "CPA desejado" (TARGET_CPA) usa
+  // uma estratégia diferente por trás mesmo recebendo o mesmo valor de meta aqui.
+  const lanceIgual =
+    d.lance?.codigo === lanceCopia &&
+    (metaCpaAplicavel ? d.lance?.codigo === "MAXIMIZE_CONVERSIONS" : !d.lance?.meta_cpa) &&
+    !d.lance?.meta_roas;
   if (!lanceIgual) {
-    const meta = d.lance?.meta_cpa ? ` com CPA desejado R$ ${Number(d.lance.meta_cpa).toFixed(2).replace(".", ",")}` : "";
-    naoCopiado.push(`Estratégia de lance: a original usa "${d.lance?.label || "não identificada"}"${meta}; a cópia usa "${lanceCopiaRotulo}"`);
+    const meta = d.lance?.meta_cpa ? ` com CPA desejado ${formatarMoedaBRLTexto(Number(d.lance.meta_cpa))}` : "";
+    const notaCpaAplicada = metaCpaAplicavel ? " (a meta de CPA foi aplicada na cópia mesmo assim)" : "";
+    naoCopiado.push(
+      `Estratégia de lance: a original usa "${d.lance?.label || "não identificada"}"${meta}; a cópia usa "${lanceCopiaRotulo}"${notaCpaAplicada}`
+    );
+  }
+  if (destino === "site" && metaCpaOriginal !== null) {
+    naoCopiado.push(
+      `Meta de CPA da original (${formatarMoedaBRLTexto(metaCpaOriginal)}) não copiada: o destino "site" usa CPC manual, que não aceita meta de CPA`
+    );
   }
 
   const outrasExtensoes = Object.entries(d.extensoes ?? {})
