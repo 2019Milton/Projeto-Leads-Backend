@@ -15092,10 +15092,20 @@ app.post("/linkedin/direcionamento/interesses", authMiddleware, async (c) => {
 app.post("/linkedin/campanha", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const { usuario_id, nome, configuracoes_avancadas, publicacao_grupo_id } = await c.req.json();
+    const { usuario_id, nome, configuracoes_avancadas, publicacao_grupo_id, nicho_id } = await c.req.json();
 
     const usuarioId = resolverUsuarioIdOperacao(user, usuario_id);
     if (!usuarioId) return negarAcessoConta(c);
+
+    // O front não envia nicho_id no nível raiz pro LinkedIn (só dentro de
+    // configuracoes_avancadas, via coletarDadosNichoAtivo) — aceita os dois
+    // formatos. Sem isso a coluna campanhas.nicho_id nunca era gravada na
+    // criação (diferente de /meta/campanha e /tiktok/campanha, que já
+    // recebem nicho_id no raiz), e o editor abria sempre no nicho errado
+    // (o primeiro da lista) até alguém salvar uma vez pra "corrigir" via
+    // COALESCE — quando também gravava o nicho da aba ativa no momento do
+    // Salvar, não necessariamente o nicho real da campanha.
+    const nichoIdCriacao = numeroOpcional(nicho_id ?? configuracoes_avancadas?.nicho_id);
 
     const conexao = await resolverConexaoLinkedIn(usuarioId);
     if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
@@ -15130,9 +15140,9 @@ app.post("/linkedin/campanha", authMiddleware, async (c) => {
     await client.query(
       `INSERT INTO campanhas (
         usuario_id, campaign_id, conta_anuncios_id, nome, status, origem,
-        configuracoes_avancadas, plataforma, publicacao_grupo_id
+        configuracoes_avancadas, plataforma, publicacao_grupo_id, nicho_id
       )
-      VALUES ($1,$2,$3,$4,$5,'plataforma',$6,'linkedin',$7)`,
+      VALUES ($1,$2,$3,$4,$5,'plataforma',$6,'linkedin',$7,$8)`,
       [
         usuarioId,
         campaignGroupId,
@@ -15140,7 +15150,8 @@ app.post("/linkedin/campanha", authMiddleware, async (c) => {
         nome || "Campanha Plataforma",
         "PAUSED",
         JSON.stringify(configuracoes_avancadas || {}),
-        textoOpcional(publicacao_grupo_id) || null
+        textoOpcional(publicacao_grupo_id) || null,
+        nichoIdCriacao
       ]
     );
 
