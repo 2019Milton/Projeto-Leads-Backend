@@ -22546,26 +22546,19 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
   let redeOrigemCampanha: string | null = null;
 
   if (sourceId) {
-    const campRow = await client.query(
-      `SELECT id, nome, nicho_id, conta_anuncios_id, configuracoes_avancadas
-       FROM campanhas
-       WHERE ad_id = $1 AND usuario_id = $2
-         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
-       LIMIT 1`,
-      [sourceId, usuarioId]
-    ).catch(() => ({ rows: [] as any[] }));
+    const campanhaEncontrada = await buscarCampanhaMetaPorAnuncio(usuarioId, sourceId);
 
-    if (campRow.rows.length) {
-      campanhaId = campRow.rows[0].id;
-      nomeCampanha = campRow.rows[0].nome || nomeCampanha;
-      nichoId = campRow.rows[0].nicho_id ?? null;
-      contaAnunciosId = campRow.rows[0].conta_anuncios_id ?? null;
+    if (campanhaEncontrada) {
+      campanhaId = campanhaEncontrada.id;
+      nomeCampanha = campanhaEncontrada.nome || nomeCampanha;
+      nichoId = campanhaEncontrada.nicho_id ?? null;
+      contaAnunciosId = campanhaEncontrada.conta_anuncios_id ?? null;
 
       // Campanha publicada separadamente por rede (ver montarContextoPublicacaoMeta
       // no front) já diz com certeza de onde é o lead — mais confiável que o
       // referral abaixo, que é um chute por palavra-chave na URL. Só campanhas
       // legadas combinadas (ou sem essa marcação) precisam do chute.
-      let cfgCampanha = campRow.rows[0].configuracoes_avancadas;
+      let cfgCampanha = campanhaEncontrada.configuracoes_avancadas;
       if (typeof cfgCampanha === "string") {
         try { cfgCampanha = JSON.parse(cfgCampanha); } catch { cfgCampanha = null; }
       }
@@ -22753,6 +22746,68 @@ async function criarLeadDeConversaGoogle(
   return novoLeadId;
 }
 
+// Campanha importada da Meta é gravada só com campaign_id (sem ad_id), e uma
+// campanha pode ter vários anúncios — então o anúncio clicado nem sempre bate
+// com campanhas.ad_id. Pergunta à Meta de qual campanha é o anúncio; cacheado
+// pra não repetir a chamada a cada mensagem do mesmo anúncio.
+const cacheCampanhaMetaPorAnuncio = new Map<string, { campaignId: string | null; expiraEm: number }>();
+
+async function obterCampaignIdMetaPorAnuncio(usuarioId: number, adId: string): Promise<string | null> {
+  const chave = `${usuarioId}:${adId}`;
+  const emCache = cacheCampanhaMetaPorAnuncio.get(chave);
+  if (emCache && emCache.expiraEm > Date.now()) return emCache.campaignId;
+
+  let campaignId: string | null = null;
+  let cachearPor = 5 * 60 * 1000;
+  try {
+    const conn = await client.query(
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+    const token = conn.rows[0]?.access_token;
+    if (token) {
+      const res = await fetch(
+        `https://graph.facebook.com/v19.0/${encodeURIComponent(adId)}?fields=campaign_id&access_token=${token}`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      const data: any = await res.json().catch(() => null);
+      if (res.ok && data?.campaign_id) {
+        campaignId = String(data.campaign_id);
+        cachearPor = 60 * 60 * 1000;
+      }
+    }
+  } catch {
+    // sem resposta da Meta: segue sem campanha e tenta de novo depois do cache curto
+  }
+
+  cacheCampanhaMetaPorAnuncio.set(chave, { campaignId, expiraEm: Date.now() + cachearPor });
+  return campaignId;
+}
+
+async function buscarCampanhaMetaPorAnuncio(usuarioId: number, adId: string) {
+  const colunas = `id, nome, nicho_id, conta_anuncios_id, configuracoes_avancadas`;
+  const porAdId = await client.query(
+    `SELECT ${colunas} FROM campanhas
+     WHERE ad_id = $1 AND usuario_id = $2
+       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+     LIMIT 1`,
+    [adId, usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+  if (porAdId.rows.length) return porAdId.rows[0];
+
+  const campaignId = await obterCampaignIdMetaPorAnuncio(usuarioId, adId);
+  if (!campaignId) return null;
+
+  const porCampanha = await client.query(
+    `SELECT ${colunas} FROM campanhas
+     WHERE campaign_id = $1 AND usuario_id = $2
+       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+     LIMIT 1`,
+    [campaignId, usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+  return porCampanha.rows[0] ?? null;
+}
+
 // Resolve o nicho pra escolher o roteiro do bot (ver avancarBotWhatsApp),
 // priorizando o clique de anúncio desta própria mensagem sobre o nicho do
 // lead já vinculado. Sem essa prioridade, um telefone que já é lead de um
@@ -22770,14 +22825,8 @@ async function resolverNichoConversaWhatsApp(
 ): Promise<number | null> {
   const referral = conversa?.referral;
   if (referral?.source_type === "ad" && referral?.source_id) {
-    const campRow = await client.query(
-      `SELECT nicho_id FROM campanhas
-       WHERE ad_id = $1 AND usuario_id = $2
-         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
-       LIMIT 1`,
-      [String(referral.source_id), usuarioId]
-    ).catch(() => ({ rows: [] as any[] }));
-    if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
+    const campanha = await buscarCampanhaMetaPorAnuncio(usuarioId, String(referral.source_id));
+    if (campanha) return campanha.nicho_id ?? null;
   }
 
   const matchLinkedIn = String(textoMensagem || "").match(/\[LI-(\d+)\]/);
@@ -27549,6 +27598,13 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       }
     }
 
+    // A detecção por nome abaixo é só visual (preenche nicho_id em memória) e o
+    // bot ignora isso — só o nicho_id gravado no banco escolhe o roteiro. O
+    // front usa este flag pra avisar quando a campanha ainda não tem nicho salvo.
+    for (const c of campanhas.rows as any[]) {
+      c.nicho_confirmado = Boolean(c.nicho_id);
+    }
+
     // Detecção de nicho por nome para campanhas sem nicho_id no BD
     const userNichos = (user.nichos || []) as Array<{id: number; slug: string; nome: string; cor: string}>;
     if (userNichos.length > 0) {
@@ -27957,6 +28013,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         veiculacao_detalhes: diagnosticoVeiculacao?.detalhes || null,
         conta_anuncios_id: campanha.conta_anuncios_id || null,
         nicho_id: campanha.nicho_id || null,
+        nicho_confirmado: Boolean(campanha.nicho_confirmado),
         nicho_slug: campanha.nicho_slug || null,
         nicho_nome: campanha.nicho_nome || null,
         nicho_cor: campanha.nicho_cor || null
@@ -31214,6 +31271,58 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
   } catch (err) {
     console.error("ERRO CONFIGURAÇÃO EDIÇÃO CAMPANHA:", err);
     return c.json({ error: "Erro ao carregar configuração da campanha" }, 500);
+  }
+});
+
+// Define o nicho de uma campanha importada (ou ainda sem nicho). Campanha
+// importada da rede nasce sem nicho_id, e é ele que escolhe o roteiro do
+// WhatsApp Bot — sem isso o bot não sabe qual roteiro usar nas conversas dela.
+app.put("/campanhas/:id/nicho", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const campanhaId = Number(c.req.param("id"));
+    if (!Number.isInteger(campanhaId) || campanhaId <= 0) {
+      return c.json({ error: "Campanha inválida" }, 400);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const usuarioId = resolverUsuarioIdOperacao(user, body?.usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const nichoId = await resolverNichoRoteiroWhatsapp(usuarioId, body?.nicho_id);
+    if (nichoId === null) return c.json({ error: "Escolha um nicho" }, 400);
+    if (nichoId === false) return c.json({ error: "Este nicho não está habilitado na sua conta" }, 400);
+
+    const campanha = await client.query(
+      `SELECT id, nome, origem, nicho_id FROM campanhas WHERE id = $1 AND usuario_id = $2`,
+      [campanhaId, usuarioId]
+    );
+    if (!campanha.rows.length) return c.json({ error: "Campanha não encontrada" }, 404);
+
+    const linha = campanha.rows[0];
+    if (campanhaTemOrigemNativa(linha.origem) && linha.nicho_id) {
+      return c.json({ error: "O nicho de campanhas criadas pela plataforma é definido na criação" }, 409);
+    }
+
+    await client.query(
+      `UPDATE campanhas SET nicho_id = $1, atualizado_em = NOW() WHERE id = $2 AND usuario_id = $3`,
+      [nichoId, campanhaId, usuarioId]
+    );
+
+    // Leads que já chegaram por essa campanha sem nicho herdam o escolhido
+    // (quando o cliente volta a falar sem novo clique no anúncio, o bot cai no
+    // nicho do lead). Leads que já têm nicho não são alterados.
+    const leads = await client.query(
+      `UPDATE leads SET nicho_id = $1
+       WHERE usuario_id = $2 AND nicho_id IS NULL
+         AND (campanha_id = $3 OR campanha = $4)`,
+      [nichoId, usuarioId, campanhaId, linha.nome]
+    );
+
+    return c.json({ sucesso: true, nicho_id: nichoId, leads_atualizados: leads.rowCount ?? 0 });
+  } catch (err: any) {
+    console.error("ERRO PUT /campanhas/:id/nicho:", err);
+    return c.json({ error: "Erro ao salvar o nicho da campanha" }, 500);
   }
 });
 
