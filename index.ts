@@ -4828,7 +4828,7 @@ async function tokenPodeOperarContaCompleta(user: any) {
       (
         ["super_admin", "master"].includes(gestor.tipo) ||
         (
-          gestor.tipo === "admin_corretor" &&
+          usuarioEhGestorVinculado(gestor.tipo) &&
           Number(alvo.admin_id) === gestorId
         )
       )
@@ -4935,7 +4935,7 @@ const authMiddleware = async (c: any, next: any) => {
       const gestorElevado =
         ["super_admin", "master"].includes(gestorAutenticado?.tipo);
       const gestorVinculado =
-        gestorAutenticado?.tipo === "admin_corretor" &&
+        usuarioEhGestorVinculado(gestorAutenticado?.tipo) &&
         Number(userBanco.admin_id) === gestorId;
 
       if (
@@ -25164,9 +25164,21 @@ app.get("/usuarios/me/plano", authMiddleware, async (c) => {
   });
 });
 
+// "Clientes gerenciados" é do Tráfego Pago: ele cria os acessos dos clientes dele,
+// conecta a conta de anúncio de cada um e gerencia só os corretores vinculados a ele
+// (usuarios.admin_id = id do gestor). Super admin e master gerenciam todos (ver
+// usuarioGestorElevado). O Admin Corretor NÃO entra aqui: ele administra outros
+// corretores da plataforma por outros caminhos (vínculo, encaminhar campanhas).
+// Função, e não constante, para poder ser usada no authMiddleware, que fica antes
+// desta linha no arquivo.
+function usuarioEhGestorVinculado(tipo: unknown) {
+  return String(tipo || "") === "trafego_pago";
+}
+
 function usuarioPodeGerenciarClientes(user: any) {
-  return ["admin_corretor", "super_admin", "master"].includes(
-    String(user?.tipo || "")
+  return (
+    usuarioEhGestorVinculado(user?.tipo) ||
+    ["super_admin", "master"].includes(String(user?.tipo || ""))
   );
 }
 
@@ -37122,7 +37134,8 @@ app.put("/admin/usuarios/:id/tipo", authMiddleware, async (c) => {
     "corretor",
     "corretor_receptor",
     "suporte",
-    "criador_campanha"
+    "criador_campanha",
+    "trafego_pago"
   ];
 
   if (!tiposPermitidos.includes(tipo)) {
