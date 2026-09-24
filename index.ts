@@ -1,5 +1,6 @@
 ﻿import { Hono } from "hono@4";
 import { cors } from "hono/cors";
+import { capturaNome, normalizarNome, renderizarTextoBot, salvarNomeBot } from "./whatsapp-bot-variaveis";
 import { Pool } from "pg";
 import bcrypt from "bcryptjs";
 import sharp from "sharp";
@@ -22362,7 +22363,7 @@ async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: 
   }
 }
 
-async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId: number | null = null) {
+async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId: number | null = null, resposta?: string) {
   if (conversa.status === "humano" || conversa.status === "encerrada") return;
 
   // Roteiro do nicho exato da conversa tem prioridade; sem isso, so cai pra um
@@ -22406,6 +22407,24 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
     // Pouco avanço real: seguro reiniciar o roteiro novo do zero.
     indice = 0;
   } else {
+    // Nunca atribui a resposta a uma pergunta de outro roteiro.
+    const anterior = passos[conversa.passo_atual];
+    if (conversa.status === "aguardando_resposta" && conversa.roteiro_id === roteiroAtivo.id && capturaNome(anterior)) {
+      if (!normalizarNome(resposta)) {
+        const texto = "Por favor, escreva seu nome em uma mensagem de texto (por exemplo: João Silva).";
+        const wamid = await enviarMensagemWhatsAppOficial(conversa.usuario_id, phoneNumberId, conversa.telefone_cliente, texto);
+        if (wamid) await client.query(
+          `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3) ON CONFLICT (wamid) DO NOTHING`,
+          [conversa.id, wamid, texto]);
+        return;
+      }
+      if (!await salvarNomeBot(client, conversa, resposta)) return;
+    }
+    // A resposta à pergunta final conclui a transferência.
+    if (conversa.status === "aguardando_resposta" && (anterior?.handoff_apos || conversa.passo_atual === passos.length - 1)) {
+      await client.query(`UPDATE whatsapp_conversas SET status = 'humano', atualizado_em = NOW() WHERE id = $1`, [conversa.id]);
+      return;
+    }
     // Se estava aguardando resposta, o cliente acabou de responder: avança pro próximo.
     // Senão (conversa nova), passo_atual (0) já é o próximo a executar.
     indice = conversa.status === "aguardando_resposta" ? conversa.passo_atual + 1 : conversa.passo_atual;
@@ -22413,6 +22432,7 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
 
   while (indice < passos.length) {
     const passo = passos[indice];
+    const textoEnviado = renderizarTextoBot(passo.texto, conversa.variaveis);
 
     const midia =
       passo.tipo === "imagem" ? { tipo: "image" as const, link: passo.midia_url }
@@ -22423,14 +22443,14 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
       conversa.usuario_id,
       phoneNumberId,
       conversa.telefone_cliente,
-      passo.texto || "",
+      textoEnviado,
       midia
     );
 
     const conteudoLog =
-      passo.tipo === "imagem" ? `[imagem]${passo.texto ? " " + passo.texto : ""}`
+      passo.tipo === "imagem" ? `[imagem]${textoEnviado ? " " + textoEnviado : ""}`
       : passo.tipo === "audio" ? "[audio]"
-      : passo.texto;
+      : textoEnviado;
 
     if (wamid) {
       await client.query(
@@ -23199,7 +23219,7 @@ async function processarEventoWhatsApp(value: any) {
     const nichoIdConversa = await resolverNichoConversaWhatsApp(conversa, usuarioId, msg.text?.body || "", leadIdVinculado)
       .catch(e => { console.error("ERRO resolverNichoConversaWhatsApp:", e); return null; });
 
-    await avancarBotWhatsApp(conversa, phoneNumberId, nichoIdConversa);
+    await avancarBotWhatsApp(conversa, phoneNumberId, nichoIdConversa, msg.text?.body);
   }
 }
 
@@ -24463,6 +24483,11 @@ await client.query(`
 await client.query(`
   ALTER TABLE whatsapp_conversas
     ADD COLUMN IF NOT EXISTS ultima_classificacao_ia_em TIMESTAMP;
+`);
+
+await client.query(`
+  ALTER TABLE whatsapp_conversas
+    ADD COLUMN IF NOT EXISTS variaveis JSONB NOT NULL DEFAULT '{}'::jsonb;
 `);
 
 // Guarda QUAL roteiro estava ativo da última vez que o bot avançou essa
