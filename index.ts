@@ -22746,6 +22746,149 @@ async function criarLeadDeConversaGoogle(
   return novoLeadId;
 }
 
+// TikTok não deixa definir a mensagem do botão de WhatsApp (só enviamos o número
+// no ad group): ele abre a conversa com um texto próprio, no formato "TikTok ID:
+// <id>. Hello! I came across your ad on TikTok...". Não há documentação oficial
+// do que é esse <id>; parceiros (Wati, Manychat) o tratam como o ID do anúncio,
+// então tentamos casar com campanhas.ad_id e com a API /ad/get/. Se não casar, o
+// bot fica quieto e um trecho da mensagem vai pro log pra conferirmos o formato.
+function extrairIdAnuncioTikTok(texto: string): string | null {
+  const m = String(texto || "").match(/TikTok\s*ID\s*[:：]?\s*\[?\s*((?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{5,64})/i);
+  return m ? m[1] : null;
+}
+
+const cacheCampanhaTikTokPorAnuncio = new Map<string, { campaignId: string | null; expiraEm: number }>();
+const anunciosTikTokJaLogados = new Set<string>();
+
+async function obterCampaignIdTikTokPorAnuncio(usuarioId: number, adId: string): Promise<string | null> {
+  const chave = `${usuarioId}:${adId}`;
+  const emCache = cacheCampanhaTikTokPorAnuncio.get(chave);
+  if (emCache && emCache.expiraEm > Date.now()) return emCache.campaignId;
+
+  let campaignId: string | null = null;
+  let cachearPor = 5 * 60 * 1000;
+  try {
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (conexao?.token && conexao.advertiserId) {
+      const resposta: any = await Promise.race([
+        listarEntidadesTikTok("/ad/get/", conexao, ["ad_id", "campaign_id"], { ad_ids: [adId] }),
+        new Promise((resolve) => setTimeout(() => resolve(null), 4000)),
+      ]);
+      const lista = resposta?.ok ? resposta.data?.data?.list : null;
+      const anuncio = Array.isArray(lista) ? lista.find((a: any) => String(a.ad_id) === adId) : null;
+      if (anuncio?.campaign_id) {
+        campaignId = String(anuncio.campaign_id);
+        cachearPor = 60 * 60 * 1000;
+      }
+    }
+  } catch {
+    // sem resposta do TikTok: segue sem campanha e tenta de novo depois do cache curto
+  }
+
+  cacheCampanhaTikTokPorAnuncio.set(chave, { campaignId, expiraEm: Date.now() + cachearPor });
+  return campaignId;
+}
+
+async function buscarCampanhaTikTokPorAnuncio(usuarioId: number, idBruto: string) {
+  const candidatos = [...new Set([idBruto, idBruto.replace(/^_+/, "")])].filter(Boolean);
+  const colunas = `id, nome, nicho_id, conta_anuncios_id`;
+
+  const porAdId = await client.query(
+    `SELECT ${colunas} FROM campanhas
+     WHERE ad_id = ANY($1::text[]) AND usuario_id = $2 AND plataforma = 'tiktok'
+     LIMIT 1`,
+    [candidatos, usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+  if (porAdId.rows.length) return porAdId.rows[0];
+
+  for (const candidato of candidatos) {
+    const campaignId = await obterCampaignIdTikTokPorAnuncio(usuarioId, candidato);
+    if (!campaignId) continue;
+    const porCampanha = await client.query(
+      `SELECT ${colunas} FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+       LIMIT 1`,
+      [campaignId, usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (porCampanha.rows.length) return porCampanha.rows[0];
+  }
+  return null;
+}
+
+async function identificarCampanhaTikTokNaMensagem(usuarioId: number, textoMensagem: string) {
+  const texto = String(textoMensagem || "");
+  const idAnuncio = extrairIdAnuncioTikTok(texto);
+  const campanha = idAnuncio ? await buscarCampanhaTikTokPorAnuncio(usuarioId, idAnuncio) : null;
+
+  if (!campanha && /tiktok/i.test(texto)) {
+    const inicio = Math.max(0, texto.search(/tiktok/i) - 20);
+    const trecho = texto.slice(inicio, inicio + 80);
+    const chave = `${usuarioId}:${idAnuncio ?? trecho}`;
+    if (!anunciosTikTokJaLogados.has(chave)) {
+      if (anunciosTikTokJaLogados.size > 500) anunciosTikTokJaLogados.clear();
+      anunciosTikTokJaLogados.add(chave);
+      console.warn("[whatsapp-tiktok] mensagem de anúncio do TikTok sem campanha reconhecida", {
+        usuario_id: usuarioId,
+        id_extraido: idAnuncio,
+        trecho,
+      });
+    }
+  }
+  return campanha;
+}
+
+// Equivalente TikTok de criarLeadDeConversaGoogle — mesmo fallback, atribuindo
+// pelo "TikTok ID" da mensagem em vez de uma tag nossa.
+async function criarLeadDeConversaTikTok(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  nomeContato?: string | null
+): Promise<number | null> {
+  const campRow = await identificarCampanhaTikTokNaMensagem(usuarioId, textoMensagem);
+  if (!campRow) return null;
+
+  // Mesma proteção contra corrida que criarLeadDeConversaCTWA usa.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const { id: campanhaId, nome: nomeCampanhaRow, nicho_id: nichoId, conta_anuncios_id: contaAnunciosId } = campRow;
+  const nomeCampanha = nomeCampanhaRow || "Campanha TikTok Ads";
+
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, nome, email, telefone,
+      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+    )
+    VALUES ($1, NULL, $2, NULL, $3, 'tiktok', 'whatsapp', 'novo', $4, $5, $6, $7, NOW())
+    RETURNING id
+    `,
+    [usuarioId, nomeContato || "Lead WhatsApp (TikTok Ads)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: nomeContato || "Lead WhatsApp (TikTok Ads)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (TikTok wa):", e));
+
+  return novoLeadId;
+}
+
 // Campanha importada da Meta é gravada só com campaign_id (sem ad_id), e uma
 // campanha pode ter vários anúncios — então o anúncio clicado nem sempre bate
 // com campanhas.ad_id. Pergunta à Meta de qual campanha é o anúncio; cacheado
@@ -22846,6 +22989,9 @@ async function resolverNichoConversaWhatsApp(
     ).catch(() => ({ rows: [] as any[] }));
     if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
   }
+
+  const campanhaTikTok = await identificarCampanhaTikTokNaMensagem(usuarioId, textoMensagem);
+  if (campanhaTikTok) return campanhaTikTok.nicho_id ?? null;
 
   if (!leadIdVinculado) return null;
   const leadNicho = await client.query(`SELECT nicho_id FROM leads WHERE id = $1`, [leadIdVinculado])
@@ -23027,6 +23173,12 @@ async function processarEventoWhatsApp(value: any) {
     if (!leadIdVinculado) {
       leadIdVinculado = await criarLeadDeConversaGoogle(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
         .catch(e => { console.error("ERRO criarLeadDeConversaGoogle:", e); return null; });
+    }
+
+    // Idem pro "TikTok ID" que o próprio TikTok coloca na mensagem do anúncio.
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaTikTok(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
+        .catch(e => { console.error("ERRO criarLeadDeConversaTikTok:", e); return null; });
     }
 
     if (leadIdVinculado) {
