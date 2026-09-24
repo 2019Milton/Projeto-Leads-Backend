@@ -1,0 +1,14 @@
+MSG: Olá! Seja muito bem-vindo à DIHOR Suplementos.
+PERGUNTA: Antes de qualquer coisa, com quem falo? [CAPTURAR:nome]
+MSG: Prazer, [nome]!
+PERGUNTA: Quantos anos você tem?
+PERGUNTA: E hoje você é casado, solteiro ou está namorando?
+MSG: Certo, [nome]. Agora vou fazer algumas perguntas para entender o que você procura. Responda apenas ao que se sentir à vontade para compartilhar.
+PERGUNTA: Você percebeu alguma mudança no seu desejo ou na sua libido?
+PERGUNTA: Tem tido dificuldade para conseguir ou manter uma ereção?
+PERGUNTA: A ejaculação acontece mais rápido do que você gostaria?
+PERGUNTA: Como estão sua disposição e seu desempenho hoje? Percebeu alguma mudança?
+MSG: Obrigado por compartilhar, [nome]. Essas informações ajudam a entender melhor o que você está buscando.
+MSG: Vou encaminhar você para nossa equipe de atendimento, que poderá explicar nossa linha de suplementação e tirar suas dúvidas sobre os produtos.
+PERGUNTA: Você tem interesse em conhecer as opções e esclarecer suas dúvidas agora?
+PERGUNTA: Posso prosseguir com o seu atendimento, [nome]? [HANDOFF]
