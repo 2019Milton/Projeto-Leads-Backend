@@ -29,6 +29,8 @@ import {
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
 
+import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
+
 const app = new Hono();
 
 const WHATSAPP_CLOUD_API_VERSION =
@@ -18687,43 +18689,15 @@ app.get(
       [usuario_id, adAccountId]
     );
 
-    // Quebra por rede (Facebook/Instagram) pro card "Status Meta" do Dashboard —
-    // campanhas separadas (ver montarContextoPublicacaoMeta no front) guardam
-    // configuracoes_avancadas.plataformas com um único elemento; campanhas
-    // legadas combinadas (ou sem essa info) caem no balde "meta" genérico, sem
-    // quebra — não dá pra saber qual rede sem essa marcação.
+    // Configuração remota ou evidência de entrega, sem alterar posicionamentos.
+    // Uma campanha em duas redes conta uma vez em cada subpainel.
     const campanhasParaQuebraRede = await client.query(
-      `
-      SELECT status, configuracoes_avancadas
-      FROM campanhas
-      WHERE usuario_id = $1
-      AND conta_anuncios_id = $2
-      `,
+      `SELECT status, campaign_id, configuracoes_avancadas
+       FROM campanhas WHERE usuario_id = $1 AND conta_anuncios_id = $2`,
       [usuario_id, adAccountId]
     );
-
-    const campanhasPorRede: Record<string, { campanhas: number; campanhas_ativas: number }> = {
-      facebook: { campanhas: 0, campanhas_ativas: 0 },
-      instagram: { campanhas: 0, campanhas_ativas: 0 }
-    };
-
-    for (const linha of campanhasParaQuebraRede.rows) {
-      let cfg = linha.configuracoes_avancadas;
-      if (typeof cfg === "string") {
-        try { cfg = JSON.parse(cfg); } catch { cfg = null; }
-      }
-      const plataformasLinha = Array.isArray(cfg?.plataformas) ? cfg.plataformas : [];
-      const rede =
-        plataformasLinha.length === 1 && ["facebook", "instagram"].includes(plataformasLinha[0])
-          ? plataformasLinha[0]
-          : null;
-      if (!rede) continue;
-
-      campanhasPorRede[rede].campanhas += 1;
-      if (["ACTIVE", "ENABLED"].includes(String(linha.status || "").toUpperCase())) {
-        campanhasPorRede[rede].campanhas_ativas += 1;
-      }
-    }
+    const contagemRedesMeta = contarCampanhasPorRedeMeta(campanhasParaQuebraRede.rows);
+    const campanhasPorRede = contagemRedesMeta.por_rede;
 
     // criado_em é timestamp sem timezone armazenado em UTC — comparar direto com
     // CURRENT_DATE (também UTC) faz "hoje" virar "ontem" assim que passa das 21h em
@@ -19133,6 +19107,7 @@ app.get(
         gasto_hoje: gastoHoje,
         gasto_hoje_formatado: gastoHojeFormatado,
         por_rede: metricasPorRede,
+        campanhas_sem_rede_identificada: contagemRedesMeta.sem_rede_identificada,
         ultimo_sync:
           conn.rows[0].ultimo_sync || null
       },
@@ -30264,6 +30239,22 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
       }
     }
 
+    let avisoRedes: string | null = null;
+    try {
+      const evidencias = await consultarRedesMeta(
+        token, adAccountId, campanhasMeta.data.map((campanha: any) => String(campanha.id))
+      );
+      for (const [campaignId, evidencia] of evidencias) {
+        await client.query(SQL_SALVAR_REDES_META, [
+          user.id, adAccountId, campaignId, JSON.stringify(evidencia)
+        ]);
+      }
+    } catch {
+      // Falha parcial não apaga a última identificação válida nem bloqueia leads.
+      avisoRedes = "Não foi possível atualizar a identificação das redes. Tente sincronizar novamente.";
+      console.warn("[meta-sync] Identificação de redes não atualizada");
+    }
+
     // =====================================================
     // 🔥 SINCRONIZA LEADS
     // =====================================================
@@ -30281,7 +30272,8 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
     
     return c.json({
       sucesso: true,
-      total: campanhasMeta.data.length
+      total: campanhasMeta.data.length,
+      aviso_redes: avisoRedes
     });
 
     } catch (err) {
