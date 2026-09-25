@@ -19,6 +19,14 @@ import {
   type LinhaRedeBruta,
   type PlataformaRanking,
 } from "./ranking-plataformas";
+import {
+  descreverConjuntosPausados,
+  resolverVeiculacaoPorCampanha,
+  rotuloVeiculacao,
+  veiculacaoParcial,
+  type ConjuntosCampanha,
+  type VeiculacaoCampanha,
+} from "./veiculacao-meta";
 
 const app = new Hono();
 
@@ -5155,7 +5163,8 @@ function diagnosticarVeiculacaoMeta(
   status: string | null,
   issues: any[] = [],
   erroPagamentoConta?: string | null,
-  campanhaStatusLocal?: string | null
+  campanhaStatusLocal?: string | null,
+  conjuntos: ConjuntosCampanha | null = null
 ) {
   const statusNormalizado =
     String(status || "").toUpperCase();
@@ -5205,6 +5214,24 @@ function diagnosticarVeiculacaoMeta(
   }
 
   if (statusNormalizado === "ACTIVE") {
+    // A campanha veicula, mas parte dos conjuntos está desligada: é um aviso, não um
+    // problema (por isso "atencao" e não "pausado"). Os outros conjuntos seguem rodando.
+    if (veiculacaoParcial({ status: statusNormalizado, conjuntos })) {
+      return {
+        tipo: "atencao",
+        subcategoria: "adset_pausado" as string | null,
+        motivo: `${descreverConjuntosPausados(conjuntos)} na Meta. Os outros continuam veiculando.`,
+        acao: "Se não foi proposital, ative o conjunto pausado na Meta.",
+        acao_passos: [
+          "Clique em 'Ver conjuntos na Meta' abaixo",
+          "Localize o conjunto de anúncios com status pausado",
+          "Ative-o usando a chave ao lado do nome do conjunto",
+          "Os anúncios voltam a veicular automaticamente"
+        ] as string[],
+        detalhes
+      };
+    }
+
     return {
       tipo: "ok",
       subcategoria: null as string | null,
@@ -5262,7 +5289,7 @@ function diagnosticarVeiculacaoMeta(
     return {
       tipo: "pausado",
       subcategoria: "adset_pausado",
-      motivo: "O conjunto de anúncios está pausado na Meta. A campanha está ativa, mas os anúncios não veiculam.",
+      motivo: `${descreverConjuntosPausados(conjuntos)} na Meta. A campanha está ativa, mas os anúncios não veiculam.`,
       acao: "Acesse os conjuntos de anúncios na Meta para ativar.",
       acao_passos: [
         "Clique em 'Ver conjuntos na Meta' abaixo",
@@ -27741,47 +27768,23 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
     }
 
     // 🔥 VEICULAÇÃO (status detalhado dos anúncios, igual ao Gerenciador de Anúncios)
-    const veiculacaoPorCampanha: Record<string, string> = {};
+    // Uma campanha só veicula se campanha, conjunto e anúncio estiverem ligados. A regra
+    // que escolhe o status da campanha (e detecta "ligada, mas sem veicular" e conjuntos
+    // pausados em parte) fica em veiculacao-meta.ts.
+    const veiculacaoPorCampanha: Record<string, VeiculacaoCampanha> = {};
 
     if (token && contaAnunciosId) {
       try {
         const adsResp = await fetch(
-          `https://graph.facebook.com/v19.0/${contaAnunciosId}/ads?fields=id,campaign_id,effective_status&limit=500&access_token=${token}`
+          `https://graph.facebook.com/v19.0/${contaAnunciosId}/ads?fields=id,campaign_id,adset_id,effective_status&limit=500&access_token=${token}`
         ).then(r => r.json());
 
         console.log("META ADS EFFECTIVE STATUS:", JSON.stringify(adsResp));
 
-        const prioridade = [
-          "WITH_ISSUES",
-          "DISAPPROVED",
-          "PENDING_BILLING_INFO",
-          "PENDING_REVIEW",
-          "IN_PROCESS",
-          "PREAPPROVED",
-          "ADSET_PAUSED",
-          "CAMPAIGN_PAUSED",
-          "PAUSED",
-          "ACTIVE",
-          "ARCHIVED",
-          "DELETED"
-        ];
-
-        const statusPorCampanha: Record<string, string[]> = {};
-
-        for (const ad of adsResp.data || []) {
-          if (!ad.campaign_id || !ad.effective_status) continue;
-
-          statusPorCampanha[ad.campaign_id] =
-            statusPorCampanha[ad.campaign_id] || [];
-          statusPorCampanha[ad.campaign_id].push(ad.effective_status);
-        }
-
-        for (const [campaignId, statuses] of Object.entries(statusPorCampanha)) {
-          const melhorStatus = prioridade.find(p => statuses.includes(p));
-          if (melhorStatus) {
-            veiculacaoPorCampanha[campaignId] = melhorStatus;
-          }
-        }
+        Object.assign(
+          veiculacaoPorCampanha,
+          resolverVeiculacaoPorCampanha(adsResp.data || [])
+        );
       } catch (e) {
         console.error("ERRO ADS EFFECTIVE STATUS:", e);
       }
@@ -28017,10 +28020,12 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           : null;
 
       // 🔥 VEICULAÇÃO (status detalhado igual ao Gerenciador de Anúncios)
-      const veiculacaoStatus =
+      const veiculacaoResolvida =
         campanhaEhMeta
           ? (veiculacaoPorCampanha[campanha.campaign_id] || null)
           : null;
+
+      const veiculacaoStatus = veiculacaoResolvida?.status || null;
 
       // Corrige divergência de status entre banco e Meta automaticamente.
       // Ex.: usuário pausou direto na Meta → banco ainda mostra ACTIVE.
@@ -28045,7 +28050,8 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
             veiculacaoStatus,
             issuesCampanha,
             mensagemErroPagamento || erroPagamentoConta,
-            campanha.status
+            campanha.status,
+            veiculacaoResolvida?.conjuntos || null
           )
         : null;
 
@@ -28186,7 +28192,20 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           campanha.configuracoes_avancadas?.ultimo_erro_publicacao || null,
         erro_pagamento: mensagemErroPagamento || null,
         veiculacao: veiculacaoStatus,
-        veiculacao_label: campanhaEhMeta ? traduzirVeiculacaoMeta(veiculacaoStatus) : null,
+        // "Ativo · 1 de 3 conjuntos pausados" quando só parte dos conjuntos está desligada.
+        veiculacao_label: campanhaEhMeta
+          ? rotuloVeiculacao(traduzirVeiculacaoMeta(veiculacaoStatus), veiculacaoResolvida)
+          : null,
+        // Campanha ligada (ACTIVE) em que nenhum anúncio veicula porque o conjunto ou os
+        // anúncios estão pausados. null fora da Meta. Alimenta a etiqueta "ATIVA · sem
+        // veicular" e a separação nos contadores do Dashboard.
+        veiculacao_sem_veicular: campanhaEhMeta
+          ? Boolean(
+              veiculacaoResolvida?.semVeicular &&
+              ["ACTIVE", "ENABLED"].includes(String(campanha.status || "").toUpperCase())
+            )
+          : null,
+        veiculacao_conjuntos: veiculacaoResolvida?.conjuntos || null,
         veiculacao_tipo: diagnosticoVeiculacao?.tipo || null,
         veiculacao_subcategoria: diagnosticoVeiculacao?.subcategoria || null,
         veiculacao_motivo: diagnosticoVeiculacao?.motivo || null,
