@@ -26641,10 +26641,10 @@ app.get("/campanhas", authMiddleware, async (c) => {
       `
       SELECT
         c.*,
-        COALESCE(n.id,   nd.id)   AS nicho_id,
-        COALESCE(n.slug, nd.slug) AS nicho_slug,
-        COALESCE(n.nome, nd.nome) AS nicho_nome,
-        COALESCE(n.cor,  nd.cor)  AS nicho_cor,
+        n.id AS nicho_id,
+        n.slug AS nicho_slug,
+        n.nome AS nicho_nome,
+        n.cor AS nicho_cor,
         COALESCE(dono_origem.email,     dono.email)     AS criado_por_email,
         COALESCE(dono_origem.nome,      dono.nome)      AS criado_por_nome,
         COALESCE(dono_origem.sobrenome, dono.sobrenome) AS criado_por_sobrenome,
@@ -26690,26 +26690,6 @@ app.get("/campanhas", authMiddleware, async (c) => {
         ON dono_origem.id = origem_c.usuario_id
       LEFT JOIN nichos n
         ON n.id = c.nicho_id
-      LEFT JOIN LATERAL (
-        SELECT ni.id, ni.slug, ni.nome, ni.cor
-        FROM nichos ni
-        WHERE c.nicho_id IS NULL AND (
-          EXISTS (SELECT 1 FROM campanhas_saude      cs WHERE cs.campanha_id = c.id) AND ni.slug = 'saude'
-          OR
-          EXISTS (SELECT 1 FROM campanhas_imoveis    ci WHERE ci.campanha_id = c.id) AND ni.slug = 'imoveis'
-          OR
-          EXISTS (SELECT 1 FROM campanhas_suplementos cp WHERE cp.campanha_id = c.id) AND ni.slug = 'suplementos'
-          OR
-          EXISTS (SELECT 1 FROM campanhas_higienizacao chg WHERE chg.campanha_id = c.id) AND ni.slug = 'higienizacao'
-          OR
-          EXISTS (SELECT 1 FROM campanhas_telecom ctc WHERE ctc.campanha_id = c.id) AND ni.slug = 'telecom'
-          OR
-          EXISTS (SELECT 1 FROM campanhas_cursos_online cco WHERE cco.campanha_id = c.id) AND ni.slug = 'cursos_online'
-          OR
-          EXISTS (SELECT 1 FROM leads l WHERE l.campanha = c.nome AND l.nicho_id = ni.id AND l.usuario_id = c.usuario_id LIMIT 1)
-        )
-        LIMIT 1
-      ) nd ON true
       WHERE
         c.usuario_id = $1
         AND NOT (
@@ -26726,7 +26706,7 @@ app.get("/campanhas", authMiddleware, async (c) => {
           OR (c.plataforma = 'linkedin' AND c.conta_anuncios_id = $6)
           OR (c.plataforma = 'kwai' AND c.conta_anuncios_id = $7)
         )
-        AND ($3::text IS NULL OR COALESCE(n.slug, nd.slug) = $3)
+        AND ($3::text IS NULL OR n.slug = $3)
       ORDER BY c.id DESC
       `,
       [user.id, contaAnunciosId ?? null, nichoSlug ?? null, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn, contaAnunciosIdKwai]
@@ -27549,6 +27529,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       `
       SELECT
         c.*,
+        n.slug AS nicho_slug,
+        n.nome AS nicho_nome,
+        n.cor AS nicho_cor,
         ci.tipo_imovel,
         ci.finalidade,
         ci.valor_min,
@@ -27611,6 +27594,7 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
           '[]'
         ) AS corretores_envio_historico
       FROM campanhas c
+      LEFT JOIN nichos n ON n.id = c.nicho_id
       INNER JOIN usuarios dono
         ON dono.id = c.usuario_id
       LEFT JOIN campanhas origem_c
@@ -27791,41 +27775,9 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       }
     }
 
-    // A detecção por nome abaixo é só visual (preenche nicho_id em memória) e o
-    // bot ignora isso — só o nicho_id gravado no banco escolhe o roteiro. O
-    // front usa este flag pra avisar quando a campanha ainda não tem nicho salvo.
-    for (const c of campanhas.rows as any[]) {
-      c.nicho_confirmado = Boolean(c.nicho_id);
-    }
-
-    // Detecção de nicho por nome para campanhas sem nicho_id no BD
-    const userNichos = (user.nichos || []) as Array<{id: number; slug: string; nome: string; cor: string}>;
-    if (userNichos.length > 0) {
-      const norm = (t: string) =>
-        String(t).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-      const saasNicho = userNichos.find(n => n.slug === "saas" || norm(n.nome).includes("saas") || norm(n.nome).includes("plataforma"));
-      for (const c of campanhas.rows as any[]) {
-        // Migra nicho legado "Plataforma" para o nicho SaaS atual do usuário
-        if (saasNicho && c.nicho_nome && /^plataforma$/i.test(c.nicho_nome.trim())) {
-          c.nicho_id   = saasNicho.id;
-          c.nicho_slug = saasNicho.slug;
-          c.nicho_nome = saasNicho.nome;
-          c.nicho_cor  = saasNicho.cor;
-          continue;
-        }
-        if (c.nicho_id || c.nicho_slug) continue;
-        const nomeLower = norm(c.nome || "");
-        for (const nicho of userNichos) {
-          const nichoNomeLower = norm(nicho.nome || "");
-          if (nomeLower.includes(nichoNomeLower) || nomeLower.includes(nicho.slug)) {
-            c.nicho_id   = nicho.id;
-            c.nicho_slug = nicho.slug;
-            c.nicho_nome = nicho.nome;
-            c.nicho_cor  = nicho.cor;
-            break;
-          }
-        }
-      }
+    // Somente o nicho salvo na campanha define sua classificação.
+    for (const campanha of campanhas.rows as any[]) {
+      campanha.nicho_confirmado = Boolean(campanha.nicho_id);
     }
 
     const metricas = [];
@@ -28055,14 +28007,6 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
             veiculacaoResolvida?.conjuntos || null
           )
         : null;
-
-      // Persiste nicho detectado pelas tabelas de detalhe ou leads
-      if (!campanha.nicho_id && campanha.nicho_slug) {
-        client.query(
-          `UPDATE campanhas SET nicho_id = (SELECT id FROM nichos WHERE slug = $1 LIMIT 1) WHERE id = $2`,
-          [campanha.nicho_slug, campanha.id]
-        ).catch(() => {});
-      }
 
       if (erroPagamentoConta || mensagemErroPagamento) {
         console.error(
