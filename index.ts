@@ -27,6 +27,7 @@ import {
   type ConjuntosCampanha,
   type VeiculacaoCampanha,
 } from "./veiculacao-meta";
+import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
 
 const app = new Hono();
 
@@ -29718,6 +29719,79 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA GOOGLE:", err);
     return c.json({ error: "Erro ao buscar performance diaria do Google Ads", detalhe: err?.message || err }, 500);
+  }
+});
+
+// Detalhe por campanha de um dia, para a linha do dia expandir no painel de performance do
+// Google. Mesmo formato de /meta/performance-diaria/:data/campanhas. Só entram as campanhas
+// criadas/importadas na plataforma (o mesmo filtro do total do dia acima), e os leads vêm do
+// banco, casados pelo nome da campanha (é o que o lead do Google grava).
+app.get("/google/performance-diaria/:data/campanhas", authMiddleware, async (c: any) => {
+  try {
+    const user: any = c.get("user");
+    const data = c.req.param("data");
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+      return c.json({ error: "Data invalida. Use YYYY-MM-DD" }, 400);
+    }
+
+    if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return c.json({ error: "Google Ads nao configurado" }, 400);
+    }
+
+    const conn = await client.query(
+      `SELECT refresh_token, dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [user.id]
+    );
+    const row = conn.rows[0];
+    const customerId = row?.dados_conta?.customer_id;
+    const loginCustomerId = row?.dados_conta?.login_customer_id || null;
+
+    if (!row?.refresh_token || !customerId) {
+      return c.json({ error: "Google Ads nao conectado" }, 400);
+    }
+
+    const accessToken = await obterAccessTokenGoogle(row.refresh_token);
+
+    const campanhaIdsResult = await client.query(
+      `SELECT DISTINCT campaign_id FROM campanhas
+       WHERE usuario_id = $1 AND LOWER(COALESCE(plataforma, '')) IN ('google', 'google_ads') AND campaign_id IS NOT NULL
+         AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')`,
+      [user.id]
+    );
+    const campaignIdsUsuario = new Set<string>(
+      campanhaIdsResult.rows.map((r: any) => String(r.campaign_id))
+    );
+
+    const linhas: any[] = campaignIdsUsuario.size
+      ? await googleAdsQuery(
+          customerId, accessToken,
+          // A data já passou pela validação YYYY-MM-DD acima.
+          `SELECT campaign.id, campaign.name, metrics.impressions, metrics.clicks, metrics.cost_micros
+           FROM campaign WHERE segments.date = '${data}'`,
+          loginCustomerId
+        ) as any[]
+      : [];
+
+    const leadsResult = await client.query(
+      `SELECT campanha, COUNT(*)::int AS total
+       FROM leads
+       WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads') AND DATE(criado_em) = $2::date
+       GROUP BY campanha`,
+      [user.id, data]
+    );
+
+    const { campanhas, leadsSemCampanha } = montarCampanhasDiaGoogle(
+      linhas,
+      campaignIdsUsuario,
+      leadsResult.rows
+    );
+
+    return c.json({ data, campanhas, leads_sem_campanha: leadsSemCampanha });
+  } catch (err: any) {
+    console.error("ERRO CAMPANHAS DIA GOOGLE:", err);
+    return c.json({ error: "Erro ao buscar campanhas do dia", detalhe: err?.message }, 500);
   }
 });
 
