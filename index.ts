@@ -3094,6 +3094,223 @@ function limiteMensalIAUsuario(valor: unknown, padrao: number): number {
   const numero = Number(valor);
   return Number.isFinite(numero) && numero >= 0 ? numero : padrao;
 }
+
+/* =========================
+   ⚠️ FALHAS DOS PROVEDORES DE IA
+========================= */
+
+// OpenAI e Anthropic podem recusar a chamada por motivos que o corretor não resolve
+// (sem crédito, chave inválida, modelo removido). Antes o erro só ia para o console e o
+// sistema seguia em silêncio para o outro provedor ou para um texto-modelo. Agora toda
+// chamada passa por fetchProvedorIA: a falha é classificada, vira alerta no painel de IA
+// do admin (tabela ia_alertas_provedor) e notificação para os super admins.
+type ProvedorIA = "openai" | "anthropic";
+type TipoFalhaProvedorIA =
+  | "sem_credito"
+  | "chave_invalida"
+  | "acesso_negado"
+  | "modelo_invalido"
+  | "limite_taxa"
+  | "sobrecarga"
+  | "outro";
+
+const NOME_PROVEDOR_IA: Record<ProvedorIA, string> = {
+  openai: "OpenAI",
+  anthropic: "Anthropic (Claude)"
+};
+
+const ROTULO_FALHA_PROVEDOR_IA: Record<TipoFalhaProvedorIA, string> = {
+  sem_credito: "Sem crédito ou limite de gasto atingido",
+  chave_invalida: "Chave de API inválida",
+  acesso_negado: "Acesso negado pelo provedor",
+  modelo_invalido: "Modelo ou recurso não encontrado",
+  limite_taxa: "Limite de requisições por minuto",
+  sobrecarga: "Provedor instável ou sobrecarregado",
+  outro: "Erro do provedor"
+};
+
+// Só estes viram alerta: exigem ação do admin. Limite por minuto e instabilidade passam sozinhos.
+const TIPOS_FALHA_PROVEDOR_IA_CRITICOS: TipoFalhaProvedorIA[] = [
+  "sem_credito",
+  "chave_invalida",
+  "acesso_negado",
+  "modelo_invalido"
+];
+
+// Um sucesso prova que o problema acabou, então o alerta fecha sozinho. Os demais dependem
+// do modelo ou do recurso usado (um sucesso com outro modelo não prova nada): o admin fecha.
+const TIPOS_FALHA_PROVEDOR_IA_AUTO_RESOLVIVEIS: TipoFalhaProvedorIA[] = [
+  "sem_credito",
+  "chave_invalida"
+];
+
+// Provedores com alerta crítico aberto (só em memória, recarregado do banco na subida).
+// Serve para dizer ao corretor, na resposta, que o admin já foi avisado.
+const provedoresIAComFalhaCritica = new Set<ProvedorIA>();
+const ultimoAlertaProvedorIAEm = new Map<string, number>();
+
+function classificarFalhaProvedorIA(status: number, corpo: any) {
+  const erro = corpo?.error && typeof corpo.error === "object" ? corpo.error : {};
+  const codigo = String(erro.code || erro.type || "").trim().slice(0, 60) || null;
+  // A mensagem da OpenAI para chave inválida traz um pedaço da chave: nunca logar nem gravar crua.
+  const mensagem = String(erro.message || (typeof corpo?.error === "string" ? corpo.error : ""))
+    .replace(/sk-[A-Za-z0-9_\-*.]{4,}/g, "sk-***")
+    .slice(0, 300);
+  const texto = `${codigo || ""} ${mensagem}`.toLowerCase();
+
+  let tipo: TipoFalhaProvedorIA = "outro";
+  if (/insufficient_quota|exceeded your current quota|billing_hard_limit|billing hard limit|credit balance is too low|specified workspace api usage limits|insufficient_funds|out of credits/.test(texto)) {
+    tipo = "sem_credito";
+  } else if (status === 401 || /invalid_api_key|authentication_error|incorrect api key|invalid x-api-key/.test(texto)) {
+    tipo = "chave_invalida";
+  } else if (status === 403 || /permission_error|permission_denied/.test(texto)) {
+    tipo = "acesso_negado";
+  } else if (status === 404 || /model_not_found|does not exist or you do not have access/.test(texto)) {
+    tipo = "modelo_invalido";
+  } else if (status === 429 || /rate_limit/.test(texto)) {
+    tipo = "limite_taxa";
+  } else if (status >= 500 || /overloaded/.test(texto)) {
+    tipo = "sobrecarga";
+  }
+
+  return { tipo, codigo, mensagem };
+}
+
+function textoAlertaProvedorIA(provider: ProvedorIA, tipo: TipoFalhaProvedorIA) {
+  const nome = NOME_PROVEDOR_IA[provider];
+  const variavelChave = provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+  const acao: Record<TipoFalhaProvedorIA, string> = {
+    sem_credito: `Recarregue o saldo ou aumente o limite de gasto na página de Billing da ${nome}.`,
+    chave_invalida: `Confira a chave ${variavelChave} nas variáveis da Railway.`,
+    acesso_negado: `Verifique as permissões da chave e da organização na ${nome}.`,
+    modelo_invalido: `Confira o modelo configurado no Painel IA Ouro e nas variáveis da Railway.`,
+    limite_taxa: "",
+    sobrecarga: "",
+    outro: ""
+  };
+  return {
+    titulo: `IA: ${nome} — ${ROTULO_FALHA_PROVEDOR_IA[tipo]}`,
+    mensagem:
+      `${ROTULO_FALHA_PROVEDOR_IA[tipo]} na ${nome}. ` +
+      `Enquanto isso a plataforma usa o outro provedor ou respostas-modelo. ${acao[tipo]}`.trim()
+  };
+}
+
+async function gravarAlertaProvedorIA(
+  provider: ProvedorIA,
+  falha: { tipo: TipoFalhaProvedorIA; codigo: string | null; mensagem: string },
+  contexto: string,
+  status: number
+) {
+  const gravado = await client.query(
+    `
+    INSERT INTO ia_alertas_provedor (provider, tipo, contexto, status_http, codigo, mensagem)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT (provider, tipo) WHERE resolvido_em IS NULL
+    DO UPDATE SET
+      ocorrencias = ia_alertas_provedor.ocorrencias + 1,
+      ultima_em = NOW(),
+      contexto = EXCLUDED.contexto,
+      status_http = EXCLUDED.status_http,
+      codigo = EXCLUDED.codigo,
+      mensagem = EXCLUDED.mensagem
+    RETURNING id
+    `,
+    [provider, falha.tipo, contexto, status, falha.codigo, falha.mensagem]
+  );
+  const alertaId = gravado.rows[0]?.id;
+  if (!alertaId) return;
+
+  // Avisa os super admins no máximo a cada 6h por alerta (o UPDATE condicional evita
+  // duas falhas simultâneas notificarem em dobro).
+  const podeNotificar = await client.query(
+    `
+    UPDATE ia_alertas_provedor
+    SET notificado_em = NOW()
+    WHERE id = $1
+      AND (notificado_em IS NULL OR notificado_em < NOW() - INTERVAL '6 hours')
+    RETURNING id
+    `,
+    [alertaId]
+  );
+  if (!podeNotificar.rows.length) return;
+
+  const admins = await client.query(`SELECT id FROM usuarios WHERE tipo = 'super_admin'`);
+  const texto = textoAlertaProvedorIA(provider, falha.tipo);
+  for (const admin of admins.rows) {
+    await client.query(
+      `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
+       VALUES ($1, 'ia_provedor_alerta', $2, $3)`,
+      [admin.id, texto.titulo, texto.mensagem]
+    );
+  }
+}
+
+function registrarFalhaProvedorIA(provider: ProvedorIA, contexto: string, status: number, corpo: any) {
+  const falha = classificarFalhaProvedorIA(status, corpo);
+  console.error(
+    `[ia-provedor] ${provider} (${contexto}): HTTP ${status} tipo=${falha.tipo} codigo=${falha.codigo || "-"} mensagem=${falha.mensagem}`
+  );
+
+  if (!TIPOS_FALHA_PROVEDOR_IA_CRITICOS.includes(falha.tipo)) return falha;
+
+  provedoresIAComFalhaCritica.add(provider);
+
+  // Com o crédito esgotado, cada chamada falha: não vale uma ida ao banco por falha.
+  const chave = `${provider}:${falha.tipo}`;
+  const agora = Date.now();
+  if (agora - (ultimoAlertaProvedorIAEm.get(chave) || 0) < 60_000) return falha;
+  ultimoAlertaProvedorIAEm.set(chave, agora);
+
+  gravarAlertaProvedorIA(provider, falha, contexto, status).catch((e: any) =>
+    console.error("[ia-provedor] erro ao gravar alerta:", e?.message || e)
+  );
+  return falha;
+}
+
+function marcarSucessoProvedorIA(provider: ProvedorIA) {
+  if (!provedoresIAComFalhaCritica.has(provider)) return;
+  provedoresIAComFalhaCritica.delete(provider);
+  client
+    .query(
+      `UPDATE ia_alertas_provedor
+       SET resolvido_em = NOW()
+       WHERE provider = $1 AND tipo = ANY($2::text[]) AND resolvido_em IS NULL`,
+      [provider, TIPOS_FALHA_PROVEDOR_IA_AUTO_RESOLVIVEIS]
+    )
+    .catch((e: any) => console.error("[ia-provedor] erro ao fechar alerta:", e?.message || e));
+}
+
+// Substitui fetch nas chamadas à OpenAI/Anthropic: devolve a mesma Response (quem chama
+// continua lendo o corpo normalmente) e registra a falha quando o provedor recusa.
+async function fetchProvedorIA(
+  provider: ProvedorIA,
+  contexto: string,
+  url: string,
+  init: RequestInit
+): Promise<Response> {
+  const resposta = await fetch(url, init);
+  if (resposta.ok) {
+    marcarSucessoProvedorIA(provider);
+    return resposta;
+  }
+  let corpo: any = null;
+  try {
+    corpo = await resposta.clone().json();
+  } catch {
+    // corpo que não é JSON: a classificação usa só o status HTTP
+  }
+  registrarFalhaProvedorIA(provider, contexto, resposta.status, corpo);
+  return resposta;
+}
+
+// Texto para o corretor quando nenhum provedor respondeu.
+function mensagemIAIndisponivel(): string {
+  return provedoresIAComFalhaCritica.size > 0
+    ? "A IA está indisponível no momento. O administrador já foi avisado."
+    : "A IA não respondeu agora. Tente novamente em instantes.";
+}
+
 const OPENAI_RESPONSES_URL =
   "https://api.openai.com/v1/responses";
 
@@ -3891,7 +4108,7 @@ async function gerarAnaliseIAOpenAI(
             max_tokens: 1200
           };
 
-      const response = await fetch(
+      const response = await fetchProvedorIA("openai", "analise_lead",
         usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
         {
           method: "POST",
@@ -3928,7 +4145,7 @@ async function gerarAnaliseIAOpenAI(
     try {
       const anthropicModelo =
         textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      const resp = await fetchProvedorIA("anthropic", "analise_lead", "https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
           "x-api-key": anthropicKey,
@@ -4241,7 +4458,7 @@ async function gerarSugestaoComercialOpenAI(
             ]
           };
 
-      const response = await fetch(
+      const response = await fetchProvedorIA("openai", "sugestao_comercial",
         usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
         {
           method: "POST",
@@ -4277,7 +4494,7 @@ async function gerarSugestaoComercialOpenAI(
     try {
       const anthropicModelo =
         textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      const resp = await fetchProvedorIA("anthropic", "sugestao_comercial", "https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
           "x-api-key": anthropicKey,
@@ -4685,7 +4902,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
             ]
           };
 
-      const response = await fetch(
+      const response = await fetchProvedorIA("openai", "analise_trafego",
         usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
         {
           method: "POST",
@@ -4724,7 +4941,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
     try {
       const anthropicModelo =
         textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      const resp = await fetchProvedorIA("anthropic", "analise_trafego", "https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
           "x-api-key": anthropicKey,
@@ -20003,7 +20220,7 @@ app.post("/assistente-contas-anuncios/analisar-tela", authMiddleware, async (c) 
     };
 
     assistenteAnaliseTelaUltima.set(usuarioId, Date.now());
-    const resposta = await fetch(OPENAI_RESPONSES_URL, {
+    const resposta = await fetchProvedorIA("openai", "assistente_tela", OPENAI_RESPONSES_URL, {
       method: "POST",
       signal: AbortSignal.timeout(40000),
       headers: {
@@ -20327,7 +20544,7 @@ async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Pro
     form.append("model", "whisper-1");
     form.append("language", "pt");
 
-    const transcricaoRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    const transcricaoRes = await fetchProvedorIA("openai", "transcricao_audio", "https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: { Authorization: `Bearer ${openaiKey}` },
       body: form,
@@ -21501,7 +21718,7 @@ app.post("/ia/whatsapp-bot/gerar", authMiddleware, async (c) => {
       ? { model: modelo, temperature: 1.0, instructions: systemMsg, input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }] }
       : { model: modelo, temperature: 1.0, response_format: { type: "json_object" }, messages: [{ role: "system", content: systemMsg }, { role: "user", content: prompt }] };
 
-    const resp = await fetch(usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
+    const resp = await fetchProvedorIA("openai", "roteiro_whatsapp", usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify(respBody),
@@ -21907,7 +22124,7 @@ async function classificarStatusLeadPorConversa(
             max_tokens: 300
           };
 
-      const resp = await fetch(usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
+      const resp = await fetchProvedorIA("openai", "classificacao_conversa", usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify(respBody)
@@ -21938,7 +22155,7 @@ async function classificarStatusLeadPorConversa(
   if (anthropicKey) {
     try {
       const anthropicModelo = textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      const resp = await fetchProvedorIA("anthropic", "classificacao_conversa", "https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -23537,6 +23754,39 @@ await client.query(`
 await client.query(`
   ALTER TABLE ia_usos ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'openai';
 `);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ia_alertas_provedor (
+    id SERIAL PRIMARY KEY,
+    provider TEXT NOT NULL,
+    tipo TEXT NOT NULL,
+    contexto TEXT,
+    status_http INTEGER,
+    codigo TEXT,
+    mensagem TEXT,
+    ocorrencias INTEGER NOT NULL DEFAULT 1,
+    primeira_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    ultima_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    notificado_em TIMESTAMP,
+    resolvido_em TIMESTAMP
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_ia_alertas_provedor_aberto
+    ON ia_alertas_provedor (provider, tipo) WHERE resolvido_em IS NULL;
+`);
+
+// Depois de um deploy a memória zera: recarrega quais provedores têm alerta aberto para o
+// próximo sucesso conseguir fechá-lo e para as respostas ao corretor seguirem corretas.
+{
+  const alertasAbertos = await client.query(
+    `SELECT DISTINCT provider FROM ia_alertas_provedor WHERE resolvido_em IS NULL`
+  );
+  for (const linha of alertasAbertos.rows) {
+    if (linha.provider === "openai" || linha.provider === "anthropic") {
+      provedoresIAComFalhaCritica.add(linha.provider);
+    }
+  }
+}
+
 
 await client.query(`
   CREATE TABLE IF NOT EXISTS ia_config (
@@ -28384,7 +28634,7 @@ async function pesquisarNotasMercadoNicho(nicho: { slug: string; nome: string })
   );
 
   const modelo = modeloResponsesCriativo();
-  const response = await fetch(OPENAI_RESPONSES_URL, {
+  const response = await fetchProvedorIA("openai", "ranking_plataformas", OPENAI_RESPONSES_URL, {
     method: "POST",
     headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
     signal: AbortSignal.timeout(180_000),
@@ -33593,16 +33843,20 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
       );
     }
 
-    await registrarUsoIA(
-      Number(user.id),
-      "analise_lead",
-      "lead",
-      lead.id,
-      usoIA?.custo_estimado || IA_CUSTO_ESTIMADO_PADRAO,
-      Number(usoIA?.usage?.input_tokens || 0),
-      Number(usoIA?.usage?.output_tokens || 0),
-      usoIA?.provider || "openai"
-    );
+    // Se nenhum provedor respondeu, quem devolveu a análise foi o motor local (sem custo):
+    // não gasta a cota de chamadas do corretor.
+    if (usoIA) {
+      await registrarUsoIA(
+        Number(user.id),
+        "analise_lead",
+        "lead",
+        lead.id,
+        usoIA.custo_estimado || IA_CUSTO_ESTIMADO_PADRAO,
+        Number(usoIA.usage?.input_tokens || 0),
+        Number(usoIA.usage?.output_tokens || 0),
+        usoIA.provider || "openai"
+      );
+    }
 
     return c.json({ analise });
 
@@ -34180,12 +34434,62 @@ app.get("/admin/ia/saldos", authMiddleware, async (c) => {
     return c.json({
       openai: { ...(por_provider.openai || vazio), saldo_api: openaiSaldo },
       anthropic: { ...anthropicData, saldo_calculado: anthropicSaldo },
+      alertas: await listarAlertasProvedorIAAbertos(),
       atualizado_em: new Date().toISOString()
     });
 
   } catch (err) {
     console.error("ERRO SALDOS IA:", err);
     return c.json({ error: "Erro ao consultar saldos" }, 500);
+  }
+});
+
+// Alertas abertos de OpenAI/Anthropic (sem crédito, chave inválida etc.). Mesmo formato
+// usado pelo painel de IA do admin dentro de /admin/ia/saldos.
+async function listarAlertasProvedorIAAbertos() {
+  const alertas = await client.query(`
+    SELECT id, provider, tipo, contexto, status_http, codigo, mensagem, ocorrencias, primeira_em, ultima_em
+    FROM ia_alertas_provedor
+    WHERE resolvido_em IS NULL
+    ORDER BY ultima_em DESC
+    LIMIT 20
+  `);
+  return alertas.rows.map((linha: any) => ({
+    ...linha,
+    provedor_nome: NOME_PROVEDOR_IA[linha.provider as ProvedorIA] || linha.provider,
+    rotulo: ROTULO_FALHA_PROVEDOR_IA[linha.tipo as TipoFalhaProvedorIA] || linha.tipo,
+    acao: textoAlertaProvedorIA(linha.provider as ProvedorIA, linha.tipo as TipoFalhaProvedorIA).mensagem
+  }));
+}
+
+app.post("/admin/ia/alertas/:id/resolver", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
+
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id) || id <= 0) return c.json({ error: "Alerta inválido" }, 400);
+
+    const fechado = await client.query(
+      `UPDATE ia_alertas_provedor SET resolvido_em = NOW()
+       WHERE id = $1 AND resolvido_em IS NULL
+       RETURNING provider`,
+      [id]
+    );
+    if (!fechado.rows.length) return c.json({ error: "Alerta não encontrado ou já resolvido" }, 404);
+
+    // Sem mais alerta aberto para o provedor, as respostas ao corretor voltam ao texto normal.
+    const provider = fechado.rows[0].provider as ProvedorIA;
+    const restantes = await client.query(
+      `SELECT 1 FROM ia_alertas_provedor WHERE provider = $1 AND resolvido_em IS NULL LIMIT 1`,
+      [provider]
+    );
+    if (!restantes.rows.length) provedoresIAComFalhaCritica.delete(provider);
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO RESOLVER ALERTA IA:", err);
+    return c.json({ error: "Erro ao resolver alerta" }, 500);
   }
 });
 
@@ -35025,19 +35329,23 @@ app.post("/ia/leads/:id/sugestao", authMiddleware, async (c) => {
         fallback
       );
 
-    await registrarUsoIA(
-      Number(user.id),
-      tipoUso,
-      "lead",
-      lead.id,
-      usoIA.custo_estimado,
-      Number(usoIA.usage?.input_tokens || 0),
-      Number(usoIA.usage?.output_tokens || 0),
-      usoIA.provider || "openai"
-    );
+    // provider "fallback" = nenhum provedor respondeu e a sugestão é o texto-modelo: não conta na cota.
+    if (usoIA.provider !== "fallback") {
+      await registrarUsoIA(
+        Number(user.id),
+        tipoUso,
+        "lead",
+        lead.id,
+        usoIA.custo_estimado,
+        Number(usoIA.usage?.input_tokens || 0),
+        Number(usoIA.usage?.output_tokens || 0),
+        usoIA.provider || "openai"
+      );
+    }
 
     return c.json({
-      sugestao: usoIA.sugestao
+      sugestao: usoIA.sugestao,
+      ...(usoIA.provider === "fallback" ? { aviso: `${mensagemIAIndisponivel()} Esta é uma sugestão-modelo, não gerada por IA.` } : {})
     });
   } catch (err) {
     console.error("ERRO IA SUGESTAO LEAD:", err);
@@ -35144,7 +35452,7 @@ app.post("/ia/leads/reativacao-lote", authMiddleware, async (c) => {
 
     if (usoIA.provider === "fallback") {
       return c.json({
-        error: "Nenhuma IA configurada respondeu agora. Verifique OpenAI/Anthropic no painel administrativo."
+        error: mensagemIAIndisponivel()
       }, 503);
     }
 
@@ -35294,7 +35602,7 @@ app.get("/ia/resumo-diario", authMiddleware, async (c) => {
 
     if (usoIA.provider === "fallback") {
       return c.json({
-        error: "Nenhuma IA configurada respondeu agora. Verifique OpenAI/Anthropic no painel administrativo."
+        error: mensagemIAIndisponivel()
       }, 503);
     }
 
@@ -36076,7 +36384,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
               ]
             };
 
-        const resp = await fetch(
+        const resp = await fetchProvedorIA("openai", "criador_campanha",
           usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions",
           {
             method: "POST",
@@ -36115,7 +36423,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     const tentarAnthropic = async () => {
       if (!anthropicKey) return null;
       try {
-        const respAnthropic = await fetch("https://api.anthropic.com/v1/messages", {
+        const respAnthropic = await fetchProvedorIA("anthropic", "criador_campanha", "https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
             "x-api-key": anthropicKey,
@@ -36172,7 +36480,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     }
     return c.json({
       sugestoes: fallbackVariacoes(topico),
-      _origem: "sem_chave"
+      _origem: "sem_chave",
+      aviso: `${mensagemIAIndisponivel()} As opções abaixo são modelos prontos, não foram geradas por IA.`
     });
 
   } catch (err) {
@@ -36359,7 +36668,7 @@ async function pesquisarReferenciasCriativoIA(
   const fallbackDirecao = (briefing.nicho && DIRECAO_VISUAL_NICHO[briefing.nicho]) || DIRECAO_VISUAL_GENERICA;
 
   try {
-    const response = await fetch(OPENAI_RESPONSES_URL, {
+    const response = await fetchProvedorIA("openai", "criativo_pesquisa", OPENAI_RESPONSES_URL, {
       method: "POST",
       headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -36522,7 +36831,7 @@ async function gerarImagemCriativoOpenAI(args: {
       formData.append(campoImagem, blob, `referencia_${i + 1}.png`);
     }
 
-    const response = await fetch("https://api.openai.com/v1/images/edits", {
+    const response = await fetchProvedorIA("openai", "criativo_imagem", "https://api.openai.com/v1/images/edits", {
       method: "POST",
       headers: { "Authorization": `Bearer ${args.openaiKey}` },
       body: formData
@@ -36532,7 +36841,7 @@ async function gerarImagemCriativoOpenAI(args: {
     return { imagemBase64: data?.data?.[0]?.b64_json || "", usage: data?.usage };
   }
 
-  const response = await fetch("https://api.openai.com/v1/images/generations", {
+  const response = await fetchProvedorIA("openai", "criativo_imagem", "https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: { "Authorization": `Bearer ${args.openaiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -36556,7 +36865,7 @@ async function avaliarCriativoIA(
   briefing: BriefingCriativoIA
 ) {
   try {
-    const response = await fetch(OPENAI_RESPONSES_URL, {
+    const response = await fetchProvedorIA("openai", "criativo_avaliacao", OPENAI_RESPONSES_URL, {
       method: "POST",
       headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
