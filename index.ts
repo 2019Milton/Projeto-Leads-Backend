@@ -3076,6 +3076,24 @@ type TipoUsoIA =
   | "transcricao_audio";
 
 const IA_CUSTO_ESTIMADO_PADRAO = 0.08;
+
+// Usos disparados pela própria plataforma, sem o corretor pedir (job de classificação
+// do Kanban e transcrição de áudio do WhatsApp). Contam no teto global de IA e no
+// gasto real, mas NÃO no limite mensal individual: senão quem usa o atendimento por
+// WhatsApp esgota as chamadas sem nunca ter usado a IA e o bloqueio aparece em
+// recursos como "Gerar campanha com IA".
+const TIPOS_USO_IA_AUTOMATICOS: TipoUsoIA[] = [
+  "classificacao_kanban_conversa",
+  "transcricao_audio"
+];
+
+// Limite mensal individual de IA: vazio cai no padrão da plataforma e 0 = ilimitado
+// (o teto global continua valendo). Antes `valor || padrao` transformava o 0 em padrão.
+function limiteMensalIAUsuario(valor: unknown, padrao: number): number {
+  if (valor === null || valor === undefined || valor === "") return padrao;
+  const numero = Number(valor);
+  return Number.isFinite(numero) && numero >= 0 ? numero : padrao;
+}
 const OPENAI_RESPONSES_URL =
   "https://api.openai.com/v1/responses";
 
@@ -4037,14 +4055,15 @@ async function validarLimiteIAUsuario(user: any) {
     FROM ia_usos
     WHERE usuario_id = $1
     AND criado_em >= date_trunc('month', CURRENT_DATE)
+    AND NOT (tipo = ANY($2::text[]))
     `,
-    [user.id]
+    [user.id, TIPOS_USO_IA_AUTOMATICOS]
   );
 
   const chamadasMes = Number(uso.rows[0]?.chamadas_mes || 0);
   const custoMes = Number(uso.rows[0]?.custo_mes || 0);
-  const limiteChamadas = Number(user.ia_limite_mensal || 300);
-  const limiteCusto = Number(user.ia_custo_limite_mensal || 120);
+  const limiteChamadas = limiteMensalIAUsuario(user.ia_limite_mensal, 300);
+  const limiteCusto = limiteMensalIAUsuario(user.ia_custo_limite_mensal, 120);
 
   if (limiteChamadas > 0 && chamadasMes >= limiteChamadas) {
     return {
@@ -25174,8 +25193,9 @@ app.get("/usuarios/me/plano", authMiddleware, async (c) => {
     FROM ia_usos
     WHERE usuario_id = $1
     AND criado_em >= date_trunc('month', CURRENT_DATE)
+    AND NOT (tipo = ANY($2::text[]))
     `,
-    [user.id]
+    [user.id, TIPOS_USO_IA_AUTOMATICOS]
   );
 
   return c.json({
@@ -25186,8 +25206,8 @@ app.get("/usuarios/me/plano", authMiddleware, async (c) => {
     ia: {
       uso_mes: Number(uso.rows[0]?.uso_mes || 0),
       custo_mes: Number(uso.rows[0]?.custo_mes || 0),
-      limite_mensal: Number(user.ia_limite_mensal || 300),
-      custo_limite_mensal: Number(user.ia_custo_limite_mensal || 120)
+      limite_mensal: limiteMensalIAUsuario(user.ia_limite_mensal, 300),
+      custo_limite_mensal: limiteMensalIAUsuario(user.ia_custo_limite_mensal, 120)
     }
   });
 });
@@ -34024,8 +34044,10 @@ app.get("/admin/ia", authMiddleware, async (c) => {
         u.ia_custo_limite_mensal,
         COALESCE(u.ia_ativo, true) AS ia_ativo,
         COALESCE(u.ia_provider, 'auto') AS ia_provider,
-        COALESCE(COUNT(iu.id), 0) AS chamadas_mes,
-        COALESCE(SUM(iu.custo_estimado), 0) AS custo_mes,
+        COUNT(iu.id) FILTER (WHERE NOT (iu.tipo = ANY($1::text[]))) AS chamadas_mes,
+        COALESCE(SUM(iu.custo_estimado) FILTER (WHERE NOT (iu.tipo = ANY($1::text[]))), 0) AS custo_mes,
+        COUNT(iu.id) FILTER (WHERE iu.tipo = ANY($1::text[])) AS chamadas_automaticas_mes,
+        COALESCE(SUM(iu.custo_estimado) FILTER (WHERE iu.tipo = ANY($1::text[])), 0) AS custo_automatico_mes,
         COALESCE(SUM(iu.tokens_entrada), 0) AS tokens_entrada_mes,
         COALESCE(SUM(iu.tokens_saida), 0) AS tokens_saida_mes,
         MAX(iu.criado_em) AS ultimo_uso
@@ -34048,7 +34070,7 @@ app.get("/admin/ia", authMiddleware, async (c) => {
         u.ia_ativo,
         u.ia_provider
       ORDER BY u.plano_ativado_em DESC NULLS LAST, u.id ASC
-    `);
+    `, [TIPOS_USO_IA_AUTOMATICOS]);
 
     const configAtual = config.rows[0] || {};
     const modeloRailway =
