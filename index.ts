@@ -3878,44 +3878,127 @@ function extrairTextoRespostaOpenAI(data: any) {
   return partes.join("\n").trim();
 }
 
-function calcularCustoEstimadoAnthropic(usage: { input_tokens: number; output_tokens: number }) {
-  // claude-haiku-4-5-20251001: $0.25/1M input, $1.25/1M output
-  const inputBRL = Number(Bun.env.ANTHROPIC_INPUT_1M_BRL || 1.44);
-  const outputBRL = Number(Bun.env.ANTHROPIC_OUTPUT_1M_BRL || 7.19);
+
+/* =========================
+   💰 PRECOS DOS MODELOS DE IA
+========================= */
+// Precos oficiais em USD por 1M de tokens (verificados em platform.claude.com/docs e
+// platform.openai.com/docs em 2026-09-27). Convertidos para BRL pela cotacao configurada,
+// em vez de embutir um valor em BRL fixo que fica errado a cada variacao do cambio.
+// Fonte de verdade unica: tanto o custo estimado (BRL, ia_usos) quanto o saldo calculado da
+// Anthropic (USD, /admin/ia/saldos) leem daqui — antes cada um tinha seu proprio numero
+// hardcoded e podiam divergir (o saldo usava preco do Haiku 3, nunca atualizado pro 4.5).
+// Modelo nao listado (versao nova que ainda nao veio pro admin) cai no PRECO_PADRAO_* em USD,
+// que e so uma estimativa — nunca fica com custo zerado por modelo desconhecido.
+type PrecoPor1M = { input: number; output: number };
+
+const PRECOS_OPENAI_USD_1M: Record<string, PrecoPor1M> = {
+  "gpt-5-mini": { input: 0.25, output: 2.00 },
+  "gpt-4o-mini": { input: 0.15, output: 0.60 },
+  "gpt-4o": { input: 2.50, output: 10.00 },
+  "gpt-5": { input: 1.25, output: 10.00 },
+  "gpt-4.1": { input: 2.00, output: 8.00 },
+  "gpt-4.1-mini": { input: 0.40, output: 1.60 },
+  "gpt-4.1-nano": { input: 0.10, output: 0.40 }
+};
+const PRECO_PADRAO_OPENAI_USD: PrecoPor1M = { input: 0.25, output: 2.00 }; // nivel gpt-5-mini/4o-mini
+
+const PRECOS_ANTHROPIC_USD_1M: Record<string, PrecoPor1M> = {
+  "claude-haiku-4-5-20251001": { input: 1.00, output: 5.00 },
+  "claude-sonnet-4-6": { input: 3.00, output: 15.00 },
+  "claude-opus-4-8": { input: 5.00, output: 25.00 }
+};
+const PRECO_PADRAO_ANTHROPIC_USD: PrecoPor1M = PRECOS_ANTHROPIC_USD_1M["claude-haiku-4-5-20251001"];
+
+// gpt-image-1 cobra tokens de entrada de texto ($5/1M) e de imagem ($10/1M) a precos
+// diferentes, mas o app nao guarda essa quebra — usa o preco de imagem (o mais caro dos
+// dois) pro total de entrada: superestima um pouco em vez de repetir o custo zerado de antes.
+const PRECO_IMAGEM_OPENAI_USD_1M: PrecoPor1M = { input: 10.00, output: 40.00 };
+const WHISPER_USD_POR_MINUTO = 0.006;
+
+function precoModelo(tabela: Record<string, PrecoPor1M>, padrao: PrecoPor1M, modelo: string | null | undefined) {
+  return (modelo && tabela[modelo]) || padrao;
+}
+
+function precoAnthropicUSD(modelo: string | null | undefined) {
+  return precoModelo(PRECOS_ANTHROPIC_USD_1M, PRECO_PADRAO_ANTHROPIC_USD, modelo);
+}
+
+// Cotacao USD/BRL pra converter os precos oficiais (em USD) pro custo estimado em BRL.
+// Sem variavel configurada cai no valor de quando essa conversao foi implementada
+// (2026-09-27, ~R$5,19) — ajuste a variavel USD_BRL_RATE na Railway quando o cambio mudar
+// bastante, em vez de mexer no codigo.
+function cotacaoUsdBrl() {
+  const valor = Number(Bun.env.USD_BRL_RATE);
+  return Number.isFinite(valor) && valor > 0 ? valor : 5.19;
+}
+
+function calcularCustoEstimadoAnthropic(usage: { input_tokens: number; output_tokens: number }, modelo?: string | null) {
+  // Sem override manual (env), usa o preco oficial do modelo realmente usado, convertido
+  // pela cotacao configurada — antes era sempre o preco do Haiku, mesmo com Sonnet/Opus ativo.
+  const precoUSD = precoAnthropicUSD(modelo);
+  const cotacao = cotacaoUsdBrl();
+  const inputBRL = Number(Bun.env.ANTHROPIC_INPUT_1M_BRL || 0) || precoUSD.input * cotacao;
+  const outputBRL = Number(Bun.env.ANTHROPIC_OUTPUT_1M_BRL || 0) || precoUSD.output * cotacao;
   return Number(
     ((usage.input_tokens / 1_000_000) * inputBRL +
      (usage.output_tokens / 1_000_000) * outputBRL).toFixed(4)
   );
 }
 
-function calcularCustoEstimadoOpenAI(usage: any) {
+function calcularCustoEstimadoOpenAI(usage: any, modelo?: string | null) {
   const inputTokens =
     Number(usage?.input_tokens || 0);
 
   const outputTokens =
     Number(usage?.output_tokens || 0);
 
-  const custoEntradaPorMilhao =
+  // Variavel de ambiente sempre manda, pra quem quiser um preco negociado manual.
+  // Sem ela, usa a tabela oficial do modelo realmente usado (antes, sem as variaveis
+  // configuradas, todo modelo — do gpt-4o-mini ao gpt-4o — pagava o mesmo R$0,08 fixo).
+  const custoEntradaPorMilhaoEnv =
     Number(Bun.env.OPENAI_INPUT_1M_BRL || 0);
 
-  const custoSaidaPorMilhao =
+  const custoSaidaPorMilhaoEnv =
     Number(Bun.env.OPENAI_OUTPUT_1M_BRL || 0);
 
-  if (
-    custoEntradaPorMilhao > 0 ||
-    custoSaidaPorMilhao > 0
-  ) {
+  if (custoEntradaPorMilhaoEnv > 0 || custoSaidaPorMilhaoEnv > 0) {
     return Number(
       (
-        (inputTokens / 1_000_000) *
-        custoEntradaPorMilhao +
-        (outputTokens / 1_000_000) *
-        custoSaidaPorMilhao
+        (inputTokens / 1_000_000) * custoEntradaPorMilhaoEnv +
+        (outputTokens / 1_000_000) * custoSaidaPorMilhaoEnv
       ).toFixed(4)
     );
   }
 
-  return IA_CUSTO_ESTIMADO_PADRAO;
+  if (!inputTokens && !outputTokens) {
+    return IA_CUSTO_ESTIMADO_PADRAO;
+  }
+
+  const precoUSD = precoModelo(PRECOS_OPENAI_USD_1M, PRECO_PADRAO_OPENAI_USD, modelo);
+  const cotacao = cotacaoUsdBrl();
+  return Number(
+    (
+      (inputTokens / 1_000_000) * precoUSD.input * cotacao +
+      (outputTokens / 1_000_000) * precoUSD.output * cotacao
+    ).toFixed(4)
+  );
+}
+
+// gpt-image-1 nao tem "modelo" configuravel (e sempre o mesmo), so preco de imagem,
+// bem mais caro que texto — por isso e uma funcao a parte, nao mais uma reaproveitando
+// calcularCustoEstimadoOpenAI com o modelo de texto (que zerava o custo do banner).
+function calcularCustoEstimadoImagemOpenAI(usage: any) {
+  const inputTokens = Number(usage?.input_tokens || 0);
+  const outputTokens = Number(usage?.output_tokens || 0);
+  if (!inputTokens && !outputTokens) return 0;
+  const cotacao = cotacaoUsdBrl();
+  return Number(
+    (
+      (inputTokens / 1_000_000) * PRECO_IMAGEM_OPENAI_USD_1M.input * cotacao +
+      (outputTokens / 1_000_000) * PRECO_IMAGEM_OPENAI_USD_1M.output * cotacao
+    ).toFixed(4)
+  );
 }
 
 function normalizarAnaliseOpenAI(
@@ -4126,7 +4209,7 @@ async function gerarAnaliseIAOpenAI(
           return {
             analise: parseAnalise(texto),
             usage: data?.usage || {},
-            custo_estimado: calcularCustoEstimadoOpenAI(data?.usage),
+            custo_estimado: calcularCustoEstimadoOpenAI(data?.usage, modelo),
             modelo,
             provider: "openai"
           };
@@ -4169,7 +4252,7 @@ async function gerarAnaliseIAOpenAI(
           return {
             analise: parseAnalise(texto),
             usage: { input_tokens: inTok, output_tokens: outTok },
-            custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }),
+            custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }, anthropicModelo),
             modelo: anthropicModelo,
             provider: "anthropic"
           };
@@ -4476,7 +4559,7 @@ async function gerarSugestaoComercialOpenAI(
           return {
             sugestao: parseSugestao(texto, "openai"),
             usage: data?.usage || null,
-            custo_estimado: calcularCustoEstimadoOpenAI(data?.usage),
+            custo_estimado: calcularCustoEstimadoOpenAI(data?.usage, modelo),
             provider: "openai"
           };
         }
@@ -4518,7 +4601,7 @@ async function gerarSugestaoComercialOpenAI(
           return {
             sugestao: parseSugestao(texto, "anthropic"),
             usage: { input_tokens: inTok, output_tokens: outTok },
-            custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }),
+            custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }, anthropicModelo),
             provider: "anthropic"
           };
         }
@@ -4925,7 +5008,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
       return {
         sugestao: parseSugestao(texto, "openai"),
         usage: data?.usage || null,
-        custo_estimado: calcularCustoEstimadoOpenAI(data?.usage),
+        custo_estimado: calcularCustoEstimadoOpenAI(data?.usage, modelo),
         provider: "openai"
       };
     } catch (err) {
@@ -4970,7 +5053,7 @@ async function gerarAnaliseTrafegoPagoIA(campanha: any) {
       return {
         sugestao: parseSugestao(texto, "anthropic"),
         usage: { input_tokens: inTok, output_tokens: outTok },
-        custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }),
+        custo_estimado: calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }, anthropicModelo),
         provider: "anthropic"
       };
     } catch (err) {
@@ -20562,7 +20645,7 @@ async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Pro
       // do WhatsApp, usa uma estimativa fixa conservadora (~1min) só pra manter o teto
       // mensal de custo de IA (mesmo que processarClassificacaoStatusLeadIA já respeita)
       // ciente desse gasto também.
-      registrarUsoIA(usuarioId, "transcricao_audio", "whatsapp_mensagem", mediaId, 0.01, 0, 0, "openai")
+      registrarUsoIA(usuarioId, "transcricao_audio", "whatsapp_mensagem", mediaId, Number((WHISPER_USD_POR_MINUTO * cotacaoUsdBrl()).toFixed(4)), 0, 0, "openai")
         .catch((e: any) => console.error("[transcricao-audio] erro ao registrar uso IA:", e));
     } else {
       console.warn(`[transcricao-audio] Whisper retornou texto vazio pra mediaId=${mediaId}`);
@@ -21741,7 +21824,7 @@ app.post("/ia/whatsapp-bot/gerar", authMiddleware, async (c) => {
       input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
       output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0),
     };
-    const custo = calcularCustoEstimadoOpenAI(usageNorm);
+    const custo = calcularCustoEstimadoOpenAI(usageNorm, modelo);
     await registrarUsoIA(Number(user.id), "roteiro_whatsapp", "whatsapp_bot", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
 
     return c.json({ passos });
@@ -22138,7 +22221,7 @@ async function classificarStatusLeadPorConversa(
             input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
             output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0)
           };
-          const custo = calcularCustoEstimadoOpenAI(usage);
+          const custo = calcularCustoEstimadoOpenAI(usage, modelo);
           await registrarUsoIA(usuarioId, "classificacao_kanban_conversa", "lead", lead?.id ?? null, custo, usage.input_tokens, usage.output_tokens);
           return parseResultado(texto);
         }
@@ -22172,7 +22255,7 @@ async function classificarStatusLeadPorConversa(
         if (texto) {
           const inTok = Number(data?.usage?.input_tokens || 0);
           const outTok = Number(data?.usage?.output_tokens || 0);
-          const custo = calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok });
+          const custo = calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }, anthropicModelo);
           await registrarUsoIA(usuarioId, "classificacao_kanban_conversa", "lead", lead?.id ?? null, custo, inTok, outTok, "anthropic");
           return parseResultado(texto);
         }
@@ -28602,7 +28685,7 @@ async function registrarExecucaoRankingMercado(
         modelo,
         Number(usage?.input_tokens || 0),
         Number(usage?.output_tokens || 0),
-        status === "ok" ? calcularCustoEstimadoOpenAI(usage) : 0,
+        status === "ok" ? calcularCustoEstimadoOpenAI(usage, modelo) : 0,
         erro ? erro.slice(0, 500) : null,
       ]
     );
@@ -34374,6 +34457,11 @@ app.get("/admin/ia/saldos", authMiddleware, async (c) => {
     const user: any = c.get("user");
     if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
 
+    // Modelo Anthropic realmente ativo agora — o saldo calculado precisa do preco DESSE
+    // modelo, nao de um fixo (antes era sempre o do Haiku, mesmo com Sonnet/Opus ativo).
+    const configIAAtual = await client.query("SELECT anthropic_modelo FROM ia_config WHERE id = 1 LIMIT 1");
+    const anthropicModeloAtivoSaldo = textoOpcional(configIAAtual.rows[0]?.anthropic_modelo) || "claude-haiku-4-5-20251001";
+
     const gastos = await client.query(`
       SELECT
         COALESCE(provider, 'openai') AS provider,
@@ -34422,8 +34510,9 @@ app.get("/admin/ia/saldos", authMiddleware, async (c) => {
     // Calcula saldo Anthropic em USD a partir dos tokens rastreados
     const anthropicData = por_provider.anthropic || vazio;
     const anthropicBudgetUSD = Number(Bun.env.ANTHROPIC_BUDGET_USD || 0);
-    const inputUSD = 0.25 / 1_000_000;  // claude-haiku-4-5-20251001
-    const outputUSD = 1.25 / 1_000_000;
+    const precoAnthropicAtivoUSD = precoAnthropicUSD(anthropicModeloAtivoSaldo);
+    const inputUSD = precoAnthropicAtivoUSD.input / 1_000_000;
+    const outputUSD = precoAnthropicAtivoUSD.output / 1_000_000;
     const anthropicGastoUSD = Number(
       (anthropicData.tokens_entrada * inputUSD + anthropicData.tokens_saida * outputUSD).toFixed(6)
     );
@@ -34433,7 +34522,7 @@ app.get("/admin/ia/saldos", authMiddleware, async (c) => {
 
     return c.json({
       openai: { ...(por_provider.openai || vazio), saldo_api: openaiSaldo },
-      anthropic: { ...anthropicData, saldo_calculado: anthropicSaldo },
+      anthropic: { ...anthropicData, saldo_calculado: anthropicSaldo, modelo_precificado: anthropicModeloAtivoSaldo },
       alertas: await listarAlertasProvedorIAAbertos(),
       atualizado_em: new Date().toISOString()
     });
@@ -36411,7 +36500,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
           input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
           output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0)
         };
-        const custo = calcularCustoEstimadoOpenAI(usageNorm);
+        const custo = calcularCustoEstimadoOpenAI(usageNorm, modelo);
         await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
         return { sugestoes, _origem: "openai" };
       } catch (err) {
@@ -36423,6 +36512,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     const tentarAnthropic = async () => {
       if (!anthropicKey) return null;
       try {
+        const modeloAnthropic = textoOpcional(iaConf.rows[0]?.anthropic_modelo) || "claude-haiku-4-5-20251001";
         const respAnthropic = await fetchProvedorIA("anthropic", "criador_campanha", "https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
@@ -36431,7 +36521,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            model: textoOpcional(iaConf.rows[0]?.anthropic_modelo) || "claude-haiku-4-5-20251001",
+            model: modeloAnthropic,
             max_tokens: 4096,
             system: systemMsg,
             messages: [{ role: "user", content: prompt }]
@@ -36451,7 +36541,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         const sugestoes = parseSugestoes(textoAnthropic);
         const inTok = Number(dataAnthropic?.usage?.input_tokens || 0);
         const outTok = Number(dataAnthropic?.usage?.output_tokens || 0);
-        const custoAnthropic = calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok });
+        const custoAnthropic = calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }, modeloAnthropic);
         await registrarUsoIA(Number(user.id), "criador_campanha", "campanha", null, custoAnthropic, inTok, outTok, "anthropic");
         return { sugestoes, _origem: "anthropic" };
       } catch (err) {
@@ -36972,12 +37062,17 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       imagens: imagensBase64
     });
     let imagemBase64 = geracaoInicial.imagemBase64;
-    const usagesIA: any[] = [pesquisa.usage, geracaoInicial.usage].filter(Boolean);
+    // Duas contas separadas: texto (pesquisa e avaliação, no modelo de texto configurado) e
+    // imagem (geração e refinamento, no preço bem mais caro do gpt-image-1) — antes tudo caía
+    // num "usagesIA" só e o custo do banner era sempre registrado como R$0 (só os tokens de
+    // texto contavam pra algo, e nem isso: o custo_estimado do registro ficava hardcoded 0).
+    const usagesTexto: any[] = [pesquisa.usage].filter(Boolean);
+    const usagensImagem: any[] = [geracaoInicial.usage].filter(Boolean);
 
     if (!imagemBase64) return c.json({ error: "A IA não retornou uma imagem. Tente novamente." }, 500);
 
     let avaliacao = await avaliarCriativoIA(openaiKey, imagemBase64, prompt, briefing);
-    if (avaliacao?.usage) usagesIA.push(avaliacao.usage);
+    if (avaliacao?.usage) usagesTexto.push(avaliacao.usage);
     let refinadoAutomaticamente = false;
     let avisoRefinamento: string | null = null;
 
@@ -37003,12 +37098,12 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
           imagens: [{ data: imagemBase64, tipo: "image/png" }]
         });
         if (refinamento.imagemBase64) {
-          if (refinamento.usage) usagesIA.push(refinamento.usage);
+          if (refinamento.usage) usagensImagem.push(refinamento.usage);
           imagemBase64 = refinamento.imagemBase64;
           refinadoAutomaticamente = true;
           const avaliacaoRefinada = await avaliarCriativoIA(openaiKey, imagemBase64, prompt, briefing);
           if (avaliacaoRefinada) {
-            if (avaliacaoRefinada.usage) usagesIA.push(avaliacaoRefinada.usage);
+            if (avaliacaoRefinada.usage) usagesTexto.push(avaliacaoRefinada.usage);
             avaliacao = avaliacaoRefinada;
           }
         }
@@ -37018,10 +37113,20 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
       }
     }
 
-    const tokensEntrada = usagesIA.reduce((total, usage) => total + Number(usage?.input_tokens || 0), 0);
-    const tokensSaida = usagesIA.reduce((total, usage) => total + Number(usage?.output_tokens || 0), 0);
+    const somaTokens = (lista: any[], campo: "input_tokens" | "output_tokens") =>
+      lista.reduce((total, usage) => total + Number(usage?.[campo] || 0), 0);
+    const tokensEntrada = somaTokens(usagesTexto, "input_tokens") + somaTokens(usagensImagem, "input_tokens");
+    const tokensSaida = somaTokens(usagesTexto, "output_tokens") + somaTokens(usagensImagem, "output_tokens");
+    const custoTexto = calcularCustoEstimadoOpenAI(
+      { input_tokens: somaTokens(usagesTexto, "input_tokens"), output_tokens: somaTokens(usagesTexto, "output_tokens") },
+      modeloResponsesCriativo()
+    );
+    const custoImagem = calcularCustoEstimadoImagemOpenAI({
+      input_tokens: somaTokens(usagensImagem, "input_tokens"),
+      output_tokens: somaTokens(usagensImagem, "output_tokens")
+    });
 
-    await registrarUsoIA(Number(user.id), "gerar_banner", "imagem", null, 0, tokensEntrada, tokensSaida);
+    await registrarUsoIA(Number(user.id), "gerar_banner", "imagem", null, Number((custoTexto + custoImagem).toFixed(4)), tokensEntrada, tokensSaida);
 
     return c.json({
       sucesso: true,
