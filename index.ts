@@ -4388,6 +4388,31 @@ async function validarLimiteIAUsuario(user: any) {
   };
 }
 
+
+// Soma o uso de IA do mes (chamadas + custo) para o teto global — antes só somava
+// `ia_usos`, deixando de fora o job semanal do ranking de plataformas
+// (pesquisarNotasMercadoNicho), que consulta a OpenAI por conta própria e nunca
+// aparecia nem no teto global nem no consumo por provider do admin. Usada tanto por
+// motivoBloqueioIA quanto pelo sweep de classificacao (antes cada um tinha sua propria
+// cópia da mesma consulta) e por /admin/ia/saldos.
+async function usoGlobalIAMesAtual() {
+  const resultado = await client.query(`
+    SELECT COUNT(*) AS chamadas, COALESCE(SUM(custo_estimado), 0) AS custo
+    FROM (
+      SELECT custo_estimado FROM ia_usos
+      WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+      UNION ALL
+      SELECT custo_estimado FROM ranking_mercado_execucoes
+      WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+        AND (tokens_entrada > 0 OR tokens_saida > 0)
+    ) chamadas_ia
+  `);
+  return {
+    chamadas: Number(resultado.rows[0]?.chamadas || 0),
+    custo: Number(resultado.rows[0]?.custo || 0)
+  };
+}
+
 async function motivoBloqueioIA(user: any) {
   if (!usuarioTemIA(user)) {
     return "IA disponivel apenas no plano Ouro";
@@ -4410,17 +4435,11 @@ async function motivoBloqueioIA(user: any) {
   const limReq = Number(configIA?.limite_mensal_requisicoes || 0);
   const limCusto = Number(configIA?.limite_mensal_custo || 0);
   if (limReq > 0 || limCusto > 0) {
-    const usoGlobal = await client.query(`
-      SELECT COUNT(*) AS chamadas, COALESCE(SUM(custo_estimado), 0) AS custo
-      FROM ia_usos
-      WHERE criado_em >= date_trunc('month', CURRENT_DATE)
-    `);
-    const chamadasGlobal = Number(usoGlobal.rows[0]?.chamadas || 0);
-    const custoGlobal = Number(usoGlobal.rows[0]?.custo || 0);
-    if (limReq > 0 && chamadasGlobal >= limReq) {
+    const usoGlobal = await usoGlobalIAMesAtual();
+    if (limReq > 0 && usoGlobal.chamadas >= limReq) {
       return "Limite mensal global de chamadas atingido.";
     }
-    if (limCusto > 0 && custoGlobal >= limCusto) {
+    if (limCusto > 0 && usoGlobal.custo >= limCusto) {
       return "Limite mensal global de custo atingido.";
     }
   }
@@ -28685,7 +28704,7 @@ async function registrarExecucaoRankingMercado(
         modelo,
         Number(usage?.input_tokens || 0),
         Number(usage?.output_tokens || 0),
-        status === "ok" ? calcularCustoEstimadoOpenAI(usage, modelo) : 0,
+        usage ? calcularCustoEstimadoOpenAI(usage, modelo) : 0,
         erro ? erro.slice(0, 500) : null,
       ]
     );
@@ -28776,7 +28795,11 @@ async function pesquisarNotasMercadoNicho(nicho: { slug: string; nome: string })
           }
         }
       },
-      max_output_tokens: 4000,
+      // "low" evita que o raciocinio (invisivel, mas contado no mesmo orcamento de saida)
+      // consuma os tokens antes do JSON final — foi o que estourou o max_output_tokens
+      // (a resposta vinha cortada e o JSON.parse falhava) no nicho "suplementos".
+      reasoning: { effort: "low" },
+      max_output_tokens: 6000,
       store: false
     })
   });
@@ -28784,15 +28807,29 @@ async function pesquisarNotasMercadoNicho(nicho: { slug: string; nome: string })
   const data: any = await response.json();
   if (!response.ok) throw new Error(data?.error?.message || `OpenAI HTTP ${response.status}`);
 
+  // A partir daqui a chamada ja foi paga (existe usage), mesmo se o parsing falhar —
+  // anexa no erro pra registrarExecucaoRankingMercado conseguir contabilizar o custo real
+  // em vez de gravar R$0 num nicho que realmente gastou tokens (era o caso do parsing ruim).
+  const throwComUso = (mensagem: string): never => {
+    const erro: any = new Error(mensagem);
+    erro.usage = data?.usage;
+    throw erro;
+  };
+
+  const textoResposta = extrairTextoRespostaOpenAI(data) || "";
   let resposta: unknown;
   try {
-    resposta = JSON.parse(extrairTextoRespostaOpenAI(data) || "{}");
+    resposta = JSON.parse(textoResposta || "{}");
   } catch (_) {
-    throw new Error("Resposta da IA nao e um JSON valido");
+    const tiposSaida = Array.isArray(data?.output)
+      ? data.output.map((item: any) => item?.type).filter(Boolean).join(",")
+      : "-";
+    const motivo = data?.incomplete_details?.reason || data?.status || "desconhecido";
+    throwComUso(`Resposta da IA nao e um JSON valido (motivo=${motivo}, saida=[${tiposSaida}], ${textoResposta.length} chars)`);
   }
 
   const finais = combinarNotasMercado(extrairNotasMercado(resposta), anteriores, base);
-  if (!finais.length) throw new Error("Resposta da IA sem notas confiaveis");
+  if (!finais.length) throwComUso("Resposta da IA sem notas confiaveis");
 
   const fontes = extrairFontesPesquisaCriativo(data);
   for (const nota of finais) {
@@ -28846,7 +28883,7 @@ async function executarRankingMercado(opcoes: { nichoSlug?: string; forcar?: boo
       } catch (err: any) {
         const mensagem = err?.message || String(err);
         rankingMercadoProximaTentativa.set(nicho.slug, Date.now() + RANKING_MERCADO_REPETIR_APOS_ERRO_MS);
-        await registrarExecucaoRankingMercado(nicho.slug, "erro", null, null, mensagem);
+        await registrarExecucaoRankingMercado(nicho.slug, "erro", modeloResponsesCriativo(), err?.usage || null, mensagem);
         console.error(`ERRO ranking de mercado (${nicho.slug}):`, mensagem);
         resultados.push({ nicho: nicho.slug, status: "erro", detalhe: mensagem });
       }
@@ -34462,15 +34499,25 @@ app.get("/admin/ia/saldos", authMiddleware, async (c) => {
     const configIAAtual = await client.query("SELECT anthropic_modelo FROM ia_config WHERE id = 1 LIMIT 1");
     const anthropicModeloAtivoSaldo = textoOpcional(configIAAtual.rows[0]?.anthropic_modelo) || "claude-haiku-4-5-20251001";
 
+    // Une ia_usos com o job do ranking de plataformas (que gasta OpenAI por conta
+    // própria, sem usuario_id — antes ficava fora desse consumo "por provider").
     const gastos = await client.query(`
       SELECT
-        COALESCE(provider, 'openai') AS provider,
+        provider,
         COUNT(*) AS chamadas,
         COALESCE(SUM(tokens_entrada), 0) AS tokens_entrada,
         COALESCE(SUM(tokens_saida), 0) AS tokens_saida,
         COALESCE(SUM(custo_estimado), 0) AS custo_total
-      FROM ia_usos
-      WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+      FROM (
+        SELECT COALESCE(provider, 'openai') AS provider, tokens_entrada, tokens_saida, custo_estimado
+        FROM ia_usos
+        WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+        UNION ALL
+        SELECT 'openai' AS provider, tokens_entrada, tokens_saida, custo_estimado
+        FROM ranking_mercado_execucoes
+        WHERE criado_em >= date_trunc('month', CURRENT_DATE)
+          AND (tokens_entrada > 0 OR tokens_saida > 0)
+      ) unificado
       GROUP BY provider
     `);
 
@@ -41007,14 +41054,8 @@ async function processarClassificacaoStatusLeadIA() {
     const limReq = Number(configIA?.limite_mensal_requisicoes || 0);
     const limCusto = Number(configIA?.limite_mensal_custo || 0);
     if (limReq > 0 || limCusto > 0) {
-      const usoGlobal = await client.query(`
-        SELECT COUNT(*) AS chamadas, COALESCE(SUM(custo_estimado), 0) AS custo
-        FROM ia_usos
-        WHERE criado_em >= date_trunc('month', CURRENT_DATE)
-      `);
-      const chamadasGlobal = Number(usoGlobal.rows[0]?.chamadas || 0);
-      const custoGlobal = Number(usoGlobal.rows[0]?.custo || 0);
-      if ((limReq > 0 && chamadasGlobal >= limReq) || (limCusto > 0 && custoGlobal >= limCusto)) {
+      const usoGlobal = await usoGlobalIAMesAtual();
+      if ((limReq > 0 && usoGlobal.chamadas >= limReq) || (limCusto > 0 && usoGlobal.custo >= limCusto)) {
         console.warn("[classificacao-status-ia] teto global de IA atingido, pulando este sweep");
         return;
       }
