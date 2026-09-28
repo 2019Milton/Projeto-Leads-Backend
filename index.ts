@@ -28572,6 +28572,9 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
     // conta ainda não recebeu leads, usamos as campanhas recentes. Só adotamos o
     // nicho habilitado como fallback quando ele é único; escolher um dos vários
     // nichos por ordem alfabética produziria uma recomendação arbitrária.
+    // Uma mesma conta pode anunciar em vários nichos ao mesmo tempo (abas de
+    // "Criar Campanha"), então trazemos todos os nichos com sinal no período —
+    // não só o predominante — para o front oferecer o ranking de cada um.
     const nichoResult = await client.query(
       `WITH sinais_nicho AS (
          SELECT l.nicho_id, 3::int AS peso
@@ -28587,13 +28590,19 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
        FROM sinais_nicho s
        INNER JOIN nichos n ON n.id = s.nicho_id
        GROUP BY n.id, n.slug, n.nome
-       ORDER BY relevancia DESC, n.nome ASC
-       LIMIT 1`,
+       ORDER BY relevancia DESC, n.nome ASC`,
       [user.id, inicio]
     );
 
-    let nichoReferencia = nichoResult.rows[0]
-      ? { ...nichoResult.rows[0], origem: "historico_recente" }
+    const nichosAtivos = nichoResult.rows.map((row: any) => ({
+      id: row.id,
+      slug: row.slug,
+      nome: row.nome,
+      relevancia: Number(row.relevancia || 0)
+    }));
+
+    let nichoReferencia = nichosAtivos[0]
+      ? { ...nichosAtivos[0], origem: "historico_recente" }
       : null;
 
     if (!nichoReferencia) {
@@ -28611,7 +28620,17 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
       }
     }
 
-    const nichoReferenciaId = Number(nichoReferencia?.id || 0) || null;
+    // O front pode pedir explicitamente o ranking de um dos outros nichos ativos
+    // (seletor de nicho no Hub de Integrações) em vez do predominante.
+    const nichoIdSolicitado = Number(c.req.query("nicho_id") || 0) || null;
+    const nichoSolicitado = nichoIdSolicitado
+      ? nichosAtivos.find((n: any) => Number(n.id) === nichoIdSolicitado) || null
+      : null;
+    const nichoEfetivo = nichoSolicitado
+      ? { ...nichoSolicitado, origem: "solicitado" }
+      : nichoReferencia;
+
+    const nichoReferenciaId = Number(nichoEfetivo?.id || 0) || null;
     const metricasResult = await client.query(
       `WITH leads_origem AS (
          SELECT
@@ -28671,6 +28690,8 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
       periodo_inicio: inicio.toISOString(),
       atualizado_em: new Date().toISOString(),
       nicho_referencia: nichoReferencia,
+      nicho_efetivo: nichoEfetivo,
+      nichos_ativos: nichosAtivos,
       escopo_metricas: nichoReferenciaId ? "nicho" : "geral",
       plataformas
     });
