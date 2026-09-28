@@ -31,6 +31,8 @@ import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
 
 import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
 
+import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
+
 const app = new Hono();
 
 const WHATSAPP_CLOUD_API_VERSION =
@@ -23581,6 +23583,12 @@ async function processarEventoWhatsApp(value: any) {
         .catch(e => { console.error("ERRO criarLeadDeConversaTikTok:", e); return null; });
     }
 
+    if (!leadIdVinculado) {
+      leadIdVinculado = await garantirLeadWhatsAppSemOrigem(
+        client, conversa.id, usuarioId, nomesContatos[String(telefoneCliente)] || null
+      );
+    }
+
     if (leadIdVinculado) {
       client.query(`SELECT * FROM leads WHERE id = $1`, [leadIdVinculado])
         .then(async (leadRes) => {
@@ -23595,6 +23603,33 @@ async function processarEventoWhatsApp(value: any) {
     }
 
     if (conversa.status === "humano" || conversa.status === "encerrada") continue;
+
+    // Origem ausente: guardar o contato e pedir o assunto, sem inventar campanha.
+    const triagem = await prepararTriagemWhatsApp(client, conversa.id, usuarioId, msg.text?.body || "");
+    if (triagem && !triagem.nicho_id) {
+      if (triagem.pergunta) {
+        const reserva = await client.query(
+          `UPDATE whatsapp_conversas SET variaveis=jsonb_set(COALESCE(variaveis,'{}'::jsonb),'{triagem_nichos}',$1::jsonb)
+           WHERE id=$2 AND usuario_id=$3 AND status NOT IN ('humano','encerrada')
+             AND NOT (COALESCE(variaveis,'{}'::jsonb) ? 'triagem_nichos') RETURNING id`,
+          [JSON.stringify(triagem.opcoes), conversa.id, usuarioId]
+        );
+        if (reserva.rows.length) {
+          try {
+            const wamid = await enviarMensagemWhatsAppOficial(usuarioId, phoneNumberId, telefoneCliente, triagem.pergunta);
+            if (!wamid) throw new Error("Triagem não enviada");
+            await client.query(
+              "INSERT INTO whatsapp_mensagens_log (conversa_id,wamid,direcao,conteudo) VALUES ($1,$2,'saida',$3) ON CONFLICT (wamid) DO NOTHING",
+              [conversa.id, wamid, triagem.pergunta]
+            );
+          } catch (error) {
+            await client.query("UPDATE whatsapp_conversas SET variaveis=variaveis-'triagem_nichos' WHERE id=$1 AND usuario_id=$2", [conversa.id, usuarioId]);
+            throw error;
+          }
+        }
+      }
+      continue;
+    }
 
     const nichoIdConversa = await resolverNichoConversaWhatsApp(conversa, usuarioId, msg.text?.body || "", leadIdVinculado)
       .catch(e => { console.error("ERRO resolverNichoConversaWhatsApp:", e); return null; });
