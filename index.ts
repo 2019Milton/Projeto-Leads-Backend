@@ -3176,6 +3176,13 @@ function classificarFalhaProvedorIA(status: number, corpo: any) {
   return { tipo, codigo, mensagem };
 }
 
+// Link direto pra recarregar — só faz sentido no alerta de "sem crédito" (os outros tipos
+// são config errada: chave/modelo, não saldo).
+const LINK_BILLING_PROVEDOR_IA: Record<ProvedorIA, string> = {
+  openai: "https://platform.openai.com/settings/organization/billing/overview",
+  anthropic: "https://console.anthropic.com/settings/billing"
+};
+
 function textoAlertaProvedorIA(provider: ProvedorIA, tipo: TipoFalhaProvedorIA) {
   const nome = NOME_PROVEDOR_IA[provider];
   const variavelChave = provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
@@ -3235,14 +3242,27 @@ async function gravarAlertaProvedorIA(
   );
   if (!podeNotificar.rows.length) return;
 
-  const admins = await client.query(`SELECT id FROM usuarios WHERE tipo = 'super_admin'`);
+  const admins = await client.query(`SELECT id, whatsapp FROM usuarios WHERE tipo = 'super_admin'`);
   const texto = textoAlertaProvedorIA(provider, falha.tipo);
+
+  // Sem crédito é o único tipo com link de recarga útil — os outros exigem mexer em
+  // config (chave/modelo), não dá pra "resolver pelo WhatsApp" e um link de billing ali
+  // seria instrução errada.
+  const mensagemWhatsApp = falha.tipo === "sem_credito"
+    ? `⚠️ *${NOME_PROVEDOR_IA[provider]} sem crédito* — a IA da plataforma parou de responder por esse provedor.\n\nRecarregue aqui:\n${LINK_BILLING_PROVEDOR_IA[provider]}`
+    : null;
+
   for (const admin of admins.rows) {
     await client.query(
       `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem)
        VALUES ($1, 'ia_provedor_alerta', $2, $3)`,
       [admin.id, texto.titulo, texto.mensagem]
     );
+    if (mensagemWhatsApp && admin.whatsapp) {
+      enviarLembreteWhatsApp(admin.whatsapp, mensagemWhatsApp).catch((e: any) =>
+        console.error("[ia-provedor] erro ao enviar WhatsApp de saldo baixo:", e?.message || e)
+      );
+    }
   }
 }
 
