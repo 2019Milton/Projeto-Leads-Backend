@@ -20659,7 +20659,7 @@ async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Pro
 
     const texto = String(transcricao.text).trim() || null;
     if (texto) {
-      console.log(`[transcricao-audio] sucesso, mediaId=${mediaId}: "${texto.slice(0, 80)}${texto.length > 80 ? "..." : ""}"`);
+      console.log(`[transcricao-audio] sucesso, mediaId=${mediaId} (${texto.length} caracteres — conteúdo não logado, é dado pessoal do cliente)`);
       // Whisper cobra por minuto de áudio, não por token — sem a duração exata no payload
       // do WhatsApp, usa uma estimativa fixa conservadora (~1min) só pra manter o teto
       // mensal de custo de IA (mesmo que processarClassificacaoStatusLeadIA já respeita)
@@ -21994,6 +21994,25 @@ app.post("/webhook/tiktok", async (c) => {
    primeiro ponto a conferir contra um evento real — o polling continua
    sendo o caminho garantido enquanto isso.
 ========================= */
+
+// Resumo seguro do webhook do LinkedIn pra log: mantém só o que é técnico (conta, form,
+// id do lead, quantas respostas vieram) e deixa de fora formResponse.answers — é ali que
+// mora o nome/e-mail/telefone/qualificação do lead (ver processarLeadGenFormResponseLinkedIn,
+// que já extrai esses campos pra gravar em `leads`; não precisa duplicar em texto no log).
+function resumoWebhookLinkedInParaLog(body: any) {
+  const elementos = Array.isArray(body?.elements) ? body.elements : Array.isArray(body) ? body : [body];
+  return {
+    total_elementos: elementos.length,
+    elementos: elementos.map((el: any) => ({
+      owner: el?.owner?.sponsoredAccount || el?.owner || null,
+      lead_gen_form: el?.versionedLeadGenFormUrn || el?.leadGenFormUrn || el?.leadGenForm || null,
+      lead_id: el?.id ?? null,
+      submitted_at: el?.submittedAt ?? null,
+      total_respostas: Array.isArray(el?.formResponse?.answers) ? el.formResponse.answers.length : 0
+    }))
+  };
+}
+
 app.get("/webhook/linkedin", async (c) => {
   const challenge = c.req.query("challenge");
   if (challenge) return c.text(challenge);
@@ -22016,7 +22035,7 @@ app.post("/webhook/linkedin", async (c) => {
 
   try {
     const body = await c.req.json() as any;
-    console.log("WEBHOOK LINKEDIN RECEBIDO:", JSON.stringify(body));
+    console.log("WEBHOOK LINKEDIN RECEBIDO:", JSON.stringify(resumoWebhookLinkedInParaLog(body)));
 
     const eventos = Array.isArray(body?.elements) ? body.elements : Array.isArray(body) ? body : [body];
 
@@ -22079,7 +22098,7 @@ app.post("/webhook/kwai", async (c) => {
 
   try {
     const body = await c.req.json().catch(() => ({}));
-    console.log("WEBHOOK KWAI RECEBIDO (schema ainda nao confirmado, log cru):", JSON.stringify(body));
+    console.log("WEBHOOK KWAI RECEBIDO (schema ainda nao confirmado, dado pessoal reconhecido é redigido):", JSON.stringify(redigirDadosPessoais(body)));
 
     // TODO(kwai): quando a Kuaishou aprovar o parceiro e publicar o schema de
     // eventos de lead, espelhar aqui o mesmo fluxo do /webhook/tiktok acima:
@@ -25155,7 +25174,7 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
         resetUrl
       );
 
-      console.log("[RESET] email enviado para", user.email);
+      console.log("[RESET] email enviado para", mascararEmail(user.email));
     }
 
     return c.json({
@@ -39764,6 +39783,51 @@ async function notificarNovoLeadWhatsApp(
   }
 }
 
+
+// Mascara telefone (só dígitos, com ou sem 55) mantendo os últimos 4 dígitos — dá pra
+// bater com um ticket de suporte sem expor o número inteiro no log do servidor.
+function mascararTelefone(valor: unknown): string {
+  const digitos = String(valor || "").replace(/\D/g, "");
+  if (!digitos) return "-";
+  return `***${digitos.slice(-4)}`;
+}
+
+// Mascara e-mail mantendo o 1º caractere do usuário e o domínio inteiro (domínio sozinho
+// não identifica ninguém e ajuda a distinguir contas de teste/corporativas nos logs).
+function mascararEmail(valor: unknown): string {
+  const texto = String(valor || "");
+  const arroba = texto.indexOf("@");
+  if (arroba <= 0) return "-";
+  return `${texto[0]}***${texto.slice(arroba)}`;
+}
+
+// Redige dado pessoal de um payload de webhook ainda não mapeado (hoje só o do Kwai,
+// cujo schema a Kuaishou ainda não confirmou — ver comentário no /webhook/kwai). Troca só
+// o VALOR das chaves reconhecidas como pessoais por "[redigido]"; a estrutura (chaves,
+// ids, tipos de evento) continua visível pra descobrir o formato real do payload.
+// Cobertura best-effort: se um provedor guardar nome/telefone/email num campo genérico
+// (tipo "answer" ou "value"), esse valor passa batido — foi o caso do LinkedIn, corrigido
+// à parte com um resumo dedicado (resumoWebhookLinkedInParaLog) em vez desta função.
+const CHAVES_DADOS_PESSOAIS =
+  /^(nome|name|first_?name|last_?name|full_?name|email|e_?mail|telefone|phone|phone_?number|celular|whatsapp|cpf|cnpj|documento|rg|endereco|address|username|ig_username)$/i;
+
+function redigirDadosPessoais(valor: unknown, profundidade = 0): unknown {
+  if (profundidade > 6) return valor; // trava contra payload malformado/circular
+  if (Array.isArray(valor)) {
+    return valor.map((item) => redigirDadosPessoais(item, profundidade + 1));
+  }
+  if (valor && typeof valor === "object") {
+    const copia: Record<string, unknown> = {};
+    for (const [chave, item] of Object.entries(valor as Record<string, unknown>)) {
+      copia[chave] = CHAVES_DADOS_PESSOAIS.test(chave)
+        ? "[redigido]"
+        : redigirDadosPessoais(item, profundidade + 1);
+    }
+    return copia;
+  }
+  return valor;
+}
+
 // Formato de telefone que o WhatsApp (Z-API e Cloud API oficial) espera: só
 // dígitos, sempre com o prefixo 55. Mesma normalização usada pra vincular uma
 // conversa a um lead pelo telefone (ver vincularConversaAoLead).
@@ -39800,7 +39864,7 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
     });
     const body = await res.json();
     if (res.ok) {
-      console.log(`[z-api] ✅ enviado para ${phone}`);
+      console.log(`[z-api] ✅ enviado para ${mascararTelefone(phone)}`);
     } else {
       console.error(`[z-api] ❌ erro ${res.status}:`, JSON.stringify(body));
     }
@@ -40161,7 +40225,7 @@ async function enviarMensagemWhatsAppOficial(
     );
     const body = await res.json() as any;
     if (res.ok) {
-      console.log(`[whatsapp-oficial] ✅ enviado para ${to}`);
+      console.log(`[whatsapp-oficial] ✅ enviado para ${mascararTelefone(to)}`);
       return body?.messages?.[0]?.id ?? null;
     } else {
       console.error(`[whatsapp-oficial] ❌ erro ${res.status}:`, JSON.stringify(body));
