@@ -46,6 +46,15 @@ import {
 } from "./contato-formulario";
 
 import {
+  DESCRICAO_SCHEMA_CLASSIFICACAO_CONVERSA,
+  SCHEMA_CLASSIFICACAO_CONVERSA,
+  instrucoesQualificacao,
+  interpretarClassificacao,
+  lerQualificacaoIA,
+  type ClassificacaoConversa,
+} from "./classificacao-conversa";
+
+import {
   MOEDA_VALOR_NEGOCIO,
   etapaFunilFormularioMeta,
   montarEventoMeta,
@@ -22431,10 +22440,11 @@ async function classificarStatusLeadPorConversa(
   lead: any,
   transcricao: string,
   usuarioId: number
-): Promise<{ status: StatusLeadKanban | null; motivo: string | null }> {
+): Promise<ClassificacaoConversa> {
+  const semResultado: ClassificacaoConversa = { status: null, motivo: null, qualificacao: null };
   const configIA = await buscarConfigIA();
   if (configIA?.status !== "contratado") {
-    return { status: null, motivo: null };
+    return semResultado;
   }
 
   const estagioCtx = estagioKanbanContexto(lead?.status || "novo");
@@ -22445,24 +22455,18 @@ async function classificarStatusLeadPorConversa(
     `Os 5 estágios possíveis são: "novo" (contato ainda não iniciado), "primeiro_contato" (primeiro contato já feito, sem negociação real ainda), "em_conversa" (negociação em andamento — dúvidas, objeções, envio de proposta), "fechado" (negócio fechado/vendido, cliente confirmou compra/contratação), "perdido" (cliente desistiu, disse não ter mais interesse, parou de responder de forma definitiva ou recusou explicitamente). ` +
     `O lead está registrado atualmente como "${estagioCtx.label}" (${estagioCtx.objetivo}) — mas ignore isso se a conversa mostrar claramente outro estágio: decida pelo conteúdo real da conversa, não pelo status atual. ` +
     `Só use confianca:"alta" quando a conversa deixar claro o estágio; use "baixa" em qualquer caso de dúvida, conversa curta/ambígua, ou papo que não indica progresso real. ` +
+    // Mesma chamada também julga se o lead é qualificado pelos critérios do
+    // nicho — entra no score e no "Qualified Lead" (ver classificacao-conversa.ts).
+    instrucoesQualificacao(ctx.nicho, Array.isArray(ctx.qualificadores) ? ctx.qualificadores : []) + " " +
     `Responda SOMENTE JSON, em português do Brasil, sem texto fora do JSON.`;
-  const schemaDescricao =
-    `{"status":"novo"|"primeiro_contato"|"em_conversa"|"fechado"|"perdido","confianca":"alta"|"baixa","motivo":"string curta explicando a decisão"}`;
+  const schemaDescricao = DESCRICAO_SCHEMA_CLASSIFICACAO_CONVERSA;
   const userText = JSON.stringify({
     status_atual: estagioCtx.chave,
     conversa: transcricao,
-    objetivo: "Classificar o estágio real do funil com base na conversa completa entre corretor e cliente."
+    objetivo: "Classificar o estágio real do funil e se o cliente é um lead qualificado, com base na conversa completa entre corretor e cliente."
   });
 
-  const parseResultado = (texto: string): { status: StatusLeadKanban | null; motivo: string | null } => {
-    const limpo = texto.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-    const parsed = JSON.parse(limpo);
-    const statusValidos: StatusLeadKanban[] = ["novo", "primeiro_contato", "em_conversa", "fechado", "perdido"];
-    return {
-      status: parsed?.confianca === "alta" && statusValidos.includes(parsed?.status) ? parsed.status : null,
-      motivo: textoOpcional(parsed?.motivo)
-    };
-  };
+  const parseResultado = (texto: string): ClassificacaoConversa => interpretarClassificacao(texto);
 
   const iaConf = await buscarConfigIA();
 
@@ -22485,16 +22489,7 @@ async function classificarStatusLeadPorConversa(
                 type: "json_schema",
                 name: "classificacao_status_lead",
                 strict: true,
-                schema: {
-                  type: "object",
-                  additionalProperties: false,
-                  required: ["status", "confianca", "motivo"],
-                  properties: {
-                    status: { type: "string", enum: ["novo", "primeiro_contato", "em_conversa", "fechado", "perdido"] },
-                    confianca: { type: "string", enum: ["alta", "baixa"] },
-                    motivo: { type: "string" }
-                  }
-                }
+                schema: SCHEMA_CLASSIFICACAO_CONVERSA
               }
             },
             // "low" basta pra essa classificação (é um julgamento simples de
@@ -22513,7 +22508,8 @@ async function classificarStatusLeadPorConversa(
               { role: "system", content: systemMsg + `\n\nResponda SOMENTE JSON no formato: ${schemaDescricao}` },
               { role: "user", content: userText }
             ],
-            max_tokens: 300
+            // 500: a resposta agora traz também a qualificação (3 campos a mais).
+            max_tokens: 500
           };
 
       const resp = await fetchProvedorIA("openai", "classificacao_conversa", usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
@@ -22552,7 +22548,8 @@ async function classificarStatusLeadPorConversa(
         headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
         body: JSON.stringify({
           model: anthropicModelo,
-          max_tokens: 300,
+          // 500: a resposta agora traz também a qualificação (3 campos a mais).
+          max_tokens: 500,
           system: systemMsg + `\n\nResponda SOMENTE JSON no formato: ${schemaDescricao}`,
           messages: [{ role: "user", content: userText }]
         })
@@ -22576,7 +22573,7 @@ async function classificarStatusLeadPorConversa(
     }
   }
 
-  return { status: null, motivo: null };
+  return semResultado;
 }
 
 // 🔥 WEBHOOK Z-API — eventos de conexão/desconexão do WhatsApp pessoal do
@@ -25392,6 +25389,14 @@ await client.query(`
 await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS meta_etapas_funil_enviadas JSONB;
+`);
+
+// Último julgamento confiante da IA sobre a conversa do WhatsApp:
+// {resultado: "qualificado"|"nao_qualificado", motivo, avaliado_em} — entra
+// no score (ver classificacao-conversa.ts e processarClassificacaoStatusLeadIA).
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS ia_qualificacao JSONB;
 `);
 
 // Primeiro contato automático com lead de formulário (ver
@@ -34075,6 +34080,7 @@ app.get("/leads", authMiddleware, async (c) => {
         l.valor_negocio,
         l.whatsapp_contato_enviado_em,
         l.whatsapp_contato_erro,
+        l.ia_qualificacao,
         l.respostas_qualificacao,
         l.criado_em,
         l.nicho_id,
@@ -34263,6 +34269,7 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
         l.score,
         l.score_manual,
         l.motivo_perda,
+        l.ia_qualificacao,
         l.respostas_qualificacao,
         l.criado_em,
         n.slug AS nicho_slug,
@@ -34304,6 +34311,7 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
         l.score,
         l.score_manual,
         l.motivo_perda,
+        l.ia_qualificacao,
         l.respostas_qualificacao,
         l.criado_em,
         n.slug AS nicho_slug,
@@ -41586,6 +41594,21 @@ async function processarClassificacaoStatusLeadIA() {
         await enriquecerLeadParaInteligencia(row);
         const classificacao = await classificarStatusLeadPorConversa(row, transcricao, row.usuario_id);
 
+        // Julgamento de qualificação da IA (só vem com confiança alta). Salvo
+        // ANTES de mexer no status, pra atualizarStatusLeadBackend (RETURNING *)
+        // já calcular o score com ele. Fica o último julgamento confiante.
+        const qualificacaoAnterior = lerQualificacaoIA(row.ia_qualificacao)?.resultado ?? null;
+        const qualificacaoMudou =
+          Boolean(classificacao.qualificacao) &&
+          classificacao.qualificacao?.resultado !== qualificacaoAnterior;
+
+        if (classificacao.qualificacao) {
+          await client.query(
+            `UPDATE leads SET ia_qualificacao = $1 WHERE id = $2`,
+            [JSON.stringify({ ...classificacao.qualificacao, avaliado_em: new Date().toISOString() }), row.id]
+          );
+        }
+
         if (classificacao.status && classificacao.status !== statusAtual) {
           await atualizarStatusLeadBackend(
             row.id,
@@ -41609,6 +41632,14 @@ async function processarClassificacaoStatusLeadIA() {
               classificacao.motivo || "Decisão automática com base na conversa do WhatsApp."
             ]
           ).catch((e: any) => console.error("ERRO ao inserir notificacao lead_movido_ia:", e));
+        } else if (qualificacaoMudou) {
+          // Status igual, mas o julgamento de qualificação mudou: reavalia o
+          // score e o envio às plataformas (o caminho acima já faz isso via
+          // atualizarStatusLeadBackend quando o status muda).
+          const atualizado = await client.query(`SELECT * FROM leads WHERE id = $1`, [row.id]);
+          if (atualizado.rows[0]) {
+            await avaliarEEnviarQualificacaoLead(atualizado.rows[0], row.usuario_id);
+          }
         }
       } catch (e) {
         console.error("ERRO ao classificar status por conversa (lead " + row.id + "):", e);

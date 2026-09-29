@@ -18,6 +18,8 @@
 // A comparação é feita sem acento e por palavra inteira (com plural simples),
 // respeitando negação ("não quero agendar", "sem entrada" não contam).
 
+import { lerQualificacaoIA } from "./classificacao-conversa";
+
 export type ChaveNicho =
   | "imoveis" | "saude" | "suplementos" | "saas" | "higienizacao" | "telecom"
   | "cursos_online" | "educacao" | "auto" | "consorcio";
@@ -326,6 +328,23 @@ export function calcularScoreLead(lead: any) {
   if (desinteresse.length) {
     pontos -= 30;
     base.push(`-30 Lead indica baixo interesse: ${listarTermos(desinteresse)}`);
+  }
+
+  // 🤖 Julgamento da IA sobre a conversa do WhatsApp (critérios do nicho —
+  // ver classificacao-conversa.ts). Pesa como intenção forte: qualifica quem
+  // se expressou sem as palavras-chave e derruba falso positivo de quem usou
+  // a palavra mas mostrou que não tem intenção. Só é salvo quando a IA tem
+  // confiança alta.
+  const avaliacaoIA = lerQualificacaoIA(lead?.ia_qualificacao);
+  if (avaliacaoIA) {
+    const detalhe = avaliacaoIA.motivo ? `: ${avaliacaoIA.motivo}` : "";
+    if (avaliacaoIA.resultado === "qualificado") {
+      pontos += 30;
+      base.push(`+30 IA avaliou a conversa: lead qualificado${detalhe}`);
+    } else {
+      pontos -= 30;
+      base.push(`-30 IA avaliou a conversa: lead não qualificado${detalhe}`);
+    }
   }
 
   // 🔄 Lead repetido
