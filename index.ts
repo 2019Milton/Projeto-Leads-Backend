@@ -23501,6 +23501,15 @@ async function processarEventoWhatsApp(value: any) {
     const telefoneCliente = msg.from;
     if (!telefoneCliente) continue;
 
+    // A Meta às vezes entrega a mensagem de clique em anúncio primeiro como
+    // type "unsupported" (sem texto nem referral) e logo depois de novo, com o
+    // MESMO wamid, completa. Processar a vazia gravava o wamid (o dedupe abaixo
+    // descartava a completa, com o anúncio) e disparava triagem/lead sem origem.
+    if (msg.type === "unsupported") {
+      console.log(`[whatsapp-webhook] mensagem ${msg.id} type=unsupported ignorada (erro ${msg.errors?.[0]?.code ?? "-"}), aguardando reentrega completa`);
+      continue;
+    }
+
     const conversa = await obterOuCriarConversaWhatsApp(usuarioId, telefoneCliente);
 
     // Dedupe por wamid: Meta reentrega webhook "pelo menos uma vez". Se o insert
