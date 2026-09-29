@@ -57,11 +57,21 @@ import {
 import {
   MOEDA_VALOR_NEGOCIO,
   etapaFunilFormularioMeta,
+  idEventoSiteMeta,
   montarEventoMeta,
   valorVendaInformado,
   type EtapaConversao,
   type EtapaFunilFormulario,
+  type EtapaSite,
 } from "./eventos-meta";
+
+import {
+  detectarRedeSite,
+  montarFbc,
+  normalizarAtribuicao,
+  scriptFormularioSite,
+  validarEnvioSite,
+} from "./site-captura";
 
 import {
   TERMOS_BAIXO_INTERESSE,
@@ -420,9 +430,16 @@ const allowedOrigins = new Set(
   ].filter(Boolean) as string[]
 );
 
-function resolverOrigemCors(origin: string) {
+function resolverOrigemCors(origin: string, c?: any) {
   if (!origin) {
     return "*";
+  }
+
+  // Rotas públicas do formulário do site do corretor (ver site-captura.ts):
+  // o envio vem do domínio do site dele, que não está na lista. Essas rotas
+  // não usam cookie nem token — a chave pública do formulário vai no corpo.
+  if (String(c?.req?.path || "").startsWith("/site/")) {
+    return origin;
   }
 
   if (
@@ -1137,12 +1154,13 @@ async function obterOuCriarDatasetMetaUsuario(
 async function enviarEventoMetaConversionLeads(
   usuarioId: number,
   lead: any,
-  eventName: EtapaConversao | EtapaFunilFormulario
+  eventName: EtapaConversao | EtapaFunilFormulario | EtapaSite
 ): Promise<{ ok: boolean; erro?: string }> {
 
   const isCtwa = Boolean(lead?.ctwa_clid);
+  const isSite = lead?.plataforma === "site";
 
-  if (!isCtwa && !lead?.lead_id) {
+  if (!isCtwa && !isSite && !lead?.lead_id) {
     return { ok: false, erro: "Lead sem lead_id da Meta" };
   }
 
@@ -1233,7 +1251,9 @@ async function avaliarEEnviarQualificacaoMeta(
 ) {
   try {
 
-    if (!leadRow?.lead_id && !leadRow?.ctwa_clid) {
+    const ehSiteMeta = leadRow?.plataforma === "site" && leadRow?.origem === "meta";
+
+    if (!leadRow?.lead_id && !leadRow?.ctwa_clid && !ehSiteMeta) {
       return;
     }
 
@@ -1245,7 +1265,7 @@ async function avaliarEEnviarQualificacaoMeta(
     // à parte, sem isso nunca disparariam evento nenhum pra Meta.
     const ehMeta = (leadRow.plataforma || leadRow.origem) === "meta";
     const ehWhatsappCtwa = leadRow.plataforma === "whatsapp" && Boolean(leadRow.ctwa_clid);
-    if (!ehMeta && !ehWhatsappCtwa) {
+    if (!ehMeta && !ehWhatsappCtwa && !ehSiteMeta) {
       return;
     }
 
@@ -1423,9 +1443,11 @@ async function avaliarEEnviarQualificacaoLead(
   // um lead LinkedIn vindo do WhatsApp (plataforma='whatsapp', origem=
   // 'linkedin') cairia no fallback da Meta e nunca mandaria conversão pro
   // LinkedIn.
+  // 'site' (formulário do site do corretor) é canal como 'whatsapp': a rede
+  // que trouxe o clique está em "origem" (ver detectarRedeSite).
   const plataformaLead = leadRow?.plataforma;
   const rede =
-    (!plataformaLead || plataformaLead === "whatsapp")
+    (!plataformaLead || plataformaLead === "whatsapp" || plataformaLead === "site")
       ? (leadRow?.origem || plataformaLead)
       : plataformaLead;
 
@@ -21348,6 +21370,207 @@ app.post("/whatsapp/contato-formulario/modelo-sugerido", authMiddleware, async (
   }
 });
 
+/* =========================
+   🌐 FORMULÁRIO DO SITE DO CORRETOR (ver site-captura.ts)
+   Rotas públicas em /site/* (CORS liberado só pra elas, ver
+   resolverOrigemCors); configuração autenticada em /site-formulario/*.
+========================= */
+
+// Script que o corretor cola no site. Público e sem dado do corretor — a
+// chave vai na própria URL do <script> e só é validada no envio.
+app.get("/site/form.js", (c) => {
+  c.header("Content-Type", "application/javascript; charset=utf-8");
+  c.header("Cache-Control", "public, max-age=300");
+  return c.body(scriptFormularioSite());
+});
+
+// "Lead" padrão da Meta na chegada do lead de site vindo de anúncio da Meta —
+// é o evento que campanha de site otimizada por conversão usa. Mesmo gate de
+// plano dos demais eventos; best-effort.
+async function enviarLeadSiteMeta(usuarioId: number, lead: any) {
+  try {
+    const usuario = await client.query(`SELECT plano FROM usuarios WHERE id = $1`, [usuarioId]);
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) return;
+    const resultado = await enviarEventoMetaConversionLeads(usuarioId, lead, "Lead");
+    if (!resultado.ok) {
+      console.warn(`[site] evento Lead da Meta não enviado (lead ${lead.id}): ${resultado.erro}`);
+    }
+  } catch (err) {
+    console.error(`[site] erro no evento Lead da Meta (lead ${lead?.id}):`, err);
+  }
+}
+
+app.post("/site/leads", async (c) => {
+  const limite = limitarRequisicao(c, "site-leads", 10, 60 * 1000);
+  if (limite) return limite;
+
+  try {
+    const corpo: any = await c.req.json().catch(() => null);
+    const chave = String(corpo?.k || "");
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(chave)) {
+      return c.json({ error: "Formulário não configurado." }, 400);
+    }
+
+    const usuarioRes = await client.query(`SELECT id FROM usuarios WHERE site_chave = $1`, [chave]);
+    const usuarioId: number | undefined = usuarioRes.rows[0]?.id;
+    if (!usuarioId) {
+      return c.json({ error: "Formulário não configurado." }, 404);
+    }
+
+    // Campo escondido preenchido = robô: responde sucesso sem gravar.
+    if (String(corpo?.hp || "").trim()) {
+      return c.json({ ok: true });
+    }
+
+    const validacao = validarEnvioSite(corpo);
+    if (!validacao.ok || !validacao.dados) {
+      return c.json({ error: validacao.erro || "Dados inválidos." }, 400);
+    }
+    const dados = validacao.dados;
+
+    const atribuicao: any = normalizarAtribuicao(corpo?.atribuicao);
+    if (atribuicao.fbclid && !atribuicao.fbc) {
+      atribuicao.fbc = montarFbc(atribuicao.fbclid, Date.now());
+    }
+    const ip = obterIpRequisicao(c);
+    if (ip && ip !== "ip-desconhecido") atribuicao.ip = ip;
+    const userAgent = String(c.req.header("user-agent") || "").slice(0, 500);
+    if (userAgent) atribuicao.user_agent = userAgent;
+    atribuicao.capturado_em = new Date().toISOString();
+
+    const rede = detectarRedeSite(atribuicao);
+
+    // Envio repetido (duplo clique, recarregou a página): mesmo telefone no
+    // mesmo corretor nos últimos 10 minutos não vira lead novo.
+    const duplicado = await client.query(
+      `SELECT id FROM leads
+       WHERE usuario_id = $1 AND plataforma = 'site'
+         AND regexp_replace(COALESCE(telefone, ''), '[^0-9]', '', 'g') = $2
+         AND criado_em > NOW() - INTERVAL '10 minutes'
+       ORDER BY id DESC LIMIT 1`,
+      [usuarioId, dados.telefone]
+    );
+    if (duplicado.rows.length) {
+      return c.json({ ok: true, event_id: idEventoSiteMeta(duplicado.rows[0].id, "Lead") });
+    }
+
+    // Campanha pela UTM: o id da campanha na rede (ex.: utm_campaign={{campaign.id}}
+    // nos parâmetros de URL da Meta) ou o nome dela na plataforma.
+    let campanha: any = null;
+    if (atribuicao.utm_campaign) {
+      const campanhaRes = await client.query(
+        `SELECT id, nome, nicho_id, conta_anuncios_id FROM campanhas
+         WHERE usuario_id = $1 AND (campaign_id = $2 OR nome = $2)
+         ORDER BY id DESC LIMIT 1`,
+        [usuarioId, atribuicao.utm_campaign]
+      );
+      campanha = campanhaRes.rows[0] || null;
+    }
+
+    const contaAnunciosId =
+      campanha?.conta_anuncios_id ||
+      (rede === "meta" ? await obterContaAnunciosSelecionadaIdUsuario(usuarioId) : null);
+
+    const inserido = await client.query(
+      `INSERT INTO leads (
+         usuario_id, nome, telefone, email, origem, plataforma, status, campanha,
+         campanha_id, nicho_id, conta_anuncios_id, gclid, respostas_qualificacao, atribuicao, criado_em
+       )
+       VALUES ($1, $2, $3, $4, $5, 'site', 'novo', $6, $7, $8, $9, $10, $11, $12, NOW())
+       RETURNING *`,
+      [
+        usuarioId,
+        dados.nome,
+        dados.telefone,
+        dados.email,
+        rede,
+        campanha?.nome || atribuicao.utm_campaign || "Formulário do site",
+        campanha?.id ?? null,
+        campanha?.nicho_id ?? null,
+        contaAnunciosId ? String(contaAnunciosId) : null,
+        atribuicao.gclid || null,
+        JSON.stringify(dados.mensagem ? [{ pergunta: "Mensagem", resposta: dados.mensagem }] : []),
+        JSON.stringify(atribuicao)
+      ]
+    );
+    const lead = inserido.rows[0];
+
+    console.log(`✅ LEAD DO SITE: lead ${lead.id} usuário ${usuarioId} (rede: ${rede})`);
+
+    notificarNovoLeadWhatsApp(usuarioId, {
+      nome: dados.nome,
+      telefone: dados.telefone,
+      email: dados.email,
+      campanha: lead.campanha
+    }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (site):", e));
+
+    if (rede === "meta") {
+      enviarLeadSiteMeta(usuarioId, lead);
+    }
+
+    avaliarEEnviarQualificacaoLead({ ...lead }, usuarioId)
+      .catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (site):", err));
+
+    iniciarContatoWhatsAppLeadFormulario(usuarioId, lead.id)
+      .catch(err => console.error("ERRO contato WhatsApp formulário (site):", err));
+
+    return c.json({ ok: true, event_id: idEventoSiteMeta(lead.id, "Lead") });
+  } catch (err) {
+    console.error("ERRO POST /site/leads:", err);
+    return c.json({ error: "Não foi possível enviar agora. Tente novamente." }, 500);
+  }
+});
+
+async function obterOuCriarChaveSite(usuarioId: number): Promise<string> {
+  const atual = await client.query(`SELECT site_chave FROM usuarios WHERE id = $1`, [usuarioId]);
+  if (atual.rows[0]?.site_chave) return atual.rows[0].site_chave;
+  const nova = randomBytes(18).toString("base64url");
+  await client.query(
+    `UPDATE usuarios SET site_chave = $1 WHERE id = $2 AND site_chave IS NULL`,
+    [nova, usuarioId]
+  );
+  const depois = await client.query(`SELECT site_chave FROM usuarios WHERE id = $1`, [usuarioId]);
+  return depois.rows[0]?.site_chave;
+}
+
+app.get("/site-formulario/configuracao", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const chave = await obterOuCriarChaveSite(user.id);
+    const estatisticas = await client.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE criado_em > NOW() - INTERVAL '30 days')::int AS leads_30d,
+         COUNT(*) FILTER (WHERE criado_em > NOW() - INTERVAL '30 days' AND origem <> 'site')::int AS com_origem_30d,
+         MAX(criado_em) AS ultimo_lead_em
+       FROM leads WHERE usuario_id = $1 AND plataforma = 'site'`,
+      [user.id]
+    );
+    const porRede = await client.query(
+      `SELECT origem AS rede, COUNT(*)::int AS total
+       FROM leads WHERE usuario_id = $1 AND plataforma = 'site' AND criado_em > NOW() - INTERVAL '30 days'
+       GROUP BY origem ORDER BY total DESC`,
+      [user.id]
+    );
+    return c.json({ chave, estatisticas: estatisticas.rows[0], por_rede: porRede.rows });
+  } catch (err) {
+    console.error("ERRO GET /site-formulario/configuracao:", err);
+    return c.json({ error: "Erro ao carregar o formulário do site" }, 500);
+  }
+});
+
+// Troca a chave: o código antigo colado no site para de funcionar.
+app.post("/site-formulario/nova-chave", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const nova = randomBytes(18).toString("base64url");
+    await client.query(`UPDATE usuarios SET site_chave = $1 WHERE id = $2`, [nova, user.id]);
+    return c.json({ ok: true, chave: nova });
+  } catch (err) {
+    console.error("ERRO POST /site-formulario/nova-chave:", err);
+    return c.json({ error: "Erro ao gerar nova chave" }, 500);
+  }
+});
+
 app.get("/whatsapp/bot", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
@@ -25397,6 +25620,24 @@ await client.query(`
 await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS ia_qualificacao JSONB;
+`);
+
+// Formulário do site do corretor (ver site-captura.ts): chave pública por
+// corretor (vai no <script> colado no site) e a origem do clique de cada lead
+// de site (fbclid/fbc/fbp, gclid, ttclid, UTMs, página, IP e navegador) — é
+// com ela que o evento volta pra rede certa.
+await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS site_chave TEXT;
+`);
+
+await client.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS usuarios_site_chave_unica ON usuarios (site_chave) WHERE site_chave IS NOT NULL;
+`);
+
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS atribuicao JSONB;
 `);
 
 // Primeiro contato automático com lead de formulário (ver
@@ -33820,6 +34061,8 @@ app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
     // quais linhas são desse tipo pra poder rotular como "Meta Ads · WhatsApp" em vez de só
     // "Meta Ads" (perderia a info de que veio de conversa, não formulário) ou só "whatsapp"
     // (perderia de qual plataforma veio o anúncio).
+    // 'site' (formulário do site do corretor) é canal igual a 'whatsapp': conta
+    // na rede que trouxe o clique (origem) ou fica em 'site' quando não há rede.
     // Dentro do balde 'meta', refina pra facebook/instagram quando a campanha
     // do lead (campanha_id) tiver essa marcação — mesma resolução usada em
     // /meta/status-completo e no front (plataformaCampanhaExibicao). Campanha
@@ -33828,7 +34071,7 @@ app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
     const result = await client.query(
       `SELECT
          CASE
-           WHEN COALESCE(NULLIF(l.plataforma, 'whatsapp'), l.origem, 'formulario') = 'meta'
+           WHEN COALESCE(NULLIF(NULLIF(l.plataforma, 'whatsapp'), 'site'), l.origem, 'formulario') = 'meta'
            THEN COALESCE(
              CASE
                WHEN c.configuracoes_avancadas->'plataformas' = '["facebook"]'::jsonb THEN 'facebook'
@@ -33836,7 +34079,7 @@ app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
              END,
              'meta'
            )
-           ELSE COALESCE(NULLIF(l.plataforma, 'whatsapp'), l.origem, 'formulario')
+           ELSE COALESCE(NULLIF(NULLIF(l.plataforma, 'whatsapp'), 'site'), l.origem, 'formulario')
          END AS plataforma,
          (l.plataforma = 'whatsapp') AS canal_whatsapp,
          COUNT(*)::int AS total
@@ -33876,63 +34119,63 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       `
       SELECT
         COUNT(*) FILTER (
-          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
+          WHERE COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'meta'
         )::int AS total_leads_meta,
         COUNT(*) FILTER (
           WHERE meta_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'meta'
         )::int AS qualificados_enviados,
         COUNT(*) FILTER (
           WHERE meta_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'meta'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'meta'
         )::int AS fechados_enviados,
 
         COUNT(*) FILTER (
-          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'google'
+          WHERE COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'google'
         )::int AS total_leads_google,
         COUNT(*) FILTER (
           WHERE google_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'google'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'google'
         )::int AS qualificados_enviados_google,
         COUNT(*) FILTER (
           WHERE google_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'google'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'google'
         )::int AS fechados_enviados_google,
 
         COUNT(*) FILTER (
-          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'tiktok'
+          WHERE COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'tiktok'
         )::int AS total_leads_tiktok,
         COUNT(*) FILTER (
           WHERE tiktok_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'tiktok'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'tiktok'
         )::int AS qualificados_enviados_tiktok,
         COUNT(*) FILTER (
           WHERE tiktok_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'tiktok'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'tiktok'
         )::int AS fechados_enviados_tiktok,
 
         COUNT(*) FILTER (
-          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'kwai'
+          WHERE COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'kwai'
         )::int AS total_leads_kwai,
         COUNT(*) FILTER (
           WHERE kwai_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'kwai'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'kwai'
         )::int AS qualificados_enviados_kwai,
         COUNT(*) FILTER (
           WHERE kwai_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'kwai'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'kwai'
         )::int AS fechados_enviados_kwai,
 
         COUNT(*) FILTER (
-          WHERE COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'linkedin'
+          WHERE COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'linkedin'
         )::int AS total_leads_linkedin,
         COUNT(*) FILTER (
           WHERE linkedin_evento_qualificado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'linkedin'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'linkedin'
         )::int AS qualificados_enviados_linkedin,
         COUNT(*) FILTER (
           WHERE linkedin_evento_fechado_enviado_em IS NOT NULL
-          AND COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') = 'linkedin'
+          AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'linkedin'
         )::int AS fechados_enviados_linkedin
       FROM leads
       WHERE usuario_id = $1
@@ -33954,7 +34197,7 @@ app.get("/leads/meta-conversao/estatisticas", authMiddleware, async (c) => {
       `
       SELECT
         nome,
-        COALESCE(NULLIF(plataforma, 'whatsapp'), origem, 'formulario') AS plataforma,
+        COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') AS plataforma,
         meta_evento_qualificado_enviado_em,
         meta_evento_fechado_enviado_em,
         google_evento_qualificado_enviado_em,
@@ -34116,6 +34359,9 @@ app.get("/leads", authMiddleware, async (c) => {
       AND (
         COALESCE(l.origem, 'manual') <> 'meta'
         OR l.conta_anuncios_id = $2
+        -- lead do formulário do site vindo da Meta nem sempre tem conta de
+        -- anúncios (corretor sem Meta conectada) — nunca some da lista.
+        OR l.plataforma = 'site'
       )
       ORDER BY l.criado_em DESC
       `,

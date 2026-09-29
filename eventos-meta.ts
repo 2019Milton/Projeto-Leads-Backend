@@ -17,7 +17,13 @@
 //    isso o fechamento vai como Purchase, com o valor do negócio.
 //    Doc: developers.facebook.com/documentation/ads-commerce/conversions-api/business-messaging
 
+import { createHash } from "node:crypto";
+
 export type EtapaConversao = "Qualified Lead" | "Closed Won";
+
+// Lead de site (canal plataforma = 'site', ver site-captura.ts): além das
+// etapas de sempre, manda o "Lead" padrão da Meta na chegada do lead.
+export type EtapaSite = "Lead";
 
 // Demais etapas do funil, só para lead de formulário: no Conversion Leads o
 // nome da etapa é livre e a Meta recomenda mandar todas as etapas (ela usa o
@@ -69,15 +75,73 @@ export function valorVendaInformado(lead: any, etapa: EtapaConversao): number | 
   return valor !== null && valor > 0 ? valor : null;
 }
 
+function sha256(valor: string): string {
+  return createHash("sha256").update(valor).digest("hex");
+}
+
+// Mesmo id no evento do servidor e no fbq("track","Lead") do navegador (o
+// script do site recebe esse id na resposta) — a Meta descarta a duplicata.
+export function idEventoSiteMeta(leadId: number | string, etapa: string): string {
+  return `lead-${leadId}-${String(etapa).toLowerCase().replace(/\s+/g, "-")}`;
+}
+
+function lerAtribuicao(valor: unknown): any {
+  if (valor && typeof valor === "object") return valor;
+  try { return JSON.parse(String(valor || "{}")); } catch { return {}; }
+}
+
+// Lead de site: casamento pelo clique (fbc/fbp) + e-mail/telefone com hash
+// (formato de user_data da Conversions API: em/ph/external_id hasheados;
+// fbc, fbp, IP e user agent crus). A chegada ("Lead") vai como evento de
+// site; qualificação e venda aconteceram depois, no atendimento, e vão como
+// evento do sistema.
+function montarEventoSiteMeta(lead: any, etapa: string, eventTime: number, valor: number | null) {
+  const atr = lerAtribuicao(lead?.atribuicao);
+  const user_data: Record<string, any> = {};
+
+  const email = String(lead?.email || "").trim().toLowerCase();
+  if (email) user_data.em = [sha256(email)];
+
+  let telefone = String(lead?.telefone || "").replace(/\D/g, "");
+  if (telefone && !telefone.startsWith("55") && (telefone.length === 10 || telefone.length === 11)) telefone = `55${telefone}`;
+  if (telefone) user_data.ph = [sha256(telefone)];
+
+  if (lead?.id !== undefined && lead?.id !== null) user_data.external_id = [sha256(`lead-${lead.id}`)];
+  if (atr.fbc) user_data.fbc = String(atr.fbc);
+  if (atr.fbp) user_data.fbp = String(atr.fbp);
+  if (atr.ip) user_data.client_ip_address = String(atr.ip);
+  if (atr.user_agent) user_data.client_user_agent = String(atr.user_agent);
+
+  const naChegada = etapa === "Lead";
+  const evento: Record<string, any> = {
+    event_name: etapa === "Closed Won" ? "Purchase" : etapa,
+    event_time: eventTime,
+    event_id: idEventoSiteMeta(lead?.id, etapa),
+    action_source: naChegada ? "website" : "system_generated",
+    user_data
+  };
+  if (naChegada && atr.pagina) evento.event_source_url = String(atr.pagina);
+  if (etapa === "Closed Won") evento.custom_data = { currency: MOEDA_VALOR_NEGOCIO, value: valor ?? 0 };
+  return evento;
+}
+
 export function montarEventoMeta(params: {
   lead: any;
-  etapa: EtapaConversao | EtapaFunilFormulario;
+  etapa: EtapaConversao | EtapaFunilFormulario | EtapaSite;
   wabaId?: string | null;
   agoraSegundos?: number;
 }): Record<string, any> {
   const { lead, etapa } = params;
   const eventTime = params.agoraSegundos ?? Math.floor(Date.now() / 1000);
   const valor = valorNegocioLead(lead);
+
+  if (lead?.plataforma === "site") {
+    return montarEventoSiteMeta(lead, etapa, eventTime, valor);
+  }
+
+  if (etapa === "Lead") {
+    throw new Error(`Etapa "Lead" só existe pra lead de site`);
+  }
 
   if (lead?.ctwa_clid) {
     const nomeWhatsapp = EVENTO_WHATSAPP_META[etapa as EtapaConversao];

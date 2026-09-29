@@ -57,7 +57,10 @@ export function motivoParaNaoContatar(params: {
   if (!config.ativo) return "desativado";
   if (!config.template_nome || !config.template_idioma) return "sem modelo escolhido";
   if (!lead) return "lead não encontrado";
-  if (!lead.lead_id || !PLATAFORMAS_FORMULARIO.has(String(lead.plataforma || ""))) return "não é lead de formulário";
+  // Formulário nativo das redes (lead_id da própria rede) ou formulário do
+  // site do corretor (plataforma 'site', ver site-captura.ts).
+  const formularioDeRede = Boolean(lead.lead_id) && PLATAFORMAS_FORMULARIO.has(String(lead.plataforma || ""));
+  if (!formularioDeRede && lead.plataforma !== "site") return "não é lead de formulário";
   if (lead.whatsapp_contato_enviado_em) return "já contatado";
 
   const digitos = String(lead.telefone || "").replace(/\D/g, "");

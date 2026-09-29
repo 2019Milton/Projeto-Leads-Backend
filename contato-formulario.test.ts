@@ -19,6 +19,8 @@ test("contata só lead de formulário novo, com telefone, com o recurso ligado",
   expect(motivoParaNaoContatar({ config: { ...config, template_nome: null }, lead, agora })).toBe("sem modelo escolhido");
   expect(motivoParaNaoContatar({ config, lead: { ...lead, lead_id: null }, agora })).toBe("não é lead de formulário");
   expect(motivoParaNaoContatar({ config, lead: { ...lead, plataforma: "whatsapp" }, agora })).toBe("não é lead de formulário");
+  // Formulário do site do corretor também recebe o primeiro contato.
+  expect(motivoParaNaoContatar({ config, lead: { ...lead, lead_id: null, plataforma: "site" }, agora })).toBeNull();
   expect(motivoParaNaoContatar({ config, lead: { ...lead, whatsapp_contato_enviado_em: "2026-09-29T11:55:00Z" }, agora })).toBe("já contatado");
   expect(motivoParaNaoContatar({ config, lead: { ...lead, telefone: "123" }, agora })).toBe("sem telefone válido");
   expect(motivoParaNaoContatar({ config, lead: null, agora })).toBe("lead não encontrado");
