@@ -1,5 +1,26 @@
 import { expect, test } from "bun:test";
-import { montarEventoMeta, valorNegocioLead, valorVendaInformado } from "./eventos-meta";
+import { etapaFunilFormularioMeta, montarEventoMeta, valorNegocioLead, valorVendaInformado } from "./eventos-meta";
+
+test("etapas do funil só para lead de formulário, conforme o status", () => {
+  expect(etapaFunilFormularioMeta({ lead_id: "1", status: "primeiro_contato" })).toBe("Contacted");
+  expect(etapaFunilFormularioMeta({ lead_id: "1", status: "em_conversa" })).toBe("In Conversation");
+  expect(etapaFunilFormularioMeta({ lead_id: "1", status: "perdido" })).toBe("Lost");
+  expect(etapaFunilFormularioMeta({ lead_id: "1", status: "novo" })).toBeNull();
+  expect(etapaFunilFormularioMeta({ lead_id: "1", status: "fechado" })).toBeNull(); // já vai como Closed Won
+  expect(etapaFunilFormularioMeta({ ctwa_clid: "x", status: "em_conversa" })).toBeNull();
+  expect(etapaFunilFormularioMeta({ status: "em_conversa" })).toBeNull();
+});
+
+test("etapa do funil vai no formato CRM; no WhatsApp é recusada", () => {
+  expect(montarEventoMeta({ lead: { lead_id: "9", valor_negocio: 100 }, etapa: "Lost", agoraSegundos: 1 })).toEqual({
+    event_name: "Lost",
+    event_time: 1,
+    action_source: "system_generated",
+    user_data: { lead_id: "9" },
+    custom_data: { event_source: "crm", lead_event_source: "Plataforma de Leads" }
+  });
+  expect(() => montarEventoMeta({ lead: { ctwa_clid: "x" }, etapa: "Contacted", wabaId: "1" })).toThrow();
+});
 
 test("valor da venda pras outras plataformas: só no fechamento e só se positivo", () => {
   expect(valorVendaInformado({ valor_negocio: "2500.50" }, "Closed Won")).toBe(2500.5);

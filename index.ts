@@ -45,7 +45,14 @@ import {
   type ConfigContatoFormulario,
 } from "./contato-formulario";
 
-import { MOEDA_VALOR_NEGOCIO, montarEventoMeta, valorVendaInformado } from "./eventos-meta";
+import {
+  MOEDA_VALOR_NEGOCIO,
+  etapaFunilFormularioMeta,
+  montarEventoMeta,
+  valorVendaInformado,
+  type EtapaConversao,
+  type EtapaFunilFormulario,
+} from "./eventos-meta";
 
 import {
   TERMOS_BAIXO_INTERESSE,
@@ -1121,7 +1128,7 @@ async function obterOuCriarDatasetMetaUsuario(
 async function enviarEventoMetaConversionLeads(
   usuarioId: number,
   lead: any,
-  eventName: "Qualified Lead" | "Closed Won"
+  eventName: EtapaConversao | EtapaFunilFormulario
 ): Promise<{ ok: boolean; erro?: string }> {
 
   const isCtwa = Boolean(lead?.ctwa_clid);
@@ -1279,6 +1286,34 @@ async function avaliarEEnviarQualificacaoMeta(
           `UPDATE leads SET meta_evento_fechado_enviado_em = NOW() WHERE id = $1`,
           [leadRow.id]
         );
+      }
+    }
+
+    // Demais etapas do funil (lead de formulário): Contacted, In
+    // Conversation, Lost — uma vez cada. Reserva antes de enviar (dois
+    // gatilhos juntos não duplicam) e libera se a Meta recusar, pra tentar
+    // de novo na próxima avaliação.
+    const etapaFunil = etapaFunilFormularioMeta(leadRow);
+
+    if (etapaFunil) {
+      const reserva = await client.query(
+        `UPDATE leads
+         SET meta_etapas_funil_enviadas = COALESCE(meta_etapas_funil_enviadas, '{}'::jsonb) || jsonb_build_object($2::text, NOW())
+         WHERE id = $1 AND NOT (COALESCE(meta_etapas_funil_enviadas, '{}'::jsonb) ? $2::text)
+         RETURNING id`,
+        [leadRow.id, etapaFunil]
+      );
+
+      if (reserva.rows.length) {
+        const resultado =
+          await enviarEventoMetaConversionLeads(usuarioId, leadRow, etapaFunil);
+
+        if (!resultado.ok) {
+          await client.query(
+            `UPDATE leads SET meta_etapas_funil_enviadas = meta_etapas_funil_enviadas - $2::text WHERE id = $1`,
+            [leadRow.id, etapaFunil]
+          );
+        }
       }
     }
 
@@ -25348,6 +25383,15 @@ await client.query(`
 await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS valor_negocio NUMERIC(14,2);
+`);
+
+// Etapas do funil já enviadas à Meta pra lead de formulário (Contacted, In
+// Conversation, Lost), como {"Contacted": "<quando>"} — ver
+// avaliarEEnviarQualificacaoMeta. Qualified/Closed Won seguem nas colunas
+// próprias de sempre.
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS meta_etapas_funil_enviadas JSONB;
 `);
 
 // Primeiro contato automático com lead de formulário (ver

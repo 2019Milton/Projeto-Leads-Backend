@@ -19,6 +19,25 @@
 
 export type EtapaConversao = "Qualified Lead" | "Closed Won";
 
+// Demais etapas do funil, só para lead de formulário: no Conversion Leads o
+// nome da etapa é livre e a Meta recomenda mandar todas as etapas (ela usa o
+// funil inteiro pra aprender quem avança). No WhatsApp não há equivalente —
+// lá só valem os nomes da lista padrão (ver EVENTO_WHATSAPP_META).
+export type EtapaFunilFormulario = "Contacted" | "In Conversation" | "Lost";
+
+export const ETAPA_FUNIL_POR_STATUS: Record<string, EtapaFunilFormulario> = {
+  primeiro_contato: "Contacted",
+  em_conversa: "In Conversation",
+  perdido: "Lost"
+};
+
+// Etapa do funil que o status atual do lead representa, se for lead de
+// formulário da Meta (lead_id nativo, sem ctwa_clid).
+export function etapaFunilFormularioMeta(lead: any): EtapaFunilFormulario | null {
+  if (!lead?.lead_id || lead?.ctwa_clid) return null;
+  return ETAPA_FUNIL_POR_STATUS[String(lead?.status || "")] ?? null;
+}
+
 // Nome do "CRM" que aparece no Gerenciador de Eventos da Meta (mesmo nome do
 // dataset criado em obterOuCriarDatasetMetaUsuario).
 export const NOME_CRM_META = "Plataforma de Leads";
@@ -52,7 +71,7 @@ export function valorVendaInformado(lead: any, etapa: EtapaConversao): number | 
 
 export function montarEventoMeta(params: {
   lead: any;
-  etapa: EtapaConversao;
+  etapa: EtapaConversao | EtapaFunilFormulario;
   wabaId?: string | null;
   agoraSegundos?: number;
 }): Record<string, any> {
@@ -61,8 +80,12 @@ export function montarEventoMeta(params: {
   const valor = valorNegocioLead(lead);
 
   if (lead?.ctwa_clid) {
+    const nomeWhatsapp = EVENTO_WHATSAPP_META[etapa as EtapaConversao];
+    if (!nomeWhatsapp) {
+      throw new Error(`Etapa "${etapa}" não tem evento equivalente no WhatsApp`);
+    }
     const evento: Record<string, any> = {
-      event_name: EVENTO_WHATSAPP_META[etapa],
+      event_name: nomeWhatsapp,
       event_time: eventTime,
       action_source: "business_messaging",
       messaging_channel: "whatsapp",
