@@ -1,5 +1,12 @@
 import { expect, test } from "bun:test";
-import { montarEventoMeta, valorNegocioLead } from "./eventos-meta";
+import { montarEventoMeta, valorNegocioLead, valorVendaInformado } from "./eventos-meta";
+
+test("valor da venda pras outras plataformas: só no fechamento e só se positivo", () => {
+  expect(valorVendaInformado({ valor_negocio: "2500.50" }, "Closed Won")).toBe(2500.5);
+  expect(valorVendaInformado({ valor_negocio: "2500.50" }, "Qualified Lead")).toBeNull();
+  expect(valorVendaInformado({ valor_negocio: 0 }, "Closed Won")).toBeNull();
+  expect(valorVendaInformado({}, "Closed Won")).toBeNull();
+});
 
 const agoraSegundos = 1_790_000_000;
 

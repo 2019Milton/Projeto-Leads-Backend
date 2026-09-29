@@ -45,7 +45,7 @@ import {
   type ConfigContatoFormulario,
 } from "./contato-formulario";
 
-import { montarEventoMeta } from "./eventos-meta";
+import { MOEDA_VALOR_NEGOCIO, montarEventoMeta, valorVendaInformado } from "./eventos-meta";
 
 import {
   TERMOS_BAIXO_INTERESSE,
@@ -8173,6 +8173,14 @@ async function enviarEventoGoogleAdsConversionLeads(
     if (lead?.gclid) evento.adIdentifiers = { gclid: lead.gclid };
     if (userIdentifiers.length) evento.userData = { userIdentifiers };
 
+    // Valor da venda informado pelo corretor ao fechar (ver eventos-meta.ts).
+    // Campos do Event da Data Manager API: conversionValue + currency.
+    const valorVenda = valorVendaInformado(lead, eventName);
+    if (valorVenda !== null) {
+      evento.conversionValue = valorVenda;
+      evento.currency = MOEDA_VALOR_NEGOCIO;
+    }
+
     const res = await fetch(`${DATA_MANAGER_API}/events:ingest`, {
       method: "POST",
       headers: {
@@ -12746,6 +12754,9 @@ async function enviarEventoTikTokConversionLeads(
 
     const telefoneDigitos = String(lead.telefone || "").replace(/\D/g, "");
 
+    // Valor da venda informado pelo corretor ao fechar (ver eventos-meta.ts).
+    const valorVenda = valorVendaInformado(lead, eventName);
+
     const resultado = await tiktokFetch("/event/track/", conexao.token, {
       method: "POST",
       body: {
@@ -12759,6 +12770,9 @@ async function enviarEventoTikTokConversionLeads(
               email: lead.email ? hashSha256(lead.email) : undefined,
               phone_number: telefoneDigitos ? hashSha256(telefoneDigitos) : undefined,
             },
+            ...(valorVenda !== null
+              ? { properties: { value: valorVenda, currency: MOEDA_VALOR_NEGOCIO } }
+              : {}),
           },
         ],
       },
@@ -16754,7 +16768,11 @@ async function enviarEventoLinkedInConversionLeads(
       body: {
         conversion: conversionRuleUrn,
         conversionHappenedAt: Date.now(),
-        conversionValue: { currencyCode: "BRL", amount: "0" },
+        // Valor da venda informado pelo corretor ao fechar; sem ele, 0 como antes.
+        conversionValue: {
+          currencyCode: MOEDA_VALOR_NEGOCIO,
+          amount: valorVendaInformado(lead, eventName)?.toFixed(2) ?? "0"
+        },
         user: { userIds: [{ idType: "SHA256_EMAIL", idValue: lead.email ? hashSha256(lead.email) : undefined }] },
         eventId: `lead-${lead.id}-${eventName.replace(/\s+/g, "-").toLowerCase()}`,
       }

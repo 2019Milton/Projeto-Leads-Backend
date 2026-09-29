@@ -40,6 +40,16 @@ export function valorNegocioLead(lead: any): number | null {
   return Number.isFinite(valor) && valor >= 0 ? Math.round(valor * 100) / 100 : null;
 }
 
+// Valor da venda a mandar pras outras plataformas (Google, TikTok, LinkedIn):
+// só no fechamento e só quando o corretor informou um valor positivo — sem
+// valor, o evento vai exatamente como antes (sem campo de valor, ou 0 onde o
+// campo já existia).
+export function valorVendaInformado(lead: any, etapa: EtapaConversao): number | null {
+  if (etapa !== "Closed Won") return null;
+  const valor = valorNegocioLead(lead);
+  return valor !== null && valor > 0 ? valor : null;
+}
+
 export function montarEventoMeta(params: {
   lead: any;
   etapa: EtapaConversao;
