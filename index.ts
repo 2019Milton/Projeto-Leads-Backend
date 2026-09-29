@@ -33,6 +33,8 @@ import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META }
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 
+import { montarEventoMeta } from "./eventos-meta";
+
 import {
   TERMOS_BAIXO_INTERESSE,
   TERMOS_INTENCAO_FORTE,
@@ -1156,27 +1158,9 @@ async function enviarEventoMetaConversionLeads(
       conexao.rows[0]?.dataset_id ||
       (await obterOuCriarDatasetMetaUsuario(usuarioId, contaAnunciosId, token));
 
-    // ⚠️ Formato business_messaging/user_data.ctwa_clid segue a documentação
-    // pública da Meta pra Click-to-WhatsApp — ainda não confirmado contra
-    // tráfego real. ctwa_clid vai cru (não hasheado), diferente dos campos de
-    // PII do resto da integração.
-    const evento = isCtwa
-      ? {
-          event_name: eventName,
-          event_time: Math.floor(Date.now() / 1000),
-          action_source: "business_messaging",
-          messaging_channel: "whatsapp",
-          user_data: {
-            ctwa_clid: lead.ctwa_clid,
-            whatsapp_business_account_id: wabaId
-          }
-        }
-      : {
-          event_name: eventName,
-          event_time: Math.floor(Date.now() / 1000),
-          action_source: "system_generated",
-          lead_id: String(lead.lead_id)
-        };
+    // Formulário (Conversion Leads) e WhatsApp (Business Messaging) têm
+    // formatos e nomes de evento diferentes — ver eventos-meta.ts.
+    const evento = montarEventoMeta({ lead, etapa: eventName, wabaId });
 
     const resposta = await fetch(
       `https://graph.facebook.com/v19.0/${datasetId}/events?access_token=${token}`,
@@ -1190,8 +1174,16 @@ async function enviarEventoMetaConversionLeads(
     if (resposta?.error) {
       const erro =
         mensagemErroMeta(resposta, "Erro ao enviar evento para a Meta");
-      console.error(`CONVERSION LEADS (${eventName}) erro:`, erro);
+      console.error(`CONVERSION LEADS (${evento.event_name}) erro:`, erro);
       return { ok: false, erro };
+    }
+
+    // A Meta responde 200 mesmo quando descarta ou estranha o evento — o
+    // motivo vem em "messages". Sem esse log, um evento mal formado passa
+    // despercebido (foi o que aconteceu com os nomes fora da lista padrão
+    // no WhatsApp).
+    if (Array.isArray(resposta?.messages) && resposta.messages.length) {
+      console.warn(`CONVERSION LEADS (${evento.event_name}) avisos da Meta:`, JSON.stringify(resposta.messages));
     }
 
     return { ok: true };
@@ -24978,6 +24970,15 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS linkedin_evento_fechado_enviado_em TIMESTAMP;
 `);
 
+// Valor do negócio fechado (em reais), informado pelo corretor ao marcar o
+// lead como fechado. Vai no evento de venda pras plataformas (Purchase no
+// WhatsApp da Meta, que é o evento que ela usa pra otimizar por venda — ver
+// eventos-meta.ts).
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS valor_negocio NUMERIC(14,2);
+`);
+
 // Mesmo rastreio de envio, agora para o Kwai Ads (ver
 // avaliarEEnviarQualificacaoLead / avaliarEEnviarQualificacaoKwai). Colunas
 // criadas desde já mesmo sem nenhum mecanismo de envio real ainda (ver
@@ -33641,6 +33642,7 @@ app.get("/leads", authMiddleware, async (c) => {
         l.score,
         l.score_manual,
         l.motivo_perda,
+        l.valor_negocio,
         l.respostas_qualificacao,
         l.criado_em,
         l.nicho_id,
@@ -33980,10 +33982,17 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
 async function atualizarStatusLeadBackend(
   leadId: string | number,
   usuarioId: number,
-  dados: { observacao?: string | null; status: string; motivo_perda?: string | null; score_manual?: string | null },
+  dados: {
+    observacao?: string | null;
+    status: string;
+    motivo_perda?: string | null;
+    score_manual?: string | null;
+    // undefined = não mexe no valor salvo (ex.: classificação da IA).
+    valor_negocio?: number | null;
+  },
   origem: "manual" | "ia_conversa" = "manual"
 ) {
-  const { observacao, status, motivo_perda, score_manual } = dados;
+  const { observacao, status, motivo_perda, score_manual, valor_negocio } = dados;
 
   // 🔥 busca lead atual
   const leadAtual = await client.query(
@@ -34011,7 +34020,8 @@ async function atualizarStatusLeadBackend(
       observacao = $1,
       status = $2,
       motivo_perda = $3,
-      score_manual = $4
+      score_manual = $4,
+      valor_negocio = CASE WHEN $7::boolean THEN $8::numeric ELSE valor_negocio END
     WHERE
       id = $5
     AND usuario_id = $6
@@ -34023,7 +34033,9 @@ async function atualizarStatusLeadBackend(
       motivo_perda,
       score_manual,
       leadId,
-      usuarioId
+      usuarioId,
+      valor_negocio !== undefined,
+      valor_negocio ?? null
     ]
   );
 
@@ -34046,8 +34058,12 @@ async function atualizarStatusLeadBackend(
     // fechado
     if (status === "fechado") {
 
+      const valorSalvo = Number(result.rows[0]?.valor_negocio);
+
       descricao =
-        "Lead marcado como FECHADO";
+        Number.isFinite(valorSalvo) && result.rows[0]?.valor_negocio !== null
+          ? `Lead marcado como FECHADO (${valorSalvo.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })})`
+          : "Lead marcado como FECHADO";
     }
 
     if (origem === "ia_conversa") {
@@ -34132,17 +34148,38 @@ app.put("/leads/:id", authMiddleware, async (c) => {
 
     const id = c.req.param("id");
 
+    const corpo = await c.req.json();
+
     const {
       observacao,
       status,
       motivo_perda,
       score_manual
-    } = await c.req.json();
+    } = corpo;
+
+    // valor_negocio ausente no corpo = mantém o salvo; null/"" = limpa.
+    let valorNegocio: number | null | undefined = undefined;
+
+    if (corpo && Object.prototype.hasOwnProperty.call(corpo, "valor_negocio")) {
+      const bruto = corpo.valor_negocio;
+
+      if (bruto === null || String(bruto).trim() === "") {
+        valorNegocio = null;
+      } else {
+        const numero = Number(String(bruto).replace(",", "."));
+
+        if (!Number.isFinite(numero) || numero < 0 || numero > 999_999_999_999) {
+          return c.json({ error: "Valor do negócio inválido" }, 400);
+        }
+
+        valorNegocio = Math.round(numero * 100) / 100;
+      }
+    }
 
     const leadAtualizado = await atualizarStatusLeadBackend(
       id,
       user.id,
-      { observacao, status, motivo_perda, score_manual },
+      { observacao, status, motivo_perda, score_manual, valor_negocio: valorNegocio },
       "manual"
     );
 
