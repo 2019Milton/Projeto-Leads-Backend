@@ -33,6 +33,17 @@ import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META }
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 
+import {
+  TERMOS_BAIXO_INTERESSE,
+  TERMOS_INTENCAO_FORTE,
+  TERMOS_PREPARO_FINANCEIRO,
+  TERMOS_URGENCIA,
+  calcularScoreLead,
+  detectarChaveNicho,
+  encontrarTermos,
+  textoSinaisDoLead,
+} from "./score-lead";
+
 const app = new Hono();
 
 const WHATSAPP_CLOUD_API_VERSION =
@@ -1272,6 +1283,77 @@ async function avaliarEEnviarQualificacaoMeta(
   }
 }
 
+// Mesmo critério de marcarLeadsRecorrentes (telefone só com dígitos, >= 8, ou
+// e-mail sem caixa/espaço batendo com outro lead do mesmo corretor), mas pra
+// um lead só, direto no banco.
+async function leadEhRecorrente(lead: any, usuarioId: number) {
+  const telefone = normalizarTelefoneLead(lead?.telefone);
+  const email = normalizarContatoLead(lead?.email);
+
+  if (telefone.length < 8 && !email) {
+    return false;
+  }
+
+  const resultado = await client.query(
+    `
+    SELECT EXISTS (
+      SELECT 1
+      FROM leads
+      WHERE usuario_id = $1
+      AND id <> $2
+      AND (
+        (LENGTH($3) >= 8 AND regexp_replace(COALESCE(telefone, ''), '[^0-9]', '', 'g') = $3)
+        OR ($4 <> '' AND LOWER(TRIM(COALESCE(email, ''))) = $4)
+      )
+    ) AS repetido
+    `,
+    [usuarioId, lead.id, telefone, email]
+  );
+
+  return Boolean(resultado.rows[0]?.repetido);
+}
+
+// O score que decide o envio de "Qualified Lead" tem que ser o mesmo que o
+// corretor vê na Central de Leads. Os pontos que criam um lead (sync/webhook
+// da Meta, Google, TikTok, LinkedIn) chamam o dispatcher com um objeto
+// parcial (id, lead_id, campanha, respostas) — sem telefone/e-mail, nicho,
+// conversa do WhatsApp nem as colunas *_evento_*_enviado_em. Aqui completa
+// com o que está no banco (só campos ausentes; o que veio de quem chamou
+// prevalece), a conversa separada por autor e a marcação de lead recorrente.
+// Best-effort: falha aqui não impede a avaliação com o que já se tem.
+async function completarLeadParaQualificacao(leadRow: any, usuarioId: number) {
+  if (!leadRow?.id) {
+    return leadRow;
+  }
+
+  try {
+    if (!("telefone" in leadRow) || !("meta_evento_qualificado_enviado_em" in leadRow)) {
+      const doBanco = await client.query(
+        `SELECT * FROM leads WHERE id = $1 AND usuario_id = $2`,
+        [leadRow.id, usuarioId]
+      );
+
+      for (const [campo, valor] of Object.entries(doBanco.rows[0] || {})) {
+        if (leadRow[campo] === undefined) {
+          leadRow[campo] = valor;
+        }
+      }
+    }
+
+    if (leadRow.whatsapp_transcricao_cliente === undefined) {
+      await enriquecerLeadParaInteligencia(leadRow);
+    }
+
+    if (leadRow.repetido === undefined) {
+      leadRow.repetido = await leadEhRecorrente(leadRow, usuarioId);
+    }
+  } catch (err) {
+    console.error("ERRO completarLeadParaQualificacao:", err);
+  }
+
+  return leadRow;
+}
+
 // Dispatcher multi-plataforma: decide se o lead é Meta/WhatsApp-CTWA (fluxo
 // acima, inalterado — chamado direto), Google Ads ou TikTok, e manda pro
 // avaliador certo. Todos os pontos que criam/atualizam um lead devem chamar
@@ -1282,6 +1364,8 @@ async function avaliarEEnviarQualificacaoLead(
   leadRow: any,
   usuarioId: number
 ) {
+  await completarLeadParaQualificacao(leadRow, usuarioId);
+
   // "plataforma" na tabela leads é sobrecarregado: pra leads nativos vale o
   // nome da rede de anúncio (google/tiktok/linkedin), mas pra leads criados
   // a partir de uma conversa de WhatsApp (CTWA da Meta ou o equivalente via
@@ -2475,182 +2559,6 @@ async function registrarSenhaAnterior(
   );
 }
 
-// 🔥 SCORE AUTOMÁTICO
-function calcularScoreLead(
-  lead: any
-) {
-
-  // 🔥 SCORE MANUAL
-  if (lead.score_manual) {
-
-    return {
-      score: lead.score_manual,
-      pontos: null,
-      base: [
-        "Score definido manualmente"
-      ]
-    };
-  }
-
-  let pontos = 0;
-
-  const base = [];
-
-  const respostasTexto =
-    textoRespostasQualificacao(lead)
-      .toLowerCase();
-
-  const textoComercial =
-    [
-      lead.campanha,
-      lead.observacao,
-      respostasTexto,
-      lead.whatsapp_transcricao
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-
-  const textoQualificacao =
-    [
-      lead.observacao,
-      respostasTexto,
-      lead.whatsapp_transcricao
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-
-  // 🆕 Lead novo
-  pontos += 10;
-  base.push("+10 Lead recém capturado");
-
-  if (lead.telefone) {
-    pontos += 10;
-    base.push("+10 Telefone informado");
-  }
-
-  if (lead.email) {
-    pontos += 5;
-    base.push("+5 Email informado");
-  }
-
-  if (lead.status === "primeiro_contato") {
-    pontos += 15;
-    base.push("+15 Atendimento iniciado");
-  }
-
-  if (lead.status === "em_conversa") {
-    pontos += 30;
-    base.push("+30 Lead em conversa");
-  }
-
-  if (lead.status === "fechado") {
-    pontos += 60;
-    base.push("+60 Lead fechado");
-  }
-
-  if (lead.status === "perdido") {
-    pontos -= 40;
-    base.push("-40 Lead marcado como perdido");
-  }
-
-  if (
-    textoComercial.includes("visita") ||
-    textoComercial.includes("agendar") ||
-    textoComercial.includes("financiamento") ||
-    textoComercial.includes("simula��o") ||
-    textoComercial.includes("simulacao") ||
-    textoComercial.includes("entrada") ||
-    textoComercial.includes("comprar") ||
-    textoComercial.includes("compra") ||
-    textoComercial.includes("orcamento") ||
-    textoComercial.includes("or�amento") ||
-    textoComercial.includes("valor") ||
-    textoComercial.includes("parcela")
-  ) {
-
-    pontos += 30;
-    base.push("+30 Dados indicam inten��o forte");
-  }
-
-  if (
-    textoComercial.includes("urgente") ||
-    textoComercial.includes("rapido") ||
-    textoComercial.includes("r�pido") ||
-    textoComercial.includes("hoje") ||
-    textoComercial.includes("essa semana")
-  ) {
-
-    pontos += 20;
-    base.push("+20 Lead demonstra urg�ncia");
-  }
-
-  if (
-    respostasTexto.includes("renda") ||
-    respostasTexto.includes("credito") ||
-    respostasTexto.includes("cr�dito") ||
-    respostasTexto.includes("fgts") ||
-    respostasTexto.includes("pre aprovado") ||
-    respostasTexto.includes("pr� aprovado")
-  ) {
-
-    pontos += 15;
-    base.push("+15 Respostas qualificadoras indicam preparo financeiro");
-  }
-
-  if (
-    textoQualificacao.includes("n�o responde") ||
-    textoQualificacao.includes("nao responde") ||
-    textoQualificacao.includes("sem interesse") ||
-    textoQualificacao.includes("desistiu") ||
-    textoQualificacao.includes("curioso") ||
-    textoQualificacao.includes("pesquisando")
-  ) {
-
-    pontos -= 30;
-    base.push("-30 Dados indicam baixo interesse");
-  }
-  // 🔄 Lead repetido
-  if (lead.repetido) {
-
-    pontos += 20;
-    base.push("+20 Lead retornou novamente");
-  }
-
-  // 🎯 Sinal específico do nicho do lead (imóveis, saúde, suplementos...) —
-  // além das regras genéricas acima, cada nicho tem seu próprio vocabulário
-  // de intenção forte (ver VOCABULARIO_NICHO).
-  const chaveNicho = detectarChaveNicho(lead);
-
-  if (chaveNicho) {
-    const vocabularioNicho = VOCABULARIO_NICHO[chaveNicho];
-
-    if (vocabularioNicho.some(palavra => textoComercial.includes(palavra))) {
-      pontos += 20;
-      base.push(`+20 Sinal específico do nicho (${contextoNicho(lead).nicho})`);
-    }
-  }
-
-  // 🔥 Classificação final
-  let score = "frio";
-
-  if (pontos >= 70) {
-
-    score = "quente";
-
-  } else if (pontos >= 35) {
-
-    score = "morno";
-  }
-
-  return {
-    score,
-    pontos,
-    base
-  };
-}
-
 const ML_LEADS_MIN_AMOSTRAS = 10;
 const ML_LEADS_MIN_AMOSTRAS_POR_CLASSE = 4;
 
@@ -2841,9 +2749,12 @@ function extrairFeaturesMLLead(lead: any) {
     textoRespostasQualificacao(lead)
   );
 
+  // Só a fala do cliente: a do corretor ("segue a proposta", "parabéns pela
+  // compra") não é característica do lead, e depois do fechamento só vaza o
+  // resultado pro modelo.
   adicionarTokensTextoMLLead(
     features,
-    lead?.whatsapp_transcricao
+    lead?.whatsapp_transcricao_cliente
   );
 
   return [...features];
@@ -3340,43 +3251,28 @@ function usuarioTemIA(user: any) {
   return usuarioTemRecurso(user, "ia_leads");
 }
 
-function textoLeadIA(lead: any) {
-  return [
-    lead?.nome,
-    lead?.origem,
-    lead?.campanha,
-    lead?.observacao,
-    lead?.whatsapp_transcricao,
-    ...(Array.isArray(lead?.respostas_qualificacao)
-      ? lead.respostas_qualificacao.map((item: any) =>
-          `${item?.pergunta || ""} ${item?.resposta || ""}`
-        )
-      : [])
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-}
-
+// Mesmo texto e mesmo casamento de termos do score (score-lead.ts): só o que
+// é sinal do lead (fala dele no WhatsApp, respostas do formulário lidas contra
+// a pergunta, observação do corretor), sem acento, por palavra inteira e
+// respeitando negação. Antes lia também nome/campanha/fala do corretor com
+// includes() — uma lead chamada "Caroline" virava "objeção de preço" (caro).
 function detectarSinaisIA(lead: any, ml: any) {
-  const texto = textoLeadIA(lead);
+  const texto = textoSinaisDoLead(lead);
+  const achou = (termos: string[]) => encontrarTermos(texto, termos).length > 0;
   const sinais: string[] = [];
   const riscos: string[] = [];
 
-  if (texto.includes("visita") || texto.includes("agendar")) {
-    sinais.push("demonstrou interesse em visita");
+  const intencao = encontrarTermos(texto, TERMOS_INTENCAO_FORTE);
+  if (intencao.length) {
+    sinais.push(`demonstrou intencao de avancar (${intencao.slice(0, 3).join(", ")})`);
   }
 
-  if (texto.includes("financiamento") || texto.includes("entrada")) {
-    sinais.push("mencionou financiamento ou entrada");
+  if (achou(TERMOS_PREPARO_FINANCEIRO)) {
+    sinais.push("mencionou financiamento, entrada ou preparo financeiro");
   }
 
-  if (texto.includes("urgente") || texto.includes("rapido") || texto.includes("rápido")) {
-    sinais.push("indicou urgencia de atendimento");
-  }
-
-  if (texto.includes("hoje") || texto.includes("essa semana")) {
-    sinais.push("tem indicio de prazo curto");
+  if (achou(TERMOS_URGENCIA)) {
+    sinais.push("indicou urgencia ou prazo curto");
   }
 
   if (lead?.telefone) {
@@ -3387,19 +3283,19 @@ function detectarSinaisIA(lead: any, ml: any) {
     sinais.push(`ML estima ${ml.probabilidade_conversao || 0}% de conversao`);
   }
 
-  if (texto.includes("sem interesse") || texto.includes("nao quero") || texto.includes("não quero")) {
+  if (achou(TERMOS_BAIXO_INTERESSE)) {
     riscos.push("sinalizou baixo interesse");
   }
 
-  if (texto.includes("caro") || texto.includes("preco") || texto.includes("preço") || texto.includes("valor alto")) {
+  if (achou(["caro", "muito caro", "valor alto", "fora do orcamento", "acima do orcamento", "nao cabe no bolso"])) {
     riscos.push("possivel objecao de preco");
   }
 
-  if (texto.includes("sem entrada") || texto.includes("sem credito") || texto.includes("sem crédito")) {
+  if (achou(["sem entrada", "sem credito", "nome sujo", "restricao no nome", "nao tenho renda"])) {
     riscos.push("possivel objecao financeira");
   }
 
-  if (texto.includes("longe") || texto.includes("bairro") || texto.includes("localizacao") || texto.includes("localização")) {
+  if (achou(["longe", "localizacao ruim", "fora da regiao"])) {
     riscos.push("possivel objecao de localizacao");
   }
 
@@ -3413,48 +3309,6 @@ function detectarSinaisIA(lead: any, ml: any) {
 
   return { sinais, riscos };
 }
-
-// Chave curta de nicho usada tanto pelo contexto da IA (contextoNicho) quanto
-// pela pontuação por regras e pelas features do ML (calcularScoreLead,
-// extrairFeaturesMLLead) — único lugar que decide "qual nicho é esse lead".
-type ChaveNicho =
-  | "imoveis" | "saude" | "suplementos" | "saas" | "higienizacao" | "telecom"
-  | "cursos_online" | "educacao" | "auto" | "consorcio";
-
-function detectarChaveNicho(lead: any): ChaveNicho | null {
-  const slug = String(lead?.nicho_slug || "").toLowerCase();
-  const nome = String(lead?.nicho_nome || "").toLowerCase();
-
-  if (slug.includes("imovel") || slug.includes("imóvel") || nome.includes("imóv") || nome.includes("imovel")) return "imoveis";
-  if (slug.includes("saude")  || slug.includes("saúde")  || nome.includes("saúde") || nome.includes("saude")) return "saude";
-  if (slug.includes("suplement") || nome.includes("suplement")) return "suplementos";
-  if (slug.includes("saas") || slug.includes("plataforma") || nome.includes("saas") || nome.includes("plataforma")) return "saas";
-  if (slug.includes("higien") || nome.includes("higien")) return "higienizacao";
-  if (slug.includes("telecom") || nome.includes("telecom")) return "telecom";
-  if (slug.includes("curso_online") || slug.includes("cursos_online") || nome.includes("curso online") || nome.includes("cursos online")) return "cursos_online";
-  if (slug.includes("educa") || nome.includes("educa") || nome.includes("curso") || nome.includes("ensino")) return "educacao";
-  if (slug.includes("auto") || nome.includes("auto") || nome.includes("veículo") || nome.includes("veiculo") || nome.includes("carro")) return "auto";
-  if (slug.includes("consorcio") || slug.includes("consórcio") || nome.includes("consórcio") || nome.includes("consorcio")) return "consorcio";
-
-  return null;
-}
-
-// Palavras-chave reais por nicho, usadas pela pontuação por regras
-// (calcularScoreLead) — derivadas dos "qualificadores" que contextoNicho já
-// usa nos prompts de IA, só que aqui viram termos que batem contra o texto
-// do lead (campanha/observação/respostas), não tópicos pra pergunta.
-const VOCABULARIO_NICHO: Record<ChaveNicho, string[]> = {
-  imoveis: ["financiamento", "entrada", "visita", "aluguel", "condominio", "condomínio", "escritura", "metragem", "iptu", "chaves"],
-  saude: ["cobertura", "sinistro", "carencia", "carência", "reembolso", "internacao", "internação", "operadora", "mensalidade", "dependente"],
-  suplementos: ["assinatura", "recorrencia", "recorrência", "whey", "creatina", "treino", "academia", "hipertrofia", "emagrecimento", "dose"],
-  saas: ["implantacao", "implantação", "licenca", "licença", "usuarios", "usuários", "integracao", "integração", "trial", "onboarding"],
-  higienizacao: ["estofado", "colchao", "colchão", "carpete", "tapete", "sofa", "sofá", "acaro", "ácaro", "mofo", "pos obra", "pós obra", "agendamento", "orcamento", "orçamento"],
-  telecom: ["internet dedicada", "link dedicado", "firewall", "pabx", "ramal", "hotspot", "wifi corporativo", "uptime", "sla", "provedor", "fornecedor"],
-  cursos_online: ["curso online", "aula gravada", "aula ao vivo", "certificado", "acesso vitalicio", "acesso vitalício", "plataforma de ensino", "parcelamento", "nova profissao", "nova profissão", "renda extra", "inscricao", "inscrição", "modulo", "módulo"],
-  educacao: ["matricula", "matrícula", "turma", "bolsa", "certificado", "presencial", "carga horaria", "carga horária", "professor", "aula"],
-  auto: ["seminovo", "revisao", "revisão", "test drive", "quilometragem", "troca", "financiamento", "entrada", "placa", "laudo"],
-  consorcio: ["carta de credito", "carta de crédito", "contemplacao", "contemplação", "lance", "grupo", "cota", "assembleia"]
-};
 
 function contextoNicho(lead: any) {
   const chave = detectarChaveNicho(lead);
@@ -23401,12 +23255,30 @@ async function resolverNichoConversaWhatsApp(
   return leadNicho.rows[0]?.nicho_id ?? null;
 }
 
-// Preenche nicho_slug/nicho_nome + o transcript de mensagens do WhatsApp
-// (direcao IN 'entrada'/'echo' — fala do cliente e fala real do corretor pelo
-// próprio app; 'saida' fica de fora porque é texto fixo do roteiro do bot,
-// não sinal) num lead já carregado. Usado onde não dá pra fazer um SELECT com
-// JOIN direto: PUT /leads/:id (só tem o RETURNING * cru do UPDATE) e o
-// webhook do WhatsApp (lead buscado avulso após vincularConversaAoLead).
+// Transcrição do WhatsApp de um lead, em duas versões (usar dentro de um
+// SELECT ... FROM whatsapp_mensagens_log wml JOIN whatsapp_conversas wc):
+// - transcricao: cliente + corretor, rotulada por autor ("Cliente: ..." /
+//   "Corretor: ..."), pra IA entender quem disse o quê;
+// - transcricao_cliente: só a fala do cliente — é o que o score usa
+//   (score-lead.ts). Sem essa separação, "vamos agendar uma visita?" dito pelo
+//   corretor contava como intenção do cliente e mandava "Qualified Lead" pras
+//   plataformas de anúncio.
+// Filtre direcao IN ('entrada', 'echo') no WHERE: 'saida' é texto fixo do
+// roteiro do bot, não sinal.
+const SQL_COLUNAS_TRANSCRICAO_WHATSAPP = `
+  string_agg(
+    CASE WHEN wml.direcao = 'entrada' THEN 'Cliente: ' ELSE 'Corretor: ' END || wml.conteudo,
+    chr(10) ORDER BY wml.criado_em
+  ) AS transcricao,
+  string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em)
+    FILTER (WHERE wml.direcao = 'entrada') AS transcricao_cliente`;
+
+// Preenche nicho_slug/nicho_nome + as transcrições do WhatsApp (ver
+// SQL_COLUNAS_TRANSCRICAO_WHATSAPP) num lead já carregado. Usado onde não dá
+// pra fazer um SELECT com JOIN direto: PUT /leads/:id (só tem o RETURNING *
+// cru do UPDATE), o webhook do WhatsApp (lead buscado avulso após
+// vincularConversaAoLead) e o envio de qualificação às plataformas
+// (completarLeadParaQualificacao).
 async function enriquecerLeadParaInteligencia(lead: any) {
   if (!lead?.id) {
     return lead;
@@ -23417,14 +23289,16 @@ async function enriquecerLeadParaInteligencia(lead: any) {
     SELECT
       n.slug AS nicho_slug,
       n.nome AS nicho_nome,
-      (
-        SELECT string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em)
-        FROM whatsapp_mensagens_log wml
-        JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
-        WHERE wc.lead_id = l.id AND wml.direcao IN ('entrada', 'echo')
-      ) AS whatsapp_transcricao
+      wt.transcricao AS whatsapp_transcricao,
+      wt.transcricao_cliente AS whatsapp_transcricao_cliente
     FROM leads l
     LEFT JOIN nichos n ON n.id = l.nicho_id
+    LEFT JOIN LATERAL (
+      SELECT ${SQL_COLUNAS_TRANSCRICAO_WHATSAPP}
+      FROM whatsapp_mensagens_log wml
+      JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+      WHERE wc.lead_id = l.id AND wml.direcao IN ('entrada', 'echo')
+    ) wt ON TRUE
     WHERE l.id = $1
     `,
     [lead.id]
@@ -23435,6 +23309,7 @@ async function enriquecerLeadParaInteligencia(lead: any) {
   lead.nicho_slug = row?.nicho_slug || null;
   lead.nicho_nome = row?.nicho_nome || null;
   lead.whatsapp_transcricao = row?.whatsapp_transcricao || null;
+  lead.whatsapp_transcricao_cliente = row?.whatsapp_transcricao_cliente || null;
 
   return lead;
 }
@@ -23603,7 +23478,7 @@ async function processarEventoWhatsApp(value: any) {
         .then(async (leadRes) => {
           const lead = leadRes.rows[0];
           if (!lead) return;
-          await enriquecerLeadParaInteligencia(lead);
+          await completarLeadParaQualificacao(lead, usuarioId);
           const scoreData = calcularScoreLead(lead);
           lead.score = scoreData.score;
           await avaliarEEnviarQualificacaoLead(lead, usuarioId);
@@ -33786,11 +33661,12 @@ app.get("/leads", authMiddleware, async (c) => {
         l.linkedin_evento_fechado_enviado_em,
         COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma,
         l.rede_origem,
-        wt.transcricao AS whatsapp_transcricao
+        wt.transcricao AS whatsapp_transcricao,
+        wt.transcricao_cliente AS whatsapp_transcricao_cliente
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
       LEFT JOIN (
-        SELECT wc.lead_id, string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em) AS transcricao
+        SELECT wc.lead_id, ${SQL_COLUNAS_TRANSCRICAO_WHATSAPP}
         FROM whatsapp_mensagens_log wml
         JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
         WHERE wc.lead_id IS NOT NULL AND wml.direcao IN ('entrada', 'echo')
@@ -33957,14 +33833,16 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
         l.criado_em,
         n.slug AS nicho_slug,
         n.nome AS nicho_nome,
-        (
-          SELECT string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em)
-          FROM whatsapp_mensagens_log wml
-          JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
-          WHERE wc.lead_id = l.id AND wml.direcao IN ('entrada', 'echo')
-        ) AS whatsapp_transcricao
+        wt.transcricao AS whatsapp_transcricao,
+        wt.transcricao_cliente AS whatsapp_transcricao_cliente
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
+      LEFT JOIN LATERAL (
+        SELECT ${SQL_COLUNAS_TRANSCRICAO_WHATSAPP}
+        FROM whatsapp_mensagens_log wml
+        JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+        WHERE wc.lead_id = l.id AND wml.direcao IN ('entrada', 'echo')
+      ) wt ON TRUE
       WHERE l.id = $1
       AND l.usuario_id = $2
       LIMIT 1
@@ -33996,11 +33874,12 @@ app.get("/ia/leads/:id", authMiddleware, async (c) => {
         l.criado_em,
         n.slug AS nicho_slug,
         n.nome AS nicho_nome,
-        wt.transcricao AS whatsapp_transcricao
+        wt.transcricao AS whatsapp_transcricao,
+        wt.transcricao_cliente AS whatsapp_transcricao_cliente
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
       LEFT JOIN (
-        SELECT wc.lead_id, string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em) AS transcricao
+        SELECT wc.lead_id, ${SQL_COLUNAS_TRANSCRICAO_WHATSAPP}
         FROM whatsapp_mensagens_log wml
         JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
         WHERE wc.lead_id IS NOT NULL AND wml.direcao IN ('entrada', 'echo')
@@ -34224,8 +34103,10 @@ async function atualizarStatusLeadBackend(
 
   // RETURNING * só traz dados crus (nicho_id como FK, nada de WhatsApp) —
   // sem isso a pontuação/ML por nicho/conversa nunca dispara ao editar um
-  // lead direto, só na listagem (GET /leads, que já faz os JOINs).
-  await enriquecerLeadParaInteligencia(leadAtualizado);
+  // lead direto, só na listagem (GET /leads, que já faz os JOINs). Mesmo
+  // preparo que o envio de qualificação usa, pra o score devolvido aqui ser o
+  // mesmo que decide o evento.
+  await completarLeadParaQualificacao(leadAtualizado, usuarioId);
 
   const scoreData =
     calcularScoreLead(leadAtualizado);
