@@ -15,11 +15,17 @@ export const STATUS_KANBAN_IA: StatusKanbanIA[] = ["novo", "primeiro_contato", "
 
 export function instrucoesQualificacao(nicho: string, qualificadores: string[]): string {
   const criterios = qualificadores.length ? qualificadores.join(", ") : "orçamento, prazo e necessidade concreta";
+  // Visto em produção (2026-09-29): sem as regras de "não basta" e "não
+  // presuma", a IA qualificou quem só deu nome/estado civil ou respondeu
+  // "Sim" a uma pergunta do bot, "presumindo" o objetivo.
   return (
     `Além do estágio, avalie se o CLIENTE é um lead QUALIFICADO para ${nicho}. Julgue só pelo que o cliente escreveu — ` +
-    `o que o corretor diz ou pergunta não conta como interesse do cliente. ` +
-    `"qualificado": o cliente mostrou interesse real em comprar/contratar E deu pelo menos um dado concreto que o encaixa ` +
-    `(critérios do nicho: ${criterios}; ou pediu proposta, visita, simulação, forma de pagamento). ` +
+    `o que o corretor diz ou pergunta não conta como interesse do cliente. Não presuma nem complete o que o cliente não disse. ` +
+    `"qualificado" exige as DUAS coisas, ditas pelo próprio cliente: (1) um sinal claro de compra — pediu preço, cotação, proposta, ` +
+    `simulação, visita ou forma de pagamento, ou disse que quer comprar/contratar/fechar; e (2) pelo menos um dado concreto que o encaixa ` +
+    `(critérios do nicho: ${criterios}). ` +
+    `NÃO bastam, sozinhos: dar nome ou dados pessoais, responder "sim"/"ok" a uma pergunta do atendimento, dizer um objetivo genérico, ` +
+    `cumprimentar ou só perguntar como funciona. ` +
     `"nao_qualificado": deixou claro que não tem interesse, está só curioso sem intenção de comprar, está fora do perfil ` +
     `(sem orçamento, região não atendida, procura outra coisa), é número errado ou não quer ser contatado. ` +
     `"indefinido": informação insuficiente para julgar (conversa curta, só saudações, cliente ainda não respondeu). ` +

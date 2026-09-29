@@ -38,6 +38,8 @@ test("instrução usa os critérios do nicho e o formato exige os campos novos",
   expect(texto).toContain("Imóveis");
   expect(texto).toContain("faixa de valor, prazo para decisão");
   expect(texto).toContain("o que o corretor diz ou pergunta não conta");
+  expect(texto).toContain("Não presuma");
+  expect(texto).toContain("NÃO bastam");
   expect(SCHEMA_CLASSIFICACAO_CONVERSA.required).toContain("qualificacao");
 });
 
