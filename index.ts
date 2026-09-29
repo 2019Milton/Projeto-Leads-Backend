@@ -33,6 +33,18 @@ import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META }
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 
+import {
+  MODELO_SUGERIDO,
+  avaliarModelo,
+  lerConfigContatoFormulario,
+  montarMensagemModelo,
+  motivoParaNaoContatar,
+  primeiroNomeLead,
+  renderizarCorpoModelo,
+  variantesTelefoneBR,
+  type ConfigContatoFormulario,
+} from "./contato-formulario";
+
 import { montarEventoMeta } from "./eventos-meta";
 
 import {
@@ -6209,6 +6221,11 @@ async function sincronizarLeadsMetaUsuario(
           },
           usuarioId
         ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (auto sync meta):", err));
+
+        // criado_em aqui é NOW() (reimportação) — a janela de contato usa a
+        // data real do lead na Meta, pra não mandar mensagem a lead antigo.
+        iniciarContatoWhatsAppLeadFormulario(usuarioId, leadSincronizado.rows[0]?.id, lead.created_time || null)
+          .catch(err => console.error("ERRO contato WhatsApp formulário (auto sync meta):", err));
       }
     }
   }
@@ -7871,6 +7888,9 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
         },
         usuarioId
       ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync google):", err));
+
+      iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInseridoGoogle.rows[0]?.id)
+        .catch(err => console.error("ERRO contato WhatsApp formulário (sync google):", err));
       totalLeads++;
     }
 
@@ -12982,6 +13002,9 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
           usuarioId
         ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync tiktok):", err));
 
+        iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInseridoTikTok.rows[0]?.id)
+          .catch(err => console.error("ERRO contato WhatsApp formulário (sync tiktok):", err));
+
         totalLeads++;
       }
     }
@@ -16558,6 +16581,9 @@ async function processarLeadGenFormResponseLinkedIn(
     },
     usuarioId
   ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (linkedin):", err));
+
+  iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInseridoLinkedIn.rows[0]?.id)
+    .catch(err => console.error("ERRO contato WhatsApp formulário (linkedin):", err));
 
   return true;
 }
@@ -20936,6 +20962,330 @@ function validarPassosRoteiro(passos: any[]) {
 // sem nicho criado entre dois deploys. Ver avancarBotWhatsApp.
 const CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO = new Date("2026-09-16T00:00:00Z");
 
+/* =========================
+   📨 PRIMEIRO CONTATO AUTOMÁTICO COM LEAD DE FORMULÁRIO (ver contato-formulario.ts)
+   Desligado por padrão: só age pro corretor que ativar e escolher um modelo
+   aprovado. Chamado sem await nos pontos que criam lead de formulário — nunca
+   atrasa nem derruba a gravação do lead.
+========================= */
+
+async function registrarFalhaContatoFormulario(leadId: number, usuarioId: number, erro: string) {
+  await client.query(
+    `UPDATE leads SET whatsapp_contato_enviado_em = NULL, whatsapp_contato_erro = $1 WHERE id = $2 AND usuario_id = $3`,
+    [erro.slice(0, 500), leadId, usuarioId]
+  ).catch((e: any) => console.error("[contato-formulario] erro ao registrar falha:", e));
+}
+
+async function iniciarContatoWhatsAppLeadFormulario(
+  usuarioId: number,
+  leadId: number | null | undefined,
+  criadoNaOrigem?: Date | string | null
+) {
+  if (!leadId) return;
+
+  try {
+    const cfgRes = await client.query(
+      `SELECT whatsapp_contato_formulario FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+    const config = lerConfigContatoFormulario(cfgRes.rows[0]?.whatsapp_contato_formulario);
+    if (!config.ativo) return;
+
+    const leadRes = await client.query(
+      `SELECT id, nome, telefone, lead_id, plataforma, nicho_id, criado_em, whatsapp_contato_enviado_em
+       FROM leads WHERE id = $1 AND usuario_id = $2`,
+      [leadId, usuarioId]
+    );
+    const lead = leadRes.rows[0];
+
+    const motivo = motivoParaNaoContatar({ config, lead, criadoNaOrigem });
+    if (motivo) {
+      console.log(`[contato-formulario] lead ${leadId} sem contato automático: ${motivo}`);
+      return;
+    }
+
+    const conexaoRes = await client.query(
+      `SELECT dados_conta->>'phone_number_id' AS phone_number_id
+       FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'
+       LIMIT 1`,
+      [usuarioId]
+    );
+    const phoneNumberId = conexaoRes.rows[0]?.phone_number_id;
+    if (!phoneNumberId) {
+      await registrarFalhaContatoFormulario(leadId, usuarioId, "WhatsApp não conectado");
+      return;
+    }
+
+    const para = normalizarTelefoneWhatsApp(lead.telefone);
+
+    // Conversa recente com esse número (o lead já chamou, ou está em
+    // atendimento): não manda o modelo por cima.
+    const conversaRecente = await client.query(
+      `SELECT id FROM whatsapp_conversas
+       WHERE usuario_id = $1
+         AND telefone_cliente = ANY($2::text[])
+         AND status <> 'encerrada'
+         AND ultima_mensagem_em > NOW() - INTERVAL '24 hours'
+       LIMIT 1`,
+      [usuarioId, variantesTelefoneBR(para)]
+    );
+    if (conversaRecente.rows.length) {
+      await registrarFalhaContatoFormulario(leadId, usuarioId, "Já existe conversa em andamento com esse número");
+      return;
+    }
+
+    // Reserva o envio (um lead nunca recebe o modelo duas vezes, mesmo se
+    // webhook e sincronização chegarem juntos).
+    const reserva = await client.query(
+      `UPDATE leads SET whatsapp_contato_enviado_em = NOW(), whatsapp_contato_erro = NULL
+       WHERE id = $1 AND usuario_id = $2 AND whatsapp_contato_enviado_em IS NULL
+       RETURNING id`,
+      [leadId, usuarioId]
+    );
+    if (!reserva.rows.length) return;
+
+    const token = await obterTokenWhatsappUsuario(usuarioId);
+    if (!token) {
+      await registrarFalhaContatoFormulario(leadId, usuarioId, "Token do WhatsApp ausente");
+      return;
+    }
+
+    const primeiroNome = primeiroNomeLead(lead.nome);
+    const res = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${phoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(montarMensagemModelo({
+          para,
+          nome: config.template_nome as string,
+          idioma: config.template_idioma as string,
+          variaveis: config.template_variaveis,
+          primeiroNome
+        }))
+      }
+    );
+    const corpo: any = await res.json().catch(() => ({}));
+    const wamid = corpo?.messages?.[0]?.id;
+
+    if (!res.ok || !wamid) {
+      const erro = corpo?.error?.error_user_msg || corpo?.error?.message || `HTTP ${res.status}`;
+      console.error(`[contato-formulario] envio falhou (lead ${leadId}):`, JSON.stringify(corpo?.error || corpo));
+      await registrarFalhaContatoFormulario(leadId, usuarioId, erro);
+      return;
+    }
+
+    // wa_id é o identificador que o WhatsApp usa pro número (às vezes sem o
+    // 9º dígito) — é com ele que a resposta do lead chega no webhook, então
+    // a conversa é gravada com ele pra resposta cair já vinculada ao lead.
+    const waId = String(corpo?.contacts?.[0]?.wa_id || para);
+
+    // Com roteiro ativo pro nicho do lead, a resposta dele segue o roteiro
+    // (status 'bot'); sem roteiro, vai direto pro corretor ('humano'), e a
+    // IA já classifica o status pela conversa.
+    const roteiro = await client.query(
+      `SELECT 1 FROM whatsapp_bot_config
+       WHERE usuario_id = $1 AND ativo = TRUE AND jsonb_array_length(passos) > 0
+         AND (nicho_id = $2 OR (nicho_id IS NULL AND criado_em < $3))
+       LIMIT 1`,
+      [usuarioId, lead.nicho_id ?? null, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
+    );
+    const statusInicial = roteiro.rows.length ? "bot" : "humano";
+
+    const conversa = await client.query(
+      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, passo_atual, lead_id, atualizado_em, ultima_mensagem_em)
+       VALUES ($1, $2, $3, 0, $4, NOW(), NOW())
+       ON CONFLICT (usuario_id, telefone_cliente)
+       DO UPDATE SET
+         lead_id = EXCLUDED.lead_id,
+         -- quem já foi atendido por humano nessa conversa continua com o corretor
+         status = CASE WHEN whatsapp_conversas.status = 'humano' THEN 'humano' ELSE EXCLUDED.status END,
+         passo_atual = 0,
+         roteiro_id = NULL,
+         atualizado_em = NOW(),
+         ultima_mensagem_em = NOW()
+       RETURNING id`,
+      [usuarioId, waId, statusInicial, leadId]
+    );
+
+    await client.query(
+      `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo)
+       VALUES ($1, $2, 'saida', $3) ON CONFLICT (wamid) DO NOTHING`,
+      [conversa.rows[0].id, wamid, renderizarCorpoModelo(config.template_corpo, primeiroNome) || `[modelo ${config.template_nome}]`]
+    );
+
+    await client.query(
+      `INSERT INTO lead_historico (lead_id, usuario_id, tipo, descricao) VALUES ($1, $2, 'whatsapp', $3)`,
+      [leadId, usuarioId, `Primeiro contato automático enviado pelo WhatsApp (modelo "${config.template_nome}")`]
+    ).catch((e: any) => console.error("[contato-formulario] erro no histórico:", e));
+
+    console.log(`[contato-formulario] ✅ lead ${leadId} contatado (${mascararTelefone(waId)}, conversa ${statusInicial})`);
+  } catch (err) {
+    console.error(`[contato-formulario] exceção (lead ${leadId}):`, err);
+    await registrarFalhaContatoFormulario(leadId, usuarioId, "Erro interno ao enviar");
+  }
+}
+
+// Conexão do WhatsApp do corretor com o necessário pra listar/criar modelos.
+async function obterContaWhatsappModelos(usuarioId: number) {
+  const conexao = await client.query(
+    `SELECT access_token, dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'
+     LIMIT 1`,
+    [usuarioId]
+  );
+  const wabaId = conexao.rows[0]?.dados_conta?.waba_id;
+  const token = conexao.rows[0]?.access_token || Bun.env.WHATSAPP_SYSTEM_USER_TOKEN || "";
+  return wabaId && token ? { wabaId: String(wabaId), token } : null;
+}
+
+async function listarModelosWhatsapp(conta: { wabaId: string; token: string }) {
+  const res = await fetch(
+    `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${conta.wabaId}/message_templates?fields=name,language,status,category,components&limit=200`,
+    { headers: { Authorization: `Bearer ${conta.token}` } }
+  );
+  const dados: any = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(dados?.error?.error_user_msg || dados?.error?.message || `HTTP ${res.status}`);
+  }
+  return (Array.isArray(dados?.data) ? dados.data : []).map((m: any) => {
+    const avaliacao = avaliarModelo(m);
+    return {
+      nome: String(m.name || ""),
+      idioma: String(m.language || ""),
+      status: String(m.status || ""),
+      categoria: String(m.category || ""),
+      corpo: avaliacao.corpo,
+      variaveis: avaliacao.variaveis,
+      compativel: avaliacao.compativel,
+      motivo: avaliacao.motivo
+    };
+  });
+}
+
+app.get("/whatsapp/contato-formulario", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const cfgRes = await client.query(`SELECT whatsapp_contato_formulario FROM usuarios WHERE id = $1`, [user.id]);
+    const config = lerConfigContatoFormulario(cfgRes.rows[0]?.whatsapp_contato_formulario);
+
+    const estatisticas = await client.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE whatsapp_contato_enviado_em > NOW() - INTERVAL '30 days')::int AS enviados_30d,
+         COUNT(*) FILTER (WHERE whatsapp_contato_erro IS NOT NULL AND criado_em > NOW() - INTERVAL '30 days')::int AS falhas_30d,
+         (SELECT whatsapp_contato_erro FROM leads
+          WHERE usuario_id = $1 AND whatsapp_contato_erro IS NOT NULL
+          ORDER BY criado_em DESC LIMIT 1) AS ultima_falha
+       FROM leads WHERE usuario_id = $1`,
+      [user.id]
+    );
+
+    const conta = await obterContaWhatsappModelos(user.id);
+    if (!conta) {
+      return c.json({ config, conectado: false, modelos: [], estatisticas: estatisticas.rows[0] });
+    }
+
+    let modelos: any[] = [];
+    let erroModelos: string | null = null;
+    try {
+      modelos = await listarModelosWhatsapp(conta);
+    } catch (e: any) {
+      erroModelos = e?.message || "Não foi possível listar os modelos";
+    }
+
+    return c.json({
+      config,
+      conectado: true,
+      modelos,
+      erro_modelos: erroModelos,
+      modelo_sugerido: { nome: MODELO_SUGERIDO.name, idioma: MODELO_SUGERIDO.language, corpo: MODELO_SUGERIDO.components[0].text },
+      estatisticas: estatisticas.rows[0]
+    });
+  } catch (err) {
+    console.error("ERRO GET /whatsapp/contato-formulario:", err);
+    return c.json({ error: "Erro ao carregar o contato automático" }, 500);
+  }
+});
+
+app.put("/whatsapp/contato-formulario", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const corpo = await c.req.json().catch(() => ({}));
+    const ativo = corpo?.ativo === true;
+    const nome = textoOpcional(corpo?.template_nome);
+    const idioma = textoOpcional(corpo?.template_idioma);
+
+    const atualRes = await client.query(`SELECT whatsapp_contato_formulario FROM usuarios WHERE id = $1`, [user.id]);
+    const atual = lerConfigContatoFormulario(atualRes.rows[0]?.whatsapp_contato_formulario);
+    let novo: ConfigContatoFormulario = { ...atual, ativo };
+
+    if (nome || ativo) {
+      if (!nome || !idioma) {
+        return c.json({ error: "Escolha um modelo de mensagem aprovado" }, 400);
+      }
+      const conta = await obterContaWhatsappModelos(user.id);
+      if (!conta) {
+        return c.json({ error: "Conecte o WhatsApp antes de configurar o contato automático" }, 400);
+      }
+      const modelos = await listarModelosWhatsapp(conta);
+      const modelo = modelos.find((m: any) => m.nome === nome && m.idioma === idioma);
+      if (!modelo) {
+        return c.json({ error: "Modelo não encontrado nesta conta do WhatsApp" }, 400);
+      }
+      if (!modelo.compativel) {
+        return c.json({ error: `Este modelo não pode ser usado: ${modelo.motivo}` }, 400);
+      }
+      novo = {
+        ativo,
+        template_nome: modelo.nome,
+        template_idioma: modelo.idioma,
+        template_corpo: modelo.corpo,
+        template_variaveis: modelo.variaveis === 1 ? 1 : 0
+      };
+    }
+
+    await client.query(
+      `UPDATE usuarios SET whatsapp_contato_formulario = $1 WHERE id = $2`,
+      [JSON.stringify(novo), user.id]
+    );
+    return c.json({ ok: true, config: novo });
+  } catch (err: any) {
+    console.error("ERRO PUT /whatsapp/contato-formulario:", err);
+    return c.json({ error: err?.message ? `Erro ao salvar: ${err.message}` : "Erro ao salvar o contato automático" }, 500);
+  }
+});
+
+// Cria na conta do corretor o modelo sugerido (vai pra análise da Meta; só
+// pode ser escolhido depois de aprovado).
+app.post("/whatsapp/contato-formulario/modelo-sugerido", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conta = await obterContaWhatsappModelos(user.id);
+    if (!conta) {
+      return c.json({ error: "Conecte o WhatsApp antes de criar o modelo" }, 400);
+    }
+    const res = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${conta.wabaId}/message_templates`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${conta.token}` },
+        body: JSON.stringify(MODELO_SUGERIDO)
+      }
+    );
+    const dados: any = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const mensagem = dados?.error?.error_user_msg || dados?.error?.message || `HTTP ${res.status}`;
+      console.error("ERRO criar modelo sugerido WhatsApp:", JSON.stringify(dados?.error || dados));
+      return c.json({ error: `A Meta recusou o modelo: ${mensagem}` }, 400);
+    }
+    return c.json({ ok: true, status: dados?.status || "PENDING", categoria: dados?.category || MODELO_SUGERIDO.category });
+  } catch (err) {
+    console.error("ERRO POST /whatsapp/contato-formulario/modelo-sugerido:", err);
+    return c.json({ error: "Erro ao criar o modelo" }, 500);
+  }
+});
+
 app.get("/whatsapp/bot", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
@@ -22483,6 +22833,9 @@ app.post("/webhook/meta", async (c) => {
               },
               usuarioId
             ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (webhook meta):", err));
+
+            iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInserido.rows[0]?.id, criadoEmMeta)
+              .catch(err => console.error("ERRO contato WhatsApp formulário (webhook meta):", err));
           }
         }
       }
@@ -24977,6 +25330,21 @@ await client.query(`
 await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS valor_negocio NUMERIC(14,2);
+`);
+
+// Primeiro contato automático com lead de formulário (ver
+// iniciarContatoWhatsAppLeadFormulario): configuração por corretor (desligada
+// por padrão) e o registro do envio por lead — reserva atômica pra nunca
+// mandar o modelo duas vezes, e o motivo quando falha.
+await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS whatsapp_contato_formulario JSONB;
+`);
+
+await client.query(`
+  ALTER TABLE leads
+    ADD COLUMN IF NOT EXISTS whatsapp_contato_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS whatsapp_contato_erro TEXT;
 `);
 
 // Mesmo rastreio de envio, agora para o Kwai Ads (ver
@@ -33643,6 +34011,8 @@ app.get("/leads", authMiddleware, async (c) => {
         l.score_manual,
         l.motivo_perda,
         l.valor_negocio,
+        l.whatsapp_contato_enviado_em,
+        l.whatsapp_contato_erro,
         l.respostas_qualificacao,
         l.criado_em,
         l.nicho_id,
