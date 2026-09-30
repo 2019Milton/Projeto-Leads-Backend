@@ -1,5 +1,26 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { decidirOtimizacaoSiteMeta, dominioDoReferer } from "./site-captura";
+
+test("campanha direto para o site só otimiza por lead com o código instalado", () => {
+  const agora = new Date("2026-09-30T12:00:00Z");
+  expect(decidirOtimizacaoSiteMeta({ temRecursoEventos: true, codigoVistoEm: "2026-09-29T10:00:00Z", agora }).otimizacao).toBe("lead");
+  expect(decidirOtimizacaoSiteMeta({ temRecursoEventos: true, ultimoLeadSiteEm: "2026-09-10T10:00:00Z", agora }).otimizacao).toBe("lead");
+  expect(decidirOtimizacaoSiteMeta({ temRecursoEventos: true, codigoVistoEm: "2026-08-01T10:00:00Z", agora })).toEqual({
+    otimizacao: "visitas", motivo: "código do formulário ainda não detectado no site"
+  });
+  expect(decidirOtimizacaoSiteMeta({ temRecursoEventos: true, agora }).otimizacao).toBe("visitas");
+  expect(decidirOtimizacaoSiteMeta({ temRecursoEventos: false, codigoVistoEm: "2026-09-29T10:00:00Z", agora }).otimizacao).toBe("visitas");
+  expect(decidirOtimizacaoSiteMeta({ temRecursoEventos: true, codigoVistoEm: "lixo", agora }).otimizacao).toBe("visitas");
+});
+
+test("domínio do site pela página que carregou o script", () => {
+  expect(dominioDoReferer("https://www.CasaVerde.com.br/lancamento?fbclid=x")).toBe("www.casaverde.com.br");
+  expect(dominioDoReferer("")).toBeNull();
+  expect(dominioDoReferer(undefined)).toBeNull();
+  expect(dominioDoReferer("javascript:alert(1)")).toBeNull();
+});
+
 import { botaoFinalFormularioMeta, detectarRedeSite, montarFbc, normalizarAtribuicao, scriptFormularioSite, validarEnvioSite } from "./site-captura";
 
 test("botão final do formulário da Meta leva ao site do corretor", () => {

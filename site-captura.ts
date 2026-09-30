@@ -81,6 +81,48 @@ export function validarEnvioSite(corpo: any): {
   return { ok: true, dados: { nome, telefone, email, mensagem } };
 }
 
+// Campanha Meta "Direto para o site": otimizar por quem PREENCHE o formulário
+// do site (evento padrão Lead no dataset do corretor) em vez de por quem só
+// abre a página. Só vale quando o código está instalado — sem ele a Meta não
+// recebe nenhum Lead pra aprender e a campanha entrega mal. "Instalado" =
+// o script foi carregado por uma página do site nos últimos 30 dias (ver GET
+// /site/form.js) ou já chegou lead pelo formulário do site nesse período.
+export const JANELA_CODIGO_SITE_DIAS = 30;
+
+export function decidirOtimizacaoSiteMeta(params: {
+  temRecursoEventos: boolean;
+  codigoVistoEm?: Date | string | null;
+  ultimoLeadSiteEm?: Date | string | null;
+  agora?: Date;
+}): { otimizacao: "lead" | "visitas"; motivo: string } {
+  const agora = params.agora ?? new Date();
+  if (!params.temRecursoEventos) {
+    return { otimizacao: "visitas", motivo: "plano sem envio de eventos para a Meta" };
+  }
+  const recente = (valor?: Date | string | null) => {
+    if (!valor) return false;
+    const data = new Date(valor);
+    return Number.isFinite(data.getTime()) &&
+      agora.getTime() - data.getTime() <= JANELA_CODIGO_SITE_DIAS * 86_400_000;
+  };
+  if (recente(params.codigoVistoEm) || recente(params.ultimoLeadSiteEm)) {
+    return { otimizacao: "lead", motivo: "código do formulário instalado no site" };
+  }
+  return { otimizacao: "visitas", motivo: "código do formulário ainda não detectado no site" };
+}
+
+// Domínio da página que carregou o script (cabeçalho Referer). Sem Referer
+// (script aberto direto no navegador) não conta como instalado.
+export function dominioDoReferer(referer: unknown): string | null {
+  try {
+    const url = new URL(String(referer ?? ""));
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    return url.hostname.toLowerCase().slice(0, 200) || null;
+  } catch {
+    return null;
+  }
+}
+
 function urlHttp(valor: unknown): URL | null {
   try {
     const url = new URL(String(valor ?? "").trim());

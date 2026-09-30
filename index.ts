@@ -67,7 +67,9 @@ import {
 
 import {
   botaoFinalFormularioMeta,
+  decidirOtimizacaoSiteMeta,
   detectarRedeSite,
+  dominioDoReferer,
   montarFbc,
   normalizarAtribuicao,
   scriptFormularioSite,
@@ -1909,6 +1911,55 @@ function montarDestinoAdsetMeta(
   };
 }
 
+// Situação do formulário do site de um corretor pra decidir a otimização da
+// campanha "Direto para o site" (ver decidirOtimizacaoSiteMeta).
+async function situacaoOtimizacaoSiteMeta(usuarioId: number) {
+  const dados = await client.query(
+    `SELECT u.plano, u.site_codigo_visto_em, u.site_codigo_dominio,
+            (SELECT MAX(criado_em) FROM leads WHERE usuario_id = u.id AND plataforma = 'site') AS ultimo_lead_site_em
+     FROM usuarios u WHERE u.id = $1`,
+    [usuarioId]
+  );
+  const linha = dados.rows[0] || {};
+  const decisao = decidirOtimizacaoSiteMeta({
+    temRecursoEventos: usuarioTemRecurso(linha, "meta_conversion_leads"),
+    codigoVistoEm: linha.site_codigo_visto_em,
+    ultimoLeadSiteEm: linha.ultimo_lead_site_em
+  });
+  return {
+    ...decisao,
+    codigo_visto_em: linha.site_codigo_visto_em || null,
+    codigo_dominio: linha.site_codigo_dominio || null
+  };
+}
+
+// promoted_object de conversão "Lead" no dataset do corretor, ou null quando
+// a campanha deve ficar otimizando por visitas.
+async function obterPromotedObjectLeadSiteMeta(usuarioId: number) {
+  try {
+    const situacao = await situacaoOtimizacaoSiteMeta(usuarioId);
+    if (situacao.otimizacao !== "lead") {
+      console.log(`[site] campanha direto para o site do usuário ${usuarioId} otimiza por visitas: ${situacao.motivo}`);
+      return null;
+    }
+    const conexao = await client.query(
+      `SELECT access_token, conta_anuncios_id, dataset_id FROM meta_conexoes
+       WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1`,
+      [usuarioId]
+    );
+    const token = conexao.rows[0]?.access_token;
+    const contaAnunciosId = conexao.rows[0]?.conta_anuncios_id;
+    if (!token || !contaAnunciosId) return null;
+    const datasetId =
+      conexao.rows[0]?.dataset_id ||
+      (await obterOuCriarDatasetMetaUsuario(usuarioId, contaAnunciosId, token));
+    return datasetId ? { pixel_id: String(datasetId), custom_event_type: "LEAD" } : null;
+  } catch (err) {
+    console.error("ERRO obterPromotedObjectLeadSiteMeta:", err);
+    return null;
+  }
+}
+
 // Cria o Ad Set pro destino pedido. Pra Lead Ads mantém o caminho existente
 // (Quality Lead com fallback). Pra WhatsApp NÃO tenta Quality Lead — a Meta
 // não aceita optimization_goal QUALITY_LEAD/promoted_object com pixel_id num
@@ -1923,10 +1974,25 @@ async function criarAdSetMetaParaDestino(
   if (destino === "whatsapp") {
     return enviarPayloadMetaComFallbackBid(url, payloadBase, `${contexto}_WHATSAPP`);
   }
-  // "site" usa LANDING_PAGE_VIEWS (já definido em payloadBase por
-  // montarDestinoAdsetMeta) — a otimização inteligente de Quality Lead é
-  // específica de LEAD_GENERATION e sobrescreveria esse optimization_goal.
+  // "site" ("Direto para o site"): com o código do formulário instalado no
+  // site, otimiza por quem PREENCHE (OFFSITE_CONVERSIONS no evento padrão Lead
+  // do dataset — o mesmo "Lead" que POST /site/leads envia). Sem o código, ou
+  // se a Meta recusar, fica em LANDING_PAGE_VIEWS (payloadBase, de
+  // montarDestinoAdsetMeta). A otimização de Quality Lead é específica de
+  // LEAD_GENERATION e não se aplica aqui.
   if (destino === "site") {
+    const promotedLead = await obterPromotedObjectLeadSiteMeta(usuarioId);
+    if (promotedLead) {
+      const resposta = await enviarPayloadMetaComFallbackBid(
+        url,
+        { ...payloadBase, optimization_goal: "OFFSITE_CONVERSIONS", promoted_object: promotedLead },
+        `${contexto}_SITE_LEAD`
+      );
+      if (!resposta.error) {
+        return resposta;
+      }
+      console.warn(`${contexto}: Meta recusou otimizar o site por Lead, usando LANDING_PAGE_VIEWS`, resposta.error);
+    }
     return enviarPayloadMetaComFallbackBid(url, payloadBase, `${contexto}_SITE`);
   }
   return criarAdSetMetaComOtimizacaoInteligente(url, payloadBase, contexto, usuarioId);
@@ -21375,6 +21441,19 @@ app.post("/whatsapp/contato-formulario/modelo-sugerido", authMiddleware, async (
 // Script que o corretor cola no site. Público e sem dado do corretor — a
 // chave vai na própria URL do <script> e só é validada no envio.
 app.get("/site/form.js", (c) => {
+  // Script carregado por uma página (tem Referer) = código instalado no site.
+  // Grava no máximo 1x por hora por corretor; nunca atrasa a entrega do script.
+  const chave = String(c.req.query("k") || "");
+  const dominio = dominioDoReferer(c.req.header("referer"));
+  if (dominio && /^[A-Za-z0-9_-]{16,64}$/.test(chave)) {
+    client.query(
+      `UPDATE usuarios SET site_codigo_visto_em = NOW(), site_codigo_dominio = $2
+       WHERE site_chave = $1
+         AND (site_codigo_visto_em IS NULL OR site_codigo_visto_em < NOW() - INTERVAL '1 hour')`,
+      [chave, dominio]
+    ).catch((e: any) => console.error("[site] erro ao registrar código visto:", e?.message || e));
+  }
+
   c.header("Content-Type", "application/javascript; charset=utf-8");
   c.header("Cache-Control", "public, max-age=300");
   return c.body(scriptFormularioSite());
@@ -21547,7 +21626,18 @@ app.get("/site-formulario/configuracao", authMiddleware, async (c) => {
        GROUP BY origem ORDER BY total DESC`,
       [user.id]
     );
-    return c.json({ chave, estatisticas: estatisticas.rows[0], por_rede: porRede.rows });
+    const situacao = await situacaoOtimizacaoSiteMeta(user.id);
+    return c.json({
+      chave,
+      estatisticas: estatisticas.rows[0],
+      por_rede: porRede.rows,
+      // Código instalado? Decide se a campanha Meta "Direto para o site"
+      // otimiza por lead ou por visitas (ver decidirOtimizacaoSiteMeta).
+      codigo_visto_em: situacao.codigo_visto_em,
+      codigo_dominio: situacao.codigo_dominio,
+      otimizacao_meta: situacao.otimizacao,
+      otimizacao_meta_motivo: situacao.motivo
+    });
   } catch (err) {
     console.error("ERRO GET /site-formulario/configuracao:", err);
     return c.json({ error: "Erro ao carregar o formulário do site" }, 500);
@@ -25634,6 +25724,16 @@ await client.query(`
 await client.query(`
   ALTER TABLE leads
     ADD COLUMN IF NOT EXISTS atribuicao JSONB;
+`);
+
+// Última vez que o script do formulário do site foi carregado por uma página
+// do site do corretor (e de qual domínio) — prova de que o código está
+// instalado. Decide se a campanha Meta "Direto para o site" otimiza por lead
+// (ver decidirOtimizacaoSiteMeta).
+await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS site_codigo_visto_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS site_codigo_dominio TEXT;
 `);
 
 // Primeiro contato automático com lead de formulário (ver
