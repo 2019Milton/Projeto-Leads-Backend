@@ -81,6 +81,38 @@ export function validarEnvioSite(corpo: any): {
   return { ok: true, dados: { nome, telefone, email, mensagem } };
 }
 
+function urlHttp(valor: unknown): URL | null {
+  try {
+    const url = new URL(String(valor ?? "").trim());
+    return url.protocol === "https:" || url.protocol === "http:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+// Botão da tela de obrigado do formulário da Meta. É ele que faz a opção
+// "Formulário + botão para o seu site" da criação de campanha: o lead é
+// captado pelo formulário da própria rede (a plataforma recebe nome e
+// telefone pela API) e o botão final leva ao site do corretor, sem instalar
+// nada no site. Antes, sem link informado, o botão levava a google.com.
+// Ordem: link escolhido pro botão (obrigado_url, ou o link do site quando a
+// campanha é "formulário + site") → site do anunciante tirado da URL da
+// política de privacidade → google.com (legado, só se não houver nada).
+export function botaoFinalFormularioMeta(cfg: any): { website_url: string; button_text: string } {
+  const doSite = urlHttp(cfg?.obrigado_url) || (cfg?.site_via_formulario ? urlHttp(cfg?.link) : null);
+  const textoInformado = String(cfg?.obrigado_botao ?? "").trim();
+
+  if (doSite) {
+    return { website_url: doSite.toString(), button_text: textoInformado || "Visitar site" };
+  }
+
+  const privacidade = urlHttp(cfg?.privacidade_url || cfg?.url_privacidade);
+  return {
+    website_url: privacidade ? `${privacidade.origin}/` : "https://google.com",
+    button_text: textoInformado || "Ver mais"
+  };
+}
+
 // Script servido em GET /site/form.js?k=<chave>. Sem dependências; descobre a
 // API pelo próprio src. Atributos opcionais no <script>: data-botao,
 // data-cor, data-sucesso, data-campanha, data-sem-formulario (só captura e

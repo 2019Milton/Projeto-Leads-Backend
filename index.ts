@@ -66,6 +66,7 @@ import {
 } from "./eventos-meta";
 
 import {
+  botaoFinalFormularioMeta,
   detectarRedeSite,
   montarFbc,
   normalizarAtribuicao,
@@ -17714,11 +17715,9 @@ app.post("/meta/formulario", authMiddleware, async (c) => {
         "https://google.com"
       );
 
-    const obrigadoUrl =
-      urlOpcional(
-        avancadas.obrigado_url,
-        "https://google.com"
-      );
+    // Botão final do formulário: leva ao site do corretor (opção
+    // "Formulário + botão para o seu site") — ver botaoFinalFormularioMeta.
+    const botaoFinal = botaoFinalFormularioMeta(avancadas);
 
     const payloadFormulario: any = {
       name: `Form Leads ${Date.now()}`,
@@ -17744,11 +17743,8 @@ app.post("/meta/formulario", authMiddleware, async (c) => {
             avancadas.obrigado_texto
           ) || "Recebemos seus dados 🚀",
         button_type: "VIEW_WEBSITE",
-        button_text:
-          textoOpcional(
-            avancadas.obrigado_botao
-          ) || "Ver mais",
-        website_url: obrigadoUrl
+        button_text: botaoFinal.button_text,
+        website_url: botaoFinal.website_url
       },
       access_token: pageToken
     };
@@ -33551,13 +33547,8 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
             textoOpcional(cfg.mensagem_agradecimento) ||
             "Recebemos seus dados 🚀",
           button_type: "VIEW_WEBSITE",
-          button_text:
-            textoOpcional(cfg.obrigado_botao) ||
-            "Ver mais",
-          website_url: urlOpcional(
-            cfg.obrigado_url || cfg.url_privacidade || cfg.privacidade_url,
-            "https://google.com"
-          )
+          // Leva ao site do corretor — ver botaoFinalFormularioMeta.
+          ...botaoFinalFormularioMeta(cfg)
         },
         access_token: pageToken
       };
@@ -41696,8 +41687,8 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
           title: textoOpcional(cfgFormulario.mensagem_agradecimento_titulo) || "Obrigado!",
           body: textoOpcional(cfgFormulario.mensagem_agradecimento) || "Recebemos seus dados 🚀",
           button_type: "VIEW_WEBSITE",
-          button_text: "Ver mais",
-          website_url: urlOpcional(cfgFormulario.url_privacidade, "https://google.com")
+          // Leva ao site do corretor — ver botaoFinalFormularioMeta.
+          ...botaoFinalFormularioMeta(cfgFormulario)
         },
         access_token: pagina.access_token
       };

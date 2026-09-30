@@ -1,6 +1,23 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { detectarRedeSite, montarFbc, normalizarAtribuicao, scriptFormularioSite, validarEnvioSite } from "./site-captura";
+import { botaoFinalFormularioMeta, detectarRedeSite, montarFbc, normalizarAtribuicao, scriptFormularioSite, validarEnvioSite } from "./site-captura";
+
+test("botão final do formulário da Meta leva ao site do corretor", () => {
+  // "Formulário + botão para o seu site": o link do site vai no botão.
+  expect(botaoFinalFormularioMeta({ site_via_formulario: true, link: "https://casaverde.com.br/lancamento" }))
+    .toEqual({ website_url: "https://casaverde.com.br/lancamento", button_text: "Visitar site" });
+  // Link próprio do botão e texto escolhido prevalecem.
+  expect(botaoFinalFormularioMeta({ obrigado_url: "https://x.com.br/obrigado", obrigado_botao: "Ver imóveis", link: "https://y.com" }))
+    .toEqual({ website_url: "https://x.com.br/obrigado", button_text: "Ver imóveis" });
+  // Sem link: site do anunciante pela política de privacidade (antes ia pra google.com).
+  expect(botaoFinalFormularioMeta({ privacidade_url: "https://casaverde.com.br/privacidade" }))
+    .toEqual({ website_url: "https://casaverde.com.br/", button_text: "Ver mais" });
+  expect(botaoFinalFormularioMeta({ url_privacidade: "https://casaverde.com.br/p" }).website_url).toBe("https://casaverde.com.br/");
+  // link sem a marca de "formulário + site" não vira botão (campanha de formulário comum).
+  expect(botaoFinalFormularioMeta({ link: "https://y.com", privacidade_url: "https://z.com/p" }).website_url).toBe("https://z.com/");
+  expect(botaoFinalFormularioMeta({ obrigado_url: "javascript:alert(1)" }).website_url).toBe("https://google.com");
+  expect(botaoFinalFormularioMeta({}).website_url).toBe("https://google.com");
+});
 import { idEventoSiteMeta, montarEventoMeta } from "./eventos-meta";
 
 const sha = (v: string) => createHash("sha256").update(v).digest("hex");
