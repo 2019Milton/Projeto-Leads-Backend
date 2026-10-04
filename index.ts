@@ -21838,6 +21838,2864 @@ app.delete("/whatsapp/bot/:id", authMiddleware, async (c) => {
 const URL_BACKEND_PUBLICA =
   (Bun.env.URL_BACKEND_PUBLICA || "https://function-bun-production-446a.up.railway.app")
     .replace(/\/+$/g, "");
+
+const WHATSAPP_BOT_MIDIA_MIME_PERMITIDOS: Record<string, string[]> = {
+  imagem: ["image/jpeg", "image/png", "image/webp"],
+  // formatos aceitos pela propria Meta pra mensagem de audio no WhatsApp Cloud API
+  audio: ["audio/mpeg", "audio/ogg", "audio/mp4", "audio/aac", "audio/amr"]
+};
+const WHATSAPP_BOT_MIDIA_TAMANHO_MAX = 15 * 1024 * 1024;
+
+app.post("/whatsapp-bot/midia", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const body = await c.req.formData();
+    const arquivo = body.get("arquivo") as File | null;
+    const tipo = String(body.get("tipo") || "");
+
+    if (!arquivo) {
+      return c.json({ error: "Arquivo não enviado" }, 400);
+    }
+    if (!["imagem", "audio"].includes(tipo)) {
+      return c.json({ error: "Tipo inválido" }, 400);
+    }
+
+    const mimeType = arquivo.type || "";
+    if (!WHATSAPP_BOT_MIDIA_MIME_PERMITIDOS[tipo].includes(mimeType)) {
+      return c.json({
+        error:
+          tipo === "imagem"
+            ? "Formato de imagem não suportado. Use JPEG, PNG ou WEBP."
+            : "Formato de áudio não suportado. Use MP3, OGG, M4A ou AMR."
+      }, 400);
+    }
+
+    const bytes = await arquivo.arrayBuffer();
+    if (bytes.byteLength > WHATSAPP_BOT_MIDIA_TAMANHO_MAX) {
+      return c.json({ error: "Arquivo muito grande (máximo 15MB)" }, 400);
+    }
+
+    const token = randomBytes(24).toString("base64url");
+    const row = await client.query(
+      `INSERT INTO whatsapp_bot_midias (usuario_id, tipo, mime_type, dados, token)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [user.id, tipo, mimeType, Buffer.from(bytes), token]
+    );
+
+    const id = row.rows[0].id;
+    return c.json({
+      id,
+      url: `${URL_BACKEND_PUBLICA}/whatsapp-bot/midia/${token}`,
+      tipo,
+      mime_type: mimeType
+    });
+  } catch (err) {
+    console.error("ERRO POST /whatsapp-bot/midia:", err);
+    return c.json({ error: "Erro ao enviar arquivo" }, 500);
+  }
+});
+
+// Sem authMiddleware de proposito: quem busca esse link e o servidor da Meta,
+// na hora de entregar a mensagem — nao o navegador do corretor logado. Por
+// isso o identificador é um token opaco aleatório (nao o id sequencial do
+// banco) — ver backfillWhatsappBotMidiaTokens: sem isso qualquer um podia
+// enumerar /1, /2, /3... e baixar mídia de bot de outro corretor.
+app.get("/whatsapp-bot/midia/:token", async (c) => {
+  try {
+    const token = c.req.param("token");
+    if (!token) {
+      return c.text("Não encontrado", 404);
+    }
+
+    const row = await client.query(
+      `SELECT mime_type, dados FROM whatsapp_bot_midias WHERE token = $1`,
+      [token]
+    );
+    if (!row.rows.length) {
+      return c.text("Não encontrado", 404);
+    }
+
+    const { mime_type, dados } = row.rows[0];
+    return c.body(dados, 200, {
+      "Content-Type": mime_type,
+      "Cache-Control": "public, max-age=31536000, immutable"
+    });
+  } catch (err) {
+    console.error("ERRO GET /whatsapp-bot/midia/:token:", err);
+    return c.text("Erro ao carregar mídia", 500);
+  }
+});
+
+/* =========================
+   💰 FINANCEIRO (cobrança mensal por usuário)
+========================= */
+
+const FINANCEIRO_ARQUIVO_MIME_PERMITIDOS = [
+  "application/pdf", "image/jpeg", "image/png", "image/webp"
+];
+const FINANCEIRO_ARQUIVO_TAMANHO_MAX = 15 * 1024 * 1024; // 15MB, mesmo teto do whatsapp_bot_midias
+
+async function lerArquivoFinanceiro(c: any): Promise<
+  { erro: string } | { erro: null; mimeType: string; bytes: Buffer }
+> {
+  const body = await c.req.formData();
+  const arquivo = body.get("arquivo") as File | null;
+
+  if (!arquivo) {
+    return { erro: "Arquivo não enviado" } as any;
+  }
+
+  const mimeType = arquivo.type || "";
+  if (!FINANCEIRO_ARQUIVO_MIME_PERMITIDOS.includes(mimeType)) {
+    return { erro: "Formato não suportado. Use PDF, JPEG, PNG ou WEBP." } as any;
+  }
+
+  const bytesArrayBuffer = await arquivo.arrayBuffer();
+  if (bytesArrayBuffer.byteLength > FINANCEIRO_ARQUIVO_TAMANHO_MAX) {
+    return { erro: "Arquivo muito grande (máximo 15MB)" } as any;
+  }
+
+  return { erro: null, mimeType, bytes: Buffer.from(bytesArrayBuffer) };
+}
+
+const CHAVE_PIX_TIPO_LABEL: Record<string, string> = {
+  cpf: "CPF",
+  cnpj: "CNPJ",
+  email: "E-mail",
+  telefone: "Telefone",
+  aleatoria: "Chave aleatória",
+};
+
+// Identifica o formato de uma chave PIX (CPF, CNPJ, e-mail, telefone ou
+// aleatória/EVP) só pra saber que rótulo mostrar pro usuário que vai pagar —
+// não confere dígito verificador, não é uma validação bancária.
+function identificarChavePix(valorBruto: unknown): { tipo: string; valor: string } | null {
+  const valor = String(valorBruto || "").trim();
+  if (!valor) return null;
+
+  if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(valor)) {
+    return { tipo: "aleatoria", valor: valor.toLowerCase() };
+  }
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(valor)) {
+    return { tipo: "email", valor: valor.toLowerCase() };
+  }
+  if (valor.startsWith("+") || /[()]/.test(valor)) {
+    const digitos = valor.replace(/\D/g, "");
+    if (digitos.length < 10 || digitos.length > 13) return null;
+    return { tipo: "telefone", valor: `+${digitos.startsWith("55") ? digitos : "55" + digitos}` };
+  }
+
+  const somenteDigitos = valor.replace(/\D/g, "");
+  if (somenteDigitos.length === 11) return { tipo: "cpf", valor: somenteDigitos };
+  if (somenteDigitos.length === 14) return { tipo: "cnpj", valor: somenteDigitos };
+
+  return null;
+}
+
+function linhaFinanceiroParaJson(linha: any) {
+  return {
+    id: linha.id,
+    usuario_id: linha.usuario_id,
+    mes_referencia: linha.mes_referencia,
+    valor: Number(linha.valor),
+    status: linha.status,
+    tem_comprovante: linha.comprovante_dados !== null && linha.comprovante_dados !== undefined,
+    comprovante_enviado_em: linha.comprovante_enviado_em,
+    tem_nf: linha.nf_dados !== null && linha.nf_dados !== undefined,
+    nf_enviada_em: linha.nf_enviada_em,
+    observacao: linha.observacao,
+    pix_chave: linha.pix_chave,
+    pix_tipo: linha.pix_tipo,
+    pix_tipo_label: linha.pix_tipo ? (CHAVE_PIX_TIPO_LABEL[linha.pix_tipo] || linha.pix_tipo) : null,
+    criado_em: linha.criado_em
+  };
+}
+
+// 🔹 Usuário comum — vê só os próprios lançamentos.
+app.get("/financeiro/meus-lancamentos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+
+    const result = await client.query(
+      `SELECT id, usuario_id, mes_referencia, valor, status,
+              comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+              observacao, pix_chave, pix_tipo, criado_em
+       FROM financeiro_lancamentos
+       WHERE usuario_id = $1
+       ORDER BY mes_referencia DESC`,
+      [user.id]
+    );
+
+    return c.json(result.rows.map(linhaFinanceiroParaJson));
+  } catch (err) {
+    console.error("ERRO GET /financeiro/meus-lancamentos:", err);
+    return c.json({ error: "Erro ao carregar lançamentos" }, 500);
+  }
+});
+
+// 🔹 Usuário comum sobe o comprovante de pagamento de um lançamento próprio.
+app.post("/financeiro/lancamentos/:id/comprovante", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const dono = await client.query(
+      `SELECT usuario_id FROM financeiro_lancamentos WHERE id = $1`,
+      [id]
+    );
+    if (!dono.rows.length || dono.rows[0].usuario_id !== user.id) {
+      return c.json({ error: "Lançamento não encontrado" }, 404);
+    }
+
+    const arquivo = await lerArquivoFinanceiro(c);
+    if (arquivo.erro) return c.json({ error: arquivo.erro }, 400);
+
+    await client.query(
+      `UPDATE financeiro_lancamentos
+       SET comprovante_dados = $1, comprovante_mime = $2, comprovante_enviado_em = NOW(),
+           status = CASE WHEN status = 'aguardando_pagamento' THEN 'comprovante_enviado' ELSE status END
+       WHERE id = $3`,
+      [arquivo.bytes, arquivo.mimeType, id]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO POST /financeiro/lancamentos/:id/comprovante:", err);
+    return c.json({ error: "Erro ao enviar comprovante" }, 500);
+  }
+});
+
+// 🔹 Baixa o comprovante ou a NF de um lançamento — dono do lançamento ou super_admin.
+async function servirArquivoFinanceiro(c: any, coluna: "comprovante" | "nf") {
+  const user: any = c.get("user");
+  const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) return c.text("Não encontrado", 404);
+
+  const row = await client.query(
+    `SELECT usuario_id, ${coluna}_dados AS dados, ${coluna}_mime AS mime
+     FROM financeiro_lancamentos WHERE id = $1`,
+    [id]
+  );
+
+  if (!row.rows.length || !row.rows[0].dados) {
+    return c.text("Não encontrado", 404);
+  }
+
+  const linha = row.rows[0];
+  if (linha.usuario_id !== user.id && user.tipo !== "super_admin") {
+    return c.text("Acesso negado", 403);
+  }
+
+  return c.body(linha.dados, 200, {
+    "Content-Type": linha.mime || "application/octet-stream"
+  });
+}
+
+app.get("/financeiro/lancamentos/:id/comprovante", authMiddleware, (c) =>
+  servirArquivoFinanceiro(c, "comprovante")
+);
+
+app.get("/financeiro/lancamentos/:id/nf", authMiddleware, (c) =>
+  servirArquivoFinanceiro(c, "nf")
+);
+
+// 🔹 Admin — lista usuários (exceto contas administrativas) com o resumo do
+// lançamento mais recente de cada um, pra montar a tabela do painel.
+app.get("/admin/financeiro/usuarios", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const result = await client.query(
+      `SELECT
+         u.id, u.nome, u.sobrenome, u.email,
+         ultimo.mes_referencia AS ultimo_mes_referencia,
+         ultimo.valor AS ultimo_valor,
+         ultimo.status AS ultimo_status
+       FROM usuarios u
+       LEFT JOIN LATERAL (
+         SELECT mes_referencia, valor, status
+         FROM financeiro_lancamentos f
+         WHERE f.usuario_id = u.id
+         ORDER BY mes_referencia DESC
+         LIMIT 1
+       ) ultimo ON true
+       WHERE u.tipo NOT IN ('super_admin', 'master')
+       ORDER BY u.nome NULLS LAST, u.email`
+    );
+
+    return c.json(result.rows.map((linha: any) => ({
+      id: linha.id,
+      nome: [linha.nome, linha.sobrenome].filter(Boolean).join(" ") || linha.email,
+      email: linha.email,
+      ultimo_lancamento: linha.ultimo_mes_referencia
+        ? {
+            mes_referencia: linha.ultimo_mes_referencia,
+            valor: Number(linha.ultimo_valor),
+            status: linha.ultimo_status
+          }
+        : null
+    })));
+  } catch (err) {
+    console.error("ERRO GET /admin/financeiro/usuarios:", err);
+    return c.json({ error: "Erro ao carregar usuários" }, 500);
+  }
+});
+
+// 🔹 Admin — histórico completo de lançamentos de um usuário específico.
+app.get("/admin/financeiro/usuarios/:usuarioId/lancamentos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const usuarioId = Number(c.req.param("usuarioId"));
+    if (!Number.isFinite(usuarioId)) return c.json({ error: "Usuário inválido" }, 400);
+
+    const result = await client.query(
+      `SELECT id, usuario_id, mes_referencia, valor, status,
+              comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+              observacao, pix_chave, pix_tipo, criado_em
+       FROM financeiro_lancamentos
+       WHERE usuario_id = $1
+       ORDER BY mes_referencia DESC`,
+      [usuarioId]
+    );
+
+    return c.json(result.rows.map(linhaFinanceiroParaJson));
+  } catch (err) {
+    console.error("ERRO GET /admin/financeiro/usuarios/:usuarioId/lancamentos:", err);
+    return c.json({ error: "Erro ao carregar lançamentos" }, 500);
+  }
+});
+
+// 🔹 Admin — lança (ou atualiza, se já existir pro mesmo usuário+mês) a cobrança do mês.
+app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const { usuario_id, mes_referencia, valor, observacao, pix_chave } = await c.req.json();
+
+    const usuarioId = Number(usuario_id);
+    const valorNumero = Number(valor);
+
+    if (!Number.isFinite(usuarioId)) {
+      return c.json({ error: "Usuário inválido" }, 400);
+    }
+    if (!mes_referencia || !/^\d{4}-\d{2}(-\d{2})?$/.test(String(mes_referencia))) {
+      return c.json({ error: "Mês de referência inválido" }, 400);
+    }
+    if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+      return c.json({ error: "Informe um valor válido" }, 400);
+    }
+
+    const chavePixTexto = textoOpcional(pix_chave);
+    const chavePix = chavePixTexto ? identificarChavePix(chavePixTexto) : null;
+    if (chavePixTexto && !chavePix) {
+      return c.json({ error: "Chave PIX em formato inválido (use CPF, CNPJ, e-mail, telefone ou chave aleatória)" }, 400);
+    }
+
+    // Aceita mês (YYYY-MM) por compatibilidade, mas cai no dia 1 só nesse caso —
+    // quando vem dia explícito (YYYY-MM-DD) do front, é ele que é gravado.
+    const dataReferencia = String(mes_referencia).length > 7
+      ? String(mes_referencia)
+      : `${String(mes_referencia)}-01`;
+
+    const result = await client.query(
+      `INSERT INTO financeiro_lancamentos (usuario_id, mes_referencia, valor, observacao, pix_chave, pix_tipo)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (usuario_id, mes_referencia)
+       DO UPDATE SET valor = EXCLUDED.valor, observacao = EXCLUDED.observacao,
+                     pix_chave = EXCLUDED.pix_chave, pix_tipo = EXCLUDED.pix_tipo
+       RETURNING id, usuario_id, mes_referencia, valor, status,
+                 comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+                 observacao, pix_chave, pix_tipo, criado_em`,
+      [usuarioId, dataReferencia, valorNumero, textoOpcional(observacao) || null,
+       chavePix?.valor || null, chavePix?.tipo || null]
+    );
+
+    return c.json(linhaFinanceiroParaJson(result.rows[0]));
+  } catch (err) {
+    console.error("ERRO POST /admin/financeiro/lancamentos:", err);
+    return c.json({ error: "Erro ao lançar cobrança" }, 500);
+  }
+});
+
+// 🔹 Admin — edita data/valor/observação/chave PIX de um lançamento existente.
+app.put("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const { mes_referencia, valor, observacao, pix_chave } = await c.req.json();
+    const valorNumero = Number(valor);
+    if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+      return c.json({ error: "Informe um valor válido" }, 400);
+    }
+    if (!mes_referencia || !/^\d{4}-\d{2}(-\d{2})?$/.test(String(mes_referencia))) {
+      return c.json({ error: "Data de referência inválida" }, 400);
+    }
+
+    const chavePixTexto = textoOpcional(pix_chave);
+    const chavePix = chavePixTexto ? identificarChavePix(chavePixTexto) : null;
+    if (chavePixTexto && !chavePix) {
+      return c.json({ error: "Chave PIX em formato inválido (use CPF, CNPJ, e-mail, telefone ou chave aleatória)" }, 400);
+    }
+
+    const dataReferencia = String(mes_referencia).length > 7
+      ? String(mes_referencia)
+      : `${String(mes_referencia)}-01`;
+
+    let result;
+    try {
+      result = await client.query(
+        `UPDATE financeiro_lancamentos
+         SET mes_referencia = $1, valor = $2, observacao = $3, pix_chave = $4, pix_tipo = $5
+         WHERE id = $6
+         RETURNING id, usuario_id, mes_referencia, valor, status,
+                   comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
+                   observacao, pix_chave, pix_tipo, criado_em`,
+        [dataReferencia, valorNumero, textoOpcional(observacao) || null,
+         chavePix?.valor || null, chavePix?.tipo || null, id]
+      );
+    } catch (erroQuery: any) {
+      if (erroQuery?.code === "23505") {
+        return c.json({ error: "Já existe um lançamento desse usuário nessa data de referência" }, 409);
+      }
+      throw erroQuery;
+    }
+
+    if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
+
+    return c.json(linhaFinanceiroParaJson(result.rows[0]));
+  } catch (err) {
+    console.error("ERRO PUT /admin/financeiro/lancamentos/:id:", err);
+    return c.json({ error: "Erro ao atualizar lançamento" }, 500);
+  }
+});
+
+// 🔹 Admin — exclui um lançamento existente.
+app.delete("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const result = await client.query(
+      `DELETE FROM financeiro_lancamentos WHERE id = $1 RETURNING id`,
+      [id]
+    );
+
+    if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO DELETE /admin/financeiro/lancamentos/:id:", err);
+    return c.json({ error: "Erro ao excluir lançamento" }, 500);
+  }
+});
+
+// 🔹 Admin sobe a Nota Fiscal de um lançamento — isso confirma o pagamento.
+app.post("/admin/financeiro/lancamentos/:id/nf", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
+
+    const arquivo = await lerArquivoFinanceiro(c);
+    if (arquivo.erro) return c.json({ error: arquivo.erro }, 400);
+
+    const result = await client.query(
+      `UPDATE financeiro_lancamentos
+       SET nf_dados = $1, nf_mime = $2, nf_enviada_em = NOW(), status = 'pago'
+       WHERE id = $3
+       RETURNING id`,
+      [arquivo.bytes, arquivo.mimeType, id]
+    );
+
+    if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO POST /admin/financeiro/lancamentos/:id/nf:", err);
+    return c.json({ error: "Erro ao enviar nota fiscal" }, 500);
+  }
+});
+
+// Passos genéricos usados quando a IA não está disponível/configurada ou falha —
+// mesmo roteiro que já aparecia como placeholder no textarea, nunca deixa o
+// corretor sem nada na tela.
+function passosRoteiroFallback() {
+  return [
+    { ordem: 1, tipo: "mensagem", texto: "Olá! Tudo bem? Obrigado por entrar em contato.", handoff_apos: false },
+    { ordem: 2, tipo: "pergunta", texto: "Pra te atender melhor, qual é o seu nome?", handoff_apos: false },
+    { ordem: 3, tipo: "mensagem", texto: "Perfeito! Já vou te conectar com um corretor pra continuar seu atendimento.", handoff_apos: true },
+  ];
+}
+
+function parsePassosRoteiroIA(texto: string) {
+  let raw = (texto || "").trim();
+  raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/, "").replace(/```\s*$/, "");
+  let json: any;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const passosBrutos = Array.isArray(json?.passos) ? json.passos : [];
+  const limpos = passosBrutos
+    .map((p: any, i: number) => ({
+      ordem: i + 1,
+      tipo: p?.tipo === "pergunta" ? "pergunta" : "mensagem",
+      texto: String(p?.texto || "").slice(0, 300).trim(),
+      handoff_apos: Boolean(p?.handoff_apos),
+    }))
+    .filter((p: any) => p.texto);
+  if (limpos.length && !limpos.some((p: any) => p.handoff_apos)) {
+    limpos[limpos.length - 1].handoff_apos = true;
+  }
+  return limpos;
+}
+
+app.post("/ia/whatsapp-bot/gerar", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const bloqueio = await motivoBloqueioIA(user);
+    if (bloqueio) return c.json({ error: bloqueio }, 403);
+
+    const { contexto, nicho_id } = await c.req.json();
+    if (!String(contexto || "").trim()) {
+      return c.json({ error: "Descreva o negócio antes de gerar." }, 400);
+    }
+
+    // Nicho e opcional aqui (roteiro sem nicho nao tem um) — mas quando informado
+    // precisa pertencer ao usuario, senao a IA geraria em cima do nome de um
+    // nicho que nao e dele.
+    let nichoNome: string | null = null;
+    const nichoIdInformado = Number(nicho_id);
+    if (Number.isInteger(nichoIdInformado) && nichoIdInformado > 0) {
+      const nichoPermitido = await client.query(
+        `SELECT n.nome
+         FROM usuario_nichos un
+         INNER JOIN nichos n ON n.id = un.nicho_id
+         WHERE un.usuario_id = $1 AND n.id = $2
+         LIMIT 1`,
+        [user.id, nichoIdInformado]
+      );
+      if (!nichoPermitido.rows.length) {
+        return c.json({ error: "O nicho selecionado não está habilitado para este usuário" }, 403);
+      }
+      nichoNome = nichoPermitido.rows[0].nome;
+    }
+
+    const openaiKey = Bun.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return c.json({ passos: passosRoteiroFallback() });
+    }
+
+    const systemMsg =
+      `Você é um especialista em atendimento via WhatsApp para corretores${nichoNome ? ` de ${nichoNome}` : " de seguros e imóveis"} no Brasil. ` +
+      "Crie roteiros curtos de bot de primeiro atendimento. Retorne SOMENTE JSON valido no formato " +
+      `{"passos":[{"tipo":"mensagem"|"pergunta","texto":"...","handoff_apos":boolean}]}, sem nenhum texto fora do JSON.`;
+    const prompt =
+      (nichoNome ? `Nicho deste roteiro: ${nichoNome}\n` : "") +
+      `Negócio/contexto informado pelo corretor: "${String(contexto).trim()}"\n\n` +
+      `Crie um roteiro de 3 a 6 passos${nichoNome ? `, com perguntas e linguagem relevantes especificamente para o nicho de ${nichoNome}` : ""}. Passos "mensagem" só informam algo e seguem sozinhos; ` +
+      `passos "pergunta" perguntam algo e esperam a resposta do cliente antes de seguir. ` +
+      `O ultimo passo deve ter handoff_apos:true, indicando que a conversa deve ser transferida para o corretor humano.`;
+
+    const iaConf = await client.query("SELECT modelo FROM ia_config WHERE id = 1 LIMIT 1");
+    const modelo =
+      textoOpcional(iaConf.rows[0]?.modelo) ||
+      textoOpcional(Bun.env.OPENAI_MODEL) ||
+      "gpt-5-mini";
+    const usarResponsesAPI =
+      modelo.startsWith("gpt-5") || modelo.startsWith("o1") || modelo.startsWith("o3") || modelo.startsWith("o4");
+
+    const respBody = usarResponsesAPI
+      ? { model: modelo, temperature: 1.0, instructions: systemMsg, input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }] }
+      : { model: modelo, temperature: 1.0, response_format: { type: "json_object" }, messages: [{ role: "system", content: systemMsg }, { role: "user", content: prompt }] };
+
+    const resp = await fetchProvedorIA("openai", "roteiro_whatsapp", usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(respBody),
+    });
+    const data: any = await resp.json();
+    if (!resp.ok) {
+      console.error("WHATSAPP BOT IA ERROR:", data?.error?.message, "| model:", modelo);
+      return c.json({ passos: passosRoteiroFallback() });
+    }
+
+    const textoResposta: string = usarResponsesAPI
+      ? extrairTextoRespostaOpenAI(data)
+      : (data?.choices?.[0]?.message?.content || "");
+    const passos = parsePassosRoteiroIA(textoResposta);
+    if (!passos.length) {
+      return c.json({ passos: passosRoteiroFallback() });
+    }
+
+    const usageNorm = {
+      input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
+      output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0),
+    };
+    const custo = calcularCustoEstimadoOpenAI(usageNorm, modelo);
+    await registrarUsoIA(Number(user.id), "roteiro_whatsapp", "whatsapp_bot", null, custo, usageNorm.input_tokens, usageNorm.output_tokens);
+
+    return c.json({ passos });
+  } catch (err) {
+    console.error("ERRO /ia/whatsapp-bot/gerar:", err);
+    return c.json({ passos: passosRoteiroFallback() });
+  }
+});
+
+/* =========================
+   🎵 WEBHOOK TIKTOK — leads em tempo real
+========================= */
+
+// TikTok envia GET para verificação do endpoint (challenge)
+app.get("/webhook/tiktok", async (c) => {
+  const challenge = c.req.query("challenge");
+  if (challenge) return c.text(challenge);
+  return c.text("TikTok webhook ativo");
+});
+
+app.post("/webhook/tiktok", async (c) => {
+  // TikTok manda o secret no header Authorization (Bearer).
+  const auth = c.req.header("authorization") || "";
+  const provided = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!validarTokenFixoWebhook(Bun.env.TIKTOK_WEBHOOK_SECRET, provided, "TIKTOK")) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const body = await c.req.json() as any;
+    console.log("WEBHOOK TIKTOK RECEBIDO:", JSON.stringify(body));
+
+    // TikTok envia um array de eventos em data
+    const eventos = Array.isArray(body) ? body : [body];
+
+    for (const evento of eventos) {
+      if (evento.event_type !== "LEAD_GENERATION_NEW_LEAD") continue;
+
+      const advertiserId = String(evento.advertiser_id ?? "");
+      const leadId       = String(evento.lead_id ?? "");
+      const formId       = String(evento.form_id ?? "");
+
+      if (!leadId || !advertiserId) continue;
+
+      // Identifica o usuário pela conta de anunciante
+      const conn = await client.query(
+        `SELECT usuario_id, access_token
+         FROM plataforma_conexoes
+         WHERE plataforma = 'tiktok'
+           AND dados_conta->>'advertiser_id' = $1
+         LIMIT 1`,
+        [advertiserId]
+      );
+      if (!conn.rows.length) {
+        console.log("TikTok webhook: anunciante nao identificado:", advertiserId);
+        continue;
+      }
+
+      const usuarioId = Number(conn.rows[0].usuario_id);
+      const token     = conn.rows[0].access_token;
+
+      const jaExiste = await client.query(
+        `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+        [leadId, usuarioId]
+      );
+      if (jaExiste.rows.length > 0) continue;
+
+      // Busca os dados completos do lead — nao existe um /lead/get/ por lead_id
+      // isolado (ver baixarLeadsTikTokPorFormulario); baixa o CSV do formulario
+      // inteiro (task assincrona) e filtra a linha pelo lead_id do evento.
+      if (!formId) {
+        console.error("TIKTOK WEBHOOK: evento sem form_id, nao e possivel buscar o lead:", leadId);
+        continue;
+      }
+      const linhasCsv = await baixarLeadsTikTokPorFormulario(advertiserId, formId, token);
+      const linha = linhasCsv?.find(l => valorCsvPorChavesPossiveis(l, ["lead_id"]) === leadId);
+      if (!linha) {
+        console.error("TIKTOK WEBHOOK: lead nao encontrado no export do formulario:", leadId, formId);
+        continue;
+      }
+
+      const campaignIdCsv = valorCsvPorChavesPossiveis(linha, ["campaign_id"]);
+      let nomeCampanha = valorCsvPorChavesPossiveis(linha, ["campaign_name"]) || "Campanha TikTok";
+      let nichoId: number | null = null;
+      const campRow = await client.query(
+        `SELECT nome, nicho_id FROM campanhas
+         WHERE usuario_id = $1 AND plataforma = 'tiktok'
+           AND (($2 <> '' AND campaign_id = $2) OR form_id = $3)
+         LIMIT 1`,
+        [usuarioId, campaignIdCsv, formId]
+      );
+      if (campRow.rows.length) {
+        nomeCampanha = campRow.rows[0].nome;
+        nichoId = campRow.rows[0].nicho_id ?? null;
+      }
+
+      const camposConhecidos = new Set([
+        "lead_id", "campaign_id", "campaign_name", "full_name", "name", "first_name",
+        "last_name", "email", "phone_number", "phone", "create_time", "submit_time",
+        "page_id", "adgroup_id", "adgroup_name", "ad_id", "ad_name",
+      ]);
+      const nome = valorCsvPorChavesPossiveis(linha, ["full_name", "name", "first_name"]) || "Lead TikTok";
+      const email = valorCsvPorChavesPossiveis(linha, ["email"]);
+      const telefone = valorCsvPorChavesPossiveis(linha, ["phone_number", "phone"]);
+      const respostasQualificacao = Object.keys(linha)
+        .filter(chave => !camposConhecidos.has(chave.trim().toLowerCase().replace(/[\s_]+/g, "_")))
+        .map(chave => ({ pergunta: chave, resposta: linha[chave] }));
+
+      const criadoEmTexto = valorCsvPorChavesPossiveis(linha, ["create_time", "submit_time"]);
+      const criadoEmData = criadoEmTexto ? new Date(criadoEmTexto) : null;
+      const criadoEm = criadoEmData && !Number.isNaN(criadoEmData.getTime()) ? criadoEmData.toISOString() : null;
+
+      await client.query(
+        `INSERT INTO leads
+           (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
+        [
+          usuarioId, leadId, nome || "Lead TikTok", email, telefone,
+          nomeCampanha, advertiserId,
+          JSON.stringify(respostasQualificacao), nichoId, criadoEm
+        ]
+      );
+
+      console.log("✅ TIKTOK LEAD SALVO:", leadId, "usuario:", usuarioId);
+      await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK TIKTOK:", err);
+    return c.json({ error: "Erro webhook TikTok" }, 500);
+  }
+});
+
+/* =========================
+   💼 WEBHOOK LINKEDIN — leads em tempo real
+   ⚠️ ASSUMPTION: diferente do TikTok acima, o mecanismo exato de assinatura/
+   verificação do "Lead Sync" (notificação em tempo real de Lead Gen Form) do
+   LinkedIn NÃO foi confirmado contra a documentação — a Advertising API
+   ainda nem foi aprovada pra essa conta, então não há como testar a
+   inscrição do endpoint nem o formato exato que o LinkedIn de fato entrega.
+   A verificação por challenge (GET) segue o mesmo padrão genérico usado
+   acima pelo TikTok; o corpo do POST assume o mesmo formato
+   LeadGenFormResponse já usado no polling (sincronizarLinkedInAdsUsuario/
+   processarLeadGenFormResponseLinkedIn), aceitando 1 evento ou uma lista.
+   Se o LinkedIn de fato ativar esse recurso pra essa conta, este é o
+   primeiro ponto a conferir contra um evento real — o polling continua
+   sendo o caminho garantido enquanto isso.
+========================= */
+
+// Resumo seguro do webhook do LinkedIn pra log: mantém só o que é técnico (conta, form,
+// id do lead, quantas respostas vieram) e deixa de fora formResponse.answers — é ali que
+// mora o nome/e-mail/telefone/qualificação do lead (ver processarLeadGenFormResponseLinkedIn,
+// que já extrai esses campos pra gravar em `leads`; não precisa duplicar em texto no log).
+function resumoWebhookLinkedInParaLog(body: any) {
+  const elementos = Array.isArray(body?.elements) ? body.elements : Array.isArray(body) ? body : [body];
+  return {
+    total_elementos: elementos.length,
+    elementos: elementos.map((el: any) => ({
+      owner: el?.owner?.sponsoredAccount || el?.owner || null,
+      lead_gen_form: el?.versionedLeadGenFormUrn || el?.leadGenFormUrn || el?.leadGenForm || null,
+      lead_id: el?.id ?? null,
+      submitted_at: el?.submittedAt ?? null,
+      total_respostas: Array.isArray(el?.formResponse?.answers) ? el.formResponse.answers.length : 0
+    }))
+  };
+}
+
+app.get("/webhook/linkedin", async (c) => {
+  const challenge = c.req.query("challenge");
+  if (challenge) return c.text(challenge);
+  return c.text("LinkedIn webhook ativo");
+});
+
+app.post("/webhook/linkedin", async (c) => {
+  const linkedinSecret = Bun.env.LINKEDIN_WEBHOOK_SECRET;
+  if (linkedinSecret) {
+    const auth = c.req.header("authorization") || "";
+    const provided = auth.replace(/^Bearer\s+/i, "").trim();
+    if (
+      !provided ||
+      provided.length !== linkedinSecret.length ||
+      !timingSafeEqual(Buffer.from(provided), Buffer.from(linkedinSecret))
+    ) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+  }
+
+  try {
+    const body = await c.req.json() as any;
+    console.log("WEBHOOK LINKEDIN RECEBIDO:", JSON.stringify(resumoWebhookLinkedInParaLog(body)));
+
+    const eventos = Array.isArray(body?.elements) ? body.elements : Array.isArray(body) ? body : [body];
+
+    for (const lead of eventos) {
+      const ownerUrn = String(lead?.owner?.sponsoredAccount || lead?.owner || "");
+      const adAccountId = ownerUrn.split(":").pop() || "";
+      if (!adAccountId) {
+        console.log("LINKEDIN WEBHOOK: evento sem conta de anuncios identificavel");
+        continue;
+      }
+
+      const conn = await client.query(
+        `SELECT usuario_id FROM plataforma_conexoes
+         WHERE plataforma = 'linkedin' AND dados_conta->>'ad_account_id' = $1
+         LIMIT 1`,
+        [adAccountId]
+      );
+      if (!conn.rows.length) {
+        console.log("LinkedIn webhook: conta de anuncios nao identificada:", adAccountId);
+        continue;
+      }
+
+      const usuarioId = Number(conn.rows[0].usuario_id);
+      const inserido = await processarLeadGenFormResponseLinkedIn(usuarioId, adAccountId, lead);
+      if (inserido) console.log("✅ LINKEDIN LEAD SALVO (webhook), usuario:", usuarioId);
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK LINKEDIN:", err);
+    return c.json({ error: "Erro webhook LinkedIn" }, 500);
+  }
+});
+
+/* =========================
+   🎬 WEBHOOK KWAI — leads em tempo real
+   🚧 STUB: diferente do webhook do TikTok acima, o payload/challenge reais de
+   verificação da Kuaishou Marketing API ainda NÃO estão confirmados —
+   aprovação de parceiro pendente (ver cabeçalho da seção KWAI ADS e o
+   comentário em OAUTH_PROVEDORES.kwai). Só a validação do segredo (mesmo
+   padrão do /webhook/tiktok, header Authorization: Bearer) é real; o corpo
+   do evento é só logado cru, sem tentar interpretar um schema adivinhado.
+========================= */
+
+// Placeholder de verificação de endpoint — ajustar quando a Kuaishou publicar
+// o mecanismo real de challenge/verificação de webhook.
+app.get("/webhook/kwai", async (c) => {
+  const challenge = c.req.query("challenge");
+  if (challenge) return c.text(challenge);
+  return c.text("Kwai webhook ativo");
+});
+
+app.post("/webhook/kwai", async (c) => {
+  // Mesmo padrão do /webhook/tiktok.
+  const auth = c.req.header("authorization") || "";
+  const provided = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!validarTokenFixoWebhook(Bun.env.KWAI_WEBHOOK_SECRET, provided, "KWAI")) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    console.log("WEBHOOK KWAI RECEBIDO (schema ainda nao confirmado, dado pessoal reconhecido é redigido):", JSON.stringify(redigirDadosPessoais(body)));
+
+    // TODO(kwai): quando a Kuaishou aprovar o parceiro e publicar o schema de
+    // eventos de lead, espelhar aqui o mesmo fluxo do /webhook/tiktok acima:
+    // identificar o usuário pelo advertiser_id, buscar o lead completo via
+    // kwaiFetch, extrair nome/email/telefone e inserir em `leads` com
+    // plataforma = 'kwai' (mesmo formato de INSERT usado na sincronização).
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK KWAI:", err);
+    return c.json({ error: "Erro webhook Kwai" }, 500);
+  }
+});
+
+type StatusLeadKanban =
+  | "novo"
+  | "primeiro_contato"
+  | "em_conversa"
+  | "fechado"
+  | "perdido";
+
+// Monta a transcrição completa da conversa (cliente + corretor, ordem
+// cronológica, rotulada por autor) pro classificador de status ler. Mesmo
+// filtro de direcao já usado em enriquecerLeadParaInteligencia/GET /leads
+// ('entrada'+'echo' = fala real de cliente e corretor; 'saida' fica de fora
+// por ser texto fixo do roteiro do bot, não sinal). Query irmã da de
+// GET /leads/:id/whatsapp (que traz tudo, incluindo 'saida', pra exibição
+// humana no drawer) — aqui filtramos pra só o que interessa como sinal de IA.
+async function construirTranscricaoRotuladaWhatsApp(leadId: number): Promise<string | null> {
+  const mensagens = await client.query(
+    `
+    SELECT wml.conteudo, wml.direcao
+    FROM whatsapp_mensagens_log wml
+    JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+    WHERE wc.lead_id = $1 AND wml.direcao IN ('entrada', 'echo')
+    ORDER BY wml.criado_em ASC
+    `,
+    [leadId]
+  );
+
+  if (!mensagens.rows.length) return null;
+
+  return mensagens.rows
+    .map((m: any) => `${m.direcao === "entrada" ? "Cliente" : "Corretor"}: ${m.conteudo || ""}`)
+    .join("\n");
+}
+
+// Lê a conversa real (cliente + corretor) e decide sozinha em qual dos 5
+// estágios do Kanban o lead deve estar — substitui a antiga pergunta pro
+// corretor via WhatsApp pessoal (Z-API). Nunca adivinha: só aplica o novo
+// status se a IA reportar confiança "alta"; qualquer falha de parse/HTTP,
+// confiança baixa ou IA pausada pelo admin vira status:null, e quem chama não
+// deve tocar no status do lead nesse caso — só tenta de novo no próximo
+// sweep, quando houver mensagem nova (ver processarClassificacaoStatusLeadIA).
+// Roda pra todo corretor (não checa plano de IA — é a plataforma decidindo
+// sozinha, não um recurso de IA que ele contratou), mas respeita o
+// kill-switch geral. Mesmo padrão dual-provider (OpenAI + JSON Schema
+// estrito, fallback Anthropic) de gerarAnaliseIAOpenAI.
+async function classificarStatusLeadPorConversa(
+  lead: any,
+  transcricao: string,
+  usuarioId: number
+): Promise<ClassificacaoConversa> {
+  const semResultado: ClassificacaoConversa = { status: null, motivo: null, qualificacao: null };
+  const configIA = await buscarConfigIA();
+  if (configIA?.status !== "contratado") {
+    return semResultado;
+  }
+
+  const estagioCtx = estagioKanbanContexto(lead?.status || "novo");
+  const ctx = contextoNicho(lead);
+
+  const systemMsg =
+    `Você analisa a conversa real de WhatsApp entre um corretor brasileiro (nicho: ${ctx.nicho}) e um cliente, e decide em qual estágio do funil de vendas (Kanban) o lead deve estar AGORA, com base só no conteúdo da conversa. ` +
+    `Os 5 estágios possíveis são: "novo" (contato ainda não iniciado), "primeiro_contato" (primeiro contato já feito, sem negociação real ainda), "em_conversa" (negociação em andamento — dúvidas, objeções, envio de proposta), "fechado" (negócio fechado/vendido, cliente confirmou compra/contratação), "perdido" (cliente desistiu, disse não ter mais interesse, parou de responder de forma definitiva ou recusou explicitamente). ` +
+    `O lead está registrado atualmente como "${estagioCtx.label}" (${estagioCtx.objetivo}) — mas ignore isso se a conversa mostrar claramente outro estágio: decida pelo conteúdo real da conversa, não pelo status atual. ` +
+    `Só use confianca:"alta" quando a conversa deixar claro o estágio; use "baixa" em qualquer caso de dúvida, conversa curta/ambígua, ou papo que não indica progresso real. ` +
+    // Mesma chamada também julga se o lead é qualificado pelos critérios do
+    // nicho — entra no score e no "Qualified Lead" (ver classificacao-conversa.ts).
+    instrucoesQualificacao(ctx.nicho, Array.isArray(ctx.qualificadores) ? ctx.qualificadores : []) + " " +
+    `Responda SOMENTE JSON, em português do Brasil, sem texto fora do JSON.`;
+  const schemaDescricao = DESCRICAO_SCHEMA_CLASSIFICACAO_CONVERSA;
+  const userText = JSON.stringify({
+    status_atual: estagioCtx.chave,
+    conversa: transcricao,
+    objetivo: "Classificar o estágio real do funil e se o cliente é um lead qualificado, com base na conversa completa entre corretor e cliente."
+  });
+
+  const parseResultado = (texto: string): ClassificacaoConversa => interpretarClassificacao(texto);
+
+  const iaConf = await buscarConfigIA();
+
+  // ── Tenta OpenAI ──────────────────────────────────────────────
+  const openaiKey = Bun.env.OPENAI_API_KEY;
+  if (openaiKey) {
+    try {
+      const modelo =
+        textoOpcional(iaConf?.modelo) || textoOpcional(Bun.env.OPENAI_MODEL) || "gpt-5-mini";
+      const usarResponsesAPI =
+        modelo.startsWith("gpt-5") || modelo.startsWith("o1") || modelo.startsWith("o3") || modelo.startsWith("o4");
+
+      const respBody = usarResponsesAPI
+        ? {
+            model: modelo,
+            instructions: systemMsg,
+            input: [{ role: "user", content: [{ type: "input_text", text: userText }] }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "classificacao_status_lead",
+                strict: true,
+                schema: SCHEMA_CLASSIFICACAO_CONVERSA
+              }
+            },
+            // "low" basta pra essa classificação (é um julgamento simples de
+            // enquadramento, não um raciocínio longo) e evita que os tokens de
+            // reasoning consumam o orçamento inteiro antes do JSON de saída
+            // (visto acontecer de verdade em teste: reasoning sozinho já
+            // gastava 256 dos 300 tokens, deixando a resposta "incomplete").
+            reasoning: { effort: "low" },
+            max_output_tokens: 600
+          }
+        : {
+            model: modelo,
+            temperature: 1.0,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: systemMsg + `\n\nResponda SOMENTE JSON no formato: ${schemaDescricao}` },
+              { role: "user", content: userText }
+            ],
+            // 500: a resposta agora traz também a qualificação (3 campos a mais).
+            max_tokens: 500
+          };
+
+      const resp = await fetchProvedorIA("openai", "classificacao_conversa", usarResponsesAPI ? OPENAI_RESPONSES_URL : "https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(respBody)
+      });
+      const data: any = await resp.json();
+
+      if (resp.ok) {
+        const texto = usarResponsesAPI ? extrairTextoRespostaOpenAI(data) : (data?.choices?.[0]?.message?.content || "");
+        if (texto) {
+          const usage = {
+            input_tokens: Number(data?.usage?.input_tokens || data?.usage?.prompt_tokens || 0),
+            output_tokens: Number(data?.usage?.output_tokens || data?.usage?.completion_tokens || 0)
+          };
+          const custo = calcularCustoEstimadoOpenAI(usage, modelo);
+          await registrarUsoIA(usuarioId, "classificacao_kanban_conversa", "lead", lead?.id ?? null, custo, usage.input_tokens, usage.output_tokens);
+          return parseResultado(texto);
+        }
+      } else {
+        console.error("CLASSIFICAR STATUS CONVERSA OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+      }
+    } catch (e) {
+      console.error("ERRO classificarStatusLeadPorConversa (OpenAI):", e);
+    }
+  }
+
+  // ── Fallback: Anthropic ───────────────────────────────────────
+  const anthropicKey = Bun.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) {
+    try {
+      const anthropicModelo = textoOpcional(iaConf?.anthropic_modelo) || "claude-haiku-4-5-20251001";
+      const resp = await fetchProvedorIA("anthropic", "classificacao_conversa", "https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: anthropicModelo,
+          // 500: a resposta agora traz também a qualificação (3 campos a mais).
+          max_tokens: 500,
+          system: systemMsg + `\n\nResponda SOMENTE JSON no formato: ${schemaDescricao}`,
+          messages: [{ role: "user", content: userText }]
+        })
+      });
+      const data: any = await resp.json();
+
+      if (resp.ok) {
+        const texto = data?.content?.[0]?.text || "";
+        if (texto) {
+          const inTok = Number(data?.usage?.input_tokens || 0);
+          const outTok = Number(data?.usage?.output_tokens || 0);
+          const custo = calcularCustoEstimadoAnthropic({ input_tokens: inTok, output_tokens: outTok }, anthropicModelo);
+          await registrarUsoIA(usuarioId, "classificacao_kanban_conversa", "lead", lead?.id ?? null, custo, inTok, outTok, "anthropic");
+          return parseResultado(texto);
+        }
+      } else {
+        console.error("CLASSIFICAR STATUS CONVERSA ANTHROPIC ERROR:", data?.error?.message);
+      }
+    } catch (e) {
+      console.error("ERRO classificarStatusLeadPorConversa (Anthropic):", e);
+    }
+  }
+
+  return semResultado;
+}
+
+// 🔥 WEBHOOK Z-API — eventos de conexão/desconexão do WhatsApp pessoal do
+// corretor usado pra notificações (novo lead, lembretes)
+app.post("/webhook/zapi", async (c) => {
+  // ⚠️ Diferente de TikTok/Kwai/Meta: confirmado contra a documentação oficial
+  // do Z-API que NÃO existe nenhum mecanismo pra configurar um token/header
+  // customizado nas chamadas de webhook que ele mesmo faz (o endpoint de
+  // configuração de webhook só aceita a URL, nada de autenticação) — não tem
+  // "o outro lado" pra configurar. Por isso este endpoint continua com
+  // validação opcional (nunca recusa em produção só por falta de secret,
+  // diferente de validarTokenFixoWebhook): o pior caso de abuso é alguém
+  // forjar um alerta falso de "WhatsApp desconectado" por e-mail — impacto
+  // baixo — enquanto travar de verdade quebraria o alerta real pra sempre.
+  const zapiSecret = Bun.env.ZAPI_WEBHOOK_SECRET;
+  if (zapiSecret) {
+    const headerToken = c.req.header("x-webhook-token") || c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (
+      !headerToken ||
+      headerToken.length !== zapiSecret.length ||
+      !timingSafeEqual(Buffer.from(headerToken), Buffer.from(zapiSecret))
+    ) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const tipo = body?.type || body?.event || "";
+
+    if (tipo === "DisconnectedCallback" || tipo === "disconnected") {
+      console.warn("[z-api webhook] instância desconectada — enviando alerta por e-mail");
+
+      const adminEmail = Bun.env.PLATAFORMA_CONTATO_EMAIL || "pereira.notlim@gmail.com";
+      const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+
+      if (Bun.env.RESEND_API_KEY) {
+        await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            from: PLATAFORMA_FROM_EMAIL,
+            to: adminEmail,
+            subject: "⚠️ WhatsApp desconectado — Plataforma de Leads",
+            text: `Atenção!\n\nSua instância Z-API (WhatsApp) foi desconectada em ${agora}.\n\nAs notificações de novos leads estão pausadas até você reconectar.\n\nAcesse https://app.z-api.io e reconecte sua instância.\n\nPlataforma de Leads`
+          })
+        }).catch((e: any) => console.error("[z-api webhook] erro ao enviar e-mail:", e));
+      }
+    }
+
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error("[z-api webhook] erro:", e);
+    return c.json({ ok: true }); // sempre retorna 200 para o Z-API não retentar
+  }
+});
+
+// 🔥 WEBHOOK META VERIFY
+app.get("/webhook/meta", async (c) => {
+
+  const mode = c.req.query("hub.mode");
+
+  const token = c.req.query("hub.verify_token");
+
+  const challenge = c.req.query("hub.challenge");
+
+  console.log("VERIFY META");
+
+  // 🔐 TOKEN FIXO
+  const VERIFY_TOKEN =
+    Bun.env.META_VERIFY_TOKEN;
+
+  if (
+    mode === "subscribe" &&
+    token === VERIFY_TOKEN
+  ) {
+
+    console.log("WEBHOOK VALIDADO");
+
+    return c.text(challenge);
+  }
+
+  return c.text("Erro verify", 403);
+});
+
+
+
+// 🔥 RECEBER LEADS META
+app.post("/webhook/meta", async (c) => {
+
+  try {
+    const corpoRaw =
+      await c.req.text();
+
+    const assinatura =
+      c.req.header("x-hub-signature-256") ||
+      c.req.header("X-Hub-Signature-256") ||
+      null;
+
+    if (!validarAssinaturaMetaWebhook(assinatura, corpoRaw)) {
+      return c.json({ error: "Assinatura Meta invalida" }, 401);
+    }
+
+    const body = JSON.parse(corpoRaw || "{}");
+
+    console.log("WEBHOOK META RECEBIDO");
+
+    if (body.entry) {
+
+      for (const entry of body.entry) {
+
+        for (const change of entry.changes || []) {
+
+          if (change.field === "leadgen") {
+
+            const lead = change.value;
+
+            console.log("NOVO LEAD:", lead);
+
+            const leadgen_id = lead.leadgen_id;
+            const page_id = lead.page_id;
+            const form_id = lead.form_id;
+
+            // 🔍 IDENTIFICA USUÁRIO PELO FORMULÁRIO OU PÁGINA
+            let usuarioId: number | null = null;
+            let nomeCampanha = "Campanha Meta";
+            let contaAnunciosId: string | null = null;
+            let nichoIdLead: number | null = null;
+            let perguntasCampanhaLead: any = null;
+
+            if (form_id) {
+              const campanhaByForm = await client.query(
+                `
+                SELECT usuario_id, nome, conta_anuncios_id, nicho_id, configuracoes_avancadas
+                FROM campanhas
+                WHERE form_id = $1
+                AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+                LIMIT 1
+                `,
+                [form_id]
+              );
+
+              if (campanhaByForm.rows.length > 0) {
+                usuarioId = campanhaByForm.rows[0].usuario_id;
+                nomeCampanha = campanhaByForm.rows[0].nome;
+                contaAnunciosId = campanhaByForm.rows[0].conta_anuncios_id;
+                nichoIdLead = campanhaByForm.rows[0].nicho_id ?? null;
+                perguntasCampanhaLead = campanhaByForm.rows[0].configuracoes_avancadas?.perguntas ?? null;
+              }
+            }
+
+            if (!usuarioId && page_id) {
+              const campanhaByPage = await client.query(
+                `
+                SELECT usuario_id, nome, conta_anuncios_id, nicho_id, configuracoes_avancadas
+                FROM campanhas
+                WHERE page_id = $1
+                AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+                ORDER BY id DESC
+                LIMIT 1
+                `,
+                [page_id]
+              );
+
+              if (campanhaByPage.rows.length > 0) {
+                usuarioId = campanhaByPage.rows[0].usuario_id;
+                nomeCampanha = campanhaByPage.rows[0].nome;
+                contaAnunciosId = campanhaByPage.rows[0].conta_anuncios_id;
+                nichoIdLead = campanhaByPage.rows[0].nicho_id ?? null;
+                perguntasCampanhaLead = campanhaByPage.rows[0].configuracoes_avancadas?.perguntas ?? null;
+              }
+            }
+
+            if (!usuarioId) {
+              console.log(
+                "Usuário não identificado para lead",
+                leadgen_id,
+                "page",
+                page_id,
+                "form",
+                form_id
+              );
+              continue;
+            }
+
+            // 🔐 BUSCA TOKEN DO USUÁRIO CORRETO
+            const conn = await client.query(
+              `
+              SELECT access_token
+              FROM meta_conexoes
+              WHERE usuario_id = $1
+              ORDER BY id DESC
+              LIMIT 1
+              `,
+              [usuarioId]
+            );
+
+            if (conn.rows.length === 0) {
+              console.log("Sem token para usuário", usuarioId);
+              continue;
+            }
+
+            const token = conn.rows[0].access_token;
+
+            // 🔄 EVITA DUPLICATA
+            const leadExiste = await client.query(
+              `
+              SELECT id
+              FROM leads
+              WHERE lead_id = $1
+              AND usuario_id = $2
+              `,
+              [leadgen_id, usuarioId]
+            );
+
+            if (leadExiste.rows.length > 0) {
+              console.log("Lead já existe:", leadgen_id);
+              continue;
+            }
+
+            // 🔥 BUSCA DADOS REAIS DO LEAD
+            const leadData = await fetch(
+              `https://graph.facebook.com/v19.0/${leadgen_id}?access_token=${token}`
+            ).then(r => r.json());
+
+            // 🔥 CAMPOS
+            let nome = null;
+            let email = null;
+            let telefone = null;
+            const respostasQualificacao: any[] = [];
+            const criadoEmMeta = leadData.created_time ? new Date(leadData.created_time).toISOString() : null;
+
+            for (const field of leadData.field_data || []) {
+              if (field.name === "full_name") {
+                nome = field.values?.[0];
+              } else if (field.name === "email") {
+                email = field.values?.[0];
+              } else if (field.name === "phone_number") {
+                telefone = field.values?.[0];
+              } else {
+                respostasQualificacao.push({
+                  pergunta: mapearPerguntaQualificacaoMeta(field.name, perguntasCampanhaLead),
+                  resposta: field.values?.[0] || ""
+                });
+              }
+            }
+
+            // 💾 SALVA LEAD VINCULADO AO USUÁRIO CORRETO
+            const leadInserido = await client.query(
+              `
+              INSERT INTO leads (
+                usuario_id,
+                lead_id,
+                nome,
+                email,
+                telefone,
+                origem,
+                plataforma,
+                status,
+                campanha,
+                conta_anuncios_id,
+                respostas_qualificacao,
+                nicho_id,
+                criado_em
+              )
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13::timestamptz, NOW()))
+              RETURNING id
+              `,
+              [
+                usuarioId,
+                leadgen_id,
+                nome || "Lead Facebook",
+                email,
+                telefone,
+                "meta",
+                "meta",
+                "novo",
+                nomeCampanha,
+                contaAnunciosId,
+                JSON.stringify(respostasQualificacao),
+                nichoIdLead,
+                criadoEmMeta
+              ]
+            );
+
+            console.log(
+              "✅ LEAD SALVO:",
+              leadgen_id,
+              "usuário:",
+              usuarioId
+            );
+
+            // 📲 notificação WhatsApp para o dono da campanha
+            await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+
+            avaliarEEnviarQualificacaoLead(
+              {
+                id: leadInserido.rows[0]?.id,
+                lead_id: leadgen_id,
+                plataforma: "meta",
+                status: "novo",
+                campanha: nomeCampanha,
+                respostas_qualificacao: respostasQualificacao
+              },
+              usuarioId
+            ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (webhook meta):", err));
+
+            iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInserido.rows[0]?.id, criadoEmMeta)
+              .catch(err => console.error("ERRO contato WhatsApp formulário (webhook meta):", err));
+          }
+        }
+      }
+    }
+
+    return c.json({
+      sucesso: true
+    });
+
+  } catch (err) {
+
+    console.error("WEBHOOK META:", err);
+
+    return c.json({
+      error: "Erro webhook"
+    }, 500);
+  }
+});
+
+/* =========================
+   💬 WEBHOOK WHATSAPP OFICIAL — bot de primeiro atendimento
+   Rota irmã do /webhook/meta acima (não reaproveitada porque o formato do evento é
+   diferente: body.object === "whatsapp_business_account" e change.field === "messages",
+   contra "page"/"leadgen" do webhook de leads).
+========================= */
+
+app.get("/webhook/whatsapp", async (c) => {
+  const mode = c.req.query("hub.mode");
+  const token = c.req.query("hub.verify_token");
+  const challenge = c.req.query("hub.challenge");
+
+  const VERIFY_TOKEN = Bun.env.WHATSAPP_VERIFY_TOKEN;
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("WEBHOOK WHATSAPP VALIDADO");
+    return c.text(challenge);
+  }
+
+  return c.text("Erro verify", 403);
+});
+
+async function obterOuCriarConversaWhatsApp(usuarioId: number, telefoneCliente: string) {
+  const existente = await client.query(
+    `SELECT * FROM whatsapp_conversas WHERE usuario_id = $1 AND telefone_cliente = $2`,
+    [usuarioId, telefoneCliente]
+  );
+  const row = existente.rows[0];
+
+  if (!row || row.status === "encerrada") {
+    const criada = await client.query(
+      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, passo_atual, atualizado_em, ultima_mensagem_em)
+       VALUES ($1, $2, 'bot', 0, NOW(), NOW())
+       ON CONFLICT (usuario_id, telefone_cliente)
+       DO UPDATE SET status = 'bot', passo_atual = 0, atualizado_em = NOW(), ultima_mensagem_em = NOW()
+       RETURNING *`,
+      [usuarioId, telefoneCliente]
+    );
+    return criada.rows[0];
+  }
+
+  await client.query(`UPDATE whatsapp_conversas SET ultima_mensagem_em = NOW() WHERE id = $1`, [row.id]);
+  return row;
+}
+
+// Roda o roteiro configurado pelo corretor a partir do passo atual da conversa,
+// mandando mensagens em sequência até parar num passo tipo "pergunta" (espera
+// resposta do cliente) ou até um handoff (fim do roteiro ou passo marcado).
+// Decide se uma conversa parada "avançou bastante" ou não, pra escolher entre
+// reiniciar o roteiro do zero ou pular direto pro corretor quando o roteiro
+// ativo muda no meio de uma conversa em aberto (ver avancarBotWhatsApp).
+// Prioridade: usa o estágio do Kanban do lead vinculado (já calculado pela IA
+// que lê a conversa inteira — não precisa reprocessar aqui). Sem lead
+// vinculado ou status ainda não classificado, cai pra uma heurística simples:
+// já respondeu 2+ perguntas do bot = avançou bastante.
+async function conversaAvancouBastante(conversa: any): Promise<boolean> {
+  if (conversa.lead_id) {
+    const lead = await client.query(`SELECT status FROM leads WHERE id = $1`, [conversa.lead_id]);
+    const statusLead = lead.rows[0]?.status;
+    if (statusLead === "em_conversa" || statusLead === "fechado") return true;
+    if (statusLead === "novo" || statusLead === "primeiro_contato" || statusLead === "perdido") return false;
+  }
+  return Number(conversa.passo_atual || 0) >= 2;
+}
+
+// Mesmo canal do aviso de lead novo (WhatsApp pessoal do corretor via Z-API),
+// mas pra avisar que um lead que já tinha avançado bastante voltou a mandar
+// mensagem depois que o roteiro do bot mudou — esse caso pula o bot e vai
+// direto pro corretor, então sem esse aviso a mensagem passaria despercebida.
+async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: string) {
+  try {
+    const row = await client.query(
+      `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
+      [usuarioId]
+    );
+    const u = row.rows[0];
+    if (!u?.whatsapp || u?.notif_whatsapp_lead === false) return;
+    const msg =
+      `🔥 *Lead quente voltou a falar!*\n\n` +
+      `📞 *Telefone:* ${telefoneCliente}\n` +
+      `Essa conversa já tinha avançado bastante antes, e o roteiro do bot mudou desde então — ` +
+      `por isso pulei direto pra você em vez de tentar continuar o bot do jeito errado.\n\n` +
+      `Acesse a plataforma para responder.`;
+    await enviarLembreteWhatsApp(u.whatsapp, msg);
+  } catch (e) {
+    console.error("Erro notif retorno lead avançado:", e);
+  }
+}
+
+async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId: number | null = null, resposta?: string) {
+  if (conversa.status === "humano" || conversa.status === "encerrada") return;
+
+  // Roteiro do nicho exato da conversa tem prioridade; sem isso, so cai pra um
+  // roteiro sem nicho se ele for de antes de CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO
+  // (legado, ver comentario na declaracao da constante). Roteiro sem nicho
+  // criado depois do corte nunca e escolhido aqui — fica so salvo, sem rodar,
+  // ate o corretor escolher um nicho (decisao explicita dele).
+  const configRes = await client.query(
+    `SELECT id, passos FROM whatsapp_bot_config
+     WHERE usuario_id = $1 AND ativo = TRUE
+       AND (nicho_id = $2 OR (nicho_id IS NULL AND criado_em < $3))
+     ORDER BY nicho_id NULLS LAST
+     LIMIT 1`,
+    [conversa.usuario_id, nichoId, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
+  );
+  const roteiroAtivo = configRes.rows[0];
+  const passos: any[] = roteiroAtivo?.passos || [];
+  if (!passos.length) return;
+
+  // Detecta troca de roteiro: a conversa estava esperando resposta usando um
+  // roteiro diferente do que está ativo agora. Continuar pelo índice antigo
+  // não faz sentido — pode cair numa pergunta sem nada a ver com o que já foi
+  // perguntado.
+  const trocouDeRoteiro =
+    conversa.status === "aguardando_resposta" &&
+    conversa.roteiro_id &&
+    conversa.roteiro_id !== roteiroAtivo.id;
+
+  let indice: number;
+
+  if (trocouDeRoteiro) {
+    if (await conversaAvancouBastante(conversa)) {
+      await client.query(
+        `UPDATE whatsapp_conversas SET status = 'humano', atualizado_em = NOW() WHERE id = $1`,
+        [conversa.id]
+      );
+      await notificarRetornoLeadAvancado(conversa.usuario_id, conversa.telefone_cliente)
+        .catch((e) => console.error("ERRO notificarRetornoLeadAvancado:", e));
+      return;
+    }
+    // Pouco avanço real: seguro reiniciar o roteiro novo do zero.
+    indice = 0;
+  } else {
+    // Nunca atribui a resposta a uma pergunta de outro roteiro.
+    const anterior = passos[conversa.passo_atual];
+    if (conversa.status === "aguardando_resposta" && conversa.roteiro_id === roteiroAtivo.id && capturaNome(anterior)) {
+      if (!normalizarNome(resposta)) {
+        const texto = "Por favor, escreva seu nome em uma mensagem de texto (por exemplo: João Silva).";
+        const wamid = await enviarMensagemWhatsAppOficial(conversa.usuario_id, phoneNumberId, conversa.telefone_cliente, texto);
+        if (wamid) await client.query(
+          `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3) ON CONFLICT (wamid) DO NOTHING`,
+          [conversa.id, wamid, texto]);
+        return;
+      }
+      if (!await salvarNomeBot(client, conversa, resposta)) return;
+    }
+    // A resposta à pergunta final conclui a transferência.
+    if (conversa.status === "aguardando_resposta" && (anterior?.handoff_apos || conversa.passo_atual === passos.length - 1)) {
+      await client.query(`UPDATE whatsapp_conversas SET status = 'humano', atualizado_em = NOW() WHERE id = $1`, [conversa.id]);
+      return;
+    }
+    // Se estava aguardando resposta, o cliente acabou de responder: avança pro próximo.
+    // Senão (conversa nova), passo_atual (0) já é o próximo a executar.
+    indice = conversa.status === "aguardando_resposta" ? conversa.passo_atual + 1 : conversa.passo_atual;
+  }
+
+  while (indice < passos.length) {
+    const passo = passos[indice];
+    const textoEnviado = renderizarTextoBot(passo.texto, conversa.variaveis);
+
+    const midia =
+      passo.tipo === "imagem" ? { tipo: "image" as const, link: passo.midia_url }
+      : passo.tipo === "audio" ? { tipo: "audio" as const, link: passo.midia_url }
+      : undefined;
+
+    const wamid = await enviarMensagemWhatsAppOficial(
+      conversa.usuario_id,
+      phoneNumberId,
+      conversa.telefone_cliente,
+      textoEnviado,
+      midia
+    );
+
+    const conteudoLog =
+      passo.tipo === "imagem" ? `[imagem]${textoEnviado ? " " + textoEnviado : ""}`
+      : passo.tipo === "audio" ? "[audio]"
+      : textoEnviado;
+
+    if (wamid) {
+      await client.query(
+        `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3)
+         ON CONFLICT (wamid) DO NOTHING`,
+        [conversa.id, wamid, conteudoLog]
+      ).catch((e) => console.error("ERRO log saida whatsapp:", e));
+    }
+
+    const ultimoPasso = indice === passos.length - 1;
+
+    if (passo.tipo === "pergunta") {
+      await client.query(
+        `UPDATE whatsapp_conversas SET status = 'aguardando_resposta', passo_atual = $1, roteiro_id = $2, atualizado_em = NOW() WHERE id = $3`,
+        [indice, roteiroAtivo.id, conversa.id]
+      );
+      return;
+    }
+    if (passo.handoff_apos || ultimoPasso) {
+      await client.query(
+        `UPDATE whatsapp_conversas SET status = 'humano', passo_atual = $1, roteiro_id = $2, atualizado_em = NOW() WHERE id = $3`,
+        [indice, roteiroAtivo.id, conversa.id]
+      );
+      return;
+    }
+    indice += 1;
+  }
+}
+
+// Vincula a conversa a um lead JÁ EXISTENTE pelo telefone — nunca cria lead
+// novo aqui (decisão original do produto, ainda válida pro caso geral: mensagem
+// de número sem lead correspondente fica só registrada em whatsapp_mensagens_log).
+// A única exceção mora em criarLeadDeConversaCTWA logo abaixo, chamada à parte
+// quando essa função retorna null — escopo restrito a conversa vinda de um
+// anúncio Click-to-WhatsApp de verdade (confirmado por ctwa_clid no referral),
+// nunca pra qualquer mensagem de estranho. Roda uma vez por conversa: assim que
+// lead_id é preenchido, próximas mensagens pulam a busca.
+async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise<number | null> {
+  if (conversa.lead_id) {
+    return conversa.lead_id;
+  }
+
+  const telefoneConversa = normalizarTelefoneWhatsApp(conversa.telefone_cliente);
+  if (!telefoneConversa) {
+    return null;
+  }
+
+  const leadsUsuario = await client.query(
+    `SELECT id, telefone FROM leads WHERE usuario_id = $1 AND telefone IS NOT NULL`,
+    [usuarioId]
+  );
+
+  const leadEncontrado = leadsUsuario.rows.find((lead: any) =>
+    normalizarTelefoneWhatsApp(lead.telefone) === telefoneConversa
+  );
+
+  if (!leadEncontrado) {
+    return null;
+  }
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [leadEncontrado.id, conversa.id]
+  );
+
+  return leadEncontrado.id;
+}
+
+// A API de Lead Ads e a de Conversion Leads não expõem se um lead veio do
+// Facebook ou do Instagram (um mesmo anúncio pode rodar nos dois ao mesmo
+// tempo) — mas o referral de Click-to-WhatsApp sim: source_url aponta pra
+// um link do instagram.com quando a pessoa clicou vindo do Instagram, ou
+// fb.me/facebook.com quando veio do Facebook. image_url serve de reforço
+// (hosts *cdninstagram.com / instagram.*.fna.fbcdn.net só existem pro IG).
+function detectarRedeOrigemReferral(referral: any): string | null {
+  const pistas = `${referral?.source_url || ""} ${referral?.image_url || ""}`.toLowerCase();
+  if (!pistas.trim()) return null;
+  if (pistas.includes("instagram")) return "instagram";
+  return "facebook";
+}
+
+// Cria um lead novo a partir de uma conversa de WhatsApp sem lead correspondente
+// — só quando a conversa carrega um referral genuíno de anúncio Click-to-WhatsApp
+// (source_type "ad"). ctwa_clid normalmente vem junto, mas a Meta às vezes entrega
+// o referral sem esse campo (visto num caso real) — nesse caso o lead ainda é
+// criado e atribuído à campanha certa via source_id, só fica sem ctwa_clid
+// (então sem reportar qualificação/fechamento pra Conversions API da Meta, que
+// exige esse campo). Sem referral de anúncio nenhum, retorna null e o
+// comportamento de sempre (mensagem só registrada, sem virar lead) continua intacto.
+async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeContato?: string | null): Promise<number | null> {
+  const referral = conversa?.referral;
+  if (!referral || referral.source_type !== "ad") {
+    return null;
+  }
+  const ctwaClid = referral.ctwa_clid || null;
+
+  // Evita corrida: se outra chamada concorrente já vinculou entre o momento em
+  // que vincularConversaAoLead rodou e agora, não duplica o lead.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const sourceId = conversa.referral?.source_id ? String(conversa.referral.source_id) : null;
+
+  let nichoId: number | null = null;
+  let nomeCampanha = "Campanha WhatsApp";
+  let campanhaId: number | null = null;
+  let contaAnunciosId: string | null = null;
+  let redeOrigemCampanha: string | null = null;
+
+  if (sourceId) {
+    const campanhaEncontrada = await buscarCampanhaMetaPorAnuncio(usuarioId, sourceId);
+
+    if (campanhaEncontrada) {
+      campanhaId = campanhaEncontrada.id;
+      nomeCampanha = campanhaEncontrada.nome || nomeCampanha;
+      nichoId = campanhaEncontrada.nicho_id ?? null;
+      contaAnunciosId = campanhaEncontrada.conta_anuncios_id ?? null;
+
+      // Campanha publicada separadamente por rede (ver montarContextoPublicacaoMeta
+      // no front) já diz com certeza de onde é o lead — mais confiável que o
+      // referral abaixo, que é um chute por palavra-chave na URL. Só campanhas
+      // legadas combinadas (ou sem essa marcação) precisam do chute.
+      let cfgCampanha = campanhaEncontrada.configuracoes_avancadas;
+      if (typeof cfgCampanha === "string") {
+        try { cfgCampanha = JSON.parse(cfgCampanha); } catch { cfgCampanha = null; }
+      }
+      const plataformasCampanha = Array.isArray(cfgCampanha?.plataformas) ? cfgCampanha.plataformas : [];
+      if (plataformasCampanha.length === 1 && ["facebook", "instagram"].includes(plataformasCampanha[0])) {
+        redeOrigemCampanha = plataformasCampanha[0];
+      }
+    }
+  }
+
+  const redeOrigem = redeOrigemCampanha || detectarRedeOrigemReferral(conversa.referral);
+
+  // conta_anuncios_id precisa vir preenchido: /meta/metricas-campanhas conta os
+  // leads de cada campanha filtrando por ele (junto com o nome) — sem isso o
+  // card mostra "0 leads" mesmo com o lead certinho no banco.
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, ctwa_clid, nome, email, telefone,
+      origem, plataforma, rede_origem, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+    )
+    VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', $5, 'novo', $6, $7, $8, $9, NOW())
+    RETURNING id
+    `,
+    [usuarioId, ctwaClid, nomeContato || "Lead WhatsApp (anúncio)", conversa.telefone_cliente, redeOrigem, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: nomeContato || "Lead WhatsApp (anúncio)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (CTWA):", e));
+
+  return novoLeadId;
+}
+
+// Equivalente LinkedIn de criarLeadDeConversaCTWA — o LinkedIn não manda
+// nenhum referral/click id junto da primeira mensagem (diferente da Meta,
+// que usa ctwa_clid), então a atribuição usa uma tag "[LI-<campaign_id>]"
+// embutida no texto pré-preenchido do link wa.me do anúncio (ver
+// montarLinkWhatsappLinkedIn em /linkedin/anuncio), procurada aqui na
+// primeira mensagem recebida. Chamado em processarEventoWhatsApp como
+// fallback só quando criarLeadDeConversaCTWA não achar nada — cobre tanto
+// "mensagem realmente veio de um anúncio LinkedIn" quanto "mensagem
+// orgânica qualquer" (nesse caso a tag simplesmente não bate e a função
+// retorna null sem side effect nenhum).
+async function criarLeadDeConversaLinkedIn(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  nomeContato?: string | null
+): Promise<number | null> {
+  const match = String(textoMensagem || "").match(/\[LI-(\d+)\]/);
+  if (!match) {
+    return null;
+  }
+  const campaignGroupId = match[1];
+
+  // Mesma proteção contra corrida que criarLeadDeConversaCTWA usa.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const campRow = await client.query(
+    `SELECT id, nome, nicho_id, conta_anuncios_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
+    [campaignGroupId, usuarioId]
+  );
+  // Tag presente mas sem campanha correspondente (apagada, ou mensagem
+  // forjada por outro motivo) — não cria lead com atribuição inventada.
+  if (!campRow.rows.length) {
+    return null;
+  }
+
+  const { id: campanhaId, nome: nomeCampanhaRow, nicho_id: nichoId, conta_anuncios_id: contaAnunciosId } = campRow.rows[0];
+  const nomeCampanha = nomeCampanhaRow || "Campanha LinkedIn";
+
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, nome, email, telefone,
+      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+    )
+    VALUES ($1, NULL, $2, NULL, $3, 'linkedin', 'whatsapp', 'novo', $4, $5, $6, $7, NOW())
+    RETURNING id
+    `,
+    [usuarioId, nomeContato || "Lead WhatsApp (LinkedIn)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: nomeContato || "Lead WhatsApp (LinkedIn)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (LinkedIn wa.me):", e));
+
+  return novoLeadId;
+}
+
+// Equivalente Google de criarLeadDeConversaLinkedIn — o Google Ads tambem nao
+// manda nenhum referral/click id junto da primeira mensagem (diferente da
+// Meta), entao a atribuicao usa a mesma estrategia de tag embutida na mensagem
+// pre-preenchida do botao de WhatsApp (ver montarMensagemWhatsappComTagGoogle
+// em /google/anuncio), procurada aqui na primeira mensagem recebida. Chamado
+// em processarEventoWhatsApp como fallback so quando nem CTWA (Meta) nem a tag
+// do LinkedIn acharem nada.
+async function criarLeadDeConversaGoogle(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  nomeContato?: string | null
+): Promise<number | null> {
+  const match = String(textoMensagem || "").match(/\[GA-(\d+)\]/);
+  if (!match) {
+    return null;
+  }
+  const campaignId = match[1];
+
+  // Mesma proteção contra corrida que criarLeadDeConversaCTWA usa.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const campRow = await client.query(
+    `SELECT id, nome, nicho_id, conta_anuncios_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google' LIMIT 1`,
+    [campaignId, usuarioId]
+  );
+  // Tag presente mas sem campanha correspondente (apagada, ou mensagem
+  // forjada por outro motivo) — não cria lead com atribuição inventada.
+  if (!campRow.rows.length) {
+    return null;
+  }
+
+  const { id: campanhaId, nome: nomeCampanhaRow, nicho_id: nichoId, conta_anuncios_id: contaAnunciosId } = campRow.rows[0];
+  const nomeCampanha = nomeCampanhaRow || "Campanha Google Ads";
+
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, nome, email, telefone,
+      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+    )
+    VALUES ($1, NULL, $2, NULL, $3, 'google', 'whatsapp', 'novo', $4, $5, $6, $7, NOW())
+    RETURNING id
+    `,
+    [usuarioId, nomeContato || "Lead WhatsApp (Google Ads)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: nomeContato || "Lead WhatsApp (Google Ads)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (Google wa):", e));
+
+  return novoLeadId;
+}
+
+// TikTok não deixa definir a mensagem do botão de WhatsApp (só enviamos o número
+// no ad group): ele abre a conversa com um texto próprio, no formato "TikTok ID:
+// <id>. Hello! I came across your ad on TikTok...". Não há documentação oficial
+// do que é esse <id>; parceiros (Wati, Manychat) o tratam como o ID do anúncio,
+// então tentamos casar com campanhas.ad_id e com a API /ad/get/. Se não casar, o
+// bot fica quieto e um trecho da mensagem vai pro log pra conferirmos o formato.
+function extrairIdAnuncioTikTok(texto: string): string | null {
+  const m = String(texto || "").match(/TikTok\s*ID\s*[:：]?\s*\[?\s*((?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{5,64})/i);
+  return m ? m[1] : null;
+}
+
+const cacheCampanhaTikTokPorAnuncio = new Map<string, { campaignId: string | null; expiraEm: number }>();
+const anunciosTikTokJaLogados = new Set<string>();
+
+async function obterCampaignIdTikTokPorAnuncio(usuarioId: number, adId: string): Promise<string | null> {
+  const chave = `${usuarioId}:${adId}`;
+  const emCache = cacheCampanhaTikTokPorAnuncio.get(chave);
+  if (emCache && emCache.expiraEm > Date.now()) return emCache.campaignId;
+
+  let campaignId: string | null = null;
+  let cachearPor = 5 * 60 * 1000;
+  try {
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (conexao?.token && conexao.advertiserId) {
+      const resposta: any = await Promise.race([
+        listarEntidadesTikTok("/ad/get/", conexao, ["ad_id", "campaign_id"], { ad_ids: [adId] }),
+        new Promise((resolve) => setTimeout(() => resolve(null), 4000)),
+      ]);
+      const lista = resposta?.ok ? resposta.data?.data?.list : null;
+      const anuncio = Array.isArray(lista) ? lista.find((a: any) => String(a.ad_id) === adId) : null;
+      if (anuncio?.campaign_id) {
+        campaignId = String(anuncio.campaign_id);
+        cachearPor = 60 * 60 * 1000;
+      }
+    }
+  } catch {
+    // sem resposta do TikTok: segue sem campanha e tenta de novo depois do cache curto
+  }
+
+  cacheCampanhaTikTokPorAnuncio.set(chave, { campaignId, expiraEm: Date.now() + cachearPor });
+  return campaignId;
+}
+
+async function buscarCampanhaTikTokPorAnuncio(usuarioId: number, idBruto: string) {
+  const candidatos = [...new Set([idBruto, idBruto.replace(/^_+/, "")])].filter(Boolean);
+  const colunas = `id, nome, nicho_id, conta_anuncios_id`;
+
+  const porAdId = await client.query(
+    `SELECT ${colunas} FROM campanhas
+     WHERE ad_id = ANY($1::text[]) AND usuario_id = $2 AND plataforma = 'tiktok'
+     LIMIT 1`,
+    [candidatos, usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+  if (porAdId.rows.length) return porAdId.rows[0];
+
+  for (const candidato of candidatos) {
+    const campaignId = await obterCampaignIdTikTokPorAnuncio(usuarioId, candidato);
+    if (!campaignId) continue;
+    const porCampanha = await client.query(
+      `SELECT ${colunas} FROM campanhas
+       WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+       LIMIT 1`,
+      [campaignId, usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (porCampanha.rows.length) return porCampanha.rows[0];
+  }
+  return null;
+}
+
+async function identificarCampanhaTikTokNaMensagem(usuarioId: number, textoMensagem: string) {
+  const texto = String(textoMensagem || "");
+  const idAnuncio = extrairIdAnuncioTikTok(texto);
+  const campanha = idAnuncio ? await buscarCampanhaTikTokPorAnuncio(usuarioId, idAnuncio) : null;
+
+  if (!campanha && /tiktok/i.test(texto)) {
+    const inicio = Math.max(0, texto.search(/tiktok/i) - 20);
+    const trecho = texto.slice(inicio, inicio + 80);
+    const chave = `${usuarioId}:${idAnuncio ?? trecho}`;
+    if (!anunciosTikTokJaLogados.has(chave)) {
+      if (anunciosTikTokJaLogados.size > 500) anunciosTikTokJaLogados.clear();
+      anunciosTikTokJaLogados.add(chave);
+      console.warn("[whatsapp-tiktok] mensagem de anúncio do TikTok sem campanha reconhecida", {
+        usuario_id: usuarioId,
+        id_extraido: idAnuncio,
+        trecho,
+      });
+    }
+  }
+  return campanha;
+}
+
+// Equivalente TikTok de criarLeadDeConversaGoogle — mesmo fallback, atribuindo
+// pelo "TikTok ID" da mensagem em vez de uma tag nossa.
+async function criarLeadDeConversaTikTok(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  nomeContato?: string | null
+): Promise<number | null> {
+  const campRow = await identificarCampanhaTikTokNaMensagem(usuarioId, textoMensagem);
+  if (!campRow) return null;
+
+  // Mesma proteção contra corrida que criarLeadDeConversaCTWA usa.
+  const atual = await client.query(
+    `SELECT lead_id FROM whatsapp_conversas WHERE id = $1`,
+    [conversa.id]
+  );
+  if (atual.rows[0]?.lead_id) {
+    return atual.rows[0].lead_id;
+  }
+
+  const { id: campanhaId, nome: nomeCampanhaRow, nicho_id: nichoId, conta_anuncios_id: contaAnunciosId } = campRow;
+  const nomeCampanha = nomeCampanhaRow || "Campanha TikTok Ads";
+
+  const leadInserido = await client.query(
+    `
+    INSERT INTO leads (
+      usuario_id, lead_id, nome, email, telefone,
+      origem, plataforma, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+    )
+    VALUES ($1, NULL, $2, NULL, $3, 'tiktok', 'whatsapp', 'novo', $4, $5, $6, $7, NOW())
+    RETURNING id
+    `,
+    [usuarioId, nomeContato || "Lead WhatsApp (TikTok Ads)", conversa.telefone_cliente, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+  );
+
+  const novoLeadId = leadInserido.rows[0].id;
+
+  await client.query(
+    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
+    [novoLeadId, conversa.id]
+  );
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: nomeContato || "Lead WhatsApp (TikTok Ads)",
+    telefone: conversa.telefone_cliente,
+    email: null,
+    campanha: nomeCampanha
+  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (TikTok wa):", e));
+
+  return novoLeadId;
+}
+
+// Campanha importada da Meta é gravada só com campaign_id (sem ad_id), e uma
+// campanha pode ter vários anúncios — então o anúncio clicado nem sempre bate
+// com campanhas.ad_id. Pergunta à Meta de qual campanha é o anúncio; cacheado
+// pra não repetir a chamada a cada mensagem do mesmo anúncio.
+const cacheCampanhaMetaPorAnuncio = new Map<string, { campaignId: string | null; expiraEm: number }>();
+
+async function obterCampaignIdMetaPorAnuncio(usuarioId: number, adId: string): Promise<string | null> {
+  const chave = `${usuarioId}:${adId}`;
+  const emCache = cacheCampanhaMetaPorAnuncio.get(chave);
+  if (emCache && emCache.expiraEm > Date.now()) return emCache.campaignId;
+
+  let campaignId: string | null = null;
+  let cachearPor = 5 * 60 * 1000;
+  try {
+    const conn = await client.query(
+      "SELECT access_token FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+    const token = conn.rows[0]?.access_token;
+    if (token) {
+      const res = await fetch(
+        `https://graph.facebook.com/v19.0/${encodeURIComponent(adId)}?fields=campaign_id&access_token=${token}`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      const data: any = await res.json().catch(() => null);
+      if (res.ok && data?.campaign_id) {
+        campaignId = String(data.campaign_id);
+        cachearPor = 60 * 60 * 1000;
+      }
+    }
+  } catch {
+    // sem resposta da Meta: segue sem campanha e tenta de novo depois do cache curto
+  }
+
+  cacheCampanhaMetaPorAnuncio.set(chave, { campaignId, expiraEm: Date.now() + cachearPor });
+  return campaignId;
+}
+
+async function buscarCampanhaMetaPorAnuncio(usuarioId: number, adId: string) {
+  const colunas = `id, nome, nicho_id, conta_anuncios_id, configuracoes_avancadas`;
+  const porAdId = await client.query(
+    `SELECT ${colunas} FROM campanhas
+     WHERE ad_id = $1 AND usuario_id = $2
+       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+     LIMIT 1`,
+    [adId, usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+  if (porAdId.rows.length) return porAdId.rows[0];
+
+  const campaignId = await obterCampaignIdMetaPorAnuncio(usuarioId, adId);
+  if (!campaignId) return null;
+
+  const porCampanha = await client.query(
+    `SELECT ${colunas} FROM campanhas
+     WHERE campaign_id = $1 AND usuario_id = $2
+       AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+     LIMIT 1`,
+    [campaignId, usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+  return porCampanha.rows[0] ?? null;
+}
+
+// Resolve o nicho pra escolher o roteiro do bot (ver avancarBotWhatsApp),
+// priorizando o clique de anúncio desta própria mensagem sobre o nicho do
+// lead já vinculado. Sem essa prioridade, um telefone que já é lead de um
+// nicho antigo (Lead Ads de anos atrás, conversa anterior etc.) mas clicou
+// AGORA num anúncio de outro nicho ficaria preso no roteiro do nicho velho —
+// porque vincularConversaAoLead reaproveita o lead existente sem olhar pro
+// clique novo (decisão certa pra não duplicar o CRM, mas errada pra escolher
+// roteiro). Não mexe em qual lead fica vinculado nem no nicho_id gravado
+// nele — só decide qual roteiro roda pra ESSA mensagem.
+async function resolverNichoConversaWhatsApp(
+  conversa: any,
+  usuarioId: number,
+  textoMensagem: string,
+  leadIdVinculado: number | null
+): Promise<number | null> {
+  const referral = conversa?.referral;
+  if (referral?.source_type === "ad" && referral?.source_id) {
+    const campanha = await buscarCampanhaMetaPorAnuncio(usuarioId, String(referral.source_id));
+    if (campanha) return campanha.nicho_id ?? null;
+  }
+
+  const matchLinkedIn = String(textoMensagem || "").match(/\[LI-(\d+)\]/);
+  if (matchLinkedIn) {
+    const campRow = await client.query(
+      `SELECT nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'linkedin' LIMIT 1`,
+      [matchLinkedIn[1], usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
+  }
+
+  const matchGoogle = String(textoMensagem || "").match(/\[GA-(\d+)\]/);
+  if (matchGoogle) {
+    const campRow = await client.query(
+      `SELECT nicho_id FROM campanhas WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google' LIMIT 1`,
+      [matchGoogle[1], usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (campRow.rows.length) return campRow.rows[0].nicho_id ?? null;
+  }
+
+  const campanhaTikTok = await identificarCampanhaTikTokNaMensagem(usuarioId, textoMensagem);
+  if (campanhaTikTok) return campanhaTikTok.nicho_id ?? null;
+
+  if (!leadIdVinculado) return null;
+  const leadNicho = await client.query(`SELECT nicho_id FROM leads WHERE id = $1`, [leadIdVinculado])
+    .catch(() => ({ rows: [] as any[] }));
+  return leadNicho.rows[0]?.nicho_id ?? null;
+}
+
+// Transcrição do WhatsApp de um lead, em duas versões (usar dentro de um
+// SELECT ... FROM whatsapp_mensagens_log wml JOIN whatsapp_conversas wc):
+// - transcricao: cliente + corretor, rotulada por autor ("Cliente: ..." /
+//   "Corretor: ..."), pra IA entender quem disse o quê;
+// - transcricao_cliente: só a fala do cliente — é o que o score usa
+//   (score-lead.ts). Sem essa separação, "vamos agendar uma visita?" dito pelo
+//   corretor contava como intenção do cliente e mandava "Qualified Lead" pras
+//   plataformas de anúncio.
+// Filtre direcao IN ('entrada', 'echo') no WHERE: 'saida' é texto fixo do
+// roteiro do bot, não sinal.
+const SQL_COLUNAS_TRANSCRICAO_WHATSAPP = `
+  string_agg(
+    CASE WHEN wml.direcao = 'entrada' THEN 'Cliente: ' ELSE 'Corretor: ' END || wml.conteudo,
+    chr(10) ORDER BY wml.criado_em
+  ) AS transcricao,
+  string_agg(wml.conteudo, ' ' ORDER BY wml.criado_em)
+    FILTER (WHERE wml.direcao = 'entrada') AS transcricao_cliente`;
+
+// Preenche nicho_slug/nicho_nome + as transcrições do WhatsApp (ver
+// SQL_COLUNAS_TRANSCRICAO_WHATSAPP) num lead já carregado. Usado onde não dá
+// pra fazer um SELECT com JOIN direto: PUT /leads/:id (só tem o RETURNING *
+// cru do UPDATE), o webhook do WhatsApp (lead buscado avulso após
+// vincularConversaAoLead) e o envio de qualificação às plataformas
+// (completarLeadParaQualificacao).
+async function enriquecerLeadParaInteligencia(lead: any) {
+  if (!lead?.id) {
+    return lead;
+  }
+
+  const extra = await client.query(
+    `
+    SELECT
+      n.slug AS nicho_slug,
+      n.nome AS nicho_nome,
+      wt.transcricao AS whatsapp_transcricao,
+      wt.transcricao_cliente AS whatsapp_transcricao_cliente
+    FROM leads l
+    LEFT JOIN nichos n ON n.id = l.nicho_id
+    LEFT JOIN LATERAL (
+      SELECT ${SQL_COLUNAS_TRANSCRICAO_WHATSAPP}
+      FROM whatsapp_mensagens_log wml
+      JOIN whatsapp_conversas wc ON wc.id = wml.conversa_id
+      WHERE wc.lead_id = l.id AND wml.direcao IN ('entrada', 'echo')
+    ) wt ON TRUE
+    WHERE l.id = $1
+    `,
+    [lead.id]
+  );
+
+  const row = extra.rows[0];
+
+  lead.nicho_slug = row?.nicho_slug || null;
+  lead.nicho_nome = row?.nicho_nome || null;
+  lead.whatsapp_transcricao = row?.whatsapp_transcricao || null;
+  lead.whatsapp_transcricao_cliente = row?.whatsapp_transcricao_cliente || null;
+
+  return lead;
+}
+
+async function processarEventoWhatsApp(value: any) {
+  const phoneNumberId = value?.metadata?.phone_number_id;
+  if (!phoneNumberId) return;
+
+  const conexao = await client.query(
+    `SELECT usuario_id FROM plataforma_conexoes WHERE plataforma = 'whatsapp' AND dados_conta->>'phone_number_id' = $1 LIMIT 1`,
+    [phoneNumberId]
+  );
+  const usuarioId = conexao.rows[0]?.usuario_id;
+  if (!usuarioId) {
+    console.warn(`[whatsapp-webhook] nenhum corretor encontrado pro phone_number_id ${phoneNumberId}`);
+    return;
+  }
+
+  const numeroBusiness = String(value.metadata?.display_phone_number || "").replace(/\D/g, "");
+
+  // Nome de exibição do WhatsApp do cliente (só vem no payload junto da
+  // primeira mensagem, em value.contacts — não em cada msg individual).
+  const nomesContatos: Record<string, string> = {};
+  for (const contato of value.contacts || []) {
+    const nome = textoOpcional(contato?.profile?.name);
+    if (contato?.wa_id && nome) {
+      nomesContatos[String(contato.wa_id)] = nome;
+    }
+  }
+
+  for (const msg of value.messages || []) {
+    const numeroOrigem = String(msg.from || "").replace(/\D/g, "");
+
+    // Mensagens vindas do nosso próprio número de notificações internas (Z-API, usado por
+    // enviarLembreteWhatsApp — ex: o resumo semanal enviado pro próprio número do WhatsApp
+    // Bot) não são de um cliente de verdade: a Meta entrega isso como mensagem recebida
+    // igual a qualquer outra, mas processar normalmente criaria uma conversa/lead fantasma
+    // e poderia disparar o roteiro automático respondendo de volta pra esse número.
+    const numeroZapi = await obterNumeroZAPI();
+    if (numeroZapi && numeroOrigem === numeroZapi) {
+      console.log(`[whatsapp-webhook] mensagem do número interno de notificações (${numeroZapi}) ignorada, não é cliente`);
+      continue;
+    }
+
+    // ⚠️ Heurística provisória de detecção de eco (coexistência): assume que uma
+    // mensagem "de" o próprio número business é o corretor respondendo pelo app dele.
+    // VERIFICAR contra a doc atual da Meta o campo real que marca isso antes de ir
+    // pra produção — coexistência é feature nova e pode expor um flag dedicado.
+    const ehEco = numeroOrigem && numeroBusiness && numeroOrigem === numeroBusiness;
+
+    if (ehEco) {
+      const telefoneCliente = msg.to || null;
+      if (!telefoneCliente) continue;
+      await client.query(
+        `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, atualizado_em)
+         VALUES ($1, $2, 'humano', NOW())
+         ON CONFLICT (usuario_id, telefone_cliente)
+         DO UPDATE SET status = 'humano', atualizado_em = NOW()`,
+        [usuarioId, telefoneCliente]
+      );
+      continue;
+    }
+
+    const telefoneCliente = msg.from;
+    if (!telefoneCliente) continue;
+
+    // A Meta às vezes entrega a mensagem de clique em anúncio primeiro como
+    // type "unsupported" (sem texto nem referral) e logo depois de novo, com o
+    // MESMO wamid, completa. Processar a vazia gravava o wamid (o dedupe abaixo
+    // descartava a completa, com o anúncio) e disparava triagem/lead sem origem.
+    if (msg.type === "unsupported") {
+      console.log(`[whatsapp-webhook] mensagem ${msg.id} type=unsupported ignorada (erro ${msg.errors?.[0]?.code ?? "-"}), aguardando reentrega completa`);
+      continue;
+    }
+
+    const conversa = await obterOuCriarConversaWhatsApp(usuarioId, telefoneCliente);
+
+    // Dedupe por wamid: Meta reentrega webhook "pelo menos uma vez". Se o insert
+    // conflitar, essa mensagem já foi processada antes — não avança o roteiro de novo.
+    // Log de diagnóstico: msg.type não fica visível no log bruto do webhook (a linha é
+    // truncada antes de chegar nesse campo), então sem isso não dá pra saber depois se uma
+    // mensagem sem texto era áudio, figurinha, localização etc. — nem se transcrição rodou.
+    if (!msg.text?.body) {
+      console.log(`[whatsapp-webhook] mensagem ${msg.id} sem texto — type=${msg.type}, audio.id=${msg.audio?.id || "-"}`);
+    }
+
+    const logRes = await client.query(
+      `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo)
+       VALUES ($1, $2, 'entrada', $3)
+       ON CONFLICT (wamid) DO NOTHING
+       RETURNING id`,
+      [
+        conversa.id,
+        msg.id,
+        msg.text?.body ||
+          (msg.type === "audio"
+            ? "[áudio — transcrevendo...]"
+            : msg.type === "image"
+              ? "[imagem]"
+              : msg.type === "document"
+                ? `[documento] ${msg.document?.filename || ""}`.trim()
+                : msg.type === "video"
+                  ? "[vídeo]"
+                  : msg.type === "sticker"
+                    ? "[figurinha]"
+                    : msg.type
+                      ? `[${msg.type}]`
+                      : null)
+      ]
+    );
+    if (logRes.rows.length === 0) {
+      console.log(`[whatsapp-webhook] mensagem ${msg.id} já processada, ignorando`);
+      continue;
+    }
+
+    // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
+    if (msg.type === "audio" && msg.audio?.id) {
+      console.log(`[transcricao-audio] iniciando transcrição da mensagem ${msg.id} (entrada)`);
+      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logRes.rows[0].id).catch((e: any) =>
+        console.error("[transcricao-audio] erro entrada:", e)
+      );
+    }
+
+    // Guarda cru o referral (anúncio "clique para WhatsApp" que originou a
+    // conversa) sempre que a mensagem trouxer um — usado por
+    // criarLeadDeConversaCTWA pra decidir se cria lead novo e por
+    // resolverNichoConversaWhatsApp (mais abaixo) pra escolher o roteiro do
+    // nicho certo. SEMPRE sobrescreve, não só na primeira vez: um telefone que
+    // já é conhecido (lead antigo de outro nicho, ou conversa anterior) pode
+    // clicar num anúncio novo depois — sem sobrescrever, esse clique novo
+    // nunca seria considerado pra nada, preso atrás do referral antigo pra
+    // sempre. Atualiza também o objeto em memória (não só o banco): essa é a
+    // MESMA mensagem que carrega o referral (só vem na mensagem do clique),
+    // então sem isso conversa.referral ficaria desatualizado até a próxima
+    // mensagem — tarde demais, o ctwa_clid só aparece uma vez.
+    if (msg.referral) {
+      await client.query(
+        `UPDATE whatsapp_conversas SET referral = $1 WHERE id = $2`,
+        [JSON.stringify(msg.referral), conversa.id]
+      ).catch(e => console.error("ERRO ao salvar referral whatsapp:", e));
+      conversa.referral = msg.referral;
+    }
+
+    // Vincula ao lead (se o telefone bater) e fecha o loop: recalcula o score
+    // já considerando a conversa e, se isso levar o lead a "quente"/fechado,
+    // dispara o evento de qualificação pra Meta na hora — não só na próxima
+    // vez que o lead for lido/salvo pela tela.
+    let leadIdVinculado = await vincularConversaAoLead(conversa, usuarioId)
+      .catch(e => { console.error("ERRO vincularConversaAoLead:", e); return null; });
+
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaCTWA(conversa, usuarioId, nomesContatos[String(telefoneCliente)] || null)
+        .catch(e => { console.error("ERRO criarLeadDeConversaCTWA:", e); return null; });
+    }
+
+    // Nenhuma mensagem da Meta trazia referral (não veio de um Click-to-WhatsApp
+    // da Meta) — tenta a atribuição LinkedIn via tag no texto antes de desistir.
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaLinkedIn(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
+        .catch(e => { console.error("ERRO criarLeadDeConversaLinkedIn:", e); return null; });
+    }
+
+    // Idem pra tag do Google Ads (ver montarMensagemWhatsappComTagGoogle).
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaGoogle(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
+        .catch(e => { console.error("ERRO criarLeadDeConversaGoogle:", e); return null; });
+    }
+
+    // Idem pro "TikTok ID" que o próprio TikTok coloca na mensagem do anúncio.
+    if (!leadIdVinculado) {
+      leadIdVinculado = await criarLeadDeConversaTikTok(conversa, usuarioId, msg.text?.body || "", nomesContatos[String(telefoneCliente)] || null)
+        .catch(e => { console.error("ERRO criarLeadDeConversaTikTok:", e); return null; });
+    }
+
+    if (!leadIdVinculado) {
+      leadIdVinculado = await garantirLeadWhatsAppSemOrigem(
+        client, conversa.id, usuarioId, nomesContatos[String(telefoneCliente)] || null
+      );
+    }
+
+    if (leadIdVinculado) {
+      client.query(`SELECT * FROM leads WHERE id = $1`, [leadIdVinculado])
+        .then(async (leadRes) => {
+          const lead = leadRes.rows[0];
+          if (!lead) return;
+          await completarLeadParaQualificacao(lead, usuarioId);
+          const scoreData = calcularScoreLead(lead);
+          lead.score = scoreData.score;
+          await avaliarEEnviarQualificacaoLead(lead, usuarioId);
+        })
+        .catch(e => console.error("ERRO avaliarEEnviarQualificacaoLead (whatsapp):", e));
+    }
+
+    if (conversa.status === "humano" || conversa.status === "encerrada") continue;
+
+    // Origem ausente: guardar o contato e pedir o assunto, sem inventar campanha.
+    const triagem = await prepararTriagemWhatsApp(client, conversa.id, usuarioId, msg.text?.body || "");
+    if (triagem && !triagem.nicho_id) {
+      if (triagem.pergunta) {
+        const reserva = await client.query(
+          `UPDATE whatsapp_conversas SET variaveis=jsonb_set(COALESCE(variaveis,'{}'::jsonb),'{triagem_nichos}',$1::jsonb)
+           WHERE id=$2 AND usuario_id=$3 AND status NOT IN ('humano','encerrada')
+             AND NOT (COALESCE(variaveis,'{}'::jsonb) ? 'triagem_nichos') RETURNING id`,
+          [JSON.stringify(triagem.opcoes), conversa.id, usuarioId]
+        );
+        if (reserva.rows.length) {
+          try {
+            const wamid = await enviarMensagemWhatsAppOficial(usuarioId, phoneNumberId, telefoneCliente, triagem.pergunta);
+            if (!wamid) throw new Error("Triagem não enviada");
+            await client.query(
+              "INSERT INTO whatsapp_mensagens_log (conversa_id,wamid,direcao,conteudo) VALUES ($1,$2,'saida',$3) ON CONFLICT (wamid) DO NOTHING",
+              [conversa.id, wamid, triagem.pergunta]
+            );
+          } catch (error) {
+            await client.query("UPDATE whatsapp_conversas SET variaveis=variaveis-'triagem_nichos' WHERE id=$1 AND usuario_id=$2", [conversa.id, usuarioId]);
+            throw error;
+          }
+        }
+      }
+      continue;
+    }
+
+    const nichoIdConversa = await resolverNichoConversaWhatsApp(conversa, usuarioId, msg.text?.body || "", leadIdVinculado)
+      .catch(e => { console.error("ERRO resolverNichoConversaWhatsApp:", e); return null; });
+
+    await avancarBotWhatsApp(conversa, phoneNumberId, nichoIdConversa, msg.text?.body);
+  }
+}
+
+// Coexistência: mensagem que o corretor manda pelo próprio app do WhatsApp (não
+// pela plataforma) chega nesse campo separado, não em "messages". Serve pra
+// marcar a conversa como 'humano' (o corretor já assumiu, o bot para de responder)
+// e logar o que foi dito — sem isso o handoff bot→corretor não é confiável em
+// Coexistência real (a heurística antiga em processarEventoWhatsApp era só um
+// palpite provisório, não o campo oficial da Meta pra isso).
+async function processarEcoWhatsApp(value: any) {
+  const phoneNumberId = value?.metadata?.phone_number_id;
+  if (!phoneNumberId) return;
+
+  const conexao = await client.query(
+    `SELECT usuario_id FROM plataforma_conexoes WHERE plataforma = 'whatsapp' AND dados_conta->>'phone_number_id' = $1 LIMIT 1`,
+    [phoneNumberId]
+  );
+  const usuarioId = conexao.rows[0]?.usuario_id;
+  if (!usuarioId) {
+    console.warn(`[whatsapp-echo] nenhum corretor encontrado pro phone_number_id ${phoneNumberId}`);
+    return;
+  }
+
+  for (const msg of value.message_echoes || []) {
+    const telefoneCliente = msg.to;
+    if (!telefoneCliente) continue;
+
+    const conversaRes = await client.query(
+      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, atualizado_em)
+       VALUES ($1, $2, 'humano', NOW())
+       ON CONFLICT (usuario_id, telefone_cliente)
+       DO UPDATE SET status = 'humano', atualizado_em = NOW()
+       RETURNING id`,
+      [usuarioId, telefoneCliente]
+    );
+    const conversaId = conversaRes.rows[0]?.id;
+    if (!conversaId) continue;
+
+    const conteudo = msg.text?.body || (msg.type ? `[${msg.type}]` : null);
+    const logEcoRes = await client.query(
+      `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'echo', $3)
+       ON CONFLICT (wamid) DO NOTHING
+       RETURNING id`,
+      [conversaId, msg.id, conteudo]
+    ).catch((e) => { console.error("ERRO log eco whatsapp:", e); return { rows: [] as any[] }; });
+
+    // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
+    if (msg.type === "audio" && msg.audio?.id && logEcoRes.rows[0]?.id) {
+      console.log(`[transcricao-audio] iniciando transcrição da mensagem ${msg.id} (echo)`);
+      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logEcoRes.rows[0].id).catch((e: any) =>
+        console.error("[transcricao-audio] erro echo:", e)
+      );
+    }
+  }
+}
+
+app.post("/webhook/whatsapp", async (c) => {
+  try {
+    const corpoRaw = await c.req.text();
+    const assinatura = c.req.header("x-hub-signature-256") || c.req.header("X-Hub-Signature-256") || null;
+    console.log("WEBHOOK WHATSAPP RECEBIDO:", corpoRaw.slice(0, 500));
+
+    if (!validarAssinaturaMetaWebhook(assinatura, corpoRaw)) {
+      console.error("WEBHOOK WHATSAPP: assinatura invalida", { assinatura });
+      return c.json({ error: "Assinatura Meta invalida" }, 401);
+    }
+
+    const body = JSON.parse(corpoRaw || "{}");
+
+    if (body.object === "whatsapp_business_account") {
+      for (const entry of body.entry || []) {
+        for (const change of entry.changes || []) {
+          if (change.field === "messages") {
+            await processarEventoWhatsApp(change.value).catch((e: any) =>
+              console.error("ERRO processarEventoWhatsApp:", e)
+            );
+          } else if (change.field === "smb_message_echoes") {
+            await processarEcoWhatsApp(change.value).catch((e: any) =>
+              console.error("ERRO processarEcoWhatsApp:", e)
+            );
+          }
+        }
+      }
+    }
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO WEBHOOK WHATSAPP:", err);
+    return c.json({ error: "Erro webhook" }, 500);
+  }
+});
+
+
+
+// 🔌 banco
+const client = new Pool({
+  connectionString: Bun.env.DATABASE_URL,
+  max: Number(Bun.env.PG_POOL_MAX || 10),
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+
+// 🗄️ tabelas
+await client.query(`
+  CREATE TABLE IF NOT EXISTS usuarios (
+    id SERIAL PRIMARY KEY,
+    email TEXT UNIQUE,
+    senha TEXT,
+    tipo TEXT DEFAULT 'cliente'
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS leads (
+    id SERIAL PRIMARY KEY,
+    nome TEXT,
+    telefone TEXT,
+    email TEXT,
+    usuario_id INTEGER,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_conexoes (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER,
+    access_token TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_oauth_states (
+    id SERIAL PRIMARY KEY,
+    state_hash TEXT NOT NULL UNIQUE,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    expira_em TIMESTAMP NOT NULL,
+    usado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_meta_oauth_states_hash
+  ON meta_oauth_states (state_hash);
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS plataforma_oauth_states (
+    id SERIAL PRIMARY KEY,
+    state_hash TEXT NOT NULL,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    plataforma TEXT NOT NULL,
+    expira_em TIMESTAMP NOT NULL,
+    usado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(state_hash, plataforma)
+  );
+`);
+
+await client.query(`
+  CREATE INDEX IF NOT EXISTS idx_plataforma_oauth_states_hash
+  ON plataforma_oauth_states (state_hash);
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_tos_aceites (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL,
+    page_id TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(usuario_id, page_id)
+  );
+`);
+
+// Checkpoint de "saldo pré-pago zerou" — guarda o gasto acumulado (amount_spent)
+// no instante em que o saldo pré-pago da Meta foi visto zerado pela primeira vez
+// no ciclo atual. Usado para estimar gasto no cartão de backup (Meta não expõe
+// isso por método de pagamento em nenhum endpoint, ver /meta/status-completo).
+await client.query(`
+  CREATE TABLE IF NOT EXISTS meta_saldo_zerado (
+    usuario_id INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    gasto_no_momento_zerado NUMERIC(12,2) NOT NULL,
+    zerado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// Throttle do alerta de saldo/limite baixo da Meta (ver verificarSaldoMetaEAlertar)
+// — evita mandar WhatsApp de novo a cada ciclo do AUTO SYNC (30 min) enquanto o
+// problema persistir; o lembrete é diário, não a cada sincronização.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS alerta_saldo_meta (
+    usuario_id INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    conta_anuncios_id TEXT,
+    ultimo_alerta_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS campanhas (
+
+    id SERIAL PRIMARY KEY,
+
+    usuario_id INTEGER,
+
+    campaign_id TEXT,
+    adset_id TEXT,
+    ad_id TEXT,
+    form_id TEXT,
+
+    page_id TEXT,
+
+    nome TEXT,
+
+    status TEXT DEFAULT 'PAUSED',
+
+    origem TEXT DEFAULT 'plataforma',
+
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS lead_historico (
+    id SERIAL PRIMARY KEY,
+    lead_id INTEGER,
+    usuario_id INTEGER,
+    tipo TEXT,
+    descricao TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expira_em TIMESTAMP NOT NULL,
+    usado_em TIMESTAMP,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS password_history (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    senha_hash TEXT NOT NULL,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS chat_conversas (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    status TEXT DEFAULT 'aberta',
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS chat_mensagens (
+    id SERIAL PRIMARY KEY,
+    conversa_id INTEGER NOT NULL REFERENCES chat_conversas(id) ON DELETE CASCADE,
+    remetente_id INTEGER,
+    remetente_tipo TEXT NOT NULL,
+    conteudo TEXT NOT NULL,
+    lido BOOLEAN DEFAULT FALSE,
+    enviado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ia_usos (
+    id SERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    tipo TEXT NOT NULL,
+    referencia_tipo TEXT,
+    referencia_id TEXT,
+    tokens_entrada INTEGER DEFAULT 0,
+    tokens_saida INTEGER DEFAULT 0,
+    custo_estimado NUMERIC(12, 4) DEFAULT 0,
+    provider TEXT DEFAULT 'openai',
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  ALTER TABLE ia_usos ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'openai';
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ia_alertas_provedor (
+    id SERIAL PRIMARY KEY,
+    provider TEXT NOT NULL,
+    tipo TEXT NOT NULL,
+    contexto TEXT,
+    status_http INTEGER,
+    codigo TEXT,
+    mensagem TEXT,
+    ocorrencias INTEGER NOT NULL DEFAULT 1,
+    primeira_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    ultima_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    notificado_em TIMESTAMP,
+    resolvido_em TIMESTAMP
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_ia_alertas_provedor_aberto
+    ON ia_alertas_provedor (provider, tipo) WHERE resolvido_em IS NULL;
+`);
+
+// Depois de um deploy a memória zera: recarrega quais provedores têm alerta aberto para o
+// próximo sucesso conseguir fechá-lo e para as respostas ao corretor seguirem corretas.
+{
+  const alertasAbertos = await client.query(
+    `SELECT DISTINCT provider FROM ia_alertas_provedor WHERE resolvido_em IS NULL`
+  );
+  for (const linha of alertasAbertos.rows) {
+    if (linha.provider === "openai" || linha.provider === "anthropic") {
+      provedoresIAComFalhaCritica.add(linha.provider);
+    }
+  }
+}
+
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ia_config (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    provedor TEXT DEFAULT 'openai',
+    modelo TEXT DEFAULT 'gpt-5-mini',
+    anthropic_modelo TEXT DEFAULT 'claude-haiku-4-5-20251001',
+    status TEXT DEFAULT 'nao_contratado',
+    assinatura_status TEXT DEFAULT 'pendente',
+    plano_api TEXT DEFAULT 'sob_demanda',
+    limite_mensal_requisicoes INTEGER DEFAULT 1000,
+    limite_mensal_custo NUMERIC(12, 2) DEFAULT 300,
+    custo_mensal_contratado NUMERIC(12, 2) DEFAULT 0,
+    ciclo_inicio DATE DEFAULT CURRENT_DATE,
+    observacoes TEXT,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  ALTER TABLE ia_config ADD COLUMN IF NOT EXISTS anthropic_modelo TEXT DEFAULT 'claude-haiku-4-5-20251001';
+`);
+
+await client.query(`
+  INSERT INTO ia_config (id)
+  VALUES (1)
+  ON CONFLICT (id) DO NOTHING;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS railway_billing_config (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    plano TEXT DEFAULT 'pro',
+    moeda TEXT DEFAULT 'USD',
+    ultimo_pagamento_valor NUMERIC(12, 2) DEFAULT 0,
+    ultimo_pagamento_data DATE,
+    proxima_fatura_base NUMERIC(12, 2) DEFAULT 20,
+    proxima_fatura_data DATE,
+    observacoes TEXT,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  INSERT INTO railway_billing_config (id)
+  VALUES (1)
+  ON CONFLICT (id) DO NOTHING;
+`);
+
+await client.query(`
+  ALTER TABLE railway_billing_config
+    ADD COLUMN IF NOT EXISTS limite_alerta_usd NUMERIC(10,2) DEFAULT 5.00,
+    ADD COLUMN IF NOT EXISTS ultima_notif_custo_data DATE,
+    ADD COLUMN IF NOT EXISTS ultima_notif_cobranca_data DATE;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS railway_billing_historico (
+    id SERIAL PRIMARY KEY,
+    ciclo_mes DATE NOT NULL UNIQUE,
+    plano TEXT DEFAULT 'pro',
+    moeda TEXT DEFAULT 'USD',
+    ultimo_pagamento_valor NUMERIC(12, 2) DEFAULT 0,
+    ultimo_pagamento_data DATE,
+    proxima_fatura_base NUMERIC(12, 2) DEFAULT 20,
+    proxima_fatura_data DATE,
+    observacoes TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS nome TEXT,
+    ADD COLUMN IF NOT EXISTS sobrenome TEXT,
+    ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT true,
+    ADD COLUMN IF NOT EXISTS admin_id INTEGER,
+    ADD COLUMN IF NOT EXISTS plano TEXT DEFAULT 'bronze',
+    ADD COLUMN IF NOT EXISTS plano_ativado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS assinatura_status TEXT DEFAULT 'manual',
+    ADD COLUMN IF NOT EXISTS assinatura_inicio TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS ia_limite_mensal INTEGER DEFAULT 300,
+    ADD COLUMN IF NOT EXISTS ia_custo_limite_mensal NUMERIC(12, 2) DEFAULT 120,
+    ADD COLUMN IF NOT EXISTS ia_ativo BOOLEAN DEFAULT true,
+    ADD COLUMN IF NOT EXISTS ia_provider TEXT DEFAULT 'auto',
+    ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS is_parceiro BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS parceiro_id INTEGER,
+    ADD COLUMN IF NOT EXISTS resumo_semanal_enviado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS painel_cliente_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS painel_slug TEXT,
+    ADD COLUMN IF NOT EXISTS painel_atualizado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS atendimento_whatsapp_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS voip_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS voip_status TEXT DEFAULT 'desativado',
+    ADD COLUMN IF NOT EXISTS voip_provedor TEXT,
+    ADD COLUMN IF NOT EXISTS voip_numero TEXT,
+    ADD COLUMN IF NOT EXISTS voip_atualizado_em TIMESTAMP;
+`);
+
 await client.query(`
   ALTER TABLE usuarios
     ADD COLUMN IF NOT EXISTS voip_numero_sid TEXT,
@@ -21947,7 +24805,6 @@ await client.query(`
 
   CREATE INDEX IF NOT EXISTS idx_voip_chamadas_externa
     ON voip_chamadas(chamada_externa_id);
-
 
   CREATE INDEX IF NOT EXISTS idx_voip_chamadas_pstn
     ON voip_chamadas(chamada_pstn_sid);
@@ -22584,7 +25441,7 @@ await client.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bot_midias_token
     ON whatsapp_bot_midias(token) WHERE token IS NOT NULL;
 
-  -- O atendimento humano reutiliza esta tabela para anexos e aceita documentos.
+  -- O atendimento humano reutiliza esta tabela para anexos e também aceita documentos.
   ALTER TABLE whatsapp_bot_midias
     DROP CONSTRAINT IF EXISTS whatsapp_bot_midias_tipo_check;
   ALTER TABLE whatsapp_bot_midias
