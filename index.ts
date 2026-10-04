@@ -87,6 +87,19 @@ import {
   textoSinaisDoLead,
 } from "./score-lead";
 
+import {
+  configuracaoTwilioVoip,
+  criarTokenTwilioVoice,
+  diagnosticarTwilioVoip,
+  escaparXmlVoip,
+  liberarNumeroTwilio,
+  normalizarNumeroBrasilVoip,
+  prepararTwimlAppTwilio,
+  provisionarNumeroLocalBrasilTwilio,
+  validarAssinaturaTwilio,
+  validarDddBrasil,
+} from "./voip-twilio";
+
 const app = new Hono();
 
 const WHATSAPP_CLOUD_API_VERSION =
@@ -5243,6 +5256,14 @@ const authMiddleware = async (c: any, next: any) => {
         COALESCE(u.voip_status, 'desativado') AS voip_status,
         u.voip_provedor,
         u.voip_numero,
+        u.voip_numero_sid,
+        u.voip_ddd,
+        u.voip_identity,
+        u.voip_ativado_em,
+        u.voip_desativado_em,
+        u.voip_ultimo_erro,
+        COALESCE(u.voip_limite_minutos_mensal, 100) AS voip_limite_minutos_mensal,
+        COALESCE(u.voip_gravacao_habilitada, false) AS voip_gravacao_habilitada,
         u.painel_slug,
         COALESCE(
           (
@@ -5333,7 +5354,8 @@ const authMiddleware = async (c: any, next: any) => {
       );
       const permitidoVoip = userBanco.voip_habilitado === true && metodo === "GET" && (
         rota === "/painel-cliente/voip/configuracao" ||
-        rota === "/painel-cliente/voip/chamadas"
+        rota === "/painel-cliente/voip/chamadas" ||
+        rota === "/painel-cliente/voip/token"
       );
       const permitido = permitidoBasico || permitidoWhatsapp || permitidoVoip;
 
@@ -24674,6 +24696,33 @@ await client.query(`
 `);
 
 await client.query(`
+  ALTER TABLE usuarios
+    ADD COLUMN IF NOT EXISTS voip_numero_sid TEXT,
+    ADD COLUMN IF NOT EXISTS voip_ddd TEXT,
+    ADD COLUMN IF NOT EXISTS voip_identity TEXT,
+    ADD COLUMN IF NOT EXISTS voip_ativado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS voip_desativado_em TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS voip_ultimo_erro TEXT,
+    ADD COLUMN IF NOT EXISTS voip_limite_minutos_mensal INTEGER NOT NULL DEFAULT 100,
+    ADD COLUMN IF NOT EXISTS voip_gravacao_habilitada BOOLEAN NOT NULL DEFAULT false;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS voip_config_global (
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    provedor TEXT NOT NULL DEFAULT 'twilio',
+    twiml_app_sid TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  INSERT INTO voip_config_global (id, provedor)
+  VALUES (1, 'twilio')
+  ON CONFLICT (id) DO NOTHING;
+`);
+
+
+await client.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_painel_slug
     ON usuarios(painel_slug)
     WHERE painel_slug IS NOT NULL;
@@ -24744,6 +24793,22 @@ await client.query(`
   CREATE INDEX IF NOT EXISTS idx_voip_chamadas_usuario
     ON voip_chamadas(usuario_id, iniciada_em DESC);
 `);
+
+await client.query(`
+  ALTER TABLE voip_chamadas
+    ADD COLUMN IF NOT EXISTS chamada_pstn_sid TEXT,
+    ADD COLUMN IF NOT EXISTS motivo_fim TEXT,
+    ADD COLUMN IF NOT EXISTS gravacao_sid TEXT,
+    ADD COLUMN IF NOT EXISTS gravacao_url TEXT,
+    ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+  CREATE INDEX IF NOT EXISTS idx_voip_chamadas_externa
+    ON voip_chamadas(chamada_externa_id);
+
+  CREATE INDEX IF NOT EXISTS idx_voip_chamadas_pstn
+    ON voip_chamadas(chamada_pstn_sid);
+`);
+
 
 await client.query(`
   CREATE TABLE IF NOT EXISTS parceiro_financeiro (
