@@ -26820,6 +26820,307 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
   }
 });
 
+
+function identidadeVoipUsuario(usuarioId: number) {
+  return `corretor_${Number(usuarioId)}`;
+}
+
+async function obterTwimlAppSidVoip() {
+  const result = await client.query(
+    "SELECT twiml_app_sid FROM voip_config_global WHERE id = 1 LIMIT 1"
+  );
+  return result.rows[0]?.twiml_app_sid || null;
+}
+
+async function salvarTwimlAppSidVoip(sid: string) {
+  await client.query(
+    `
+    INSERT INTO voip_config_global (id, provedor, twiml_app_sid, atualizado_em)
+    VALUES (1, 'twilio', $1, NOW())
+    ON CONFLICT (id) DO UPDATE SET
+      provedor = 'twilio',
+      twiml_app_sid = EXCLUDED.twiml_app_sid,
+      atualizado_em = NOW()
+    `,
+    [sid]
+  );
+}
+
+app.get("/gestor/voip/status", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+
+  if (!usuarioPodeGerenciarClientes(gestor) || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Acesso restrito ao gestor de tráfego" }, 403);
+  }
+
+  const diagnostico = diagnosticarTwilioVoip();
+  const twimlAppSid = await obterTwimlAppSidVoip();
+
+  return c.json({
+    ...diagnostico,
+    twiml_app_configurado: Boolean(twimlAppSid),
+    custo_gerado_agora: false,
+    mensagem: diagnostico.provisionamento_habilitado
+      ? "O provedor está liberado para contratar uma linha somente quando você ativar um corretor."
+      : "Provisionamento travado: nenhuma linha pode ser contratada e nenhuma cobrança de número pode começar."
+  });
+});
+
+app.post("/gestor/clientes/:id/voip/ativar", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const clienteGerenciado = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!clienteGerenciado || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  if (clienteGerenciado.voip_habilitado !== true) {
+    return c.json({
+      error: "Habilite primeiro o módulo de Telefonia VoIP para este corretor. Habilitar o módulo não gera cobrança."
+    }, 409);
+  }
+
+  if (clienteGerenciado.voip_numero && clienteGerenciado.voip_status === "ativo") {
+    return c.json({
+      sucesso: true,
+      cliente: formatarClienteGerenciado(clienteGerenciado),
+      mensagem: "A telefonia deste corretor já está ativa."
+    });
+  }
+
+  if (clienteGerenciado.voip_status === "provisionando") {
+    return c.json({ error: "Já existe uma ativação de VoIP em andamento para este corretor." }, 409);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+
+  if (body.confirmar_cobranca !== true) {
+    return c.json({
+      error: "Confirme explicitamente a contratação da linha. Só esta ação pode iniciar cobrança no provedor."
+    }, 400);
+  }
+
+  if (body.confirmar_uso_regulatorio !== true) {
+    return c.json({
+      error: "Confirme que o número será usado de forma compatível com as regras brasileiras de telefonia. Para telemarketing ativo, valide a exigência do prefixo 0303 antes da ativação."
+    }, 400);
+  }
+
+  const diagnostico = diagnosticarTwilioVoip();
+  const cfg = configuracaoTwilioVoip();
+
+  if (!diagnostico.configurado) {
+    return c.json({
+      error: "A integração Twilio ainda não está configurada no servidor.",
+      faltantes: diagnostico.faltantes
+    }, 409);
+  }
+
+  if (!diagnostico.provisionamento_habilitado) {
+    return c.json({
+      error: "O provisionamento continua travado globalmente. Defina VOIP_PROVISIONING_ENABLED=true somente quando quiser permitir ativações reais.",
+      code: "VOIP_PROVISIONING_DISABLED"
+    }, 409);
+  }
+
+  if (!cfg.bundleSid || !cfg.addressSid) {
+    return c.json({
+      error: "Antes da primeira linha brasileira, configure o Bundle regulatório e o endereço aprovados na Twilio.",
+      faltantes: [
+        ...(!cfg.bundleSid ? ["TWILIO_BRAZIL_BUNDLE_SID"] : []),
+        ...(!cfg.addressSid ? ["TWILIO_ADDRESS_SID"] : [])
+      ]
+    }, 409);
+  }
+
+  const ddd = validarDddBrasil(body.ddd || clienteGerenciado.voip_ddd || cfg.dddPadrao);
+  if (!ddd) {
+    return c.json({ error: "Informe um DDD brasileiro válido." }, 400);
+  }
+
+  const limiteInformado = Number(
+    body.limite_minutos_mensal ??
+    clienteGerenciado.voip_limite_minutos_mensal ??
+    100
+  );
+  const limiteMinutos =
+    Number.isInteger(limiteInformado) &&
+    limiteInformado >= 10 &&
+    limiteInformado <= 10000
+      ? limiteInformado
+      : 100;
+
+  await client.query(
+    `
+    UPDATE usuarios SET
+      voip_status = 'provisionando',
+      voip_provedor = 'twilio',
+      voip_ddd = $1,
+      voip_limite_minutos_mensal = $2,
+      voip_ultimo_erro = NULL,
+      voip_atualizado_em = NOW()
+    WHERE id = $3
+    `,
+    [ddd, limiteMinutos, clienteId]
+  );
+
+  let numeroProvisionado: { sid: string; numero: string } | null = null;
+
+  try {
+    const voiceUrlTwiML = `${URL_BACKEND_PUBLICA}/webhook/voip/twiml`;
+    const voiceUrlEntrada = `${URL_BACKEND_PUBLICA}/webhook/voip/incoming`;
+
+    const sidAtual = await obterTwimlAppSidVoip();
+    const twimlAppSid = await prepararTwimlAppTwilio(
+      sidAtual,
+      voiceUrlTwiML
+    );
+    await salvarTwimlAppSidVoip(twimlAppSid);
+
+    numeroProvisionado = await provisionarNumeroLocalBrasilTwilio({
+      ddd,
+      voiceUrl: voiceUrlEntrada,
+      friendlyName: `Plataforma de Leads - corretor ${clienteId}`
+    });
+
+    const identity = identidadeVoipUsuario(clienteId);
+
+    await client.query(
+      `
+      UPDATE usuarios SET
+        voip_habilitado = true,
+        voip_status = 'ativo',
+        voip_provedor = 'twilio',
+        voip_numero = $1,
+        voip_numero_sid = $2,
+        voip_identity = $3,
+        voip_ddd = $4,
+        voip_limite_minutos_mensal = $5,
+        voip_ativado_em = NOW(),
+        voip_desativado_em = NULL,
+        voip_ultimo_erro = NULL,
+        voip_atualizado_em = NOW(),
+        painel_atualizado_em = NOW()
+      WHERE id = $6
+      `,
+      [
+        numeroProvisionado.numero,
+        numeroProvisionado.sid,
+        identity,
+        ddd,
+        limiteMinutos,
+        clienteId
+      ]
+    );
+
+    const atualizado = await buscarClienteGerenciado(gestor, clienteId);
+
+    return c.json({
+      sucesso: true,
+      cliente: formatarClienteGerenciado(atualizado),
+      mensagem: "Linha VoIP ativada. A partir deste momento o provedor pode cobrar o número e o uso das chamadas."
+    });
+  } catch (err: any) {
+    if (numeroProvisionado?.sid) {
+      await liberarNumeroTwilio(numeroProvisionado.sid).catch((rollbackErr) =>
+        console.error("VOIP rollback numero:", rollbackErr)
+      );
+    }
+
+    const mensagem = String(
+      err?.message || "Falha ao ativar a telefonia"
+    ).slice(0, 500);
+
+    await client.query(
+      `
+      UPDATE usuarios SET
+        voip_status = 'erro',
+        voip_numero = NULL,
+        voip_numero_sid = NULL,
+        voip_identity = NULL,
+        voip_ultimo_erro = $1,
+        voip_atualizado_em = NOW()
+      WHERE id = $2
+      `,
+      [mensagem, clienteId]
+    ).catch(() => {});
+
+    console.error("VOIP ATIVAR ERROR:", err);
+
+    return c.json({
+      error: mensagem,
+      code: err?.codigo || "VOIP_ACTIVATION_FAILED"
+    }, Number(err?.status) >= 400 && Number(err?.status) < 600
+      ? Number(err.status)
+      : 502);
+  }
+});
+
+app.post("/gestor/clientes/:id/voip/desativar", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const clienteGerenciado = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!clienteGerenciado || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+
+  if (body.confirmar_liberacao !== true) {
+    return c.json({
+      error: "Confirme a liberação do número. A linha só deixa de gerar mensalidade externa depois que o provedor confirmar a liberação."
+    }, 400);
+  }
+
+  const numeroSid = clienteGerenciado.voip_numero_sid;
+
+  try {
+    if (numeroSid) {
+      await liberarNumeroTwilio(String(numeroSid));
+    }
+
+    await client.query(
+      `
+      UPDATE usuarios SET
+        voip_status = CASE
+          WHEN voip_habilitado THEN 'pronto_para_ativar'
+          ELSE 'desativado'
+        END,
+        voip_provedor = NULL,
+        voip_numero = NULL,
+        voip_numero_sid = NULL,
+        voip_identity = NULL,
+        voip_ativado_em = NULL,
+        voip_desativado_em = NOW(),
+        voip_ultimo_erro = NULL,
+        voip_atualizado_em = NOW(),
+        painel_atualizado_em = NOW()
+      WHERE id = $1
+      `,
+      [clienteId]
+    );
+
+    const atualizado = await buscarClienteGerenciado(gestor, clienteId);
+
+    return c.json({
+      sucesso: true,
+      cliente: formatarClienteGerenciado(atualizado),
+      mensagem: numeroSid
+        ? "Número liberado no provedor. A cobrança recorrente dessa linha foi encerrada."
+        : "Telefonia real desativada. Não havia número contratado."
+    });
+  } catch (err: any) {
+    console.error("VOIP DESATIVAR ERROR:", err);
+
+    return c.json({
+      error: "Não foi possível confirmar a liberação no provedor. O número foi mantido na conta para evitar esconder uma cobrança que ainda possa existir.",
+      detalhe: String(err?.message || err)
+    }, 502);
+  }
+});
+
 app.put("/gestor/clientes/:id/senha", authMiddleware, async (c) => {
   const gestor: any = c.get("user");
   const clienteId = Number(c.req.param("id"));
