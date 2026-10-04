@@ -5323,8 +5323,12 @@ const authMiddleware = async (c: any, next: any) => {
       );
       const permitidoWhatsapp = userBanco.atendimento_whatsapp_habilitado === true && (
         (metodo === "GET" && rota === "/painel-cliente/whatsapp/conversas") ||
+        (metodo === "GET" && rota === "/painel-cliente/whatsapp/modelos") ||
+        (metodo === "GET" && rota === "/whatsapp/diagnostico") ||
         (metodo === "GET" && /^\/painel-cliente\/whatsapp\/conversas\/\d+\/mensagens$/.test(rota)) ||
+        (metodo === "POST" && rota === "/painel-cliente/whatsapp/midia") ||
         (metodo === "POST" && /^\/painel-cliente\/whatsapp\/conversas\/\d+\/mensagens$/.test(rota)) ||
+        (metodo === "POST" && /^\/painel-cliente\/whatsapp\/conversas\/\d+\/modelo$/.test(rota)) ||
         (metodo === "PATCH" && /^\/painel-cliente\/whatsapp\/conversas\/\d+\/status$/.test(rota))
       );
       const permitidoVoip = userBanco.voip_habilitado === true && metodo === "GET" && (
@@ -24105,7 +24109,24 @@ async function processarEventoWhatsApp(value: any) {
        VALUES ($1, $2, 'entrada', $3)
        ON CONFLICT (wamid) DO NOTHING
        RETURNING id`,
-      [conversa.id, msg.id, msg.text?.body || null]
+      [
+        conversa.id,
+        msg.id,
+        msg.text?.body ||
+          (msg.type === "audio"
+            ? "[áudio — transcrevendo...]"
+            : msg.type === "image"
+              ? "[imagem]"
+              : msg.type === "document"
+                ? `[documento] ${msg.document?.filename || ""}`.trim()
+                : msg.type === "video"
+                  ? "[vídeo]"
+                  : msg.type === "sticker"
+                    ? "[figurinha]"
+                    : msg.type
+                      ? `[${msg.type}]`
+                      : null)
+      ]
     );
     if (logRes.rows.length === 0) {
       console.log(`[whatsapp-webhook] mensagem ${msg.id} já processada, ignorando`);
@@ -27079,11 +27100,15 @@ app.post("/painel-cliente/whatsapp/conversas/:id/mensagens", authMiddleware, asy
   const conversaId = Number(c.req.param("id"));
   const body = await c.req.json().catch(() => ({}));
   const mensagem = textoOpcional(body.mensagem);
+  const midiaId = Number(body.midia_id || 0);
+  const midiaNome = textoOpcional(body.midia_nome).slice(0, 180);
 
   if (!Number.isInteger(conversaId) || conversaId <= 0) {
     return c.json({ error: "Conversa inválida" }, 400);
   }
-  if (!mensagem) return c.json({ error: "Digite uma mensagem" }, 400);
+  if (!mensagem && (!Number.isInteger(midiaId) || midiaId <= 0)) {
+    return c.json({ error: "Digite uma mensagem ou escolha um arquivo" }, 400);
+  }
   if (mensagem.length > 4096) {
     return c.json({ error: "A mensagem pode ter no máximo 4.096 caracteres" }, 400);
   }
@@ -27125,20 +27150,64 @@ app.post("/painel-cliente/whatsapp/conversas/:id/mensagens", authMiddleware, asy
   }
   if (!conversa.janela_atendimento_aberta) {
     return c.json({
-      error: "A janela de atendimento de 24 horas terminou. Para retomar, será necessário usar um modelo aprovado pela Meta."
+      error: "A janela de atendimento de 24 horas terminou. Use um modelo aprovado para retomar a conversa."
     }, 409);
+  }
+
+  let midia: { tipo: "image" | "audio" | "document"; link: string; nome?: string | null } | undefined;
+  let descricaoMidia = "";
+
+  if (Number.isInteger(midiaId) && midiaId > 0) {
+    const midiaResult = await client.query(
+      `
+      SELECT id, tipo, mime_type, token
+      FROM whatsapp_bot_midias
+      WHERE id = $1 AND usuario_id = $2
+      LIMIT 1
+      `,
+      [midiaId, Number(user.id)]
+    );
+    const arquivo = midiaResult.rows[0];
+    if (!arquivo?.token) {
+      return c.json({ error: "Arquivo não encontrado ou não pertence a esta conta" }, 404);
+    }
+
+    const tipoMeta =
+      arquivo.tipo === "imagem" ? "image" :
+      arquivo.tipo === "audio" ? "audio" :
+      arquivo.tipo === "documento" ? "document" :
+      null;
+
+    if (!tipoMeta) {
+      return c.json({ error: "Tipo de arquivo não suportado no atendimento" }, 400);
+    }
+
+    midia = {
+      tipo: tipoMeta,
+      link: `${URL_BACKEND_PUBLICA}/whatsapp-bot/midia/${arquivo.token}`,
+      nome: tipoMeta === "document" ? (midiaNome || "documento") : null
+    };
+    descricaoMidia =
+      tipoMeta === "image" ? "[imagem]" :
+      tipoMeta === "audio" ? "[áudio]" :
+      `[documento] ${midiaNome || "arquivo"}`;
   }
 
   const wamid = await enviarMensagemWhatsAppOficial(
     Number(user.id),
     String(conversa.phone_number_id),
     String(conversa.telefone_cliente),
-    mensagem
+    mensagem,
+    midia
   );
 
   if (!wamid) {
     return c.json({ error: "A Meta não confirmou o envio da mensagem" }, 502);
   }
+
+  const conteudoLog = midia
+    ? `${descricaoMidia}${mensagem ? ` ${mensagem}` : ""}`
+    : mensagem;
 
   const log = await client.query(
     `
@@ -27147,7 +27216,7 @@ app.post("/painel-cliente/whatsapp/conversas/:id/mensagens", authMiddleware, asy
     ON CONFLICT (wamid) DO UPDATE SET conteudo = EXCLUDED.conteudo
     RETURNING id, wamid, direcao, conteudo, criado_em
     `,
-    [conversaId, wamid, mensagem]
+    [conversaId, wamid, conteudoLog]
   );
 
   await client.query(
@@ -27198,6 +27267,237 @@ app.patch("/painel-cliente/whatsapp/conversas/:id/status", authMiddleware, async
 
   if (!result.rows[0]) return c.json({ error: "Conversa não encontrada" }, 404);
   return c.json({ sucesso: true, conversa: result.rows[0] });
+});
+
+app.get("/painel-cliente/whatsapp/modelos", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "whatsapp");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  try {
+    const conta = await obterContaWhatsappModelos(Number(user.id));
+    if (!conta) {
+      return c.json({ conectado: false, modelos: [] });
+    }
+
+    const modelos = (await listarModelosWhatsapp(conta))
+      .filter((modelo: any) => modelo.compativel === true)
+      .map((modelo: any) => ({
+        nome: modelo.nome,
+        idioma: modelo.idioma,
+        categoria: modelo.categoria,
+        corpo: modelo.corpo,
+        variaveis: Number(modelo.variaveis || 0)
+      }));
+
+    return c.json({ conectado: true, modelos });
+  } catch (err: any) {
+    console.error("ERRO modelos WhatsApp no painel:", err);
+    return c.json({
+      error: err?.message || "Não foi possível carregar os modelos aprovados"
+    }, 502);
+  }
+});
+
+app.post("/painel-cliente/whatsapp/midia", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "whatsapp");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const limite = limitarRequisicao(c, `painel-whatsapp-midia-${user.id}`, 20, 60 * 1000);
+  if (limite) return limite;
+
+  try {
+    const body = await c.req.formData();
+    const arquivo = body.get("arquivo") as File | null;
+    const tipo = String(body.get("tipo") || "");
+
+    if (!arquivo) {
+      return c.json({ error: "Arquivo não enviado" }, 400);
+    }
+
+    const permitidos: Record<string, string[]> = {
+      imagem: ["image/jpeg", "image/png", "image/webp"],
+      audio: ["audio/mpeg", "audio/ogg", "audio/mp4", "audio/aac", "audio/amr"],
+      documento: [
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      ]
+    };
+
+    if (!permitidos[tipo]) {
+      return c.json({ error: "Tipo de arquivo inválido" }, 400);
+    }
+
+    const mimeType = arquivo.type || "";
+    if (!permitidos[tipo].includes(mimeType)) {
+      return c.json({
+        error: tipo === "imagem"
+          ? "Formato de imagem não suportado. Use JPEG, PNG ou WEBP."
+          : tipo === "audio"
+            ? "Formato de áudio não suportado. Use MP3, OGG, M4A, AAC ou AMR."
+            : "Formato de documento não suportado. Use PDF, DOC ou DOCX."
+      }, 400);
+    }
+
+    const bytes = await arquivo.arrayBuffer();
+    if (bytes.byteLength > WHATSAPP_BOT_MIDIA_TAMANHO_MAX) {
+      return c.json({ error: "Arquivo muito grande (máximo 15MB)" }, 400);
+    }
+
+    const token = randomBytes(24).toString("base64url");
+    const row = await client.query(
+      `
+      INSERT INTO whatsapp_bot_midias (usuario_id, tipo, mime_type, dados, token)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id
+      `,
+      [Number(user.id), tipo, mimeType, Buffer.from(bytes), token]
+    );
+
+    return c.json({
+      id: Number(row.rows[0].id),
+      tipo: tipo === "imagem" ? "image" : tipo === "audio" ? "audio" : "document",
+      nome: String(arquivo.name || "").slice(0, 180)
+    });
+  } catch (err) {
+    console.error("ERRO upload mídia WhatsApp no painel:", err);
+    return c.json({ error: "Erro ao enviar arquivo" }, 500);
+  }
+});
+
+app.post("/painel-cliente/whatsapp/conversas/:id/modelo", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "whatsapp");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const limite = limitarRequisicao(c, `painel-whatsapp-modelo-${user.id}`, 15, 60 * 1000);
+  if (limite) return limite;
+
+  const conversaId = Number(c.req.param("id"));
+  const body = await c.req.json().catch(() => ({}));
+  const nome = textoOpcional(body.nome);
+  const idioma = textoOpcional(body.idioma);
+
+  if (!Number.isInteger(conversaId) || conversaId <= 0) {
+    return c.json({ error: "Conversa inválida" }, 400);
+  }
+  if (!nome || !idioma) {
+    return c.json({ error: "Escolha um modelo aprovado" }, 400);
+  }
+
+  try {
+    const conversaResult = await client.query(
+      `
+      SELECT
+        wc.id, wc.telefone_cliente, wc.lead_id,
+        l.nome AS lead_nome,
+        pc.dados_conta->>'phone_number_id' AS phone_number_id
+      FROM whatsapp_conversas wc
+      LEFT JOIN leads l ON l.id = wc.lead_id AND l.usuario_id = wc.usuario_id
+      LEFT JOIN LATERAL (
+        SELECT dados_conta
+        FROM plataforma_conexoes
+        WHERE usuario_id = wc.usuario_id
+          AND plataforma = 'whatsapp'
+          AND status = 'conectado'
+        ORDER BY atualizado_em DESC NULLS LAST, id DESC
+        LIMIT 1
+      ) pc ON true
+      WHERE wc.id = $1 AND wc.usuario_id = $2
+      LIMIT 1
+      `,
+      [conversaId, Number(user.id)]
+    );
+    const conversa = conversaResult.rows[0];
+
+    if (!conversa) return c.json({ error: "Conversa não encontrada" }, 404);
+    if (!conversa.phone_number_id) {
+      return c.json({ error: "O WhatsApp oficial ainda não está conectado nesta conta" }, 409);
+    }
+
+    const conta = await obterContaWhatsappModelos(Number(user.id));
+    if (!conta) {
+      return c.json({ error: "A conexão do WhatsApp está incompleta" }, 409);
+    }
+
+    const modelos = await listarModelosWhatsapp(conta);
+    const modelo = modelos.find((item: any) =>
+      item.nome === nome &&
+      item.idioma === idioma &&
+      item.compativel === true
+    );
+
+    if (!modelo) {
+      return c.json({ error: "Este modelo não está aprovado ou não é compatível para envio pelo painel" }, 400);
+    }
+
+    const primeiroNome = primeiroNomeLead(conversa.lead_nome);
+    const para = normalizarTelefoneWhatsApp(conversa.telefone_cliente);
+    if (!para) return c.json({ error: "Telefone da conversa inválido" }, 400);
+
+    const resposta = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${conversa.phone_number_id}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${conta.token}`
+        },
+        body: JSON.stringify(montarMensagemModelo({
+          para,
+          nome: modelo.nome,
+          idioma: modelo.idioma,
+          variaveis: Number(modelo.variaveis || 0),
+          primeiroNome
+        }))
+      }
+    );
+    const dados: any = await resposta.json().catch(() => ({}));
+    const wamid = dados?.messages?.[0]?.id;
+
+    if (!resposta.ok || !wamid) {
+      const mensagemErro = dados?.error?.error_user_msg || dados?.error?.message || `HTTP ${resposta.status}`;
+      console.error("ERRO envio modelo painel WhatsApp:", JSON.stringify(dados?.error || dados));
+      return c.json({ error: `A Meta recusou o envio: ${mensagemErro}` }, 502);
+    }
+
+    const conteudo = renderizarCorpoModelo(modelo.corpo, primeiroNome) || `[modelo ${modelo.nome}]`;
+
+    const log = await client.query(
+      `
+      INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo)
+      VALUES ($1, $2, 'echo', $3)
+      ON CONFLICT (wamid) DO UPDATE SET conteudo = EXCLUDED.conteudo
+      RETURNING id, wamid, direcao, conteudo, criado_em
+      `,
+      [conversaId, wamid, conteudo]
+    );
+
+    await client.query(
+      `
+      UPDATE whatsapp_conversas
+      SET status = 'humano',
+          assumida_em = COALESCE(assumida_em, NOW()),
+          encerrada_em = NULL,
+          atualizado_em = NOW(),
+          ultima_mensagem_em = NOW(),
+          atendimento_lido_em = NOW()
+      WHERE id = $1 AND usuario_id = $2
+      `,
+      [conversaId, Number(user.id)]
+    );
+
+    return c.json({
+      sucesso: true,
+      mensagem: log.rows[0],
+      modelo: { nome: modelo.nome, idioma: modelo.idioma }
+    });
+  } catch (err: any) {
+    console.error("ERRO modelo WhatsApp painel:", err);
+    return c.json({ error: err?.message || "Erro ao enviar o modelo" }, 500);
+  }
 });
 
 app.get("/painel-cliente/voip/configuracao", authMiddleware, async (c) => {
@@ -40960,7 +41260,7 @@ async function enviarMensagemWhatsAppOficial(
   phoneNumberId: string,
   telefoneDestino: string,
   texto: string,
-  midia?: { tipo: "image" | "audio"; link: string }
+  midia?: { tipo: "image" | "audio" | "document"; link: string; nome?: string | null }
 ) {
   const token = await obterTokenWhatsappUsuario(usuarioId);
   if (!token) {
@@ -40974,22 +41274,32 @@ async function enviarMensagemWhatsAppOficial(
     return;
   }
 
-  const payload = midia
-    ? {
-        messaging_product: "whatsapp",
-        to,
-        type: midia.tipo,
-        [midia.tipo]:
-          midia.tipo === "image" && texto
-            ? { link: midia.link, caption: texto }
-            : { link: midia.link }
-      }
-    : {
-        messaging_product: "whatsapp",
-        to,
-        type: "text",
-        text: { body: texto },
-      };
+  let payload: any;
+
+  if (midia) {
+    const conteudoMidia: any = { link: midia.link };
+
+    if ((midia.tipo === "image" || midia.tipo === "document") && texto) {
+      conteudoMidia.caption = texto;
+    }
+    if (midia.tipo === "document" && midia.nome) {
+      conteudoMidia.filename = String(midia.nome).slice(0, 180);
+    }
+
+    payload = {
+      messaging_product: "whatsapp",
+      to,
+      type: midia.tipo,
+      [midia.tipo]: conteudoMidia
+    };
+  } else {
+    payload = {
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: texto },
+    };
+  }
 
   try {
     const res = await fetch(
