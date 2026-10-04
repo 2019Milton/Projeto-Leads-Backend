@@ -21948,9 +21948,6 @@ await client.query(`
   CREATE INDEX IF NOT EXISTS idx_voip_chamadas_externa
     ON voip_chamadas(chamada_externa_id);
 
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_voip_chamadas_externa_unica
-    ON voip_chamadas(chamada_externa_id)
-    WHERE chamada_externa_id IS NOT NULL;
 
   CREATE INDEX IF NOT EXISTS idx_voip_chamadas_pstn
     ON voip_chamadas(chamada_pstn_sid);
@@ -25172,8 +25169,11 @@ app.post("/webhook/voip/twiml", async (c) => {
           usuario_id, provedor, chamada_externa_id, direcao, telefone,
           status, iniciada_em, atualizado_em
         )
-        VALUES ($1, 'twilio', $2, 'saida', $3, 'iniciando', NOW(), NOW())
-        ON CONFLICT DO NOTHING
+        SELECT $1, 'twilio', $2, 'saida', $3, 'iniciando', NOW(), NOW()
+        WHERE NOT EXISTS (
+          SELECT 1 FROM voip_chamadas
+          WHERE chamada_externa_id = $2
+        )
         `,
         [usuarioId, parentCallSid, destino]
       );
@@ -25252,8 +25252,11 @@ app.post("/webhook/voip/incoming", async (c) => {
           usuario_id, provedor, chamada_externa_id, direcao, telefone,
           status, iniciada_em, atualizado_em
         )
-        VALUES ($1, 'twilio', $2, 'entrada', $3, 'tocando', NOW(), NOW())
-        ON CONFLICT DO NOTHING
+        SELECT $1, 'twilio', $2, 'entrada', $3, 'tocando', NOW(), NOW()
+        WHERE NOT EXISTS (
+          SELECT 1 FROM voip_chamadas
+          WHERE chamada_externa_id = $2
+        )
         `,
         [Number(usuario.id), parentCallSid, numeroOrigem || String(dados.From || "")]
       );
