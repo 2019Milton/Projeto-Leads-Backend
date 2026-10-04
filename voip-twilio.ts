@@ -174,8 +174,10 @@ export async function buscarNumeroLocalBrasilTwilio(ddd: string) {
   const dddValido = validarDddBrasil(ddd);
   if (!dddValido) throw new Error("DDD inválido");
 
+  // O filtro AreaCode da Twilio se aplica somente a EUA/Canadá.
+  // Para o Brasil, filtra pelo prefixo E.164 +55 + DDD usando Contains.
   const query = new URLSearchParams({
-    AreaCode: dddValido,
+    Contains: `+55${dddValido}%`,
     VoiceEnabled: "true",
     PageSize: "10",
   });
