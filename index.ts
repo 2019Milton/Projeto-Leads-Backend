@@ -26435,6 +26435,14 @@ async function buscarClienteGerenciado(
       COALESCE(u.voip_status, 'desativado') AS voip_status,
       u.voip_provedor,
       u.voip_numero,
+      u.voip_numero_sid,
+      u.voip_ddd,
+      u.voip_identity,
+      u.voip_ativado_em,
+      u.voip_desativado_em,
+      u.voip_ultimo_erro,
+      COALESCE(u.voip_limite_minutos_mensal, 100) AS voip_limite_minutos_mensal,
+      COALESCE(u.voip_gravacao_habilitada, false) AS voip_gravacao_habilitada,
       u.painel_slug,
       u.criado_em,
       EXISTS(
@@ -26484,6 +26492,13 @@ function formatarClienteGerenciado(row: any) {
       : "desativado",
     voip_provedor: row.voip_provedor || null,
     voip_numero: row.voip_numero || null,
+    voip_numero_sid: row.voip_numero_sid || null,
+    voip_ddd: row.voip_ddd || null,
+    voip_ativado_em: row.voip_ativado_em || null,
+    voip_desativado_em: row.voip_desativado_em || null,
+    voip_ultimo_erro: row.voip_ultimo_erro || null,
+    voip_limite_minutos_mensal: Number(row.voip_limite_minutos_mensal || 100),
+    voip_gravacao_habilitada: row.voip_gravacao_habilitada === true,
     criado_em: row.criado_em || null,
     campanhas_total: Number(row.campanhas_total || 0),
     campanhas_ativas: Number(row.campanhas_ativas || 0),
@@ -26530,6 +26545,14 @@ app.get("/gestor/clientes", authMiddleware, async (c) => {
       COALESCE(u.voip_status, 'desativado') AS voip_status,
       u.voip_provedor,
       u.voip_numero,
+      u.voip_numero_sid,
+      u.voip_ddd,
+      u.voip_identity,
+      u.voip_ativado_em,
+      u.voip_desativado_em,
+      u.voip_ultimo_erro,
+      COALESCE(u.voip_limite_minutos_mensal, 100) AS voip_limite_minutos_mensal,
+      COALESCE(u.voip_gravacao_habilitada, false) AS voip_gravacao_habilitada,
       u.painel_slug,
       (SELECT COUNT(*)::int FROM campanhas c WHERE c.usuario_id = u.id) AS campanhas_total,
       (
@@ -26633,6 +26656,8 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
         id, email, tipo, nome, sobrenome, plano, admin_id, ativo,
         painel_cliente_habilitado, atendimento_whatsapp_habilitado,
         voip_habilitado, voip_status, voip_provedor, voip_numero,
+        voip_numero_sid, voip_ddd, voip_identity, voip_ativado_em, voip_desativado_em,
+        voip_ultimo_erro, voip_limite_minutos_mensal, voip_gravacao_habilitada,
         painel_slug, criado_em
       `,
       [
@@ -26731,11 +26756,18 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
 
   if (Object.prototype.hasOwnProperty.call(body, "voip_habilitado")) {
     const habilitado = body.voip_habilitado === true;
+
+    if (!habilitado && cliente.voip_numero) {
+      return c.json({
+        error: "Este corretor ainda possui um número VoIP contratado. Libere a linha real primeiro para garantir que a cobrança externa seja encerrada."
+      }, 409);
+    }
+
     adicionar("voip_habilitado", habilitado);
     adicionar(
       "voip_status",
       habilitado
-        ? (cliente.voip_provedor ? "ativo" : "aguardando_configuracao")
+        ? (cliente.voip_numero ? "ativo" : "pronto_para_ativar")
         : "desativado"
     );
 
@@ -26765,6 +26797,8 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
         id, email, tipo, nome, sobrenome, plano, admin_id, ativo,
         painel_cliente_habilitado, atendimento_whatsapp_habilitado,
         voip_habilitado, voip_status, voip_provedor, voip_numero,
+        voip_numero_sid, voip_ddd, voip_identity, voip_ativado_em, voip_desativado_em,
+        voip_ultimo_erro, voip_limite_minutos_mensal, voip_gravacao_habilitada,
         painel_slug, criado_em
       `,
       valores
