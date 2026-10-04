@@ -27905,15 +27905,51 @@ app.get("/painel-cliente/voip/configuracao", authMiddleware, async (c) => {
   const erroAcesso = garantirRecursoPainel(user, "voip");
   if (erroAcesso) return c.json({ error: erroAcesso }, 403);
 
+  const usuarioId = Number(user.id);
+  const ativo =
+    user.voip_habilitado === true &&
+    user.voip_status === "ativo" &&
+    Boolean(user.voip_numero) &&
+    user.voip_provedor === "twilio";
+
+  const uso = await client.query(
+    `
+    SELECT
+      COALESCE(SUM(GREATEST(COALESCE(duracao_segundos, 0), 0)), 0)::bigint AS segundos_mes,
+      COUNT(*) FILTER (
+        WHERE iniciada_em >= date_trunc('month', NOW())
+      )::int AS chamadas_mes
+    FROM voip_chamadas
+    WHERE usuario_id = $1
+      AND iniciada_em >= date_trunc('month', NOW())
+    `,
+    [usuarioId]
+  );
+
+  const segundosUsados = Number(uso.rows[0]?.segundos_mes || 0);
+  const limiteMinutos = Math.max(Number(user.voip_limite_minutos_mensal || 100), 0);
+  const minutosUsados = Math.ceil(segundosUsados / 60);
+  const minutosRestantes = Math.max(limiteMinutos - minutosUsados, 0);
+  const twimlAppSid = ativo ? await obterTwimlAppSidVoip() : null;
+
   return c.json({
     habilitado: true,
-    status: user.voip_status || "aguardando_configuracao",
+    status: user.voip_status || "pronto_para_ativar",
+    ativo,
     provedor: user.voip_provedor || null,
-    numero: user.voip_numero || null,
-    gera_cobranca: false,
-    mensagem: user.voip_status === "ativo"
-      ? "Telefonia configurada para esta conta."
-      : "A estrutura está habilitada, mas nenhuma operadora ou número foi contratado."
+    numero: ativo ? user.voip_numero : null,
+    ddd: user.voip_ddd || null,
+    gera_cobranca: ativo,
+    sdk_pronto: ativo && Boolean(twimlAppSid),
+    minutos_usados_mes: minutosUsados,
+    minutos_restantes_mes: minutosRestantes,
+    limite_minutos_mensal: limiteMinutos,
+    chamadas_mes: Number(uso.rows[0]?.chamadas_mes || 0),
+    gravacao_habilitada: user.voip_gravacao_habilitada === true,
+    ultimo_erro: user.voip_ultimo_erro || null,
+    mensagem: ativo
+      ? "Telefonia ativa. O número e as chamadas podem gerar cobrança no provedor."
+      : "Módulo preparado e sem linha contratada. Nenhuma cobrança de número ou chamada é iniciada pela plataforma neste estado."
   });
 });
 
@@ -27938,6 +27974,56 @@ app.get("/painel-cliente/voip/chamadas", authMiddleware, async (c) => {
   );
 
   return c.json({ chamadas: result.rows });
+});
+
+
+app.get("/painel-cliente/voip/token", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "voip");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  const ativo =
+    user.voip_habilitado === true &&
+    user.voip_status === "ativo" &&
+    Boolean(user.voip_numero) &&
+    user.voip_provedor === "twilio";
+
+  if (!ativo) {
+    return c.json({
+      error: "A linha VoIP ainda não foi ativada para esta conta."
+    }, 409);
+  }
+
+  const twimlAppSid = await obterTwimlAppSidVoip();
+  if (!twimlAppSid) {
+    return c.json({
+      error: "O Voice SDK ainda não foi finalizado no servidor. Peça ao gestor para revisar a configuração VoIP."
+    }, 409);
+  }
+
+  const identity =
+    user.voip_identity ||
+    identidadeVoipUsuario(Number(user.id));
+
+  try {
+    const token = criarTokenTwilioVoice({
+      identity,
+      twimlAppSid,
+      ttlSegundos: 3600
+    });
+
+    return c.json({
+      token,
+      identity,
+      expira_em_segundos: 3600,
+      numero: user.voip_numero
+    });
+  } catch (err: any) {
+    console.error("VOIP TOKEN ERROR:", err);
+    return c.json({
+      error: String(err?.message || "Não foi possível preparar o telefone no navegador")
+    }, 500);
+  }
 });
 
 app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
