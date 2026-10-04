@@ -27900,6 +27900,296 @@ app.post("/painel-cliente/whatsapp/conversas/:id/modelo", authMiddleware, async 
   }
 });
 
+
+function respostaXmlVoip(c: any, xml: string, status = 200) {
+  return c.body(xml, status, {
+    "Content-Type": "text/xml; charset=utf-8",
+    "Cache-Control": "no-store"
+  });
+}
+
+async function corpoFormularioVoip(c: any) {
+  const form = await c.req.formData();
+  const dados: Record<string, string> = {};
+  for (const [chave, valor] of form.entries()) {
+    dados[chave] = typeof valor === "string" ? valor : "";
+  }
+  return dados;
+}
+
+function assinaturaTwilioValida(c: any, dados: Record<string, string>) {
+  const assinatura =
+    c.req.header("x-twilio-signature") ||
+    c.req.header("X-Twilio-Signature");
+
+  const url = `${URL_BACKEND_PUBLICA}${c.req.path}`;
+  return validarAssinaturaTwilio(url, dados, assinatura);
+}
+
+function statusVoipEncerrado(status: string) {
+  return [
+    "completed",
+    "busy",
+    "failed",
+    "no-answer",
+    "canceled"
+  ].includes(String(status || "").toLowerCase());
+}
+
+async function segundosVoipUsadosNoMes(usuarioId: number) {
+  const result = await client.query(
+    `
+    SELECT COALESCE(SUM(GREATEST(COALESCE(duracao_segundos, 0), 0)), 0)::bigint AS segundos
+    FROM voip_chamadas
+    WHERE usuario_id = $1
+      AND iniciada_em >= date_trunc('month', NOW())
+    `,
+    [usuarioId]
+  );
+  return Number(result.rows[0]?.segundos || 0);
+}
+
+app.post("/webhook/voip/twiml", async (c) => {
+  try {
+    const dados = await corpoFormularioVoip(c);
+
+    if (!assinaturaTwilioValida(c, dados)) {
+      console.error("VOIP TWIML: assinatura Twilio inválida");
+      return respostaXmlVoip(c, "<Response><Hangup/></Response>", 403);
+    }
+
+    const from = String(dados.From || "");
+    const identityMatch = from.match(/^client:corretor_(\d+)$/);
+    const usuarioId = Number(identityMatch?.[1] || 0);
+
+    if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+      return respostaXmlVoip(c, "<Response><Hangup/></Response>");
+    }
+
+    const destino = normalizarNumeroBrasilVoip(dados.To);
+    if (!destino) {
+      return respostaXmlVoip(
+        c,
+        '<Response><Say language="pt-BR">Número inválido. Use um telefone brasileiro com DDD.</Say><Hangup/></Response>'
+      );
+    }
+
+    const usuarioResult = await client.query(
+      `
+      SELECT
+        id, voip_habilitado, voip_status, voip_provedor, voip_numero,
+        COALESCE(voip_limite_minutos_mensal, 100) AS voip_limite_minutos_mensal
+      FROM usuarios
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [usuarioId]
+    );
+    const usuario = usuarioResult.rows[0];
+
+    if (
+      !usuario ||
+      usuario.voip_habilitado !== true ||
+      usuario.voip_status !== "ativo" ||
+      usuario.voip_provedor !== "twilio" ||
+      !usuario.voip_numero
+    ) {
+      return respostaXmlVoip(c, "<Response><Hangup/></Response>");
+    }
+
+    const limiteSegundos =
+      Math.max(Number(usuario.voip_limite_minutos_mensal || 100), 0) * 60;
+    const usados = await segundosVoipUsadosNoMes(usuarioId);
+    const restantes = Math.max(limiteSegundos - usados, 0);
+
+    if (limiteSegundos > 0 && restantes <= 0) {
+      return respostaXmlVoip(
+        c,
+        '<Response><Say language="pt-BR">O limite mensal de ligações desta conta foi atingido.</Say><Hangup/></Response>'
+      );
+    }
+
+    const parentCallSid = textoOpcional(dados.CallSid).slice(0, 80) || null;
+
+    if (parentCallSid) {
+      await client.query(
+        `
+        INSERT INTO voip_chamadas (
+          usuario_id, provedor, chamada_externa_id, direcao, telefone,
+          status, iniciada_em, atualizado_em
+        )
+        VALUES ($1, 'twilio', $2, 'saida', $3, 'iniciando', NOW(), NOW())
+        ON CONFLICT DO NOTHING
+        `,
+        [usuarioId, parentCallSid, destino]
+      );
+    }
+
+    const callbackUrl =
+      `${URL_BACKEND_PUBLICA}/webhook/voip/status`;
+
+    const timeLimitAttr =
+      limiteSegundos > 0
+        ? ` timeLimit="${Math.max(1, Math.floor(restantes))}"`
+        : "";
+
+    const xml =
+      `<Response><Dial callerId="${escaparXmlVoip(usuario.voip_numero)}" answerOnBridge="true"${timeLimitAttr}><Number statusCallback="${escaparXmlVoip(callbackUrl)}" statusCallbackEvent="initiated ringing answered completed" statusCallbackMethod="POST">${escaparXmlVoip(destino)}</Number></Dial></Response>`;
+
+    return respostaXmlVoip(c, xml);
+  } catch (err) {
+    console.error("VOIP TWIML ERROR:", err);
+    return respostaXmlVoip(c, "<Response><Hangup/></Response>", 500);
+  }
+});
+
+app.post("/webhook/voip/incoming", async (c) => {
+  try {
+    const dados = await corpoFormularioVoip(c);
+
+    if (!assinaturaTwilioValida(c, dados)) {
+      console.error("VOIP INCOMING: assinatura Twilio inválida");
+      return respostaXmlVoip(c, "<Response><Reject/></Response>", 403);
+    }
+
+    const numeroDestino = normalizarNumeroBrasilVoip(dados.To);
+    const numeroOrigem = normalizarNumeroBrasilVoip(dados.From);
+
+    if (!numeroDestino) {
+      return respostaXmlVoip(c, "<Response><Reject/></Response>");
+    }
+
+    const usuarioResult = await client.query(
+      `
+      SELECT
+        id, voip_identity, voip_numero,
+        COALESCE(voip_limite_minutos_mensal, 100) AS voip_limite_minutos_mensal
+      FROM usuarios
+      WHERE voip_habilitado = true
+        AND voip_status = 'ativo'
+        AND voip_provedor = 'twilio'
+        AND regexp_replace(COALESCE(voip_numero, ''), '[^0-9]', '', 'g')
+          = regexp_replace($1, '[^0-9]', '', 'g')
+      LIMIT 1
+      `,
+      [numeroDestino]
+    );
+    const usuario = usuarioResult.rows[0];
+
+    if (!usuario) {
+      return respostaXmlVoip(c, "<Response><Reject/></Response>");
+    }
+
+    const limiteSegundos =
+      Math.max(Number(usuario.voip_limite_minutos_mensal || 100), 0) * 60;
+    const usados = await segundosVoipUsadosNoMes(Number(usuario.id));
+    const restantes = Math.max(limiteSegundos - usados, 0);
+
+    if (limiteSegundos > 0 && restantes <= 0) {
+      return respostaXmlVoip(c, "<Response><Reject reason=\"busy\"/></Response>");
+    }
+
+    const parentCallSid = textoOpcional(dados.CallSid).slice(0, 80) || null;
+
+    if (parentCallSid) {
+      await client.query(
+        `
+        INSERT INTO voip_chamadas (
+          usuario_id, provedor, chamada_externa_id, direcao, telefone,
+          status, iniciada_em, atualizado_em
+        )
+        VALUES ($1, 'twilio', $2, 'entrada', $3, 'tocando', NOW(), NOW())
+        ON CONFLICT DO NOTHING
+        `,
+        [Number(usuario.id), parentCallSid, numeroOrigem || String(dados.From || "")]
+      );
+    }
+
+    const identity =
+      usuario.voip_identity ||
+      identidadeVoipUsuario(Number(usuario.id));
+    const callbackUrl =
+      `${URL_BACKEND_PUBLICA}/webhook/voip/status`;
+    const timeLimitAttr =
+      limiteSegundos > 0
+        ? ` timeLimit="${Math.max(1, Math.floor(restantes))}"`
+        : "";
+
+    const xml =
+      `<Response><Dial answerOnBridge="true"${timeLimitAttr}><Client statusCallback="${escaparXmlVoip(callbackUrl)}" statusCallbackEvent="initiated ringing answered completed" statusCallbackMethod="POST">${escaparXmlVoip(identity)}</Client></Dial></Response>`;
+
+    return respostaXmlVoip(c, xml);
+  } catch (err) {
+    console.error("VOIP INCOMING ERROR:", err);
+    return respostaXmlVoip(c, "<Response><Reject/></Response>", 500);
+  }
+});
+
+app.post("/webhook/voip/status", async (c) => {
+  try {
+    const dados = await corpoFormularioVoip(c);
+
+    if (!assinaturaTwilioValida(c, dados)) {
+      console.error("VOIP STATUS: assinatura Twilio inválida");
+      return c.json({ error: "Assinatura inválida" }, 403);
+    }
+
+    const callSid = textoOpcional(dados.CallSid).slice(0, 80);
+    const parentCallSid = textoOpcional(dados.ParentCallSid).slice(0, 80);
+    const status = textoOpcional(dados.CallStatus || dados.DialCallStatus || "atualizando").toLowerCase();
+    const duracao = Math.max(
+      Number(dados.CallDuration || dados.DialCallDuration || 0) || 0,
+      0
+    );
+
+    if (!callSid && !parentCallSid) {
+      return c.json({ sucesso: true });
+    }
+
+    await client.query(
+      `
+      UPDATE voip_chamadas
+      SET
+        chamada_pstn_sid = CASE
+          WHEN $1 <> '' AND $1 IS DISTINCT FROM chamada_externa_id THEN $1
+          ELSE chamada_pstn_sid
+        END,
+        status = $3,
+        duracao_segundos = GREATEST(COALESCE(duracao_segundos, 0), $4),
+        atendida_em = CASE
+          WHEN $3 IN ('in-progress', 'answered') THEN COALESCE(atendida_em, NOW())
+          ELSE atendida_em
+        END,
+        encerrada_em = CASE
+          WHEN $5 THEN COALESCE(encerrada_em, NOW())
+          ELSE encerrada_em
+        END,
+        motivo_fim = CASE
+          WHEN $5 THEN $3
+          ELSE motivo_fim
+        END,
+        atualizado_em = NOW()
+      WHERE
+        ($2 <> '' AND chamada_externa_id = $2)
+        OR ($1 <> '' AND chamada_externa_id = $1)
+        OR ($1 <> '' AND chamada_pstn_sid = $1)
+      `,
+      [
+        callSid,
+        parentCallSid,
+        status || "atualizando",
+        Math.floor(duracao),
+        statusVoipEncerrado(status)
+      ]
+    );
+
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("VOIP STATUS ERROR:", err);
+    return c.json({ error: "Erro ao atualizar chamada" }, 500);
+  }
+});
+
 app.get("/painel-cliente/voip/configuracao", authMiddleware, async (c) => {
   const user: any = c.get("user");
   const erroAcesso = garantirRecursoPainel(user, "voip");
