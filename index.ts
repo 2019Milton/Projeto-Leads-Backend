@@ -29298,6 +29298,7 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
       minutos: voipUsuario?.consumo?.minutos || 0,
       custo_numero_brl: voipUsuario?.custos?.numero_brl || 0,
       custo_chamadas_brl: voipUsuario?.custos?.chamadas_brl || 0,
+      taxa_fixa_brl: voipUsuario?.custos?.taxa_fixa_brl || 0,
       valor_a_pagar_brl: voipUsuario?.custos?.valor_repassado_brl || 0,
       custo_status: (voipUsuario?.consumo?.custos_estimados || 0) > 0
         ? "parcialmente_estimado"
