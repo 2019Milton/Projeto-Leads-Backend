@@ -22,7 +22,8 @@ import { lerQualificacaoIA } from "./classificacao-conversa";
 
 export type ChaveNicho =
   | "imoveis" | "saude" | "suplementos" | "saas" | "higienizacao" | "telecom"
-  | "cursos_online" | "educacao" | "auto" | "consorcio";
+  | "cursos_online" | "faculdade_universidade" | "dentista"
+  | "educacao" | "auto" | "consorcio";
 
 // Chave curta de nicho usada tanto pelo contexto da IA (contextoNicho) quanto
 // pela pontuação por regras e pelas features do ML (calcularScoreLead,
@@ -38,6 +39,15 @@ export function detectarChaveNicho(lead: any): ChaveNicho | null {
   if (slug.includes("higien") || nome.includes("higien")) return "higienizacao";
   if (slug.includes("telecom") || nome.includes("telecom")) return "telecom";
   if (slug.includes("curso_online") || slug.includes("cursos_online") || nome.includes("curso online") || nome.includes("cursos online")) return "cursos_online";
+  if (
+    slug.includes("faculdade") || slug.includes("universidade") ||
+    nome.includes("faculdade") || nome.includes("universidade") ||
+    nome.includes("graduação") || nome.includes("graduacao")
+  ) return "faculdade_universidade";
+  if (
+    slug.includes("dentista") || slug.includes("odonto") ||
+    nome.includes("dentista") || nome.includes("odontolog")
+  ) return "dentista";
   if (slug.includes("educa") || nome.includes("educa") || nome.includes("curso") || nome.includes("ensino")) return "educacao";
   if (slug.includes("auto") || nome.includes("auto") || nome.includes("veículo") || nome.includes("veiculo") || nome.includes("carro")) return "auto";
   if (slug.includes("consorcio") || slug.includes("consórcio") || nome.includes("consórcio") || nome.includes("consorcio")) return "consorcio";
@@ -106,6 +116,8 @@ export const VOCABULARIO_NICHO: Record<ChaveNicho, string[]> = {
   higienizacao: ["estofado", "colchao", "carpete", "tapete", "sofa", "acaro", "mofo", "pos obra", "agendamento", "orcamento"],
   telecom: ["internet dedicada", "link dedicado", "firewall", "pabx", "ramal", "hotspot", "wifi corporativo", "uptime", "sla", "provedor", "fornecedor"],
   cursos_online: ["curso online", "aula gravada", "aula ao vivo", "certificado", "acesso vitalicio", "plataforma de ensino", "parcelamento", "nova profissao", "renda extra", "inscricao", "modulo"],
+  faculdade_universidade: ["matricula", "vestibular", "enem", "bolsa", "mensalidade", "graduacao", "bacharelado", "tecnologo", "ead", "campus", "transferencia", "segunda graduacao"],
+  dentista: ["consulta", "avaliacao", "implante", "aparelho", "ortodontia", "clareamento", "faceta", "lente de contato dental", "canal", "protese", "extracao", "dor de dente"],
   educacao: ["matricula", "turma", "bolsa", "certificado", "presencial", "carga horaria", "professor", "aula"],
   auto: ["seminovo", "revisao", "test drive", "quilometragem", "troca", "financiamento", "entrada", "placa", "laudo"],
   consorcio: ["carta de credito", "contemplacao", "lance", "grupo", "cota", "assembleia"]
