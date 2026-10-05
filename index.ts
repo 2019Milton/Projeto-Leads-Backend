@@ -27570,11 +27570,11 @@ app.post("/gestor/clientes/:id/voip/ativar", authMiddleware, async (c) => {
       INSERT INTO voip_linhas_historico (
         usuario_id, provedor, numero, numero_sid, custo_mensal_usd, ativada_em
       )
-      VALUES ($1, 'twilio', $2, $3, $4, NOW())
-      ON CONFLICT (numero_sid) DO UPDATE SET
-        numero = EXCLUDED.numero,
-        custo_mensal_usd = EXCLUDED.custo_mensal_usd,
-        liberada_em = NULL
+      SELECT $1, 'twilio', $2, $3, $4, NOW()
+      WHERE NOT EXISTS (
+        SELECT 1 FROM voip_linhas_historico
+        WHERE numero_sid = $3
+      )
       `,
       [clienteId, numeroProvisionado.numero, numeroProvisionado.sid, cfgCustosVoip.numeroMensalUsd]
     );
