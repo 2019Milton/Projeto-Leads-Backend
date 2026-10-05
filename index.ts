@@ -27439,8 +27439,10 @@ async function resumoCustosVoipUsuarios(
     const baseRepasseBrl = Number(
       (custoChamadasBrl + (repassarNumero ? custoNumeroBrl : 0)).toFixed(2)
     );
-    const teveLinhaNoMes = Number(linha.linhas || 0) > 0;
-    const valorRepassado = teveLinhaNoMes
+    const teveUsoVoipNoMes =
+      Number(linha.linhas || 0) > 0 ||
+      Number(chamadas.chamadas || 0) > 0;
+    const valorRepassado = teveUsoVoipNoMes
       ? custoRepasseBrl(baseRepasseBrl, margemPercentual, taxaFixa)
       : Number(baseRepasseBrl.toFixed(2));
     const margemBrl = Number((valorRepassado - custoProvedorBrl).toFixed(2));
