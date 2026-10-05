@@ -29,6 +29,8 @@ import {
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
 
+import { CATEGORIA_ACAO_GOOGLE, lerMetaCampanhaGoogle, planejarMetasCampanhaGoogle } from "./metas-google";
+
 import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
@@ -7935,16 +7937,40 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
           cfgExistente.destino === "lead_ads" ? "SUBMIT_LEAD_FORM"
           : cfgExistente.destino === "whatsapp" ? "CONTACT"
           : null;
-        if (categoriaMetaGoogle && cfgExistente.lead_form_goal !== "BIDDABLE") {
+        let metaPrincipalOk = cfgExistente.lead_form_goal === "BIDDABLE";
+        if (categoriaMetaGoogle && !metaPrincipalOk) {
           const habilitou = await tentarHabilitarMetaConversaoGoogle(
             customerId, campaignId, accessToken, loginCustomerId, categoriaMetaGoogle
           );
           if (habilitou) {
+            metaPrincipalOk = true;
             await client.query(
               `UPDATE campanhas
                SET configuracoes_avancadas = configuracoes_avancadas || $1::jsonb, atualizado_em = NOW()
                WHERE id = $2`,
               [JSON.stringify({ lead_form_goal: "BIDDABLE", lead_form_goal_configured: true }), linhaExistente.id]
+            );
+          }
+        }
+
+        // Só campanha criada com a marca alinhar_metas_plataforma (nunca as
+        // antigas): termina de alinhar as metas quando o Google já criou a
+        // meta principal e as da plataforma (ver alinharMetasCampanhaGoogle).
+        if (
+          categoriaMetaGoogle &&
+          metaPrincipalOk &&
+          cfgExistente.alinhar_metas_plataforma === true &&
+          cfgExistente.metas_plataforma_alinhadas !== true
+        ) {
+          const alinhamento = await alinharMetasCampanhaGoogle(
+            usuarioId, customerId, campaignId, accessToken, loginCustomerId, categoriaMetaGoogle
+          );
+          if (alinhamento.completo) {
+            await client.query(
+              `UPDATE campanhas
+               SET configuracoes_avancadas = configuracoes_avancadas || $1::jsonb, atualizado_em = NOW()
+               WHERE id = $2`,
+              [JSON.stringify({ metas_plataforma_alinhadas: true }), linhaExistente.id]
             );
           }
         }
@@ -8215,26 +8241,35 @@ async function obterOuCriarConversionActionGoogle(
       return existente;
     }
 
-    const resultados = await googleAdsMutate(
+    // Categoria de funil de lead do Google: QUALIFIED_LEAD (qualificado) e
+    // CONVERTED_LEAD (fechado) — validadas com validateOnly em duas contas
+    // reais em 05/10/2026, e outra ferramenta já usa QUALIFIED_LEAD em
+    // UPLOAD_CLICKS numa conta conectada. Antes ia tudo em DEFAULT ("Outros"),
+    // misturando qualificado, venda e qualquer outra ação da conta na mesma
+    // meta. ("LEAD" não existe no enum e "IMPORTED_LEAD" foi recusado ao vivo
+    // em 16/09/2026.) Se a conta recusar, cai pra DEFAULT como antes.
+    const criarAcao = (categoria: string) => googleAdsMutate(
       customerId, accessToken, "conversionActions",
       [
         {
           create: {
             name: `Plataforma de Leads - ${nomeEvento}`,
             type: "UPLOAD_CLICKS",
-            // "LEAD" nao existe no enum ConversionActionCategory (a Google Ads
-            // API rejeita com ENUM_VALUE_NOT_PERMITTED) e "IMPORTED_LEAD" —
-            // apesar de existir e ser semanticamente o correto — tambem foi
-            // rejeitado ao vivo nessa mesma conta (16/09/2026, mesmo erro).
-            // "DEFAULT" e a unica testada que a API aceitou de fato pra criar
-            // uma acao UPLOAD_CLICKS nova nessa conta.
-            category: "DEFAULT",
+            category: categoria,
             status: "ENABLED",
           },
         },
       ],
       loginCustomerId
     );
+
+    let resultados: any[];
+    try {
+      resultados = await criarAcao(CATEGORIA_ACAO_GOOGLE[chave]);
+    } catch (errCategoria: any) {
+      console.warn(`AVISO GOOGLE: categoria ${CATEGORIA_ACAO_GOOGLE[chave]} recusada, criando a ação em DEFAULT:`, errCategoria?.message);
+      resultados = await criarAcao("DEFAULT");
+    }
 
     const resourceName = resultados[0]?.resourceName;
     if (!resourceName) return null;
@@ -9859,6 +9894,87 @@ async function tentarHabilitarMetaConversaoGoogle(
   }
 }
 
+// Deixa contar no lance da campanha só a meta principal do destino e as metas
+// das ações de conversão da plataforma (ver metas-google.ts). Só em campanhas
+// criadas pela plataforma a partir de 05/10/2026 (configuracoes_avancadas.
+// alinhar_metas_plataforma) — nunca mexe em campanha antiga. Best-effort:
+// falha aqui não impede publicar. "completo" = as metas da plataforma já
+// existiam na campanha (o Google pode levar um tempo pra criá-las depois que
+// a ação é criada; a sincronização tenta de novo até completar).
+async function alinharMetasCampanhaGoogle(
+  usuarioId: number,
+  customerId: string,
+  campaignId: string,
+  accessToken: string,
+  loginCustomerId: string | null,
+  categoriaPrincipal: "SUBMIT_LEAD_FORM" | "CONTACT"
+): Promise<{ aplicado: boolean; completo: boolean }> {
+  try {
+    const campaignIdSeguro = String(campaignId || "").replace(/\D/g, "");
+    if (!campaignIdSeguro) return { aplicado: false, completo: false };
+
+    const acoes = [
+      await obterOuCriarConversionActionGoogle(usuarioId, customerId, accessToken, loginCustomerId, "qualified", "Qualified Lead"),
+      await obterOuCriarConversionActionGoogle(usuarioId, customerId, accessToken, loginCustomerId, "closed", "Closed Won")
+    ];
+    const idsAcoes = acoes
+      .map(recurso => String(recurso || "").split("/").pop() || "")
+      .filter(id => /^\d+$/.test(id));
+
+    let categoriasPlataforma: string[] = [];
+    if (idsAcoes.length) {
+      const linhasAcoes = await googleAdsQuery(
+        customerId,
+        accessToken,
+        `SELECT conversion_action.category FROM conversion_action WHERE conversion_action.id IN (${idsAcoes.join(",")})`,
+        loginCustomerId
+      );
+      categoriasPlataforma = [...new Set(
+        (linhasAcoes as any[]).map(l => String(l?.conversionAction?.category || "")).filter(Boolean)
+      )];
+    }
+
+    const linhasMetas = await googleAdsQuery(
+      customerId,
+      accessToken,
+      `SELECT campaign_conversion_goal.resource_name, campaign_conversion_goal.category,
+              campaign_conversion_goal.origin, campaign_conversion_goal.biddable
+       FROM campaign_conversion_goal
+       WHERE campaign.id = ${campaignIdSeguro}`,
+      loginCustomerId
+    );
+    const metas = (linhasMetas as any[])
+      .map(lerMetaCampanhaGoogle)
+      .filter((m): m is NonNullable<typeof m> => Boolean(m));
+
+    const plano = planejarMetasCampanhaGoogle(metas, categoriaPrincipal, categoriasPlataforma);
+    if (!plano) return { aplicado: false, completo: false };
+
+    if (plano.length) {
+      // partialFailure: uma meta recusada pelo Google não impede ajustar as outras.
+      await googleAdsMutate(
+        customerId,
+        accessToken,
+        "campaignConversionGoals",
+        plano.map(alvo => ({ update: alvo, updateMask: "biddable" })),
+        loginCustomerId,
+        { partialFailure: true }
+      );
+    }
+
+    const presentes = new Set(metas.map(m => `${m.category}/${m.origin}`));
+    const completo =
+      categoriasPlataforma.length > 0 &&
+      categoriasPlataforma.every(categoria => presentes.has(`${categoria}/WEBSITE`));
+
+    console.log(`[google-metas] campanha ${campaignIdSeguro}: ${plano.length} meta(s) ajustada(s); metas da plataforma ${completo ? "ok" : "ainda não disponíveis"}`);
+    return { aplicado: true, completo };
+  } catch (err: any) {
+    console.warn(`AVISO GOOGLE: não foi possível alinhar as metas da campanha ${campaignId}:`, err?.message);
+    return { aplicado: false, completo: false };
+  }
+}
+
 // Cria o anúncio permitido para o tipo escolhido. Pesquisa aceita site, Lead Form
 // ou Business Message/WhatsApp; Display usa o endereço do site. A linha local
 // recebe adset_id/ad_id/form_id.
@@ -10182,6 +10298,22 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       );
     }
 
+    // Campanha nova: só contam no lance a meta principal (formulário/WhatsApp)
+    // e as metas da plataforma (lead qualificado / convertido). Se a meta
+    // principal ainda não existir, a sincronização faz isso depois.
+    let metasPlataformaAlinhadas = false;
+    if (metaConversaoOtimizada && (destinoGoogle === "lead_ads" || destinoGoogle === "whatsapp")) {
+      const alinhamento = await alinharMetasCampanhaGoogle(
+        usuarioId,
+        conexao.customerId,
+        String(campaign_id),
+        conexao.accessToken,
+        conexao.loginCustomerId,
+        destinoGoogle === "lead_ads" ? "SUBMIT_LEAD_FORM" : "CONTACT"
+      );
+      metasPlataformaAlinhadas = alinhamento.completo;
+    }
+
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
       rascunho_plataforma_adicional: false,
@@ -10209,6 +10341,10 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
         // Lead Form, mas guarda o mesmo status "meta de conversão Google
         // Hosted biddable" pras duas categorias.
         lead_form_goal: metaConversaoOtimizada ? "BIDDABLE" : "AGUARDANDO_APROVACAO_GOOGLE",
+        // Ver alinharMetasCampanhaGoogle: marca de campanha nova (a
+        // sincronização só ajusta metas de campanha com essa marca).
+        alinhar_metas_plataforma: true,
+        metas_plataforma_alinhadas: metasPlataformaAlinhadas,
       } : {}),
       ...(destinoGoogle === "whatsapp" ? {
         mensagem_whatsapp: mensagemWhatsapp,
