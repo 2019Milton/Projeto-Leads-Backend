@@ -43008,7 +43008,7 @@ app.post("/campanhas/:id/rascunhos-plataformas", authMiddleware, async (c) => {
     if (!Number.isFinite(campanhaId) || campanhaId <= 0) {
       return c.json({ error: "Campanha inválida" }, 400);
     }
-    if (!rascunhos.length || rascunhos.length > 4) {
+    if (!rascunhos.length || rascunhos.length > 5) {
       return c.json({ error: "Informe ao menos uma plataforma válida" }, 400);
     }
 
@@ -43036,7 +43036,7 @@ app.post("/campanhas/:id/rascunhos-plataformas", authMiddleware, async (c) => {
       );
     }
 
-    const permitidas = new Set(["facebook", "instagram", "google", "tiktok"]);
+    const permitidas = new Set(["facebook", "instagram", "google", "tiktok", "linkedin"]);
     const resultados: any[] = [];
 
     for (const item of rascunhos) {
