@@ -39427,6 +39427,35 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       idadeMin: "22", idadeMax: "55",
       obrigadoTextoSufixo: "nossa equipe vai entrar em contato para te passar todos os detalhes da turma e formas de pagamento"
     }
+,
+    faculdade_universidade: {
+      topicoDefault: "faculdade e universidade",
+      especialidade: "captação de alunos para faculdades e universidades no Brasil, incluindo graduação presencial, EAD e híbrida",
+      v1exemplos: ["Inscrições abertas para a próxima turma", "Comece sua graduação no próximo semestre", "Dê o primeiro passo para sua formação"],
+      v1texto: "crie urgência somente com prazos, inscrições ou condições reais informadas; nunca invente bolsa, desconto ou número de vagas",
+      v2exemplos: ["Sua carreira pode começar com a escolha certa", "Transforme seu futuro com uma nova formação", "O próximo passo da sua carreira começa aqui"],
+      v2texto: "evoque crescimento profissional, realização e futuro, sem prometer emprego ou salário",
+      v3exemplos: ["Escolha o curso e a modalidade que combinam com sua rotina", "Presencial, EAD ou híbrido: encontre sua melhor opção", "Formação para avançar na sua carreira"],
+      v3texto: "destaque curso, modalidade, turno, campus, processo de ingresso e condições reais informadas",
+      perguntas: "Qual curso voce quer fazer?\nPrefere presencial, EAD ou hibrido?\nQual turno fica melhor para voce?\nEm qual cidade pretende estudar?",
+      interesses: "faculdade, universidade, graduacao, vestibular, ensino superior, carreira profissional, enem",
+      idadeMin: "17", idadeMax: "45",
+      obrigadoTextoSufixo: "nossa equipe vai entrar em contato para orientar sobre cursos, ingresso e matricula"
+    },
+    dentista: {
+      topicoDefault: "clinica odontologica",
+      especialidade: "clínicas odontológicas e captação de pacientes no Brasil, com foco em avaliação, prevenção e tratamentos odontológicos",
+      v1exemplos: ["Agende sua avaliação odontológica", "Cuide do seu sorriso com acompanhamento profissional", "Encontre o tratamento adequado após uma avaliação"],
+      v1texto: "crie chamada para avaliação ou consulta, sem diagnóstico, promessa de resultado, medo excessivo ou afirmações clínicas não comprovadas",
+      v2exemplos: ["Mais confiança para cuidar do seu sorriso", "Seu sorriso merece atenção profissional", "Cuidado odontológico para você se sentir bem"],
+      v2texto: "evoque cuidado, confiança e bem-estar sem explorar insegurança física de forma agressiva",
+      v3exemplos: ["Avaliação profissional e plano de tratamento individualizado", "Atendimento odontológico com acompanhamento", "Converse com a equipe e tire suas dúvidas"],
+      v3texto: "destaque atendimento, avaliação, estrutura e facilidades reais informadas; não invente preços, garantias ou resultados",
+      perguntas: "Qual tratamento voce procura?\nE algo urgente ou voce esta pesquisando?\nQual sua cidade ou regiao?\nQual periodo e melhor para uma avaliacao?",
+      interesses: "dentista, odontologia, clinica odontologica, implante dentario, ortodontia, aparelho dental, clareamento dental",
+      idadeMin: "18", idadeMax: "65",
+      obrigadoTextoSufixo: "nossa equipe vai entrar em contato para orientar e verificar horarios de avaliacao"
+    }
   };
 
   const cfgGenerico = {
