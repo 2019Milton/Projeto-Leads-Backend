@@ -28766,6 +28766,177 @@ app.post("/webhook/voip/status", async (c) => {
   }
 });
 
+
+app.get("/painel-cliente/voip/custos", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const erroAcesso = garantirRecursoPainel(user, "voip");
+  if (erroAcesso) return c.json({ error: erroAcesso }, 403);
+
+  sincronizarCustosVoipPendentes(6).catch(() => {});
+
+  const resumo = await resumoCustosVoipUsuarios(
+    [Number(user.id)],
+    c.req.query("mes"),
+    true
+  );
+  const proprio = resumo.usuarios[0] || null;
+
+  return c.json({
+    mes: resumo.mes,
+    cotacao_usd_brl: resumo.cotacao_usd_brl,
+    cotacao_atualizada_em: resumo.cotacao_atualizada_em,
+    tarifas_referencia: resumo.tarifas_referencia,
+    resumo: proprio,
+    mensagem: "O VoIP é cobrado separadamente da mensalidade da plataforma. Durante a conciliação algumas chamadas podem aparecer como estimadas; após a Twilio fechar a chamada o valor é atualizado para o custo final."
+  });
+});
+
+app.get("/gestor/voip/custos", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+
+  if (!usuarioPodeGerenciarClientes(gestor) || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Acesso restrito ao gestor de tráfego" }, 403);
+  }
+
+  const idsResult = await client.query(
+    `
+    SELECT id
+    FROM usuarios
+    WHERE admin_id = $1
+      AND tipo IN ('corretor', 'corretor_receptor')
+    ORDER BY id
+    `,
+    [Number(gestor.id)]
+  );
+
+  const ids = idsResult.rows.map((r: any) => Number(r.id));
+  sincronizarCustosVoipPendentes(8).catch(() => {});
+
+  const resumo = await resumoCustosVoipUsuarios(
+    ids,
+    c.req.query("mes"),
+    c.req.query("detalhes") === "1"
+  );
+
+  return c.json({
+    ...resumo,
+    visao: "gestor",
+    mensagem: "Valores de VoIP são adicionais e não fazem parte da mensalidade da Plataforma de Leads."
+  });
+});
+
+app.get("/admin/voip/custos", authMiddleware, masterMiddleware, async (c) => {
+  const idsResult = await client.query(
+    `
+    SELECT id
+    FROM usuarios
+    WHERE tipo IN ('corretor', 'corretor_receptor')
+    ORDER BY id
+    `
+  );
+
+  sincronizarCustosVoipPendentes(12).catch(() => {});
+
+  const resumo = await resumoCustosVoipUsuarios(
+    idsResult.rows.map((r: any) => Number(r.id)),
+    c.req.query("mes"),
+    c.req.query("detalhes") === "1"
+  );
+
+  return c.json({
+    ...resumo,
+    visao: "super_admin",
+    mensagem: "Custo do provedor, valor repassado e margem são separados da mensalidade da plataforma."
+  });
+});
+
+app.get("/admin/voip/faturamento/:id", authMiddleware, masterMiddleware, async (c) => {
+  const usuarioId = Number(c.req.param("id"));
+  if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+    return c.json({ error: "Usuário inválido" }, 400);
+  }
+
+  const usuario = await client.query(
+    `
+    SELECT id, nome, sobrenome, email
+    FROM usuarios
+    WHERE id = $1 AND tipo IN ('corretor', 'corretor_receptor')
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+  if (!usuario.rows[0]) return c.json({ error: "Corretor não encontrado" }, 404);
+
+  return c.json({
+    usuario: usuario.rows[0],
+    configuracao: await garantirConfigFaturamentoVoip(usuarioId)
+  });
+});
+
+app.patch("/admin/voip/faturamento/:id", authMiddleware, masterMiddleware, async (c) => {
+  const usuarioId = Number(c.req.param("id"));
+  if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+    return c.json({ error: "Usuário inválido" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const margem = Number(body.margem_percentual ?? 0);
+  const taxa = Number(body.taxa_fixa_mensal_brl ?? 0);
+  const repassarNumero = body.repassar_numero !== false;
+  const observacoes = textoOpcional(body.observacoes).slice(0, 500) || null;
+
+  if (!Number.isFinite(margem) || margem < 0 || margem > 500) {
+    return c.json({ error: "Margem percentual deve estar entre 0% e 500%." }, 400);
+  }
+  if (!Number.isFinite(taxa) || taxa < 0 || taxa > 100000) {
+    return c.json({ error: "Taxa fixa mensal inválida." }, 400);
+  }
+
+  const existe = await client.query(
+    `
+    SELECT id FROM usuarios
+    WHERE id = $1 AND tipo IN ('corretor', 'corretor_receptor')
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+  if (!existe.rows[0]) return c.json({ error: "Corretor não encontrado" }, 404);
+
+  await client.query(
+    `
+    INSERT INTO voip_faturamento_config (
+      usuario_id, margem_percentual, taxa_fixa_mensal_brl,
+      repassar_numero, observacoes, atualizado_em
+    )
+    VALUES ($1, $2, $3, $4, $5, NOW())
+    ON CONFLICT (usuario_id) DO UPDATE SET
+      margem_percentual = EXCLUDED.margem_percentual,
+      taxa_fixa_mensal_brl = EXCLUDED.taxa_fixa_mensal_brl,
+      repassar_numero = EXCLUDED.repassar_numero,
+      observacoes = EXCLUDED.observacoes,
+      atualizado_em = NOW()
+    `,
+    [usuarioId, margem, taxa, repassarNumero, observacoes]
+  );
+
+  return c.json({
+    sucesso: true,
+    configuracao: await garantirConfigFaturamentoVoip(usuarioId)
+  });
+});
+
+app.post("/admin/voip/custos/sincronizar", authMiddleware, masterMiddleware, async (c) => {
+  await Promise.all([
+    obterCotacaoUsdBrlVoip(true),
+    sincronizarCustosVoipPendentes(30)
+  ]);
+
+  return c.json({
+    sucesso: true,
+    cotacao_usd_brl: await obterCotacaoUsdBrlVoip()
+  });
+});
+
 app.get("/painel-cliente/voip/configuracao", authMiddleware, async (c) => {
   const user: any = c.get("user");
   const erroAcesso = garantirRecursoPainel(user, "voip");
