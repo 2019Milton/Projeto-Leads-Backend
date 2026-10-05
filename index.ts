@@ -39151,7 +39151,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         .map((t: string) => t.trim().slice(0, 60))
         .slice(0, 9)
     : [];
-  const plataformasValidas = new Set(["meta", "facebook", "instagram", "tiktok", "google"]);
+  const plataformasValidas = new Set(["meta", "facebook", "instagram", "tiktok", "google", "linkedin"]);
   const plataformas: string[] = Array.from(new Set(
     (Array.isArray(body.plataformas) ? body.plataformas : ["meta"])
       .map((p: unknown) => normalizarChave(p))
@@ -39242,7 +39242,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
   const incluirFacebook = plataformas.includes("facebook") || plataformas.includes("meta");
   const incluirInstagram = plataformas.includes("instagram") || plataformas.includes("meta");
   const nomesPlataformas = plataformas
-    .map(p => ({ meta: "Facebook e Instagram Ads", facebook: "Facebook Ads", instagram: "Instagram Ads", tiktok: "TikTok Ads", google: "Google Ads" }[p]))
+    .map(p => ({ meta: "Facebook e Instagram Ads", facebook: "Facebook Ads", instagram: "Instagram Ads", tiktok: "TikTok Ads", google: "Google Ads", linkedin: "LinkedIn Ads" }[p]))
     .filter(Boolean) as string[];
 
   const nichoConfig: Record<string, {
@@ -39809,6 +39809,7 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       (incluirFacebook ? `Facebook Ads: texto persuasivo, titulo, descricao, CTA, perguntas e tela de obrigado devem respeitar o nicho e os fatos existentes.\n` : "") +
       (incluirInstagram ? `Instagram Ads: a mesma base precisa soar natural em feed, stories e reels, sem depender de informacao inventada.\n` : "") +
       (incluirTikTok ? `TikTok Ads: produza mensagem direta, clara e adequada a video curto; use os campos compartilhados e nunca invente identidade, formulario, URL ou localizacao.\n` : "") +
+      (plataformas.includes("linkedin") ? `LinkedIn Ads: adapte a mensagem ao contexto profissional do nicho e use os campos compartilhados da campanha; nunca invente resultados, bolsas, descontos, credenciais ou promessas clinicas.\n` : "") +
       (incluirGoogle ? `Google Ads (${googleTipo}): complete todos os campos google_* solicitados, com intencao de busca clara, variacoes diferentes e limites de caracteres rigorosos.${googleDestinoWhatsapp ? " Nos titulos do Google, e proibido mencionar WhatsApp ou Whats App; o titulo abre o site e somente o botao abre a conversa." : ""}\n` : "");
 
     const promptCriacao =
