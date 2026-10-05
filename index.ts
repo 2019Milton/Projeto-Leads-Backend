@@ -5364,6 +5364,7 @@ const authMiddleware = async (c: any, next: any) => {
       const permitidoVoip = userBanco.voip_habilitado === true && metodo === "GET" && (
         rota === "/painel-cliente/voip/configuracao" ||
         rota === "/painel-cliente/voip/chamadas" ||
+        rota === "/painel-cliente/voip/custos" ||
         rota === "/painel-cliente/voip/token"
       );
       const permitido = permitidoBasico || permitidoWhatsapp || permitidoVoip;
@@ -27535,6 +27536,22 @@ app.post("/gestor/clientes/:id/voip/ativar", authMiddleware, async (c) => {
       ]
     );
 
+    const cfgCustosVoip = configuracaoCustosVoip();
+    await client.query(
+      `
+      INSERT INTO voip_linhas_historico (
+        usuario_id, provedor, numero, numero_sid, custo_mensal_usd, ativada_em
+      )
+      VALUES ($1, 'twilio', $2, $3, $4, NOW())
+      ON CONFLICT (numero_sid) DO UPDATE SET
+        numero = EXCLUDED.numero,
+        custo_mensal_usd = EXCLUDED.custo_mensal_usd,
+        liberada_em = NULL
+      `,
+      [clienteId, numeroProvisionado.numero, numeroProvisionado.sid, cfgCustosVoip.numeroMensalUsd]
+    );
+    await garantirConfigFaturamentoVoip(clienteId);
+
     const atualizado = await buscarClienteGerenciado(gestor, clienteId);
 
     return c.json({
@@ -27600,6 +27617,17 @@ app.post("/gestor/clientes/:id/voip/desativar", authMiddleware, async (c) => {
   try {
     if (numeroSid) {
       await liberarNumeroTwilio(String(numeroSid));
+    }
+
+    if (numeroSid) {
+      await client.query(
+        `
+        UPDATE voip_linhas_historico
+        SET liberada_em = COALESCE(liberada_em, NOW())
+        WHERE usuario_id = $1 AND numero_sid = $2
+        `,
+        [clienteId, String(numeroSid)]
+      );
     }
 
     await client.query(
@@ -28673,7 +28701,7 @@ app.post("/webhook/voip/status", async (c) => {
       return c.json({ sucesso: true });
     }
 
-    await client.query(
+    const atualizadas = await client.query(
       `
       UPDATE voip_chamadas
       SET
@@ -28700,6 +28728,7 @@ app.post("/webhook/voip/status", async (c) => {
         ($2 <> '' AND chamada_externa_id = $2)
         OR ($1 <> '' AND chamada_externa_id = $1)
         OR ($1 <> '' AND chamada_pstn_sid = $1)
+      RETURNING id
       `,
       [
         callSid,
@@ -28709,6 +28738,26 @@ app.post("/webhook/voip/status", async (c) => {
         statusVoipEncerrado(status)
       ]
     );
+
+    const linhasAtualizadas = atualizadas.rows || [];
+    const cotacao = await obterCotacaoUsdBrlVoip().catch(() => configuracaoCustosVoip().cotacaoFallback);
+
+    for (const linha of linhasAtualizadas) {
+      const chamadaId = Number(linha.id);
+      if (!chamadaId) continue;
+
+      await atualizarEstimativaCustoChamadaVoip(chamadaId, cotacao).catch(err =>
+        console.warn("VOIP CUSTO estimativa:", err)
+      );
+
+      if (statusVoipEncerrado(status)) {
+        setTimeout(() => {
+          conciliarCustoFinalChamadaVoip(chamadaId).catch(err =>
+            console.warn("VOIP CUSTO final:", err)
+          );
+        }, 5000);
+      }
+    }
 
     return c.json({ sucesso: true });
   } catch (err) {
