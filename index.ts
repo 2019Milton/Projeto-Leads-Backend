@@ -24819,6 +24819,67 @@ await client.query(`
     ON voip_chamadas(chamada_pstn_sid);
 `);
 
+await client.query(`
+  ALTER TABLE voip_chamadas
+    ADD COLUMN IF NOT EXISTS custo_estimado_usd NUMERIC(14, 6) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS custo_final_usd NUMERIC(14, 6),
+    ADD COLUMN IF NOT EXISTS custo_estimado_brl NUMERIC(14, 4) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS custo_final_brl NUMERIC(14, 4),
+    ADD COLUMN IF NOT EXISTS cotacao_usd_brl NUMERIC(12, 6),
+    ADD COLUMN IF NOT EXISTS custo_status TEXT NOT NULL DEFAULT 'estimado',
+    ADD COLUMN IF NOT EXISTS custo_atualizado_em TIMESTAMP;
+
+  CREATE INDEX IF NOT EXISTS idx_voip_chamadas_custo_pendente
+    ON voip_chamadas(custo_status, encerrada_em)
+    WHERE custo_status <> 'final';
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS voip_linhas_historico (
+    id                    SERIAL PRIMARY KEY,
+    usuario_id            INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    provedor              TEXT NOT NULL DEFAULT 'twilio',
+    numero                TEXT NOT NULL,
+    numero_sid            TEXT,
+    custo_mensal_usd      NUMERIC(12, 6) NOT NULL DEFAULT 4.25,
+    ativada_em            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    liberada_em           TIMESTAMP,
+    criado_em             TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_voip_linhas_usuario_periodo
+    ON voip_linhas_historico(usuario_id, ativada_em, liberada_em);
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_voip_linhas_sid
+    ON voip_linhas_historico(numero_sid)
+    WHERE numero_sid IS NOT NULL;
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS voip_faturamento_config (
+    usuario_id             INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    margem_percentual      NUMERIC(8, 2) NOT NULL DEFAULT 0 CHECK (margem_percentual >= 0),
+    taxa_fixa_mensal_brl   NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (taxa_fixa_mensal_brl >= 0),
+    repassar_numero        BOOLEAN NOT NULL DEFAULT true,
+    observacoes            TEXT,
+    atualizado_em          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS voip_financeiro_global (
+    id                    INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    cotacao_usd_brl       NUMERIC(12, 6) NOT NULL DEFAULT 5.21,
+    cotacao_atualizada_em TIMESTAMP,
+    atualizado_em         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  INSERT INTO voip_financeiro_global (id, cotacao_usd_brl)
+  VALUES (1, ${Number(Bun.env.VOIP_USD_BRL_FALLBACK || 5.21)})
+  ON CONFLICT (id) DO NOTHING;
+`);
+
+
 
 await client.query(`
   CREATE TABLE IF NOT EXISTS parceiro_financeiro (
