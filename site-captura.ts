@@ -87,6 +87,8 @@ export function validarEnvioSite(corpo: any): {
 // recebe nenhum Lead pra aprender e a campanha entrega mal. "Instalado" =
 // o script foi carregado por uma página do site nos últimos 30 dias (ver GET
 // /site/form.js) ou já chegou lead pelo formulário do site nesse período.
+// Vale igual pro Google (Maximizar conversões na ação "Lead do site", que a
+// tag do Google dentro do próprio script registra — ver scriptFormularioSite).
 export const JANELA_CODIGO_SITE_DIAS = 30;
 
 export function decidirOtimizacaoSiteMeta(params: {
@@ -155,14 +157,44 @@ export function botaoFinalFormularioMeta(cfg: any): { website_url: string; butto
   };
 }
 
+// Destino da conversão "Lead do site" no Google Ads ("AW-<id da conta>/<rótulo>"),
+// lido do trecho de evento que a própria API devolve em
+// conversion_action.tag_snippets. Formato estrito porque vai dentro do script
+// servido aos sites.
+export function validarSendToGoogle(valor: unknown): string | null {
+  const texto = String(valor ?? "").trim();
+  return /^AW-\d{6,15}\/[A-Za-z0-9_-]{4,64}$/.test(texto) ? texto : null;
+}
+
+export function extrairSendToGoogle(tagSnippets: unknown): string | null {
+  const lista = Array.isArray(tagSnippets) ? tagSnippets : [];
+  for (const snippet of lista) {
+    const evento = String(snippet?.eventSnippet ?? snippet?.event_snippet ?? "");
+    const achado = evento.match(/send_to['"]?\s*:\s*['"](AW-\d+\/[\w-]+)['"]/);
+    const sendTo = validarSendToGoogle(achado?.[1]);
+    if (sendTo) return sendTo;
+  }
+  return null;
+}
+
 // Script servido em GET /site/form.js?k=<chave>. Sem dependências; descobre a
 // API pelo próprio src. Atributos opcionais no <script>: data-botao,
 // data-cor, data-sucesso, data-campanha, data-sem-formulario (só captura e
-// expõe PlataformaLeads.enviar pra formulário próprio do site).
-export function scriptFormularioSite(): string {
+// expõe PlataformaLeads.enviar pra formulário próprio do site), data-sem-google
+// (não carrega a tag do Google).
+//
+// googleSendTo: com ele, o script registra a conversão "Lead do site" no
+// Google Ads a cada envio (a campanha "Direto para o site" do Google otimiza
+// por ela). O envio pelo servidor (Data Manager API) depende de uma permissão
+// que o Google ainda não liberou pro app; a tag no navegador funciona com o
+// que as contas já têm. A tag só é carregada pra quem chegou por anúncio do
+// Google (gclid/gbraid/wbraid) — visitante orgânico não recebe cookie do Google.
+export function scriptFormularioSite(opcoes: { googleSendTo?: string | null } = {}): string {
+  const googleSendTo = validarSendToGoogle(opcoes.googleSendTo) || "";
   return `(function () {
   var script = document.currentScript;
   if (!script) return;
+  var GOOGLE_SEND_TO = ${JSON.stringify(googleSendTo)};
   var src = new URL(script.src);
   var api = src.origin;
   var chave = src.searchParams.get("k") || "";
@@ -186,9 +218,37 @@ export function scriptFormularioSite(): string {
     gravar(novo);
   }
 
-  function origem() {
+  function salvoValido() {
     var salvo = ler();
-    if (salvo.capturado_em && Date.now() - salvo.capturado_em > 90 * 864e5) salvo = {};
+    return salvo.capturado_em && Date.now() - salvo.capturado_em > 90 * 864e5 ? {} : salvo;
+  }
+
+  // Tag do Google: a mesma que o Google Ads manda colar no site (gtag.js +
+  // config da conta). Na página de chegada ela lê o gclid da URL e guarda no
+  // cookie do Google; no envio do formulário, registra a conversão.
+  var googleAtivo = false;
+  (function () {
+    var veio = salvoValido();
+    if (!GOOGLE_SEND_TO || script.hasAttribute("data-sem-google")) return;
+    if (!(veio.gclid || veio.gbraid || veio.wbraid)) return;
+    var tagId = GOOGLE_SEND_TO.split("/")[0];
+    window.dataLayer = window.dataLayer || [];
+    if (typeof window.gtag !== "function") {
+      window.gtag = function () { window.dataLayer.push(arguments); };
+    }
+    if (!document.querySelector('script[src*="googletagmanager.com/gtag/js"]')) {
+      var tag = document.createElement("script");
+      tag.async = true;
+      tag.src = "https://www.googletagmanager.com/gtag/js?id=" + encodeURIComponent(tagId);
+      document.head.appendChild(tag);
+      window.gtag("js", new Date());
+    }
+    window.gtag("config", tagId);
+    googleAtivo = true;
+  })();
+
+  function origem() {
+    var salvo = salvoValido();
     var atr = {};
     CHAVES.forEach(function (k) { if (salvo[k]) atr[k] = salvo[k]; });
     atr.fbc = cookie("_fbc") || salvo.fbc || "";
@@ -216,6 +276,10 @@ export function scriptFormularioSite(): string {
         // pixel da Meta, ela descarta a duplicata.
         if (j.event_id && typeof window.fbq === "function") {
           try { window.fbq("track", "Lead", {}, { eventID: j.event_id }); } catch (e) {}
+        }
+        // transaction_id: envio repetido do mesmo lead não conta duas vezes.
+        if (googleAtivo && j.event_id) {
+          try { window.gtag("event", "conversion", { send_to: GOOGLE_SEND_TO, transaction_id: j.event_id }); } catch (e) {}
         }
         return j;
       });

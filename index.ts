@@ -29,7 +29,13 @@ import {
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
 
-import { CATEGORIA_ACAO_GOOGLE, lerMetaCampanhaGoogle, planejarMetasCampanhaGoogle } from "./metas-google";
+import {
+  CATEGORIA_ACAO_GOOGLE,
+  CATEGORIA_ACAO_LEAD_SITE_GOOGLE,
+  NOME_ACAO_LEAD_SITE_GOOGLE,
+  lerMetaCampanhaGoogle,
+  planejarMetasCampanhaGoogle
+} from "./metas-google";
 
 import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
 
@@ -72,10 +78,12 @@ import {
   decidirOtimizacaoSiteMeta,
   detectarRedeSite,
   dominioDoReferer,
+  extrairSendToGoogle,
   montarFbc,
   normalizarAtribuicao,
   scriptFormularioSite,
   validarEnvioSite,
+  validarSendToGoogle,
 } from "./site-captura";
 
 import {
@@ -1948,13 +1956,15 @@ async function situacaoOtimizacaoSiteMeta(usuarioId: number) {
     [usuarioId]
   );
   const linha = dados.rows[0] || {};
+  const temRecursoEventos = usuarioTemRecurso(linha, "meta_conversion_leads");
   const decisao = decidirOtimizacaoSiteMeta({
-    temRecursoEventos: usuarioTemRecurso(linha, "meta_conversion_leads"),
+    temRecursoEventos,
     codigoVistoEm: linha.site_codigo_visto_em,
     ultimoLeadSiteEm: linha.ultimo_lead_site_em
   });
   return {
     ...decisao,
+    tem_recurso_eventos: temRecursoEventos,
     codigo_visto_em: linha.site_codigo_visto_em || null,
     codigo_dominio: linha.site_codigo_dominio || null
   };
@@ -7975,6 +7985,34 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
             );
           }
         }
+
+        // Site otimizando por lead (ver /google/campanha): a meta da ação
+        // "Lead do site" pode aparecer na campanha só depois da criação.
+        if (
+          cfgExistente.destino === "site" &&
+          cfgExistente.otimizacao_site === "lead" &&
+          cfgExistente.alinhar_metas_plataforma === true &&
+          cfgExistente.metas_plataforma_alinhadas !== true
+        ) {
+          const conexaoSite = await client.query(
+            `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+            [usuarioId]
+          );
+          const tagSite = lerTagGoogleSite(conexaoSite.rows[0]?.dados_conta);
+          if (tagSite && tagSite.customer_id === String(customerId)) {
+            const alinhamento = await alinharMetasCampanhaGoogle(
+              usuarioId, customerId, campaignId, accessToken, loginCustomerId, tagSite.categoria, "WEBSITE"
+            );
+            if (alinhamento.completo) {
+              await client.query(
+                `UPDATE campanhas
+                 SET configuracoes_avancadas = configuracoes_avancadas || $1::jsonb, atualizado_em = NOW()
+                 WHERE id = $2`,
+                [JSON.stringify({ metas_plataforma_alinhadas: true }), linhaExistente.id]
+              );
+            }
+          }
+        }
       } else {
         if (statusCampanhaRemotaExcluida(campanha.status)) {
           continue;
@@ -8285,6 +8323,156 @@ async function obterOuCriarConversionActionGoogle(
     console.error("ERRO obterOuCriarConversionActionGoogle:", err);
     return null;
   }
+}
+
+// Ação "Lead do site" do Google Ads: tipo WEBPAGE, registrada pela tag do
+// Google que o próprio formulário do site carrega (ver scriptFormularioSite).
+// Diferente das ações de qualificado/fechado (UPLOAD_CLICKS, enviadas pelo
+// servidor pela Data Manager API), não depende da permissão "datamanager" —
+// conferido em 05/10/2026: nenhuma conexão tem essa permissão, porque o
+// Google ainda não aprovou o app para ela. Fica em
+// plataforma_conexoes.dados_conta.google_tag_site, junto com a conta em que
+// foi criada (trocar de conta exige outra ação).
+type TagGoogleSite = { customer_id: string; conversion_action: string; categoria: string; send_to: string };
+
+function lerTagGoogleSite(dadosConta: any): TagGoogleSite | null {
+  const tag = dadosConta?.google_tag_site;
+  const sendTo = validarSendToGoogle(tag?.send_to);
+  if (!tag || !sendTo || !dadosConta?.customer_id) return null;
+  if (String(tag.customer_id) !== String(dadosConta.customer_id)) return null;
+  return { customer_id: String(tag.customer_id), conversion_action: String(tag.conversion_action || ""), categoria: String(tag.categoria || ""), send_to: sendTo };
+}
+
+async function obterOuCriarTagGoogleSite(
+  usuarioId: number,
+  conexao: { accessToken: string; customerId: string; loginCustomerId: string | null }
+): Promise<TagGoogleSite | null> {
+  try {
+    const registro = await client.query(
+      `SELECT id, dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+      [usuarioId]
+    );
+    if (!registro.rows.length) return null;
+    const dadosConta = registro.rows[0].dados_conta ?? {};
+    const existente = lerTagGoogleSite(dadosConta);
+    if (existente && existente.customer_id === conexao.customerId) return existente;
+
+    // Reaproveita a ação de mesmo nome (conta que voltou a ser a selecionada,
+    // ou criada antes de um erro) em vez de duplicar.
+    const consultar = () => googleAdsQuery(
+      conexao.customerId,
+      conexao.accessToken,
+      `SELECT conversion_action.resource_name, conversion_action.category, conversion_action.tag_snippets
+       FROM conversion_action
+       WHERE conversion_action.name = '${NOME_ACAO_LEAD_SITE_GOOGLE}'
+         AND conversion_action.type = 'WEBPAGE'
+         AND conversion_action.status = 'ENABLED'
+       LIMIT 1`,
+      conexao.loginCustomerId
+    );
+    let linha: any = (await consultar())[0]?.conversionAction;
+
+    if (!linha) {
+      const criarAcao = (categoria: string) => googleAdsMutate(
+        conexao.customerId, conexao.accessToken, "conversionActions",
+        [{
+          create: {
+            name: NOME_ACAO_LEAD_SITE_GOOGLE,
+            type: "WEBPAGE",
+            category: categoria,
+            status: "ENABLED",
+            countingType: "ONE_PER_CLICK",
+          },
+        }],
+        conexao.loginCustomerId
+      );
+      try {
+        await criarAcao(CATEGORIA_ACAO_LEAD_SITE_GOOGLE);
+      } catch (errCategoria: any) {
+        console.warn(`AVISO GOOGLE: categoria ${CATEGORIA_ACAO_LEAD_SITE_GOOGLE} recusada na ação do site, criando em DEFAULT:`, errCategoria?.message);
+        await criarAcao("DEFAULT");
+      }
+      linha = (await consultar())[0]?.conversionAction;
+    }
+
+    const sendTo = extrairSendToGoogle(linha?.tagSnippets);
+    if (!linha?.resourceName || !sendTo) {
+      console.warn(`AVISO GOOGLE: ação "Lead do site" sem tag legível (usuário ${usuarioId})`);
+      return null;
+    }
+
+    const tag: TagGoogleSite = {
+      customer_id: conexao.customerId,
+      conversion_action: String(linha.resourceName),
+      categoria: String(linha.category || CATEGORIA_ACAO_LEAD_SITE_GOOGLE),
+      send_to: sendTo,
+    };
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object('google_tag_site', $1::jsonb)
+       WHERE id = $2`,
+      [JSON.stringify(tag), registro.rows[0].id]
+    );
+    cacheTagGoogleSite.clear();
+    console.log(`[site] tag do Google pronta para o usuário ${usuarioId} (categoria ${tag.categoria})`);
+    return tag;
+  } catch (err: any) {
+    console.error("ERRO obterOuCriarTagGoogleSite:", err?.message || err);
+    return null;
+  }
+}
+
+// Destino da tag do Google embutido no /site/form.js de cada corretor. Cache
+// curto: o script é público e carregado a cada visita.
+const cacheTagGoogleSite = new Map<string, { sendTo: string | null; ate: number }>();
+
+async function sendToGoogleDaChaveSite(chave: string): Promise<string | null> {
+  const emCache = cacheTagGoogleSite.get(chave);
+  if (emCache && emCache.ate > Date.now()) return emCache.sendTo;
+  let sendTo: string | null = null;
+  try {
+    const resultado = await client.query(
+      `SELECT u.plano, pc.dados_conta
+       FROM usuarios u
+       LEFT JOIN plataforma_conexoes pc ON pc.usuario_id = u.id AND pc.plataforma = 'google'
+       WHERE u.site_chave = $1
+       LIMIT 1`,
+      [chave]
+    );
+    const linha = resultado.rows[0];
+    if (linha && usuarioTemRecurso(linha, "meta_conversion_leads")) {
+      sendTo = lerTagGoogleSite(linha.dados_conta)?.send_to ?? null;
+    }
+  } catch (err: any) {
+    console.error("[site] erro ao ler a tag do Google:", err?.message || err);
+    return null;
+  }
+  if (cacheTagGoogleSite.size > 5000) cacheTagGoogleSite.clear();
+  cacheTagGoogleSite.set(chave, { sendTo, ate: Date.now() + 5 * 60 * 1000 });
+  return sendTo;
+}
+
+// Campanha Google "Direto para o site": Maximizar conversões na ação "Lead do
+// site" quando o código do formulário está instalado (mesma regra da Meta,
+// decidirOtimizacaoSiteMeta) e a tag do Google ficou pronta; senão, CPC
+// manual como antes. A tag é criada mesmo sem o código detectado, pra que o
+// script já a leve assim que for colado no site.
+async function decidirOtimizacaoSiteGoogle(
+  usuarioId: number,
+  conexao: { accessToken: string; customerId: string; loginCustomerId: string | null }
+): Promise<{ otimizacao: "lead" | "cliques"; motivo: string; tag: TagGoogleSite | null }> {
+  const situacao = await situacaoOtimizacaoSiteMeta(usuarioId);
+  if (!situacao.tem_recurso_eventos) {
+    return { otimizacao: "cliques", motivo: "plano sem envio de conversões", tag: null };
+  }
+  const tag = await obterOuCriarTagGoogleSite(usuarioId, conexao);
+  if (!tag) {
+    return { otimizacao: "cliques", motivo: "não foi possível criar a conversão do site no Google Ads", tag: null };
+  }
+  if (situacao.otimizacao !== "lead") {
+    return { otimizacao: "cliques", motivo: situacao.motivo, tag };
+  }
+  return { otimizacao: "lead", motivo: situacao.motivo, tag };
 }
 
 // Normaliza e-mail pro padrao de hashing exigido pelo Google antes de mandar
@@ -8906,10 +9094,21 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       .map((l: any) => ({ recurso: String(l?.recurso ?? ""), excluida: Boolean(l?.excluida) }))
       .filter((l: any) => /^geoTargetConstants\/\d+$/.test(l.recurso))
       .slice(0, 50);
-    // Meta de CPA só faz sentido com a estratégia "maximizar conversões" (lead_ads/
-    // WhatsApp) — o destino site usa CPC manual, que não aceita meta de CPA.
+    // "Direto para o site": Maximizar conversões na ação "Lead do site" quando o
+    // código do formulário está instalado; senão CPC manual (ver
+    // decidirOtimizacaoSiteGoogle).
+    const otimizacaoSiteGoogle = destinoGoogle === "site"
+      ? await decidirOtimizacaoSiteGoogle(usuarioId, conexao)
+      : null;
+    if (otimizacaoSiteGoogle) {
+      console.log(`[site] campanha Google direto para o site do usuário ${usuarioId}: otimiza por ${otimizacaoSiteGoogle.otimizacao} (${otimizacaoSiteGoogle.motivo})`);
+    }
+    const lanceSiteManual = destinoGoogle === "site" && otimizacaoSiteGoogle?.otimizacao !== "lead";
+
+    // Meta de CPA só faz sentido com a estratégia "maximizar conversões" — o
+    // site sem o código usa CPC manual, que não aceita meta de CPA.
     const metaCpaGoogle =
-      destinoGoogle !== "site" ? numeroOpcional(configuracoes_avancadas?.google_meta_cpa) : null;
+      !lanceSiteManual ? numeroOpcional(configuracoes_avancadas?.google_meta_cpa) : null;
     const metaCpaMicrosGoogle =
       metaCpaGoogle && metaCpaGoogle > 0 ? Math.round(metaCpaGoogle * 1_000_000) : null;
 
@@ -8955,11 +9154,12 @@ app.post("/google/campanha", authMiddleware, async (c) => {
           campaignBudget: budgetResourceName,
           ...(dataInicioGoogle ? { startDateTime: dataInicioGoogle } : {}),
           ...(dataFimGoogle ? { endDateTime: dataFimGoogle } : {}),
-          // Formulários e mensagens são metas de conversão no Google. Site puro
-          // continua em CPC manual; os dois destinos de lead usam a estratégia
-          // recomendada pelo Google para otimizar conversões — com meta de CPA
-          // quando informada (ver localidadesGoogle/metaCpaMicrosGoogle acima).
-          ...(destinoGoogle === "site"
+          // Formulários e mensagens são metas de conversão no Google. Site sem o
+          // código do formulário continua em CPC manual; os destinos de lead (e
+          // o site com o código) usam a estratégia recomendada pelo Google para
+          // otimizar conversões — com meta de CPA quando informada (ver
+          // localidadesGoogle/metaCpaMicrosGoogle acima).
+          ...(lanceSiteManual
             ? { manualCpc: {} }
             : { maximizeConversions: metaCpaMicrosGoogle ? { targetCpaMicros: String(metaCpaMicrosGoogle) } : {} }),
           ...(tipoCampanhaGoogle === "search" ? {
@@ -9013,13 +9213,39 @@ app.post("/google/campanha", authMiddleware, async (c) => {
       console.warn("AVISO: falha ao aplicar targeting geo/idioma na campanha Google Ads (não bloqueante):", err);
     }
 
+    // Site otimizando por lead: só contam no lance a ação "Lead do site" e as
+    // de qualificado/fechado da plataforma. Se a meta da ação nova ainda não
+    // apareceu na campanha, a sincronização termina depois.
+    let metasSiteAlinhadas = false;
+    if (destinoGoogle === "site" && !lanceSiteManual && otimizacaoSiteGoogle?.tag) {
+      const alinhamento = await alinharMetasCampanhaGoogle(
+        usuarioId,
+        conexao.customerId,
+        String(campaignId),
+        conexao.accessToken,
+        conexao.loginCustomerId,
+        otimizacaoSiteGoogle.tag.categoria,
+        "WEBSITE"
+      );
+      metasSiteAlinhadas = alinhamento.completo;
+    }
+
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
       campaign_budget_resource_name: budgetResourceName,
       tipo_campanha: tipoCampanhaGoogle,
       destino: destinoGoogle,
       url_destino: urlDestino,
-      estrategia_lance: destinoGoogle === "site" ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS"
+      estrategia_lance: lanceSiteManual ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS",
+      ...(destinoGoogle === "site" ? {
+        otimizacao_site: lanceSiteManual ? "cliques" : "lead",
+        otimizacao_site_motivo: otimizacaoSiteGoogle?.motivo || null,
+        ...(!lanceSiteManual ? {
+          // Ver alinharMetasCampanhaGoogle e a sincronização.
+          alinhar_metas_plataforma: true,
+          metas_plataforma_alinhadas: metasSiteAlinhadas,
+        } : {}),
+      } : {}),
     };
 
     if (rascunhoLocal) {
@@ -9908,7 +10134,8 @@ async function alinharMetasCampanhaGoogle(
   campaignId: string,
   accessToken: string,
   loginCustomerId: string | null,
-  categoriaPrincipal: "SUBMIT_LEAD_FORM" | "CONTACT"
+  categoriaPrincipal: string,
+  origemPrincipal: "GOOGLE_HOSTED" | "WEBSITE" = "GOOGLE_HOSTED"
 ): Promise<{ aplicado: boolean; completo: boolean }> {
   try {
     const campaignIdSeguro = String(campaignId || "").replace(/\D/g, "");
@@ -9948,7 +10175,7 @@ async function alinharMetasCampanhaGoogle(
       .map(lerMetaCampanhaGoogle)
       .filter((m): m is NonNullable<typeof m> => Boolean(m));
 
-    const plano = planejarMetasCampanhaGoogle(metas, categoriaPrincipal, categoriasPlataforma);
+    const plano = planejarMetasCampanhaGoogle(metas, categoriaPrincipal, categoriasPlataforma, origemPrincipal);
     if (!plano) return { aplicado: false, completo: false };
 
     if (plano.length) {
@@ -21613,14 +21840,17 @@ app.post("/whatsapp/contato-formulario/modelo-sugerido", authMiddleware, async (
    resolverOrigemCors); configuração autenticada em /site-formulario/*.
 ========================= */
 
-// Script que o corretor cola no site. Público e sem dado do corretor — a
-// chave vai na própria URL do <script> e só é validada no envio.
-app.get("/site/form.js", (c) => {
+// Script que o corretor cola no site. Público — a chave vai na própria URL do
+// <script> e só é validada no envio. O único dado do corretor no script é o
+// destino da tag de conversão do Google (público por natureza: é o mesmo que
+// o Google manda colar no site).
+app.get("/site/form.js", async (c) => {
   // Script carregado por uma página (tem Referer) = código instalado no site.
   // Grava no máximo 1x por hora por corretor; nunca atrasa a entrega do script.
   const chave = String(c.req.query("k") || "");
+  const chaveValida = /^[A-Za-z0-9_-]{16,64}$/.test(chave);
   const dominio = dominioDoReferer(c.req.header("referer"));
-  if (dominio && /^[A-Za-z0-9_-]{16,64}$/.test(chave)) {
+  if (dominio && chaveValida) {
     client.query(
       `UPDATE usuarios SET site_codigo_visto_em = NOW(), site_codigo_dominio = $2
        WHERE site_chave = $1
@@ -21629,9 +21859,11 @@ app.get("/site/form.js", (c) => {
     ).catch((e: any) => console.error("[site] erro ao registrar código visto:", e?.message || e));
   }
 
+  const googleSendTo = chaveValida ? await sendToGoogleDaChaveSite(chave) : null;
+
   c.header("Content-Type", "application/javascript; charset=utf-8");
   c.header("Cache-Control", "public, max-age=300");
-  return c.body(scriptFormularioSite());
+  return c.body(scriptFormularioSite({ googleSendTo }));
 });
 
 // "Lead" padrão da Meta na chegada do lead de site vindo de anúncio da Meta —
@@ -21802,7 +22034,17 @@ app.get("/site-formulario/configuracao", authMiddleware, async (c) => {
       [user.id]
     );
     const situacao = await situacaoOtimizacaoSiteMeta(user.id);
+    const conexaoGoogle = await client.query(
+      `SELECT dados_conta FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'google' AND refresh_token IS NOT NULL LIMIT 1`,
+      [user.id]
+    );
     return c.json({
+      // Google conectado: a mesma regra vale pra campanha Google "Direto para
+      // o site" (ver decidirOtimizacaoSiteGoogle). A tag é criada na primeira
+      // campanha dessas e entra no código sozinha.
+      google_conectado: conexaoGoogle.rows.length > 0,
+      google_tag_pronta: Boolean(lerTagGoogleSite(conexaoGoogle.rows[0]?.dados_conta)),
       chave,
       estatisticas: estatisticas.rows[0],
       por_rede: porRede.rows,
@@ -41975,7 +42217,8 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
     .filter((l) => /^geoTargetConstants\/\d+$/.test(l.recurso));
 
   // Meta de CPA: só se aplica quando o destino usa "maximizar conversões" (lead_ads/
-  // WhatsApp) — o construtor usa CPC manual pro destino site, que não aceita meta de CPA.
+  // WhatsApp) — no destino site o lance depende do código instalado (CPC manual sem
+  // ele, ver decidirOtimizacaoSiteGoogle), então a cópia não leva meta de CPA.
   const metaCpaOriginal = Number(d.lance?.meta_cpa) > 0 ? Number(d.lance.meta_cpa) : null;
   const metaCpaAplicavel = destino !== "site" && metaCpaOriginal !== null;
 
@@ -42044,7 +42287,7 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
   const lanceCopia = destino === "site" ? "MANUAL_CPC" : "MAXIMIZE_CONVERSIONS";
   const lanceCopiaRotulo =
     destino === "site"
-      ? "CPC manual"
+      ? "CPC manual, ou Maximizar conversões se o código do formulário estiver instalado no site"
       : metaCpaAplicavel
       ? `Maximizar conversões com CPA desejado ${formatarMoedaBRLTexto(metaCpaOriginal)}`
       : "Maximizar conversões (sem meta)";
@@ -42064,7 +42307,7 @@ function montarRascunhoGoogleDeCampanhaImportada(d: any):
   }
   if (destino === "site" && metaCpaOriginal !== null) {
     naoCopiado.push(
-      `Meta de CPA da original (${formatarMoedaBRLTexto(metaCpaOriginal)}) não copiada: o destino "site" usa CPC manual, que não aceita meta de CPA`
+      `Meta de CPA da original (${formatarMoedaBRLTexto(metaCpaOriginal)}) não copiada: no destino "site" a cópia começa sem meta de CPA`
     );
   }
 

@@ -57,3 +57,22 @@ test("lê a linha da API nos dois formatos de nome", () => {
   expect(lerMetaCampanhaGoogle({ campaign_conversion_goal: { resource_name: "r", category: "X", origin: "Y" } })?.biddable).toBe(false);
   expect(lerMetaCampanhaGoogle({})).toBeNull();
 });
+
+test("site: meta principal é a ação Lead do site da plataforma (origem WEBSITE)", () => {
+  // Conta real (usuário 17): outras ações de formulário do site dividem a meta
+  // SUBMIT_LEAD_FORM/WEBSITE; o formulário do Google (GOOGLE_HOSTED) não é o do site.
+  const metas = [
+    meta("SUBMIT_LEAD_FORM", "WEBSITE", false),
+    meta("SUBMIT_LEAD_FORM", "GOOGLE_HOSTED", true),
+    meta("QUALIFIED_LEAD", "WEBSITE", false),
+    meta("PAGE_VIEW", "WEBSITE", true)
+  ];
+  expect(planejarMetasCampanhaGoogle(metas, "SUBMIT_LEAD_FORM", ["QUALIFIED_LEAD"], "WEBSITE")).toEqual([
+    { resourceName: metas[0].resourceName, biddable: true },
+    { resourceName: metas[1].resourceName, biddable: false },
+    { resourceName: metas[2].resourceName, biddable: true },
+    { resourceName: metas[3].resourceName, biddable: false }
+  ]);
+  // Meta da ação nova ainda não apareceu na campanha: não mexe.
+  expect(planejarMetasCampanhaGoogle([meta("PAGE_VIEW", "WEBSITE", true)], "SUBMIT_LEAD_FORM", [], "WEBSITE")).toBeNull();
+});

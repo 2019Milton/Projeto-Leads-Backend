@@ -12,6 +12,8 @@
 //   SUBMIT_LEAD_FORM; WhatsApp = CONTACT), e
 // - as metas das ações de conversão da plataforma (lead qualificado e lead
 //   convertido, enviadas pela plataforma — origem WEBSITE).
+// No destino site ("Direto para o site" com o código instalado), a meta
+// principal é a da ação "Lead do site" da plataforma (origem WEBSITE).
 // Todo o resto é desligado SÓ nessa campanha (a conta não muda). Se a meta
 // principal ainda não existir (o Google cria depois que aprova o formulário
 // ou o número), não mexe em nada — desligar o resto deixaria a campanha sem
@@ -32,6 +34,12 @@ export const CATEGORIA_ACAO_GOOGLE = {
   closed: "CONVERTED_LEAD"
 } as const;
 
+// Ação "Lead do site" (tipo WEBPAGE, registrada pela tag do Google no
+// formulário do site): formulário enviado no site. Validada com validateOnly
+// nas 3 contas conectadas em 05/10/2026.
+export const CATEGORIA_ACAO_LEAD_SITE_GOOGLE = "SUBMIT_LEAD_FORM";
+export const NOME_ACAO_LEAD_SITE_GOOGLE = "Plataforma de Leads - Lead do site";
+
 export function lerMetaCampanhaGoogle(linha: any): MetaCampanhaGoogle | null {
   const meta = linha?.campaignConversionGoal ?? linha?.campaign_conversion_goal;
   const resourceName = meta?.resourceName ?? meta?.resource_name;
@@ -44,13 +52,17 @@ export function lerMetaCampanhaGoogle(linha: any): MetaCampanhaGoogle | null {
   };
 }
 
+// origemPrincipal: GOOGLE_HOSTED pro formulário e o WhatsApp do Google;
+// WEBSITE pro destino site, cuja meta principal é a ação "Lead do site" da
+// plataforma (SUBMIT_LEAD_FORM, registrada pela tag no formulário do site).
 export function planejarMetasCampanhaGoogle(
   metas: MetaCampanhaGoogle[],
-  categoriaPrincipal: "SUBMIT_LEAD_FORM" | "CONTACT",
-  categoriasAcoesPlataforma: string[]
+  categoriaPrincipal: string,
+  categoriasAcoesPlataforma: string[],
+  origemPrincipal: "GOOGLE_HOSTED" | "WEBSITE" = "GOOGLE_HOSTED"
 ): { resourceName: string; biddable: boolean }[] | null {
   const chave = (categoria: string, origem: string) => `${categoria}/${origem}`;
-  const principal = chave(categoriaPrincipal, "GOOGLE_HOSTED");
+  const principal = chave(categoriaPrincipal, origemPrincipal);
   if (!metas.some(m => chave(m.category, m.origin) === principal)) return null;
 
   const ligadas = new Set([principal, ...categoriasAcoesPlataforma.filter(Boolean).map(c => chave(c, "WEBSITE"))]);

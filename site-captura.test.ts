@@ -111,3 +111,78 @@ test("evento de site da Meta: Lead na chegada (site), venda como Purchase (siste
   expect(idEventoSiteMeta(42, "Lead")).toBe("lead-42-lead");
   expect(() => montarEventoMeta({ lead: { lead_id: "1" }, etapa: "Lead" })).toThrow();
 });
+
+import { extrairSendToGoogle, validarSendToGoogle } from "./site-captura";
+
+test("tag do Google: send_to lido do trecho de evento da API, formato estrito", () => {
+  // Formato real de conversion_action.tag_snippets (conferência 05/10/2026).
+  const snippets = [
+    { type: "WEBPAGE_ONCLICK", pageFormat: "HTML", eventSnippet: "<script>function gtag_report_conversion(url) {}</script>" },
+    { type: "WEBPAGE", pageFormat: "HTML", eventSnippet: "<!-- Event snippet -->\n<script>\n  gtag('event', 'conversion', {'send_to': 'AW-16773309415/AbC-d_9xyz'});\n</script>\n" }
+  ];
+  expect(extrairSendToGoogle(snippets)).toBe("AW-16773309415/AbC-d_9xyz");
+  expect(extrairSendToGoogle([])).toBeNull();
+  expect(extrairSendToGoogle(undefined)).toBeNull();
+  expect(validarSendToGoogle("AW-123/abc\"};alert(1)//")).toBeNull();
+  expect(validarSendToGoogle("G-ABC123/xyz1")).toBeNull();
+});
+
+test("script com a tag do Google: carrega só para quem veio do Google e registra a conversão no envio", async () => {
+  const js = scriptFormularioSite({ googleSendTo: "AW-16773309415/AbC-d_9xyz" });
+  expect(() => new Function(js)).not.toThrow();
+  expect(js).toContain('var GOOGLE_SEND_TO = "AW-16773309415/AbC-d_9xyz";');
+  // send_to inválido não entra no script.
+  expect(scriptFormularioSite({ googleSendTo: "AW-1/x'};alert(1)//" })).toContain('var GOOGLE_SEND_TO = "";');
+
+  // Simula a página: chegada com gclid, envio do formulário próprio.
+  const rodar = async (url: string, opcoes: { semGoogle?: boolean; armazenado?: any } = {}) => {
+    const loja: Record<string, string> = {};
+    if (opcoes.armazenado) loja.plataforma_leads_origem = JSON.stringify(opcoes.armazenado);
+    const scriptsAdicionados: string[] = [];
+    const chamadasGtag: any[] = [];
+    const attrs: Record<string, string> = { "data-sem-formulario": "" };
+    if (opcoes.semGoogle) attrs["data-sem-google"] = "";
+    const window: any = {};
+    const document: any = {
+      currentScript: {
+        src: "https://api.exemplo.com/site/form.js?k=chave",
+        hasAttribute: (n: string) => n in attrs,
+        getAttribute: (n: string) => attrs[n] ?? null
+      },
+      cookie: "",
+      referrer: "",
+      querySelector: () => null,
+      createElement: () => ({}),
+      head: { appendChild: (el: any) => scriptsAdicionados.push(el.src) }
+    };
+    const localStorage = { getItem: (k: string) => loja[k] ?? null, setItem: (k: string, v: string) => { loja[k] = v; } };
+    const location = new URL(url);
+    const fetch = async () => ({ ok: true, json: async () => ({ ok: true, event_id: "lead-7-lead" }) });
+    new Function("window", "document", "localStorage", "location", "fetch", js)(window, document, localStorage, location, fetch);
+    if (typeof window.gtag === "function") {
+      const original = window.dataLayer;
+      window.dataLayer = { push: (a: any) => { chamadasGtag.push(Array.from(a)); original.push(a); } };
+    }
+    await window.PlataformaLeads.enviar({ nome: "Ana", telefone: "11987654321" });
+    return { scriptsAdicionados, chamadasGtag, window };
+  };
+
+  const doGoogle = await rodar("https://site.com/lp?gclid=abc");
+  expect(doGoogle.scriptsAdicionados).toEqual(["https://www.googletagmanager.com/gtag/js?id=AW-16773309415"]);
+  expect(doGoogle.window.dataLayer).toBeDefined();
+  expect(doGoogle.chamadasGtag).toEqual([["event", "conversion", { send_to: "AW-16773309415/AbC-d_9xyz", transaction_id: "lead-7-lead" }]]);
+
+  // Voltou outro dia, sem gclid na URL: usa o clique guardado.
+  const volta = await rodar("https://site.com/contato", { armazenado: { gclid: "abc", capturado_em: Date.now() - 86_400_000 } });
+  expect(volta.chamadasGtag.length).toBe(1);
+
+  // Orgânico (sem clique do Google) e opt-out: nada do Google.
+  const organico = await rodar("https://site.com/lp?fbclid=x");
+  expect(organico.scriptsAdicionados).toEqual([]);
+  expect(organico.window.gtag).toBeUndefined();
+  const optOut = await rodar("https://site.com/lp?gclid=abc", { semGoogle: true });
+  expect(optOut.window.gtag).toBeUndefined();
+  // Clique guardado há mais de 90 dias não conta.
+  const velho = await rodar("https://site.com/lp", { armazenado: { gclid: "abc", capturado_em: Date.now() - 91 * 86_400_000 } });
+  expect(velho.window.gtag).toBeUndefined();
+});
