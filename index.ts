@@ -88,6 +88,7 @@ import {
 } from "./score-lead";
 
 import {
+  buscarDetalheChamadaTwilio,
   configuracaoTwilioVoip,
   criarTokenTwilioVoice,
   diagnosticarTwilioVoip,
@@ -99,6 +100,14 @@ import {
   validarAssinaturaTwilio,
   validarDddBrasil,
 } from "./voip-twilio";
+
+import {
+  configuracaoCustosVoip,
+  custoRepasseBrl,
+  estimarCustoChamadaUsd,
+  intervaloMesVoip,
+  normalizarMesVoip,
+} from "./voip-custos";
 
 const app = new Hono();
 
