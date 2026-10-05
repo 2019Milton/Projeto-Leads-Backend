@@ -110,6 +110,7 @@ import {
   custoRepasseBrl,
   estimarCustoChamadaUsd,
   intervaloMesVoip,
+  mesVoipDaData,
   normalizarMesVoip,
 } from "./voip-custos";
 
@@ -27306,7 +27307,7 @@ async function atualizarEstimativaCustoChamadaVoip(chamadaId: number, cotacaoInf
 async function conciliarCustoFinalChamadaVoip(chamadaId: number) {
   const result = await client.query(
     `
-    SELECT id, chamada_externa_id, chamada_pstn_sid, duracao_segundos, custo_status
+    SELECT id, chamada_externa_id, chamada_pstn_sid, duracao_segundos, custo_status, iniciada_em
     FROM voip_chamadas
     WHERE id = $1
     LIMIT 1
@@ -27347,7 +27348,8 @@ async function conciliarCustoFinalChamadaVoip(chamadaId: number) {
   }
 
   const custoFinalUsd = Number(precos.reduce((s, v) => s + v, 0).toFixed(6));
-  const cotacao = await obterCotacaoMesVoip(mes);
+  const mesChamada = mesVoipDaData(chamada.iniciada_em) || normalizarMesVoip(null);
+  const cotacao = await obterCotacaoMesVoip(mesChamada);
   const custoFinalBrl = Number((custoFinalUsd * cotacao).toFixed(4));
   const duracaoFinal = Math.max(
     Number(chamada.duracao_segundos || 0),
@@ -27405,7 +27407,7 @@ async function resumoCustosVoipUsuarios(
 
   const mes = normalizarMesVoip(mesInformado);
   const { inicio, fim } = intervaloMesVoip(mes);
-  const cotacao = await obterCotacaoUsdBrlVoip();
+  const cotacao = await obterCotacaoMesVoip(mes);
   const cfgCustos = configuracaoCustosVoip();
 
   if (!ids.length) {
@@ -28862,14 +28864,16 @@ function statusVoipEncerrado(status: string) {
 }
 
 async function segundosVoipUsadosNoMes(usuarioId: number) {
+  const { inicio, fim } = intervaloMesVoip(normalizarMesVoip(null));
   const result = await client.query(
     `
     SELECT COALESCE(SUM(GREATEST(COALESCE(duracao_segundos, 0), 0)), 0)::bigint AS segundos
     FROM voip_chamadas
     WHERE usuario_id = $1
-      AND iniciada_em >= date_trunc('month', NOW())
+      AND iniciada_em >= $2
+      AND iniciada_em < $3
     `,
-    [usuarioId]
+    [usuarioId, inicio, fim]
   );
   return Number(result.rows[0]?.segundos || 0);
 }
@@ -29390,18 +29394,20 @@ app.get("/painel-cliente/voip/configuracao", authMiddleware, async (c) => {
     Boolean(user.voip_numero) &&
     user.voip_provedor === "twilio";
 
+  const { inicio: inicioMesVoip, fim: fimMesVoip } =
+    intervaloMesVoip(normalizarMesVoip(null));
+
   const uso = await client.query(
     `
     SELECT
       COALESCE(SUM(GREATEST(COALESCE(duracao_segundos, 0), 0)), 0)::bigint AS segundos_mes,
-      COUNT(*) FILTER (
-        WHERE iniciada_em >= date_trunc('month', NOW())
-      )::int AS chamadas_mes
+      COUNT(*)::int AS chamadas_mes
     FROM voip_chamadas
     WHERE usuario_id = $1
-      AND iniciada_em >= date_trunc('month', NOW())
+      AND iniciada_em >= $2
+      AND iniciada_em < $3
     `,
-    [usuarioId]
+    [usuarioId, inicioMesVoip, fimMesVoip]
   );
 
   const segundosUsados = Number(uso.rows[0]?.segundos_mes || 0);
