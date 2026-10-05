@@ -24856,6 +24856,34 @@ await client.query(`
     WHERE numero_sid IS NOT NULL;
 `);
 
+// VOIP backfill linhas ativas: garante que contas ativadas antes do módulo
+// financeiro apareçam no custo mensal sem duplicar números já registrados.
+await client.query(`
+  INSERT INTO voip_linhas_historico (
+    usuario_id, provedor, numero, numero_sid, custo_mensal_usd, ativada_em
+  )
+  SELECT
+    u.id,
+    COALESCE(u.voip_provedor, 'twilio'),
+    u.voip_numero,
+    u.voip_numero_sid,
+    ${configuracaoCustosVoip().numeroMensalUsd},
+    COALESCE(u.voip_ativado_em, NOW())
+  FROM usuarios u
+  WHERE u.voip_status = 'ativo'
+    AND u.voip_numero IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM voip_linhas_historico vh
+      WHERE vh.usuario_id = u.id
+        AND (
+          (u.voip_numero_sid IS NOT NULL AND vh.numero_sid = u.voip_numero_sid)
+          OR (u.voip_numero_sid IS NULL AND vh.numero = u.voip_numero AND vh.liberada_em IS NULL)
+        )
+    );
+`); // VOIP backfill linhas ativas
+
+
 await client.query(`
   CREATE TABLE IF NOT EXISTS voip_faturamento_config (
     usuario_id             INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -29072,10 +29100,10 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
 
   const usuarioId = Number(user.id);
   const configuracao = await obterConfigFinanceiroCliente(usuarioId);
-  const voipAtivo = user.voip_habilitado === true &&
-    user.voip_status === "ativo" && Boolean(user.voip_numero);
   const whatsappAtivo = user.atendimento_whatsapp_habilitado === true;
 
+  // A mensalidade base da plataforma e o VoIP são deliberadamente separados.
+  // Nenhum consumo de telefonia entra no total_mensal da plataforma.
   const itens: any[] = [
     {
       codigo: "plano_gestao",
@@ -29083,16 +29111,6 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
       periodicidade: "mensal",
       status: "ativo",
       valor: configuracao.valor_plano_mensal
-    },
-    {
-      codigo: "voip_numero",
-      descricao: voipAtivo && user.voip_numero
-        ? `VoIP — ${user.voip_numero}`
-        : "Número e telefonia VoIP",
-      periodicidade: "mensal",
-      status: voipAtivo ? "ativo" : (user.voip_habilitado ? "aguardando_configuracao" : "desativado"),
-      valor: voipAtivo ? configuracao.valor_voip_mensal : 0,
-      valor_apos_ativacao: configuracao.valor_voip_mensal
     },
     {
       codigo: "whatsapp_oficial",
@@ -29107,13 +29125,6 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
       periodicidade: "mensal",
       status: configuracao.valor_ia_extra_mensal > 0 ? "ativo" : "nao_cobrado",
       valor: configuracao.valor_ia_extra_mensal
-    },
-    {
-      codigo: "gravacao",
-      descricao: "Gravação, transcrição e armazenamento de ligações",
-      periodicidade: "mensal",
-      status: voipAtivo && configuracao.valor_gravacao_mensal > 0 ? "ativo" : "nao_cobrado",
-      valor: voipAtivo ? configuracao.valor_gravacao_mensal : 0
     }
   ];
 
@@ -29127,10 +29138,14 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
     });
   }
 
-  const totalMensal = itens.reduce(
+  const totalMensalPlataforma = itens.reduce(
     (total, item) => total + (item.status === "ativo" ? Number(item.valor || 0) : 0),
     0
   );
+
+  const mesAtual = normalizarMesVoip(null);
+  const resumoVoip = await resumoCustosVoipUsuarios([usuarioId], mesAtual, false);
+  const voipUsuario = resumoVoip.usuarios[0] || null;
 
   const historico = await client.query(
     `
@@ -29154,26 +29169,36 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
       dia_vencimento: configuracao.dia_vencimento,
       investimento_anuncios_incluso: false
     },
-    voip: {
-      habilitado: user.voip_habilitado === true,
-      ativo: voipAtivo,
-      status: user.voip_habilitado === true
-        ? (user.voip_status || "aguardando_configuracao")
-        : "desativado",
-      numero: voipAtivo ? user.voip_numero : null,
-      valor_mensal: voipAtivo ? configuracao.valor_voip_mensal : 0,
-      valor_apos_ativacao: configuracao.valor_voip_mensal
-    },
     itens,
-    total_mensal: Number(totalMensal.toFixed(2)),
+    total_mensal: Number(totalMensalPlataforma.toFixed(2)),
+    total_mensal_plataforma: Number(totalMensalPlataforma.toFixed(2)),
+    voip: {
+      separado_da_mensalidade: true,
+      habilitado: user.voip_habilitado === true,
+      ativo: user.voip_status === "ativo" && Boolean(user.voip_numero),
+      status: user.voip_habilitado === true
+        ? (user.voip_status || "pronto_para_ativar")
+        : "desativado",
+      numero: user.voip_numero || null,
+      mes: mesAtual,
+      chamadas: voipUsuario?.consumo?.chamadas || 0,
+      minutos: voipUsuario?.consumo?.minutos || 0,
+      custo_numero_brl: voipUsuario?.custos?.numero_brl || 0,
+      custo_chamadas_brl: voipUsuario?.custos?.chamadas_brl || 0,
+      custo_provedor_brl: voipUsuario?.custos?.provedor_brl || 0,
+      valor_a_pagar_brl: voipUsuario?.custos?.valor_repassado_brl || 0,
+      custo_status: (voipUsuario?.consumo?.custos_estimados || 0) > 0
+        ? "parcialmente_estimado"
+        : "conciliado",
+      cotacao_usd_brl: resumoVoip.cotacao_usd_brl
+    },
     investimento_anuncios: {
       incluso: false,
       mensagem: "A verba de anúncios é definida separadamente e paga às plataformas de publicidade."
     },
     custos_variaveis: [
-      "Minutos de ligações VoIP",
+      "VoIP é cobrado separadamente da mensalidade da plataforma",
       "Modelos e conversas cobradas pelo WhatsApp/Meta",
-      "Gravação, transcrição e armazenamento de chamadas",
       "Créditos adicionais de inteligência artificial",
       "Taxas de ativação, portabilidade ou serviços personalizados"
     ],
