@@ -90,6 +90,22 @@ test("termo do nicho só soma quando não é um termo genérico já contado", ()
   expect(temLinha(saude, "+20 Sinal específico do nicho")).toBe(true);
 });
 
+test("reconhece Faculdade/Universidade e Dentista como nichos próprios", () => {
+  const faculdade = calcularScoreLead({
+    nicho_slug: "faculdade_universidade",
+    nicho_nome: "Faculdade / Universidade",
+    whatsapp_transcricao_cliente: "quero saber sobre bolsa e matrícula"
+  });
+  expect(faculdade.base.some((l: string) => l.includes("Faculdade / Universidade"))).toBe(true);
+
+  const dentista = calcularScoreLead({
+    nicho_slug: "dentista",
+    nicho_nome: "Dentista",
+    whatsapp_transcricao_cliente: "quero fazer uma avaliação para implante"
+  });
+  expect(dentista.base.some((l: string) => l.includes("Dentista"))).toBe(true);
+});
+
 test("faixas, status e score manual", () => {
   expect(calcularScoreLead({}).score).toBe("frio");
   expect(calcularScoreLead({ ...base, whatsapp_transcricao_cliente: "qual o valor?" }).score).toBe("morno");
