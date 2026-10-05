@@ -44762,6 +44762,137 @@ agendarRankingPlataformas();
    🚀 START
 ========================= */
 
+// TESTE TEMPORÁRIO 2026-10-05: cria somente rascunhos locais para os dois novos nichos.
+// Segurança: não chama APIs de anúncios; só executa se existir exatamente um Super Admin ativo.
+// Idempotente: reinícios do deploy não duplicam os registros.
+async function seedRascunhosNovosNichosSuperAdmin() {
+  const db = await client.connect();
+  try {
+    const admins = await db.query(
+      `SELECT id FROM usuarios
+       WHERE tipo = 'super_admin' AND COALESCE(ativo, true) = true
+       ORDER BY id ASC`
+    );
+
+    if (admins.rows.length !== 1) {
+      console.log(
+        `TESTE NOVOS NICHOS: ignorado — esperado 1 Super Admin ativo, encontrados ${admins.rows.length}.`
+      );
+      return;
+    }
+
+    const usuarioId = Number(admins.rows[0].id);
+    const plataformas = ["facebook", "instagram", "tiktok", "google", "linkedin"];
+    const nichosTeste = [
+      {
+        slug: "faculdade_universidade",
+        nome: "[TESTE] Faculdade / Universidade",
+        grupo: "teste_nicho_faculdade_universidade_20261005",
+        campos: {
+          curso_interesse: "Administração",
+          modalidade: "Presencial",
+          turno: "Noturno",
+          tipo_ingresso: "Vestibular",
+          cidade_campus: "São Paulo",
+          publico_alvo: "Pessoas interessadas em graduação"
+        }
+      },
+      {
+        slug: "dentista",
+        nome: "[TESTE] Dentista",
+        grupo: "teste_nicho_dentista_20261005",
+        campos: {
+          tratamento: "Implante dentário",
+          tipo_atendimento: "Avaliação",
+          regiao: "São Paulo",
+          forma_atendimento: "Presencial",
+          publico_alvo: "Adultos interessados em avaliação odontológica"
+        }
+      }
+    ];
+
+    await db.query("BEGIN");
+
+    for (const teste of nichosTeste) {
+      const nichoRes = await db.query(
+        `SELECT id FROM nichos WHERE slug = $1 LIMIT 1`,
+        [teste.slug]
+      );
+      const nichoId = Number(nichoRes.rows[0]?.id || 0);
+      if (!nichoId) {
+        throw new Error(`Nicho não encontrado: ${teste.slug}`);
+      }
+
+      await db.query(
+        `INSERT INTO usuario_nichos (usuario_id, nicho_id)
+         VALUES ($1, $2)
+         ON CONFLICT (usuario_id, nicho_id) DO NOTHING`,
+        [usuarioId, nichoId]
+      );
+
+      for (const plataforma of plataformas) {
+        const existente = await db.query(
+          `SELECT id FROM campanhas
+           WHERE usuario_id = $1
+             AND publicacao_grupo_id = $2
+             AND LOWER(COALESCE(plataforma, 'meta')) = $3
+             AND configuracoes_avancadas->>'teste_novos_nichos' = '2026-10-05'
+           LIMIT 1`,
+          [usuarioId, teste.grupo, plataforma]
+        );
+
+        if (existente.rows.length > 0) continue;
+
+        const orcamento = (plataforma === "google" || plataforma === "linkedin")
+          ? 50
+          : 5000;
+
+        const configuracoes = {
+          plataforma,
+          plataformas: [plataforma],
+          destino: "lead_ads",
+          nicho_id: nichoId,
+          nicho_slug: teste.slug,
+          publicacao_grupo_id: teste.grupo,
+          rascunho_plataforma_adicional: true,
+          teste_novos_nichos: "2026-10-05",
+          ...teste.campos
+        };
+
+        await db.query(
+          `INSERT INTO campanhas (
+             usuario_id, nome, status, origem, nicho_id, daily_budget,
+             configuracoes_avancadas, plataforma, publicacao_grupo_id,
+             campaign_id, adset_id, ad_id, form_id, conta_anuncios_id,
+             criado_em, atualizado_em
+           )
+           VALUES ($1,$2,'PAUSED','manual',$3,$4,$5,$6,$7,
+                   NULL,NULL,NULL,NULL,NULL,NOW(),NOW())`,
+          [
+            usuarioId,
+            teste.nome,
+            nichoId,
+            orcamento,
+            JSON.stringify(configuracoes),
+            plataforma,
+            teste.grupo
+          ]
+        );
+      }
+    }
+
+    await db.query("COMMIT");
+    console.log("TESTE NOVOS NICHOS: rascunhos locais criados/confirmados no Super Admin.");
+  } catch (err) {
+    await db.query("ROLLBACK").catch(() => null);
+    console.error("TESTE NOVOS NICHOS: falha ao criar rascunhos locais:", err);
+  } finally {
+    db.release();
+  }
+}
+
+await seedRascunhosNovosNichosSuperAdmin();
+
 Bun.serve({
   port: Number(Bun.env.PORT) || 3000,
   fetch: app.fetch,
