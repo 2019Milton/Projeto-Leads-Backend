@@ -28853,6 +28853,58 @@ app.get("/gestor/voip/custos", authMiddleware, async (c) => {
   });
 });
 
+
+app.get("/gestor/clientes/:id/voip/custos", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const clienteGerenciado = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!clienteGerenciado || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  const resumo = await resumoCustosVoipUsuarios(
+    [clienteId],
+    c.req.query("mes"),
+    true
+  );
+
+  return c.json({
+    mes: resumo.mes,
+    cotacao_usd_brl: resumo.cotacao_usd_brl,
+    resumo: resumo.usuarios[0] || null
+  });
+});
+
+app.get("/admin/voip/custos/usuario/:id", authMiddleware, masterMiddleware, async (c) => {
+  const usuarioId = Number(c.req.param("id"));
+  if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+    return c.json({ error: "Usuário inválido" }, 400);
+  }
+
+  const existe = await client.query(
+    `
+    SELECT id FROM usuarios
+    WHERE id = $1 AND tipo IN ('corretor', 'corretor_receptor')
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+  if (!existe.rows[0]) return c.json({ error: "Corretor não encontrado" }, 404);
+
+  const resumo = await resumoCustosVoipUsuarios(
+    [usuarioId],
+    c.req.query("mes"),
+    true
+  );
+
+  return c.json({
+    mes: resumo.mes,
+    cotacao_usd_brl: resumo.cotacao_usd_brl,
+    resumo: resumo.usuarios[0] || null
+  });
+});
+
 app.get("/admin/voip/custos", authMiddleware, masterMiddleware, async (c) => {
   const idsResult = await client.query(
     `
