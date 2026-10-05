@@ -89,6 +89,7 @@ import {
 
 import {
   buscarDetalheChamadaTwilio,
+  buscarPrecoNumeroLocalBrasilTwilio,
   configuracaoTwilioVoip,
   criarTokenTwilioVoice,
   diagnosticarTwilioVoip,
@@ -27751,6 +27752,24 @@ app.post("/gestor/clientes/:id/voip/ativar", authMiddleware, async (c) => {
     );
 
     const cfgCustosVoip = configuracaoCustosVoip();
+    let custoNumeroMensalUsd = cfgCustosVoip.numeroMensalUsd;
+
+    try {
+      const precoNumero = await buscarPrecoNumeroLocalBrasilTwilio();
+      if (
+        precoNumero.moeda === "USD" &&
+        Number.isFinite(precoNumero.preco_mensal) &&
+        precoNumero.preco_mensal >= 0
+      ) {
+        custoNumeroMensalUsd = precoNumero.preco_mensal;
+      }
+    } catch (err) {
+      console.warn(
+        "VOIP PREÇO NÚMERO: usando tarifa de fallback configurada",
+        err
+      );
+    }
+
     await client.query(
       `
       INSERT INTO voip_linhas_historico (
@@ -27762,7 +27781,12 @@ app.post("/gestor/clientes/:id/voip/ativar", authMiddleware, async (c) => {
         WHERE numero_sid = $3
       )
       `,
-      [clienteId, numeroProvisionado.numero, numeroProvisionado.sid, cfgCustosVoip.numeroMensalUsd]
+      [
+        clienteId,
+        numeroProvisionado.numero,
+        numeroProvisionado.sid,
+        custoNumeroMensalUsd
+      ]
     );
     await garantirConfigFaturamentoVoip(clienteId);
 
