@@ -169,6 +169,54 @@ export async function prepararTwimlAppTwilio(
   return String(dados.sid);
 }
 
+async function twilioPricingFetch(caminho: string) {
+  const cfg = configuracaoTwilioVoip();
+
+  if (!cfg.apiKeySid || !cfg.apiKeySecret) {
+    throw new Error("Credenciais da Pricing API da Twilio não configuradas");
+  }
+
+  const res = await fetch(`https://pricing.twilio.com/v1${caminho}`, {
+    method: "GET",
+    headers: {
+      "Authorization": `Basic ${Buffer.from(`${cfg.apiKeySid}:${cfg.apiKeySecret}`).toString("base64")}`
+    }
+  });
+
+  return respostaTwilio(res);
+}
+
+export async function buscarPrecoNumeroLocalBrasilTwilio() {
+  const dados = await twilioPricingFetch("/PhoneNumbers/Countries/BR");
+  const precos = Array.isArray(dados?.phone_number_prices)
+    ? dados.phone_number_prices
+    : Array.isArray(dados?.phoneNumberPrices)
+      ? dados.phoneNumberPrices
+      : [];
+
+  const local = precos.find((item: any) =>
+    String(item?.number_type || item?.numberType || "").toLowerCase() === "local"
+  );
+
+  const preco = Number(local?.current_price ?? local?.currentPrice);
+  const moeda = String(
+    local?.price_unit ||
+    local?.priceUnit ||
+    dados?.price_unit ||
+    dados?.priceUnit ||
+    "USD"
+  ).toUpperCase();
+
+  if (!Number.isFinite(preco) || preco < 0) {
+    throw new Error("A Twilio não retornou o preço mensal do número local no Brasil");
+  }
+
+  return {
+    preco_mensal: preco,
+    moeda
+  };
+}
+
 export async function buscarNumeroLocalBrasilTwilio(ddd: string) {
   const cfg = configuracaoTwilioVoip();
   const dddValido = validarDddBrasil(ddd);
