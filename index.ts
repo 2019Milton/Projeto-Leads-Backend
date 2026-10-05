@@ -3494,6 +3494,8 @@ function contextoNicho(lead: any) {
   const isHigienizacao = chave === "higienizacao";
   const isTelecom    = chave === "telecom";
   const isCursosOnline = chave === "cursos_online";
+  const isFaculdadeUniversidade = chave === "faculdade_universidade";
+  const isDentista = chave === "dentista";
   const isEducacao   = chave === "educacao";
   const isAuto       = chave === "auto";
   const isConsorcio  = chave === "consorcio";
@@ -3650,6 +3652,50 @@ function contextoNicho(lead: any) {
     msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda tem interesse no curso. Posso retomar com as opções atualizadas.`,
     msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras turmas do curso?`,
     system: "Você é uma IA comercial especializada em cursos online e infoprodutos educacionais. Analise o lead, priorize a ação do vendedor e, quando o status for perdido, foque em recuperação. Use linguagem focada em transformação pessoal/profissional, objetivo do aluno (nova profissão, renda extra, hobby) e condições de pagamento."
+  };
+
+  if (isFaculdadeUniversidade) return {
+    nicho: "Faculdade / Universidade",
+    produto: "curso de graduação ou formação superior",
+    produto_pl: "cursos de graduação e formações superiores",
+    verbo_interesse: "se matricular",
+    qualificadores: ["curso de interesse", "modalidade presencial/EAD/híbrida", "turno", "campus ou cidade", "mensalidade/bolsa", "previsão para começar"],
+    perguntas: [
+      "Qual curso ou área você pretende fazer?",
+      "Prefere presencial, EAD ou modalidade híbrida?",
+      "Qual turno fica melhor para você: manhã, tarde ou noite?",
+      "Em qual cidade ou campus você pretende estudar?",
+      "Você busca bolsa, desconto ou alguma condição específica de mensalidade?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse em estudar conosco. Qual curso você procura e quando gostaria de começar? Posso te mostrar as opções de ingresso e condições disponíveis.`,
+    msg_morno: (nome: string) => `Oi ${nome}! Para te orientar melhor, me conta qual curso você quer fazer e se prefere presencial, EAD ou híbrido.`,
+    msg_frio: (nome: string) => `Oi ${nome}! Você ainda está pesquisando faculdade ou universidade? Posso te enviar informações sobre cursos, modalidades e formas de ingresso.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que você tinha interesse em iniciar uma graduação. Ainda faz sentido? Posso verificar turmas e condições disponíveis para o curso que você procura.`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se você ainda pretende começar a faculdade. Posso retomar com opções de curso e modalidade mais alinhadas ao seu perfil.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para futuras oportunidades de matrícula?`,
+    system: "Você é uma IA comercial especializada em captação de alunos para faculdades e universidades. Use curso de interesse, modalidade, turno, localização, forma de ingresso e previsão de matrícula para qualificar o lead. Só mencione bolsa, desconto ou condições acadêmicas quando esses dados forem informados; nunca invente condições."
+  };
+
+  if (isDentista) return {
+    nicho: "Dentista",
+    produto: "tratamento odontológico",
+    produto_pl: "tratamentos odontológicos",
+    verbo_interesse: "agendar uma avaliação",
+    qualificadores: ["tratamento de interesse", "urgência", "cidade/região", "melhor horário", "forma de pagamento ou orçamento"],
+    perguntas: [
+      "Qual tratamento ou atendimento odontológico você procura?",
+      "É algo urgente ou você está pesquisando opções?",
+      "Qual sua cidade ou região?",
+      "Qual período costuma ser melhor para uma avaliação: manhã, tarde ou noite?",
+      "Você gostaria de receber informações sobre valores e formas de pagamento após a avaliação?"
+    ],
+    msg_quente: (nome: string) => `Oi ${nome}! Vi seu interesse em atendimento odontológico. Posso te ajudar a agendar uma avaliação? Qual período fica melhor para você?`,
+    msg_morno: (nome: string) => `Oi ${nome}! Para te direcionar corretamente, qual tratamento você está procurando e qual sua disponibilidade para uma avaliação?`,
+    msg_frio: (nome: string) => `Oi ${nome}! Você ainda tem interesse em atendimento odontológico? Posso te explicar como funciona a avaliação e verificar horários disponíveis.`,
+    msg_rec_alta: (nome: string) => `Oi ${nome}! Vi que você tinha interesse em atendimento odontológico. Ainda deseja agendar uma avaliação? Posso verificar os próximos horários.`,
+    msg_rec_media: (nome: string) => `Oi ${nome}! Passando para saber se ainda faz sentido retomar seu atendimento odontológico. Posso verificar opções de horário para você.`,
+    msg_rec_baixa: (nome: string) => `Oi ${nome}! Só confirmando: ainda faz sentido mantermos seu contato para um futuro atendimento odontológico?`,
+    system: "Você é uma IA comercial para clínicas odontológicas. Qualifique o lead para atendimento e agendamento sem fazer diagnóstico, prescrever tratamento ou prometer resultado clínico. Use tratamento procurado, urgência, região e disponibilidade para avaliação."
   };
 
   if (isEducacao) return {
@@ -25498,7 +25544,9 @@ await client.query(`
     ('saas',        'Plataforma / SaaS','#7C3AED'),
     ('higienizacao','Higienização',     '#16A34A'),
     ('telecom',     'Telecom Empresarial','#DC2626'),
-    ('cursos_online','Cursos Online',     '#DB2777')
+    ('cursos_online','Cursos Online',     '#DB2777'),
+    ('faculdade_universidade','Faculdade / Universidade','#0284C7'),
+    ('dentista',     'Dentista',          '#0D9488')
   ON CONFLICT (slug) DO UPDATE SET cor = EXCLUDED.cor, nome = EXCLUDED.nome;
 `);
 
@@ -39091,7 +39139,10 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     suplemento: "suplementos", nutricao_esportiva: "suplementos",
     plataforma: "saas", plataforma_saas: "saas", software: "saas", software_saas: "saas",
     limpeza: "higienizacao", telecom_empresarial: "telecom", telecomunicacoes: "telecom",
-    curso: "cursos_online", cursos: "cursos_online", infoprodutos: "cursos_online"
+    curso: "cursos_online", cursos: "cursos_online", infoprodutos: "cursos_online",
+    faculdade: "faculdade_universidade", universidade: "faculdade_universidade",
+    ensino_superior: "faculdade_universidade", graduacao: "faculdade_universidade",
+    odontologia: "dentista", clinica_odontologica: "dentista", odontologico: "dentista"
   };
   const nicho: string = nichoAliases[nichoBruto] || nichoBruto || "generico";
   const titulosAnteriores: string[] = Array.isArray(body.titulos_anteriores)
@@ -41915,10 +41966,10 @@ app.put("/usuario/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 7
+      nicho_ids.length > 20
     ) {
       return c.json(
-        { error: "Informe entre 1 e 7 nichos" },
+        { error: "Informe entre 1 e 20 nichos" },
         400
       );
     }
@@ -41988,10 +42039,10 @@ app.put("/admin/usuarios/:id/nichos", authMiddleware, async (c) => {
     if (
       !Array.isArray(nicho_ids) ||
       nicho_ids.length === 0 ||
-      nicho_ids.length > 7
+      nicho_ids.length > 20
     ) {
       return c.json(
-        { error: "Informe entre 1 e 7 nichos" },
+        { error: "Informe entre 1 e 20 nichos" },
         400
       );
     }
