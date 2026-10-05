@@ -40038,7 +40038,11 @@ const DIRECAO_VISUAL_NICHO: Record<string, string> = {
   telecom:
     "B2B telecom / IT infrastructure advertising creative. Corporate, confident, professional: deep blues or dark tones with sharp accent highlights, abstract network/connectivity motifs (subtle signal or circuit graphics), clean modern office or data-center imagery. Convey reliability and technical competence — never childish or overly playful.",
   cursos_online:
-    "Online course / infoproduct advertising creative, aimed primarily at women pursuing a new career, extra income, or personal growth. Warm, welcoming, aspirational palette (soft pinks/magentas or warm neutrals), genuine and diverse depictions of women studying or working confidently on a laptop or phone, subtle visual cues of achievement (certificate, graduation, celebrating a milestone). Convey approachability and transformation — avoid cold corporate stock-photo clichés or overly childish/school-like imagery.",
+    "Online course / infoproduct advertising creative, aimed primarily at women pursuing a new career, extra income, or personal growth. Warm, welcoming, aspirational palette (soft pinks/magentas or warm neutrals), genuine and diverse depictions of women studying or working confidently on a laptop or phone, subtle visual cues of achievement (certificate, graduation, celebrating a milestone). Convey approachability and transformation — avoid cold corporate stock-photo clichés or overly childish/school-like imagery.",  faculdade_universidade:
+    "Higher-education advertising creative for colleges and universities. Aspirational, contemporary campus or study imagery, diverse young adults and adult learners, confident academic atmosphere, clean layouts with room for course and enrollment information. Convey opportunity and professional growth without promising employment, salary, scholarships, discounts, or limited seats unless explicitly provided.",
+  dentista:
+    "Dental clinic advertising creative. Clean, welcoming and professional, using bright neutral or soft teal/blue tones, natural confident smiles and modern clinic cues. Avoid graphic procedures, exaggerated before/after imagery, shame-based messaging, diagnoses, guaranteed clinical outcomes, or invented prices.",
+
   educacao:
     "Education / online course advertising creative. Bright, optimistic, aspirational imagery of growth, achievement, or focused learning. Clean modern layout with clear visual hierarchy.",
   auto:
@@ -42858,6 +42862,9 @@ app.put("/campanhas/:id/nicho-dados", authMiddleware, async (c) => {
         [campanhaId,
          body.area_curso ?? null, body.objetivo_aluno ?? null, body.publico_alvo ?? null]
       );
+    } else if (slug === "faculdade_universidade" || slug === "dentista") {
+      // Nichos sem tabela auxiliar: usam os campos gerais da campanha e os
+      // recursos por nicho vinculados via nicho_id.
     } else {
       return c.json({ error: "Campanha sem nicho definido" }, 400);
     }
