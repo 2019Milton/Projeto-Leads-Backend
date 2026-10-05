@@ -27371,6 +27371,48 @@ async function resumoCustosVoipUsuarios(
   };
 }
 
+function resumoVoipParaCliente(item: any) {
+  if (!item) return null;
+
+  const custos = item.custos || {};
+  const margem = Math.max(Number(custos.margem_percentual || 0), 0);
+  const fator = 1 + margem / 100;
+  const taxaFixa = Math.max(Number(custos.taxa_fixa_mensal_brl || 0), 0);
+
+  const numeroCobrado = Number((Number(custos.numero_brl || 0) * fator).toFixed(2));
+  const chamadasCobradas = Number((Number(custos.chamadas_brl || 0) * fator).toFixed(2));
+
+  return {
+    id: item.id,
+    nome: item.nome,
+    email: item.email,
+    gestor: item.gestor,
+    voip: item.voip,
+    consumo: item.consumo,
+    custos: {
+      numero_brl: numeroCobrado,
+      chamadas_brl: chamadasCobradas,
+      taxa_fixa_brl: taxaFixa,
+      valor_repassado_brl: Number(custos.valor_repassado_brl || 0)
+    },
+    observacoes: item.observacoes || null,
+    chamadas: Array.isArray(item.chamadas)
+      ? item.chamadas.map((chamada: any) => ({
+          id: chamada.id,
+          direcao: chamada.direcao,
+          telefone: chamada.telefone,
+          status: chamada.status,
+          duracao_segundos: chamada.duracao_segundos,
+          iniciada_em: chamada.iniciada_em,
+          atendida_em: chamada.atendida_em,
+          encerrada_em: chamada.encerrada_em,
+          custo_status: chamada.custo_status,
+          custo_brl: Number((Number(chamada.custo_brl || 0) * fator).toFixed(2))
+        }))
+      : undefined
+  };
+}
+
 function identidadeVoipUsuario(usuarioId: number) {
   return `corretor_${Number(usuarioId)}`;
 }
@@ -28807,13 +28849,12 @@ app.get("/painel-cliente/voip/custos", authMiddleware, async (c) => {
     c.req.query("mes"),
     true
   );
-  const proprio = resumo.usuarios[0] || null;
+  const proprio = resumoVoipParaCliente(resumo.usuarios[0] || null);
 
   return c.json({
     mes: resumo.mes,
     cotacao_usd_brl: resumo.cotacao_usd_brl,
     cotacao_atualizada_em: resumo.cotacao_atualizada_em,
-    tarifas_referencia: resumo.tarifas_referencia,
     resumo: proprio,
     mensagem: "O VoIP é cobrado separadamente da mensalidade da plataforma. Durante a conciliação algumas chamadas podem aparecer como estimadas; após a Twilio fechar a chamada o valor é atualizado para o custo final."
   });
@@ -28846,8 +28887,22 @@ app.get("/gestor/voip/custos", authMiddleware, async (c) => {
     c.req.query("detalhes") === "1"
   );
 
+  const usuariosPublicos = resumo.usuarios.map(resumoVoipParaCliente);
+  const totaisPublicos = {
+    chamadas: resumo.totais.chamadas,
+    minutos: resumo.totais.minutos,
+    linhas: resumo.totais.linhas,
+    valor_repassado_brl: Number(
+      usuariosPublicos.reduce((s: number, item: any) => s + Number(item?.custos?.valor_repassado_brl || 0), 0).toFixed(2)
+    )
+  };
+
   return c.json({
-    ...resumo,
+    mes: resumo.mes,
+    cotacao_usd_brl: resumo.cotacao_usd_brl,
+    cotacao_atualizada_em: resumo.cotacao_atualizada_em,
+    usuarios: usuariosPublicos,
+    totais: totaisPublicos,
     visao: "gestor",
     mensagem: "Valores de VoIP são adicionais e não fazem parte da mensalidade da Plataforma de Leads."
   });
@@ -28872,7 +28927,7 @@ app.get("/gestor/clientes/:id/voip/custos", authMiddleware, async (c) => {
   return c.json({
     mes: resumo.mes,
     cotacao_usd_brl: resumo.cotacao_usd_brl,
-    resumo: resumo.usuarios[0] || null
+    resumo: resumoVoipParaCliente(resumo.usuarios[0] || null)
   });
 });
 
@@ -29197,7 +29252,7 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
 
   const mesAtual = normalizarMesVoip(null);
   const resumoVoip = await resumoCustosVoipUsuarios([usuarioId], mesAtual, false);
-  const voipUsuario = resumoVoip.usuarios[0] || null;
+  const voipUsuario = resumoVoipParaCliente(resumoVoip.usuarios[0] || null);
 
   const historico = await client.query(
     `
@@ -29237,7 +29292,6 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
       minutos: voipUsuario?.consumo?.minutos || 0,
       custo_numero_brl: voipUsuario?.custos?.numero_brl || 0,
       custo_chamadas_brl: voipUsuario?.custos?.chamadas_brl || 0,
-      custo_provedor_brl: voipUsuario?.custos?.provedor_brl || 0,
       valor_a_pagar_brl: voipUsuario?.custos?.valor_repassado_brl || 0,
       custo_status: (voipUsuario?.consumo?.custos_estimados || 0) > 0
         ? "parcialmente_estimado"
