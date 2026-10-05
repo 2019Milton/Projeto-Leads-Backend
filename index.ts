@@ -39206,6 +39206,17 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     nicho_area_curso: ["nicho_area_curso"],
     nicho_objetivo_aluno: ["nicho_objetivo_aluno"],
     nicho_publico_alvo_cursos_online: ["nicho_publico_alvo"],
+    nicho_curso_interesse: ["nicho_curso_interesse"],
+    nicho_modalidade_faculdade: ["nicho_modalidade_faculdade"],
+    nicho_turno_faculdade: ["nicho_turno_faculdade"],
+    nicho_tipo_ingresso: ["nicho_tipo_ingresso"],
+    nicho_cidade_campus: ["nicho_cidade_campus"],
+    nicho_publico_alvo_faculdade: ["nicho_publico_alvo_faculdade"],
+    nicho_tratamento_dentista: ["nicho_tratamento_dentista"],
+    nicho_tipo_atendimento_dentista: ["nicho_tipo_atendimento_dentista"],
+    nicho_regiao_dentista: ["nicho_regiao_dentista"],
+    nicho_forma_atendimento_dentista: ["nicho_forma_atendimento_dentista"],
+    nicho_publico_alvo_dentista: ["nicho_publico_alvo_dentista"],
     nicho_tipo_produto: ["nicho_tipo_produto"],
     nicho_publico_alvo_saas: ["nicho_publico_alvo"],
     campanha_google_titulo_1: ["google_titulo_1"],
@@ -39559,6 +39570,17 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_situacao_atual: "",
       nicho_area_curso: "",
       nicho_objetivo_aluno: "",
+      nicho_curso_interesse: "",
+      nicho_modalidade_faculdade: "",
+      nicho_turno_faculdade: "",
+      nicho_tipo_ingresso: "",
+      nicho_cidade_campus: "",
+      nicho_publico_alvo_faculdade: "",
+      nicho_tratamento_dentista: "",
+      nicho_tipo_atendimento_dentista: "",
+      nicho_regiao_dentista: "",
+      nicho_forma_atendimento_dentista: "",
+      nicho_publico_alvo_dentista: "",
       nicho_tipo_produto: "",
       cbo: true,
       attribution_spec: "7d_click_1d_view",
@@ -39631,6 +39653,17 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       nicho_situacao_atual: v?.nicho_situacao_atual || v?.situacao_atual || "",
       nicho_area_curso: v?.nicho_area_curso || v?.area_curso || "",
       nicho_objetivo_aluno: v?.nicho_objetivo_aluno || v?.objetivo_aluno || "",
+      nicho_curso_interesse: v?.nicho_curso_interesse || v?.curso_interesse || "",
+      nicho_modalidade_faculdade: v?.nicho_modalidade_faculdade || v?.modalidade || "",
+      nicho_turno_faculdade: v?.nicho_turno_faculdade || v?.turno || "",
+      nicho_tipo_ingresso: v?.nicho_tipo_ingresso || v?.tipo_ingresso || "",
+      nicho_cidade_campus: v?.nicho_cidade_campus || v?.cidade_campus || "",
+      nicho_publico_alvo_faculdade: v?.nicho_publico_alvo_faculdade || v?.publico_alvo_faculdade || "",
+      nicho_tratamento_dentista: v?.nicho_tratamento_dentista || v?.tratamento || "",
+      nicho_tipo_atendimento_dentista: v?.nicho_tipo_atendimento_dentista || v?.tipo_atendimento || "",
+      nicho_regiao_dentista: v?.nicho_regiao_dentista || v?.regiao || "",
+      nicho_forma_atendimento_dentista: v?.nicho_forma_atendimento_dentista || v?.forma_atendimento || "",
+      nicho_publico_alvo_dentista: v?.nicho_publico_alvo_dentista || v?.publico_alvo_dentista || "",
       nicho_tipo_produto: v?.nicho_tipo_produto || v?.tipo_produto || "",
       cbo: v?.cbo ?? true,
       attribution_spec: v?.attribution_spec || "7d_click_1d_view",
@@ -39819,6 +39852,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
       `Para higienizacao: nicho_tipo_servico (estofados|colchoes|carpetes_tapetes|pos_obra|ar_condicionado|caixa_dagua|geral), nicho_frequencia (avulso|recorrente), nicho_publico_alvo (residencial|comercial|industrial).\n` +
       `Para telecom: nicho_tipo_servico (link_dedicado|firewall|hotspot|pabx|smartchat|consultoria), nicho_porte_empresa (pequena|media|grande), nicho_situacao_atual (primeira_contratacao|trocando_fornecedor|ampliando_estrutura).\n` +
       `Para cursos_online: nicho_area_curso (beleza_estetica|tecnologia|gestao_negocios|saude_bemestar|idiomas|culinaria|outro), nicho_objetivo_aluno (nova_profissao|renda_extra|hobby_interesse|certificacao), nicho_publico_alvo (texto livre descrevendo o publico-alvo).\n\n` +
+      `Para faculdade_universidade: nicho_curso_interesse (texto livre), nicho_modalidade_faculdade (presencial|ead|hibrido), nicho_turno_faculdade (manha|tarde|noite|integral|flexivel), nicho_tipo_ingresso (vestibular|enem|transferencia|segunda_graduacao|outro), nicho_cidade_campus (texto livre), nicho_publico_alvo_faculdade (texto livre).\n` +
+      `Para dentista: nicho_tratamento_dentista (implante|ortodontia|clareamento|facetas|protese|endodontia|limpeza_prevencao|odontopediatria|outro), nicho_tipo_atendimento_dentista (avaliacao|geral|estetica|reabilitacao|prevencao), nicho_regiao_dentista (texto livre), nicho_forma_atendimento_dentista (particular|convenio|ambos), nicho_publico_alvo_dentista (texto livre e nao sensivel). Nunca diagnostique, prescreva ou prometa resultado clinico.\n\n` +
       (incluirGoogle
         ? `Campos extras OBRIGATORIOS por causa do Google Ads (${googleTipo}, respeite os limites de caracteres a risca):\n` +
           `google_titulo_1, google_titulo_2, google_titulo_3 (3 titulos curtos e DIFERENTES entre si, cada um com no maximo 30 caracteres),\n` +
