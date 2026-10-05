@@ -62,16 +62,105 @@ export function custoRepasseBrl(
   return Number((custo * (1 + margem / 100) + taxa).toFixed(2));
 }
 
+const FUSO_VOIP = "America/Sao_Paulo";
+
 export function normalizarMesVoip(valor: unknown) {
   const texto = String(valor || "").trim();
   if (/^\d{4}-(0[1-9]|1[0-2])$/.test(texto)) return texto;
+
+  const partes = new Intl.DateTimeFormat("en-US", {
+    timeZone: FUSO_VOIP,
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(new Date());
+
+  const ano = partes.find((p) => p.type === "year")?.value;
+  const mes = partes.find((p) => p.type === "month")?.value;
+
+  if (ano && mes) return `${ano}-${mes}`;
+
   const hoje = new Date();
   return `${hoje.getUTCFullYear()}-${String(hoje.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
 export function intervaloMesVoip(mes: string) {
   const [ano, numeroMes] = normalizarMesVoip(mes).split("-").map(Number);
-  const inicio = new Date(Date.UTC(ano, numeroMes - 1, 1));
-  const fim = new Date(Date.UTC(ano, numeroMes, 1));
+
+  // Financeiro da plataforma usa o calendário de São Paulo. Como o Brasil
+  // não usa horário de verão atualmente, 00:00 BRT corresponde a 03:00 UTC.
+  const inicio = new Date(`${ano}-${String(numeroMes).padStart(2, "0")}-01T00:00:00-03:00`);
+
+  const proximoAno = numeroMes === 12 ? ano + 1 : ano;
+  const proximoMes = numeroMes === 12 ? 1 : numeroMes + 1;
+  const fim = new Date(`${proximoAno}-${String(proximoMes).padStart(2, "0")}-01T00:00:00-03:00`);
+
   return { inicio, fim };
+}
+
+function diasNoMesUtc(ano: number, mesZeroBased: number) {
+  return new Date(Date.UTC(ano, mesZeroBased + 1, 0)).getUTCDate();
+}
+
+function proximaCobrancaNumero(atual: Date) {
+  const anoAtual = atual.getUTCFullYear();
+  const mesAtual = atual.getUTCMonth();
+  const diaAtual = atual.getUTCDate();
+
+  const proximoMesBase = mesAtual + 1;
+  const proximoAno = anoAtual + Math.floor(proximoMesBase / 12);
+  const proximoMes = ((proximoMesBase % 12) + 12) % 12;
+  const dia = Math.min(diaAtual, diasNoMesUtc(proximoAno, proximoMes));
+
+  return new Date(Date.UTC(
+    proximoAno,
+    proximoMes,
+    dia,
+    atual.getUTCHours(),
+    atual.getUTCMinutes(),
+    atual.getUTCSeconds(),
+    atual.getUTCMilliseconds()
+  ));
+}
+
+export function cobrancasNumeroVoipNoMes(params: {
+  ativadaEm: unknown;
+  liberadaEm?: unknown;
+  mes: string;
+  custoMensalUsd: unknown;
+}) {
+  const ativada = new Date(String(params.ativadaEm || ""));
+  const liberada = params.liberadaEm
+    ? new Date(String(params.liberadaEm))
+    : null;
+  const custoMensalUsd = Math.max(Number(params.custoMensalUsd || 0), 0);
+  const { inicio, fim } = intervaloMesVoip(params.mes);
+
+  if (
+    !Number.isFinite(ativada.getTime()) ||
+    (liberada && !Number.isFinite(liberada.getTime())) ||
+    custoMensalUsd <= 0 ||
+    ativada >= fim
+  ) {
+    return { quantidade: 0, custo_usd: 0, datas: [] as string[] };
+  }
+
+  let cobranca = new Date(ativada.getTime());
+  const datas: string[] = [];
+
+  // Limite defensivo de 20 anos evita loop infinito com dados corrompidos.
+  for (let i = 0; i < 240 && cobranca < fim; i += 1) {
+    if (liberada && cobranca >= liberada) break;
+
+    if (cobranca >= inicio) {
+      datas.push(cobranca.toISOString());
+    }
+
+    cobranca = proximaCobrancaNumero(cobranca);
+  }
+
+  return {
+    quantidade: datas.length,
+    custo_usd: Number((datas.length * custoMensalUsd).toFixed(6)),
+    datas,
+  };
 }
