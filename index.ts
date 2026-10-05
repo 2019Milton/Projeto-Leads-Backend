@@ -44893,6 +44893,43 @@ async function seedRascunhosNovosNichosSuperAdmin() {
 
 await seedRascunhosNovosNichosSuperAdmin();
 
+const verificacaoNovosNichos = await client.query(
+  `SELECT
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE c.status = 'PAUSED')::int AS pausados,
+      COUNT(*) FILTER (
+        WHERE c.campaign_id IS NULL
+          AND c.adset_id IS NULL
+          AND c.ad_id IS NULL
+          AND c.form_id IS NULL
+          AND c.conta_anuncios_id IS NULL
+      )::int AS somente_locais,
+      COUNT(DISTINCT n.slug)::int AS nichos,
+      COUNT(DISTINCT c.plataforma)::int AS plataformas
+   FROM campanhas c
+   JOIN nichos n ON n.id = c.nicho_id
+   JOIN usuarios u ON u.id = c.usuario_id
+   WHERE u.tipo = 'super_admin'
+     AND COALESCE(u.ativo, true) = true
+     AND c.configuracoes_avancadas->>'teste_novos_nichos' = '2026-10-05'
+     AND n.slug IN ('faculdade_universidade','dentista')
+     AND c.plataforma IN ('facebook','instagram','tiktok','google','linkedin')`
+);
+const v = verificacaoNovosNichos.rows[0];
+if (
+  Number(v.total) !== 10 ||
+  Number(v.pausados) !== 10 ||
+  Number(v.somente_locais) !== 10 ||
+  Number(v.nichos) !== 2 ||
+  Number(v.plataformas) !== 5
+) {
+  throw new Error(
+    `VALIDAÇÃO NOVOS NICHOS FALHOU: total=${v.total}, pausados=${v.pausados}, locais=${v.somente_locais}, nichos=${v.nichos}, plataformas=${v.plataformas}`
+  );
+}
+console.log("VALIDAÇÃO NOVOS NICHOS OK: 10 rascunhos locais, 2 nichos, 5 plataformas.");
+
+
 app.get("/verificacao-novos-nichos-20261005-3f6b9d", async (c) => {
   try {
     const resultado = await client.query(
