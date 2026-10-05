@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "bun run index.ts"
+    "start": "bun --preload ./financeiro-lembretes.ts run index.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
