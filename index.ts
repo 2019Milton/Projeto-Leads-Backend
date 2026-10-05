@@ -27290,17 +27290,20 @@ async function resumoCustosVoipUsuarios(
     const faturamento = configMap.get(usuarioId) || {};
 
     const custoChamadasBrl = Number(chamadas.custo_chamadas_brl || 0);
-    const custoNumeroUsd = faturamento.repassar_numero === false
-      ? 0
-      : Number(linha.custo_numero_usd || 0);
+    const custoNumeroUsd = Number(linha.custo_numero_usd || 0);
     const custoNumeroBrl = Number((custoNumeroUsd * cotacao).toFixed(2));
     const custoProvedorBrl = Number((custoChamadasBrl + custoNumeroBrl).toFixed(2));
+
     const margemPercentual = Number(faturamento.margem_percentual || 0);
     const taxaFixa = Number(faturamento.taxa_fixa_mensal_brl || 0);
+    const repassarNumero = faturamento.repassar_numero !== false;
+    const baseRepasseBrl = Number(
+      (custoChamadasBrl + (repassarNumero ? custoNumeroBrl : 0)).toFixed(2)
+    );
     const teveLinhaNoMes = Number(linha.linhas || 0) > 0;
     const valorRepassado = teveLinhaNoMes
-      ? custoRepasseBrl(custoProvedorBrl, margemPercentual, taxaFixa)
-      : Number(custoProvedorBrl.toFixed(2));
+      ? custoRepasseBrl(baseRepasseBrl, margemPercentual, taxaFixa)
+      : Number(baseRepasseBrl.toFixed(2));
     const margemBrl = Number((valorRepassado - custoProvedorBrl).toFixed(2));
 
     return {
@@ -27331,7 +27334,8 @@ async function resumoCustosVoipUsuarios(
         valor_repassado_brl: valorRepassado,
         margem_brl: margemBrl,
         margem_percentual: margemPercentual,
-        taxa_fixa_mensal_brl: taxaFixa
+        taxa_fixa_mensal_brl: taxaFixa,
+        repassar_numero: repassarNumero
       },
       observacoes: faturamento.observacoes || null,
       chamadas: incluirChamadas ? (chamadasDetalhes.get(usuarioId) || []) : undefined
@@ -27379,7 +27383,9 @@ function resumoVoipParaCliente(item: any) {
   const fator = 1 + margem / 100;
   const taxaFixa = Math.max(Number(custos.taxa_fixa_mensal_brl || 0), 0);
 
-  const numeroCobrado = Number((Number(custos.numero_brl || 0) * fator).toFixed(2));
+  const numeroCobrado = custos.repassar_numero === false
+    ? 0
+    : Number((Number(custos.numero_brl || 0) * fator).toFixed(2));
   const chamadasCobradas = Number((Number(custos.chamadas_brl || 0) * fator).toFixed(2));
 
   return {
