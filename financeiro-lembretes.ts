@@ -206,6 +206,8 @@ async function verificarLembretes(db: Pool) {
   const hoje = hojeBrasiliaISO();
 
   try {
+    await garantirEstrutura(db);
+
     const sql =
       "SELECT " +
       "f.id, f.usuario_id, f.mes_referencia, f.valor, f.observacao, " +
@@ -272,16 +274,11 @@ export function iniciarLembretesFinanceiroWhatsApp() {
     void verificarLembretes(db);
   };
 
-  void (async () => {
-    try {
-      await garantirEstrutura(db);
-      setTimeout(executar, ATRASO_PRIMEIRA_VERIFICACAO_MS);
-      setInterval(executar, INTERVALO_VERIFICACAO_MS);
-      console.log(
-        "[financeiro-whatsapp] lembretes ativos: D-1, D0 e diário após vencimento"
-      );
-    } catch (err) {
-      console.error("[financeiro-whatsapp] falha ao iniciar:", err);
-    }
-  })();
+  setTimeout(executar, 30 * 1000);
+  setInterval(executar, INTERVALO_VERIFICACAO_MS);
+  console.log(
+    "[financeiro-whatsapp] lembretes ativos: D-1, D0 e diário após vencimento"
+  );
 }
+
+iniciarLembretesFinanceiroWhatsApp();
