@@ -351,3 +351,27 @@ export function escaparXmlVoip(valor: unknown) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
 }
+
+export async function buscarDetalheChamadaTwilio(callSid: string) {
+  const sid = String(callSid || "").trim();
+  if (!sid) throw new Error("SID da chamada não informado");
+
+  const dados = await twilioFetch(
+    `/Calls/${encodeURIComponent(sid)}.json`,
+    { method: "GET" }
+  );
+
+  const precoBruto = Number(dados?.price);
+  const duracao = Number(dados?.duration);
+
+  return {
+    sid: String(dados?.sid || sid),
+    status: String(dados?.status || ""),
+    duracao_segundos: Number.isFinite(duracao) ? duracao : null,
+    preco: Number.isFinite(precoBruto) ? Math.abs(precoBruto) : null,
+    moeda: String(dados?.price_unit || "USD").toUpperCase(),
+    direcao: dados?.direction || null,
+    de: dados?.from || null,
+    para: dados?.to || null,
+  };
+}
