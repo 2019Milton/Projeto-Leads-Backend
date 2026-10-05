@@ -26899,6 +26899,449 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
 });
 
 
+
+let cotacaoVoipCache = { valor: 0, expiraEm: 0 };
+
+async function obterCotacaoUsdBrlVoip(forcar = false) {
+  const agora = Date.now();
+
+  if (!forcar && cotacaoVoipCache.valor > 0 && cotacaoVoipCache.expiraEm > agora) {
+    return cotacaoVoipCache.valor;
+  }
+
+  const cfgCustos = configuracaoCustosVoip();
+  const atual = await client.query(
+    `
+    SELECT cotacao_usd_brl, cotacao_atualizada_em
+    FROM voip_financeiro_global
+    WHERE id = 1
+    LIMIT 1
+    `
+  );
+
+  let valor = Number(atual.rows[0]?.cotacao_usd_brl || cfgCustos.cotacaoFallback);
+  const atualizadaEm = atual.rows[0]?.cotacao_atualizada_em
+    ? new Date(atual.rows[0].cotacao_atualizada_em).getTime()
+    : 0;
+  const precisaAtualizar = forcar || !atualizadaEm || (agora - atualizadaEm > 6 * 60 * 60 * 1000);
+
+  if (precisaAtualizar) {
+    try {
+      const res = await fetch("https://economia.awesomeapi.com.br/json/last/USD-BRL", {
+        signal: AbortSignal.timeout(3500)
+      });
+      const dados: any = await res.json();
+      const nova = Number(dados?.USDBRL?.bid || dados?.USDBRL?.ask);
+
+      if (res.ok && Number.isFinite(nova) && nova > 0) {
+        valor = nova;
+        await client.query(
+          `
+          INSERT INTO voip_financeiro_global (id, cotacao_usd_brl, cotacao_atualizada_em, atualizado_em)
+          VALUES (1, $1, NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE SET
+            cotacao_usd_brl = EXCLUDED.cotacao_usd_brl,
+            cotacao_atualizada_em = NOW(),
+            atualizado_em = NOW()
+          `,
+          [valor]
+        );
+      }
+    } catch (err) {
+      console.warn("VOIP COTACAO: mantendo última cotação disponível", err);
+    }
+  }
+
+  if (!Number.isFinite(valor) || valor <= 0) valor = cfgCustos.cotacaoFallback;
+  cotacaoVoipCache = { valor, expiraEm: agora + 10 * 60 * 1000 };
+  return valor;
+}
+
+async function garantirConfigFaturamentoVoip(usuarioId: number) {
+  await client.query(
+    `
+    INSERT INTO voip_faturamento_config (usuario_id)
+    VALUES ($1)
+    ON CONFLICT (usuario_id) DO NOTHING
+    `,
+    [usuarioId]
+  );
+
+  const result = await client.query(
+    `
+    SELECT usuario_id, margem_percentual, taxa_fixa_mensal_brl,
+           repassar_numero, observacoes, atualizado_em
+    FROM voip_faturamento_config
+    WHERE usuario_id = $1
+    LIMIT 1
+    `,
+    [usuarioId]
+  );
+
+  const row = result.rows[0] || {};
+  return {
+    usuario_id: Number(usuarioId),
+    margem_percentual: Number(row.margem_percentual || 0),
+    taxa_fixa_mensal_brl: Number(row.taxa_fixa_mensal_brl || 0),
+    repassar_numero: row.repassar_numero !== false,
+    observacoes: row.observacoes || null,
+    atualizado_em: row.atualizado_em || null
+  };
+}
+
+async function atualizarEstimativaCustoChamadaVoip(chamadaId: number, cotacaoInformada?: number) {
+  const result = await client.query(
+    `
+    SELECT id, direcao, telefone, duracao_segundos, custo_status
+    FROM voip_chamadas
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [chamadaId]
+  );
+  const chamada = result.rows[0];
+  if (!chamada || chamada.custo_status === "final") return null;
+
+  const cotacao = cotacaoInformada || await obterCotacaoUsdBrlVoip();
+  const custoUsd = estimarCustoChamadaUsd(
+    chamada.direcao === "entrada" ? "entrada" : "saida",
+    chamada.telefone,
+    chamada.duracao_segundos
+  );
+  const custoBrl = Number((custoUsd * cotacao).toFixed(4));
+
+  await client.query(
+    `
+    UPDATE voip_chamadas
+    SET custo_estimado_usd = $1,
+        custo_estimado_brl = $2,
+        cotacao_usd_brl = $3,
+        custo_status = CASE WHEN custo_status = 'final' THEN 'final' ELSE 'estimado' END,
+        custo_atualizado_em = NOW()
+    WHERE id = $4
+    `,
+    [custoUsd, custoBrl, cotacao, chamadaId]
+  );
+
+  return { custo_usd: custoUsd, custo_brl: custoBrl, cotacao };
+}
+
+async function conciliarCustoFinalChamadaVoip(chamadaId: number) {
+  const result = await client.query(
+    `
+    SELECT id, chamada_externa_id, chamada_pstn_sid, duracao_segundos, custo_status
+    FROM voip_chamadas
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [chamadaId]
+  );
+  const chamada = result.rows[0];
+  if (!chamada || chamada.custo_status === "final") return null;
+
+  const sids = Array.from(new Set(
+    [chamada.chamada_externa_id, chamada.chamada_pstn_sid]
+      .map((v: any) => String(v || "").trim())
+      .filter(Boolean)
+  ));
+
+  if (!sids.length || !diagnosticarTwilioVoip().configurado) {
+    return atualizarEstimativaCustoChamadaVoip(chamadaId);
+  }
+
+  const detalhes: any[] = [];
+  for (const sid of sids) {
+    try {
+      detalhes.push(await buscarDetalheChamadaTwilio(sid));
+    } catch (err) {
+      console.warn("VOIP CUSTO: preço ainda indisponível para", sid, err);
+    }
+  }
+
+  const precos = detalhes
+    .filter(item => item?.preco !== null && item?.preco !== undefined && item?.moeda === "USD")
+    .map(item => Number(item.preco))
+    .filter(Number.isFinite);
+
+  const todosComPreco = detalhes.length === sids.length && precos.length === sids.length;
+
+  if (!todosComPreco) {
+    return atualizarEstimativaCustoChamadaVoip(chamadaId);
+  }
+
+  const custoFinalUsd = Number(precos.reduce((s, v) => s + v, 0).toFixed(6));
+  const cotacao = await obterCotacaoUsdBrlVoip();
+  const custoFinalBrl = Number((custoFinalUsd * cotacao).toFixed(4));
+  const duracaoFinal = Math.max(
+    Number(chamada.duracao_segundos || 0),
+    ...detalhes.map(item => Number(item?.duracao_segundos || 0))
+  );
+
+  await client.query(
+    `
+    UPDATE voip_chamadas
+    SET custo_final_usd = $1,
+        custo_final_brl = $2,
+        cotacao_usd_brl = $3,
+        custo_status = 'final',
+        duracao_segundos = GREATEST(COALESCE(duracao_segundos, 0), $4),
+        custo_atualizado_em = NOW()
+    WHERE id = $5
+    `,
+    [custoFinalUsd, custoFinalBrl, cotacao, duracaoFinal, chamadaId]
+  );
+
+  return { custo_usd: custoFinalUsd, custo_brl: custoFinalBrl, cotacao, final: true };
+}
+
+async function sincronizarCustosVoipPendentes(limite = 12) {
+  if (!diagnosticarTwilioVoip().configurado) return;
+
+  const pendentes = await client.query(
+    `
+    SELECT id
+    FROM voip_chamadas
+    WHERE encerrada_em IS NOT NULL
+      AND custo_status <> 'final'
+      AND encerrada_em >= NOW() - INTERVAL '10 days'
+    ORDER BY encerrada_em ASC
+    LIMIT $1
+    `,
+    [Math.max(1, Math.min(Number(limite || 12), 30))]
+  );
+
+  for (const row of pendentes.rows) {
+    await conciliarCustoFinalChamadaVoip(Number(row.id)).catch(err =>
+      console.warn("VOIP CUSTO conciliacao:", err)
+    );
+  }
+}
+
+async function resumoCustosVoipUsuarios(
+  usuarioIds: number[],
+  mesInformado: unknown,
+  incluirChamadas = false
+) {
+  const ids = Array.from(new Set(
+    usuarioIds.map(Number).filter(id => Number.isInteger(id) && id > 0)
+  ));
+
+  const mes = normalizarMesVoip(mesInformado);
+  const { inicio, fim } = intervaloMesVoip(mes);
+  const cotacao = await obterCotacaoUsdBrlVoip();
+  const cfgCustos = configuracaoCustosVoip();
+
+  if (!ids.length) {
+    return {
+      mes,
+      cotacao_usd_brl: cotacao,
+      cotacao_atualizada_em: null,
+      usuarios: [],
+      totais: {
+        chamadas: 0, minutos: 0, custo_provedor_brl: 0,
+        valor_repassado_brl: 0, margem_brl: 0, linhas: 0
+      }
+    };
+  }
+
+  const [usuariosRes, chamadasRes, linhasRes, configsRes, globalRes] = await Promise.all([
+    client.query(
+      `
+      SELECT u.id, u.nome, u.sobrenome, u.email, u.admin_id,
+             u.voip_habilitado, u.voip_status, u.voip_numero,
+             g.nome AS gestor_nome, g.sobrenome AS gestor_sobrenome, g.email AS gestor_email
+      FROM usuarios u
+      LEFT JOIN usuarios g ON g.id = u.admin_id
+      WHERE u.id = ANY($1::int[])
+      ORDER BY COALESCE(g.nome, ''), COALESCE(u.nome, ''), u.email
+      `,
+      [ids]
+    ),
+    client.query(
+      `
+      SELECT
+        usuario_id,
+        COUNT(*)::int AS chamadas,
+        COALESCE(SUM(duracao_segundos), 0)::bigint AS segundos,
+        COALESCE(SUM(
+          CASE
+            WHEN custo_status = 'final' AND custo_final_brl IS NOT NULL THEN custo_final_brl
+            ELSE custo_estimado_brl
+          END
+        ), 0)::numeric AS custo_chamadas_brl,
+        COUNT(*) FILTER (WHERE custo_status = 'final')::int AS custos_finais,
+        COUNT(*) FILTER (WHERE custo_status <> 'final')::int AS custos_estimados
+      FROM voip_chamadas
+      WHERE usuario_id = ANY($1::int[])
+        AND iniciada_em >= $2
+        AND iniciada_em < $3
+      GROUP BY usuario_id
+      `,
+      [ids, inicio, fim]
+    ),
+    client.query(
+      `
+      SELECT usuario_id,
+             COUNT(*)::int AS linhas,
+             COALESCE(SUM(custo_mensal_usd), 0)::numeric AS custo_numero_usd
+      FROM voip_linhas_historico
+      WHERE usuario_id = ANY($1::int[])
+        AND ativada_em < $3
+        AND (liberada_em IS NULL OR liberada_em >= $2)
+      GROUP BY usuario_id
+      `,
+      [ids, inicio, fim]
+    ),
+    client.query(
+      `
+      SELECT usuario_id, margem_percentual, taxa_fixa_mensal_brl,
+             repassar_numero, observacoes
+      FROM voip_faturamento_config
+      WHERE usuario_id = ANY($1::int[])
+      `,
+      [ids]
+    ),
+    client.query(
+      `
+      SELECT cotacao_usd_brl, cotacao_atualizada_em
+      FROM voip_financeiro_global WHERE id = 1 LIMIT 1
+      `
+    )
+  ]);
+
+  const chamadasMap = new Map(chamadasRes.rows.map((r: any) => [Number(r.usuario_id), r]));
+  const linhasMap = new Map(linhasRes.rows.map((r: any) => [Number(r.usuario_id), r]));
+  const configMap = new Map(configsRes.rows.map((r: any) => [Number(r.usuario_id), r]));
+
+  let chamadasDetalhes = new Map<number, any[]>();
+  if (incluirChamadas) {
+    const detalhes = await client.query(
+      `
+      SELECT id, usuario_id, lead_id, direcao, telefone, status, duracao_segundos,
+             iniciada_em, atendida_em, encerrada_em, custo_status,
+             custo_estimado_usd, custo_final_usd,
+             custo_estimado_brl, custo_final_brl, cotacao_usd_brl
+      FROM voip_chamadas
+      WHERE usuario_id = ANY($1::int[])
+        AND iniciada_em >= $2
+        AND iniciada_em < $3
+      ORDER BY iniciada_em DESC
+      LIMIT 2000
+      `,
+      [ids, inicio, fim]
+    );
+    chamadasDetalhes = new Map();
+    for (const row of detalhes.rows) {
+      const id = Number(row.usuario_id);
+      const lista = chamadasDetalhes.get(id) || [];
+      lista.push({
+        ...row,
+        id: Number(row.id),
+        usuario_id: id,
+        duracao_segundos: Number(row.duracao_segundos || 0),
+        custo_brl: Number(
+          row.custo_status === "final" && row.custo_final_brl !== null
+            ? row.custo_final_brl
+            : row.custo_estimado_brl || 0
+        ),
+        custo_usd: Number(
+          row.custo_status === "final" && row.custo_final_usd !== null
+            ? row.custo_final_usd
+            : row.custo_estimado_usd || 0
+        )
+      });
+      chamadasDetalhes.set(id, lista);
+    }
+  }
+
+  const usuarios = usuariosRes.rows.map((u: any) => {
+    const usuarioId = Number(u.id);
+    const chamadas = chamadasMap.get(usuarioId) || {};
+    const linha = linhasMap.get(usuarioId) || {};
+    const faturamento = configMap.get(usuarioId) || {};
+
+    const custoChamadasBrl = Number(chamadas.custo_chamadas_brl || 0);
+    const custoNumeroUsd = faturamento.repassar_numero === false
+      ? 0
+      : Number(linha.custo_numero_usd || 0);
+    const custoNumeroBrl = Number((custoNumeroUsd * cotacao).toFixed(2));
+    const custoProvedorBrl = Number((custoChamadasBrl + custoNumeroBrl).toFixed(2));
+    const margemPercentual = Number(faturamento.margem_percentual || 0);
+    const taxaFixa = Number(faturamento.taxa_fixa_mensal_brl || 0);
+    const teveLinhaNoMes = Number(linha.linhas || 0) > 0;
+    const valorRepassado = teveLinhaNoMes
+      ? custoRepasseBrl(custoProvedorBrl, margemPercentual, taxaFixa)
+      : Number(custoProvedorBrl.toFixed(2));
+    const margemBrl = Number((valorRepassado - custoProvedorBrl).toFixed(2));
+
+    return {
+      id: usuarioId,
+      nome: `${u.nome || ""} ${u.sobrenome || ""}`.trim() || u.email,
+      email: u.email,
+      gestor: u.admin_id ? {
+        id: Number(u.admin_id),
+        nome: `${u.gestor_nome || ""} ${u.gestor_sobrenome || ""}`.trim() || u.gestor_email || "Gestor",
+        email: u.gestor_email || null
+      } : null,
+      voip: {
+        habilitado: u.voip_habilitado === true,
+        status: u.voip_status || "desativado",
+        numero: u.voip_numero || null,
+        linhas_no_mes: Number(linha.linhas || 0)
+      },
+      consumo: {
+        chamadas: Number(chamadas.chamadas || 0),
+        minutos: Number((Number(chamadas.segundos || 0) / 60).toFixed(1)),
+        custos_finais: Number(chamadas.custos_finais || 0),
+        custos_estimados: Number(chamadas.custos_estimados || 0)
+      },
+      custos: {
+        numero_brl: custoNumeroBrl,
+        chamadas_brl: Number(custoChamadasBrl.toFixed(2)),
+        provedor_brl: custoProvedorBrl,
+        valor_repassado_brl: valorRepassado,
+        margem_brl: margemBrl,
+        margem_percentual: margemPercentual,
+        taxa_fixa_mensal_brl: taxaFixa
+      },
+      observacoes: faturamento.observacoes || null,
+      chamadas: incluirChamadas ? (chamadasDetalhes.get(usuarioId) || []) : undefined
+    };
+  });
+
+  const totais = usuarios.reduce((acc: any, item: any) => {
+    acc.chamadas += item.consumo.chamadas;
+    acc.minutos += item.consumo.minutos;
+    acc.custo_provedor_brl += item.custos.provedor_brl;
+    acc.valor_repassado_brl += item.custos.valor_repassado_brl;
+    acc.margem_brl += item.custos.margem_brl;
+    acc.linhas += item.voip.linhas_no_mes;
+    return acc;
+  }, {
+    chamadas: 0, minutos: 0, custo_provedor_brl: 0,
+    valor_repassado_brl: 0, margem_brl: 0, linhas: 0
+  });
+
+  for (const chave of ["minutos", "custo_provedor_brl", "valor_repassado_brl", "margem_brl"]) {
+    totais[chave] = Number(totais[chave].toFixed(2));
+  }
+
+  return {
+    mes,
+    cotacao_usd_brl: cotacao,
+    cotacao_atualizada_em: globalRes.rows[0]?.cotacao_atualizada_em || null,
+    tarifas_referencia: {
+      numero_mensal_usd: cfgCustos.numeroMensalUsd,
+      sdk_minuto_usd: cfgCustos.sdkMinutoUsd,
+      fixo_minuto_usd: cfgCustos.fixoMinutoUsd,
+      celular_minuto_usd: cfgCustos.celularMinutoUsd,
+      entrada_minuto_usd: cfgCustos.entradaMinutoUsd
+    },
+    usuarios,
+    totais
+  };
+}
+
 function identidadeVoipUsuario(usuarioId: number) {
   return `corretor_${Number(usuarioId)}`;
 }
