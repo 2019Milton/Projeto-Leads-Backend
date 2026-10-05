@@ -44893,6 +44893,28 @@ async function seedRascunhosNovosNichosSuperAdmin() {
 
 await seedRascunhosNovosNichosSuperAdmin();
 
+app.get("/verificacao-novos-nichos-20261005-3f6b9d", async (c) => {
+  try {
+    const resultado = await client.query(
+      `SELECT n.slug AS nicho, c.plataforma, c.status,
+              (c.campaign_id IS NULL AND c.adset_id IS NULL AND c.ad_id IS NULL) AS somente_local
+       FROM campanhas c
+       JOIN nichos n ON n.id = c.nicho_id
+       JOIN usuarios u ON u.id = c.usuario_id
+       WHERE u.tipo = 'super_admin'
+         AND COALESCE(u.ativo, true) = true
+         AND c.configuracoes_avancadas->>'teste_novos_nichos' = '2026-10-05'
+       ORDER BY n.slug, c.plataforma`
+    );
+    return c.json({
+      total: resultado.rows.length,
+      rascunhos: resultado.rows
+    });
+  } catch (err) {
+    return c.json({ error: "falha_verificacao" }, 500);
+  }
+});
+
 Bun.serve({
   port: Number(Bun.env.PORT) || 3000,
   fetch: app.fetch,
