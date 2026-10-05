@@ -64,20 +64,27 @@ export function custoRepasseBrl(
 
 const FUSO_VOIP = "America/Sao_Paulo";
 
-export function normalizarMesVoip(valor: unknown) {
-  const texto = String(valor || "").trim();
-  if (/^\d{4}-(0[1-9]|1[0-2])$/.test(texto)) return texto;
+export function mesVoipDaData(valor: unknown) {
+  const data = valor instanceof Date ? valor : new Date(String(valor ?? ""));
+  if (!Number.isFinite(data.getTime())) return null;
 
   const partes = new Intl.DateTimeFormat("en-US", {
     timeZone: FUSO_VOIP,
     year: "numeric",
     month: "2-digit",
-  }).formatToParts(new Date());
+  }).formatToParts(data);
 
   const ano = partes.find((p) => p.type === "year")?.value;
   const mes = partes.find((p) => p.type === "month")?.value;
+  return ano && mes ? `${ano}-${mes}` : null;
+}
 
-  if (ano && mes) return `${ano}-${mes}`;
+export function normalizarMesVoip(valor: unknown) {
+  const texto = String(valor || "").trim();
+  if (/^\d{4}-(0[1-9]|1[0-2])$/.test(texto)) return texto;
+
+  const atual = mesVoipDaData(new Date());
+  if (atual) return atual;
 
   const hoje = new Date();
   return `${hoje.getUTCFullYear()}-${String(hoje.getUTCMonth() + 1).padStart(2, "0")}`;
