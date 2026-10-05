@@ -102,6 +102,7 @@ import {
 } from "./voip-twilio";
 
 import {
+  cobrancasNumeroVoipNoMes,
   configuracaoCustosVoip,
   custoRepasseBrl,
   estimarCustoChamadaUsd,
@@ -24821,6 +24822,20 @@ await client.query(`
 `);
 
 await client.query(`
+  DELETE FROM voip_chamadas duplicada
+  USING voip_chamadas original
+  WHERE duplicada.id > original.id
+    AND duplicada.usuario_id = original.usuario_id
+    AND duplicada.chamada_externa_id IS NOT NULL
+    AND duplicada.chamada_externa_id = original.chamada_externa_id;
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_voip_chamadas_usuario_externa_unico
+    ON voip_chamadas(usuario_id, chamada_externa_id)
+    WHERE chamada_externa_id IS NOT NULL;
+`);
+
+
+await client.query(`
   ALTER TABLE voip_chamadas
     ADD COLUMN IF NOT EXISTS custo_estimado_usd NUMERIC(14, 6) NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS custo_final_usd NUMERIC(14, 6),
@@ -24907,6 +24922,15 @@ await client.query(`
   VALUES (1, ${Number(Bun.env.VOIP_USD_BRL_FALLBACK || 5.21)})
   ON CONFLICT (id) DO NOTHING;
 `);
+
+await client.query(`
+  CREATE TABLE IF NOT EXISTS voip_cotacao_mensal (
+    mes_referencia       DATE PRIMARY KEY,
+    cotacao_usd_brl      NUMERIC(12, 6) NOT NULL,
+    cotacao_atualizada_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
 
 
 
@@ -26931,10 +26955,29 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
 
 let cotacaoVoipCache = { valor: 0, expiraEm: 0 };
 
+async function salvarCotacaoMensalVoip(mes: string, valor: number) {
+  if (!Number.isFinite(valor) || valor <= 0) return;
+
+  await client.query(
+    `
+    INSERT INTO voip_cotacao_mensal (
+      mes_referencia, cotacao_usd_brl, cotacao_atualizada_em
+    )
+    VALUES ($1::date, $2, NOW())
+    ON CONFLICT (mes_referencia) DO UPDATE SET
+      cotacao_usd_brl = EXCLUDED.cotacao_usd_brl,
+      cotacao_atualizada_em = NOW()
+    `,
+    [`${normalizarMesVoip(mes)}-01`, valor]
+  );
+}
+
 async function obterCotacaoUsdBrlVoip(forcar = false) {
   const agora = Date.now();
+  const mesAtual = normalizarMesVoip(null);
 
   if (!forcar && cotacaoVoipCache.valor > 0 && cotacaoVoipCache.expiraEm > agora) {
+    await salvarCotacaoMensalVoip(mesAtual, cotacaoVoipCache.valor).catch(() => {});
     return cotacaoVoipCache.valor;
   }
 
@@ -26952,7 +26995,10 @@ async function obterCotacaoUsdBrlVoip(forcar = false) {
   const atualizadaEm = atual.rows[0]?.cotacao_atualizada_em
     ? new Date(atual.rows[0].cotacao_atualizada_em).getTime()
     : 0;
-  const precisaAtualizar = forcar || !atualizadaEm || (agora - atualizadaEm > 6 * 60 * 60 * 1000);
+  const precisaAtualizar =
+    forcar ||
+    !atualizadaEm ||
+    (agora - atualizadaEm > 6 * 60 * 60 * 1000);
 
   if (precisaAtualizar) {
     try {
@@ -26966,7 +27012,9 @@ async function obterCotacaoUsdBrlVoip(forcar = false) {
         valor = nova;
         await client.query(
           `
-          INSERT INTO voip_financeiro_global (id, cotacao_usd_brl, cotacao_atualizada_em, atualizado_em)
+          INSERT INTO voip_financeiro_global (
+            id, cotacao_usd_brl, cotacao_atualizada_em, atualizado_em
+          )
           VALUES (1, $1, NOW(), NOW())
           ON CONFLICT (id) DO UPDATE SET
             cotacao_usd_brl = EXCLUDED.cotacao_usd_brl,
@@ -26981,8 +27029,71 @@ async function obterCotacaoUsdBrlVoip(forcar = false) {
     }
   }
 
-  if (!Number.isFinite(valor) || valor <= 0) valor = cfgCustos.cotacaoFallback;
-  cotacaoVoipCache = { valor, expiraEm: agora + 10 * 60 * 1000 };
+  if (!Number.isFinite(valor) || valor <= 0) {
+    valor = cfgCustos.cotacaoFallback;
+  }
+
+  await salvarCotacaoMensalVoip(mesAtual, valor).catch(err =>
+    console.warn("VOIP COTACAO mensal:", err)
+  );
+
+  cotacaoVoipCache = {
+    valor,
+    expiraEm: agora + 10 * 60 * 1000
+  };
+  return valor;
+}
+
+async function obterCotacaoMesVoip(mesInformado: unknown) {
+  const mes = normalizarMesVoip(mesInformado);
+  const mesAtual = normalizarMesVoip(null);
+
+  if (mes === mesAtual) {
+    return obterCotacaoUsdBrlVoip();
+  }
+
+  const salva = await client.query(
+    `
+    SELECT cotacao_usd_brl
+    FROM voip_cotacao_mensal
+    WHERE mes_referencia = $1::date
+    LIMIT 1
+    `,
+    [`${mes}-01`]
+  );
+
+  const existente = Number(salva.rows[0]?.cotacao_usd_brl || 0);
+  if (Number.isFinite(existente) && existente > 0) return existente;
+
+  const { inicio, fim } = intervaloMesVoip(mes);
+  const historica = await client.query(
+    `
+    SELECT AVG(cotacao_usd_brl)::numeric AS cotacao
+    FROM voip_chamadas
+    WHERE iniciada_em >= $1
+      AND iniciada_em < $2
+      AND cotacao_usd_brl IS NOT NULL
+      AND cotacao_usd_brl > 0
+    `,
+    [inicio, fim]
+  );
+
+  let valor = Number(historica.rows[0]?.cotacao || 0);
+  if (!Number.isFinite(valor) || valor <= 0) {
+    valor = await obterCotacaoUsdBrlVoip();
+  }
+
+  await client.query(
+    `
+    INSERT INTO voip_cotacao_mensal (
+      mes_referencia, cotacao_usd_brl, cotacao_atualizada_em
+    )
+    VALUES ($1::date, $2, NOW())
+    ON CONFLICT (mes_referencia) DO NOTHING
+    `,
+    [`${mes}-01`, valor]
+  );
+
   return valor;
 }
 
@@ -27099,7 +27210,7 @@ async function conciliarCustoFinalChamadaVoip(chamadaId: number) {
   }
 
   const custoFinalUsd = Number(precos.reduce((s, v) => s + v, 0).toFixed(6));
-  const cotacao = await obterCotacaoUsdBrlVoip();
+  const cotacao = await obterCotacaoMesVoip(mes);
   const custoFinalBrl = Number((custoFinalUsd * cotacao).toFixed(4));
   const duracaoFinal = Math.max(
     Number(chamada.duracao_segundos || 0),
@@ -27132,7 +27243,7 @@ async function sincronizarCustosVoipPendentes(limite = 12) {
     FROM voip_chamadas
     WHERE encerrada_em IS NOT NULL
       AND custo_status <> 'final'
-      AND encerrada_em >= NOW() - INTERVAL '10 days'
+      AND encerrada_em >= NOW() - INTERVAL '45 days'
     ORDER BY encerrada_em ASC
     LIMIT $1
     `,
@@ -27210,14 +27321,14 @@ async function resumoCustosVoipUsuarios(
     ),
     client.query(
       `
-      SELECT usuario_id,
-             COUNT(*)::int AS linhas,
-             COALESCE(SUM(custo_mensal_usd), 0)::numeric AS custo_numero_usd
+      SELECT
+        id, usuario_id, provedor, numero, numero_sid,
+        custo_mensal_usd, ativada_em, liberada_em
       FROM voip_linhas_historico
       WHERE usuario_id = ANY($1::int[])
         AND ativada_em < $3
         AND (liberada_em IS NULL OR liberada_em >= $2)
-      GROUP BY usuario_id
+      ORDER BY usuario_id, ativada_em
       `,
       [ids, inicio, fim]
     ),
@@ -27233,13 +27344,40 @@ async function resumoCustosVoipUsuarios(
     client.query(
       `
       SELECT cotacao_usd_brl, cotacao_atualizada_em
-      FROM voip_financeiro_global WHERE id = 1 LIMIT 1
-      `
+      FROM voip_cotacao_mensal
+      WHERE mes_referencia = $1::date
+      LIMIT 1
+      `,
+      [`${mes}-01`]
     )
   ]);
 
   const chamadasMap = new Map(chamadasRes.rows.map((r: any) => [Number(r.usuario_id), r]));
-  const linhasMap = new Map(linhasRes.rows.map((r: any) => [Number(r.usuario_id), r]));
+  const linhasMap = new Map<number, { linhas: number; custo_numero_usd: number }>();
+
+  for (const linha of linhasRes.rows) {
+    const usuarioId = Number(linha.usuario_id);
+    const cobrancas = cobrancasNumeroVoipNoMes({
+      ativadaEm: linha.ativada_em,
+      liberadaEm: linha.liberada_em,
+      mes,
+      custoMensalUsd: linha.custo_mensal_usd
+    });
+
+    if (!cobrancas.quantidade) continue;
+
+    const atual = linhasMap.get(usuarioId) || {
+      linhas: 0,
+      custo_numero_usd: 0
+    };
+
+    atual.linhas += cobrancas.quantidade;
+    atual.custo_numero_usd = Number(
+      (atual.custo_numero_usd + cobrancas.custo_usd).toFixed(6)
+    );
+    linhasMap.set(usuarioId, atual);
+  }
+
   const configMap = new Map(configsRes.rows.map((r: any) => [Number(r.usuario_id), r]));
 
   let chamadasDetalhes = new Map<number, any[]>();
