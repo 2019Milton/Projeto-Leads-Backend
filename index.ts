@@ -24139,7 +24139,9 @@ async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: 
 
 async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId: number | null = null, resposta?: string) {
   if (conversa.status === "humano" || conversa.status === "encerrada") return;
-  const numeroCfg=await obterNumeroWhatsappPorPhoneId(phoneNumberId);
+  const numeroCfg = typeof obterNumeroWhatsappPorPhoneId === "function"
+    ? await obterNumeroWhatsappPorPhoneId(phoneNumberId)
+    : null;
   if (numeroCfg && numeroCfg.bot_ativo===false) return;
 
   const configRes=numeroCfg?.roteiro_id
