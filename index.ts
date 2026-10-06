@@ -21379,8 +21379,17 @@ function diagnosticarPermissoesToken(debugData: any, wabaId: string) {
 async function obterTokenWhatsappUsuario(usuarioId: number, phoneNumberId?: string | null) {
   if (phoneNumberId) {
     const numero = await client.query(
-      `SELECT access_token FROM whatsapp_numeros
-       WHERE usuario_id=$1 AND phone_number_id=$2 AND status='conectado' LIMIT 1`,
+      `SELECT wn.access_token
+       FROM whatsapp_numeros wn
+       JOIN usuarios u ON u.id=wn.usuario_id
+       WHERE wn.usuario_id=$1
+         AND wn.phone_number_id=$2
+         AND wn.status='conectado'
+         AND (
+           COALESCE(u.whatsapp_multiplos_numeros_habilitado, false)=TRUE
+           OR wn.principal=TRUE
+         )
+       LIMIT 1`,
       [usuarioId, phoneNumberId]
     ).catch(() => ({ rows: [] as any[] }));
     if (numero.rows[0]?.access_token) return numero.rows[0].access_token;
@@ -21395,13 +21404,34 @@ async function obterTokenWhatsappUsuario(usuarioId: number, phoneNumberId?: stri
 
 async function obterNumeroWhatsappPorPhoneId(phoneNumberId: string) {
   const numero = await client.query(
-    `SELECT wn.*, c.nicho_id AS campanha_nicho_id
+    `SELECT wn.*, c.nicho_id AS campanha_nicho_id,
+            COALESCE(u.whatsapp_multiplos_numeros_habilitado, false)
+              AS whatsapp_multiplos_numeros_habilitado
      FROM whatsapp_numeros wn
+     JOIN usuarios u ON u.id=wn.usuario_id
      LEFT JOIN campanhas c ON c.id=wn.campanha_id AND c.usuario_id=wn.usuario_id
      WHERE wn.phone_number_id=$1 AND wn.status='conectado' LIMIT 1`,
     [phoneNumberId]
   ).catch(() => ({ rows: [] as any[] }));
-  if (numero.rows[0]) return numero.rows[0];
+
+  const row = numero.rows[0];
+  if (row?.whatsapp_multiplos_numeros_habilitado === true) {
+    return row;
+  }
+
+  // Feature desligada: a tabela nova funciona apenas como espelho técnico do
+  // número legado principal. Números adicionais e configurações por número
+  // ficam completamente fora do fluxo até a ativação explícita do usuário.
+  if (row?.principal === true) {
+    return {
+      ...row,
+      bot_ativo: true,
+      nicho_id: null,
+      campanha_id: null,
+      roteiro_id: null,
+      campanha_nicho_id: null
+    };
+  }
 
   const legado = await client.query(
     `SELECT usuario_id, access_token, token_expira_em,
@@ -21411,7 +21441,8 @@ async function obterNumeroWhatsappPorPhoneId(phoneNumberId: string) {
             dados_conta->>'display_name' AS display_name,
             TRUE AS principal, TRUE AS bot_ativo,
             NULL::integer AS nicho_id, NULL::integer AS campanha_id,
-            NULL::integer AS roteiro_id, NULL::integer AS campanha_nicho_id
+            NULL::integer AS roteiro_id, NULL::integer AS campanha_nicho_id,
+            FALSE AS whatsapp_multiplos_numeros_habilitado
      FROM plataforma_conexoes
      WHERE plataforma='whatsapp' AND status='conectado'
        AND dados_conta->>'phone_number_id'=$1 LIMIT 1`,
