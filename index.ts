@@ -86,6 +86,8 @@ import {
   validarSendToGoogle,
 } from "./site-captura";
 
+import { avaliarSaldoIA, mensagemSaldoIA, recargaAutomaticaValida } from "./saldo-ia";
+
 import {
   TERMOS_BAIXO_INTERESSE,
   TERMOS_INTENCAO_FORTE,
@@ -3470,7 +3472,10 @@ function classificarFalhaProvedorIA(status: number, corpo: any) {
   const texto = `${codigo || ""} ${mensagem}`.toLowerCase();
 
   let tipo: TipoFalhaProvedorIA = "outro";
-  if (/insufficient_quota|exceeded your current quota|billing_hard_limit|billing hard limit|credit balance is too low|specified workspace api usage limits|insufficient_funds|out of credits/.test(texto)) {
+  // "You have no credits remaining. Add credits to continue..." (OpenAI, visto em
+  // 05/10/2026) vinha com HTTP 429 e não casava com nada daqui: virava "limite de
+  // taxa", que não gera alerta — o WhatsApp de sem crédito nunca saiu.
+  if (/insufficient_quota|exceeded your current quota|billing_hard_limit|billing hard limit|credit balance is too low|specified workspace api usage limits|insufficient_funds|out of credits|no credits remaining|add credits to continue|insufficient_credits|billing_not_active/.test(texto)) {
     tipo = "sem_credito";
   } else if (status === 401 || /invalid_api_key|authentication_error|incorrect api key|invalid x-api-key/.test(texto)) {
     tipo = "chave_invalida";
@@ -25310,6 +25315,23 @@ await client.query(`
   }
 }
 
+// Saldo estimado dos créditos de IA (ver saldo-ia.ts). base = saldo informado
+// pelo admin (ou o valor de recarga automática presumida), a partir de base_em.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS ia_saldos_provedor (
+    provider TEXT PRIMARY KEY,
+    saldo_base_usd NUMERIC(12, 4) NOT NULL,
+    base_em TIMESTAMP NOT NULL DEFAULT NOW(),
+    base_origem TEXT NOT NULL DEFAULT 'informado',
+    alerta_abaixo_usd NUMERIC(12, 4),
+    recarga_auto_abaixo_usd NUMERIC(12, 4),
+    recarga_auto_ate_usd NUMERIC(12, 4),
+    alerta_baixo_enviado_em TIMESTAMP,
+    ultima_recarga_estimada_em TIMESTAMP,
+    atualizado_em TIMESTAMP NOT NULL DEFAULT NOW()
+  );
+`);
+
 
 await client.query(`
   CREATE TABLE IF NOT EXISTS ia_config (
@@ -38257,9 +38279,30 @@ app.get("/admin/ia/saldos", authMiddleware, async (c) => {
       ? { budget_usd: anthropicBudgetUSD, gasto_usd: anthropicGastoUSD, saldo_usd: Math.max(0, anthropicBudgetUSD - anthropicGastoUSD) }
       : null;
 
+    // Saldo estimado = informado pelo admin − gasto da plataforma desde então
+    // (ver saldo-ia.ts). null enquanto o admin não informar.
+    const situacaoSaldos = await situacaoSaldosIA();
+    const saldoEstimado = (provider: ProvedorIA) => {
+      const s = situacaoSaldos[provider];
+      if (!s) return null;
+      const n = (v: any) => (v === null || v === undefined ? null : Number(v));
+      return {
+        estimado_usd: s.avaliacao.estimadoUsd,
+        base_usd: Number(s.linha.saldo_base_usd),
+        base_em: s.linha.base_em,
+        base_origem: s.linha.base_origem,
+        gasto_usd: Number(s.gasto.toFixed(4)),
+        alerta_abaixo_usd: n(s.linha.alerta_abaixo_usd),
+        recarga_auto_abaixo_usd: n(s.linha.recarga_auto_abaixo_usd),
+        recarga_auto_ate_usd: n(s.linha.recarga_auto_ate_usd),
+        alerta_baixo_enviado_em: s.linha.alerta_baixo_enviado_em,
+        ultima_recarga_estimada_em: s.linha.ultima_recarga_estimada_em
+      };
+    };
+
     return c.json({
-      openai: { ...(por_provider.openai || vazio), saldo_api: openaiSaldo },
-      anthropic: { ...anthropicData, saldo_calculado: anthropicSaldo, modelo_precificado: anthropicModeloAtivoSaldo },
+      openai: { ...(por_provider.openai || vazio), saldo_api: openaiSaldo, saldo_estimado: saldoEstimado("openai") },
+      anthropic: { ...anthropicData, saldo_calculado: anthropicSaldo, modelo_precificado: anthropicModeloAtivoSaldo, saldo_estimado: saldoEstimado("anthropic") },
       alertas: await listarAlertasProvedorIAAbertos(),
       atualizado_em: new Date().toISOString()
     });
@@ -38316,6 +38359,167 @@ app.post("/admin/ia/alertas/:id/resolver", authMiddleware, async (c) => {
   } catch (err) {
     console.error("ERRO RESOLVER ALERTA IA:", err);
     return c.json({ error: "Erro ao resolver alerta" }, 500);
+  }
+});
+
+/* =========================
+   💳 SALDO ESTIMADO DOS CRÉDITOS DE IA (ver saldo-ia.ts)
+========================= */
+
+// Gasto da plataforma no provedor desde "desde", em USD (custo_estimado é BRL,
+// convertido pela mesma cotação). Inclui o job do ranking, que gasta OpenAI
+// sem usuário (mesma união de usoGlobalIAMesAtual).
+// "desde" vai como texto do próprio banco (base_em::text): um Date do JS perde os
+// microssegundos e o fuso, e a comparação deixaria de bater.
+async function gastoIAUsdDesde(provider: ProvedorIA, desde: string): Promise<number> {
+  const resultado = await client.query(
+    `SELECT COALESCE(SUM(custo_estimado), 0) AS custo_brl FROM (
+       SELECT custo_estimado FROM ia_usos
+       WHERE COALESCE(provider, 'openai') = $1 AND criado_em > $2::timestamp
+       UNION ALL
+       SELECT custo_estimado FROM ranking_mercado_execucoes
+       WHERE $1 = 'openai' AND criado_em > $2::timestamp AND (tokens_entrada > 0 OR tokens_saida > 0)
+     ) gastos`,
+    [provider, desde]
+  );
+  return Number(resultado.rows[0]?.custo_brl || 0) / cotacaoUsdBrl();
+}
+
+async function situacaoSaldosIA() {
+  const linhas = await client.query(`SELECT *, base_em::text AS base_em_texto FROM ia_saldos_provedor`);
+  const saida: Record<string, any> = {};
+  for (const linha of linhas.rows) {
+    const provider = linha.provider as ProvedorIA;
+    const gasto = await gastoIAUsdDesde(provider, linha.base_em_texto);
+    const avaliacao = avaliarSaldoIA({
+      saldoBaseUsd: Number(linha.saldo_base_usd),
+      gastoDesdeBaseUsd: gasto,
+      alertaAbaixoUsd: linha.alerta_abaixo_usd === null ? null : Number(linha.alerta_abaixo_usd),
+      recargaAutoAbaixoUsd: linha.recarga_auto_abaixo_usd === null ? null : Number(linha.recarga_auto_abaixo_usd),
+      recargaAutoAteUsd: linha.recarga_auto_ate_usd === null ? null : Number(linha.recarga_auto_ate_usd),
+      alertaBaixoJaEnviado: Boolean(linha.alerta_baixo_enviado_em)
+    });
+    saida[provider] = { linha, gasto, avaliacao };
+  }
+  return saida;
+}
+
+async function notificarSuperAdminsIA(tipo: string, titulo: string, mensagemWhatsApp: string) {
+  const admins = await client.query(`SELECT id, whatsapp FROM usuarios WHERE tipo = 'super_admin'`);
+  for (const admin of admins.rows) {
+    await client.query(
+      `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem) VALUES ($1, $2, $3, $4)`,
+      [admin.id, tipo, titulo, mensagemWhatsApp.replace(/\*/g, "")]
+    );
+    if (admin.whatsapp) {
+      enviarLembreteWhatsApp(admin.whatsapp, mensagemWhatsApp).catch((e: any) =>
+        console.error("[ia-saldo] erro ao enviar WhatsApp:", e?.message || e)
+      );
+    }
+  }
+}
+
+// Roda a cada 10 min e depois de o admin informar o saldo. O UPDATE com a
+// condição do estado lido garante um aviso só, mesmo com duas verificações juntas.
+async function verificarSaldosIA() {
+  try {
+    const situacao = await situacaoSaldosIA();
+    for (const [provider, { linha, avaliacao }] of Object.entries(situacao) as [ProvedorIA, any][]) {
+      if (avaliacao.acao === "nenhuma") continue;
+      const texto = mensagemSaldoIA({
+        nomeProvedor: NOME_PROVEDOR_IA[provider],
+        acao: avaliacao.acao,
+        estimadoUsd: avaliacao.estimadoUsd,
+        alertaAbaixoUsd: linha.alerta_abaixo_usd === null ? null : Number(linha.alerta_abaixo_usd),
+        recargaAutoAbaixoUsd: linha.recarga_auto_abaixo_usd === null ? null : Number(linha.recarga_auto_abaixo_usd),
+        recargaAutoAteUsd: linha.recarga_auto_ate_usd === null ? null : Number(linha.recarga_auto_ate_usd),
+        linkBilling: LINK_BILLING_PROVEDOR_IA[provider]
+      });
+
+      const marcado = avaliacao.acao === "recarga_automatica"
+        ? await client.query(
+            `UPDATE ia_saldos_provedor
+             SET saldo_base_usd = recarga_auto_ate_usd, base_em = NOW(), base_origem = 'recarga_estimada',
+                 alerta_baixo_enviado_em = NULL, ultima_recarga_estimada_em = NOW(), atualizado_em = NOW()
+             WHERE provider = $1 AND base_em::text = $2
+             RETURNING provider`,
+            [provider, linha.base_em_texto]
+          )
+        : await client.query(
+            `UPDATE ia_saldos_provedor SET alerta_baixo_enviado_em = NOW(), atualizado_em = NOW()
+             WHERE provider = $1 AND base_em::text = $2 AND alerta_baixo_enviado_em IS NULL
+             RETURNING provider`,
+            [provider, linha.base_em_texto]
+          );
+      if (!marcado.rows.length) continue;
+
+      console.log(`[ia-saldo] ${provider}: ${avaliacao.acao} (estimado US$ ${avaliacao.estimadoUsd.toFixed(2)})`);
+      await notificarSuperAdminsIA(
+        avaliacao.acao === "recarga_automatica" ? "ia_saldo_recarga" : "ia_saldo_baixo",
+        texto.titulo,
+        texto.whatsapp
+      );
+    }
+  } catch (err) {
+    console.error("[ia-saldo] erro ao verificar saldos:", err);
+  }
+}
+
+setInterval(verificarSaldosIA, 10 * 60 * 1000);
+
+// O admin informa o saldo que está vendo no painel do provedor (e o aviso /
+// recarga automática configurados lá). Recomeça a estimativa a partir de agora.
+app.post("/admin/ia/saldo-provedor", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
+
+    const corpo: any = await c.req.json().catch(() => ({}));
+    const provider = corpo?.provider;
+    if (provider !== "openai" && provider !== "anthropic") {
+      return c.json({ error: "Provedor inválido" }, 400);
+    }
+    const numero = (valor: any) => {
+      if (valor === null || valor === undefined || String(valor).trim() === "") return null;
+      const n = Number(String(valor).replace(",", "."));
+      return Number.isFinite(n) && n >= 0 && n < 1_000_000 ? n : NaN;
+    };
+    const saldo = numero(corpo?.saldo_usd);
+    const alerta = numero(corpo?.alerta_abaixo_usd);
+    const recargaAbaixo = numero(corpo?.recarga_auto_abaixo_usd);
+    const recargaAte = numero(corpo?.recarga_auto_ate_usd);
+    if (saldo === null || Number.isNaN(saldo)) return c.json({ error: "Informe o saldo atual em US$." }, 400);
+    if ([alerta, recargaAbaixo, recargaAte].some(v => Number.isNaN(v))) {
+      return c.json({ error: "Valores inválidos." }, 400);
+    }
+    const temRecarga = recargaAbaixo !== null || recargaAte !== null;
+    if (temRecarga && !recargaAutomaticaValida(recargaAbaixo, recargaAte)) {
+      return c.json({ error: "Na recarga automática, o valor \"recarrega até\" precisa ser maior que o \"abaixo de\"." }, 400);
+    }
+
+    await client.query(
+      `INSERT INTO ia_saldos_provedor (
+         provider, saldo_base_usd, base_em, base_origem, alerta_abaixo_usd,
+         recarga_auto_abaixo_usd, recarga_auto_ate_usd, alerta_baixo_enviado_em, atualizado_em
+       )
+       VALUES ($1, $2, NOW(), 'informado', $3, $4, $5, NULL, NOW())
+       ON CONFLICT (provider) DO UPDATE SET
+         saldo_base_usd = EXCLUDED.saldo_base_usd,
+         base_em = NOW(),
+         base_origem = 'informado',
+         alerta_abaixo_usd = EXCLUDED.alerta_abaixo_usd,
+         recarga_auto_abaixo_usd = EXCLUDED.recarga_auto_abaixo_usd,
+         recarga_auto_ate_usd = EXCLUDED.recarga_auto_ate_usd,
+         alerta_baixo_enviado_em = NULL,
+         atualizado_em = NOW()`,
+      [provider, saldo, alerta, temRecarga ? recargaAbaixo : null, temRecarga ? recargaAte : null]
+    );
+
+    await verificarSaldosIA();
+    return c.json({ sucesso: true });
+  } catch (err) {
+    console.error("ERRO SALDO PROVEDOR IA:", err);
+    return c.json({ error: "Erro ao salvar o saldo" }, 500);
   }
 });
 
