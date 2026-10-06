@@ -22444,6 +22444,7 @@ function linhaFinanceiroParaJson(linha: any) {
     pix_chave: linha.pix_chave,
     pix_tipo: linha.pix_tipo,
     pix_tipo_label: linha.pix_tipo ? (CHAVE_PIX_TIPO_LABEL[linha.pix_tipo] || linha.pix_tipo) : null,
+    lembretes_whatsapp: Array.isArray(linha.lembretes_whatsapp) ? linha.lembretes_whatsapp : [],
     criado_em: linha.criado_em
   };
 }
@@ -22454,12 +22455,25 @@ app.get("/financeiro/meus-lancamentos", authMiddleware, async (c) => {
     const user: any = c.get("user");
 
     const result = await client.query(
-      `SELECT id, usuario_id, mes_referencia, valor, status,
-              comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
-              observacao, pix_chave, pix_tipo, criado_em
-       FROM financeiro_lancamentos
-       WHERE usuario_id = $1
-       ORDER BY mes_referencia DESC`,
+      `SELECT f.id, f.usuario_id, f.mes_referencia, f.valor, f.status,
+              f.comprovante_dados, f.comprovante_enviado_em, f.nf_dados, f.nf_enviada_em,
+              f.observacao, f.pix_chave, f.pix_tipo, f.criado_em,
+              COALESCE((
+                SELECT json_agg(
+                  json_build_object(
+                    'tipo', w.tipo,
+                    'data_envio', w.data_envio,
+                    'dias_atraso', w.dias_atraso,
+                    'enviado_em', w.enviado_em
+                  )
+                  ORDER BY w.data_envio DESC, w.id DESC
+                )
+                FROM financeiro_lembretes_whatsapp w
+                WHERE w.lancamento_id = f.id
+              ), '[]'::json) AS lembretes_whatsapp
+       FROM financeiro_lancamentos f
+       WHERE f.usuario_id = $1
+       ORDER BY f.mes_referencia DESC`,
       [user.id]
     );
 
@@ -22594,12 +22608,25 @@ app.get("/admin/financeiro/usuarios/:usuarioId/lancamentos", authMiddleware, asy
     if (!Number.isFinite(usuarioId)) return c.json({ error: "Usuário inválido" }, 400);
 
     const result = await client.query(
-      `SELECT id, usuario_id, mes_referencia, valor, status,
-              comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
-              observacao, pix_chave, pix_tipo, criado_em
-       FROM financeiro_lancamentos
-       WHERE usuario_id = $1
-       ORDER BY mes_referencia DESC`,
+      `SELECT f.id, f.usuario_id, f.mes_referencia, f.valor, f.status,
+              f.comprovante_dados, f.comprovante_enviado_em, f.nf_dados, f.nf_enviada_em,
+              f.observacao, f.pix_chave, f.pix_tipo, f.criado_em,
+              COALESCE((
+                SELECT json_agg(
+                  json_build_object(
+                    'tipo', w.tipo,
+                    'data_envio', w.data_envio,
+                    'dias_atraso', w.dias_atraso,
+                    'enviado_em', w.enviado_em
+                  )
+                  ORDER BY w.data_envio DESC, w.id DESC
+                )
+                FROM financeiro_lembretes_whatsapp w
+                WHERE w.lancamento_id = f.id
+              ), '[]'::json) AS lembretes_whatsapp
+       FROM financeiro_lancamentos f
+       WHERE f.usuario_id = $1
+       ORDER BY f.mes_referencia DESC`,
       [usuarioId]
     );
 
@@ -26024,6 +26051,17 @@ await client.query(`
 
   ALTER TABLE financeiro_lancamentos ADD COLUMN IF NOT EXISTS pix_chave TEXT;
   ALTER TABLE financeiro_lancamentos ADD COLUMN IF NOT EXISTS pix_tipo TEXT;
+  ALTER TABLE financeiro_lancamentos ADD COLUMN IF NOT EXISTS ultimo_lembrete_whatsapp_data DATE;
+
+  CREATE TABLE IF NOT EXISTS financeiro_lembretes_whatsapp (
+    id             SERIAL PRIMARY KEY,
+    lancamento_id  INTEGER NOT NULL REFERENCES financeiro_lancamentos(id) ON DELETE CASCADE,
+    tipo           TEXT NOT NULL CHECK (tipo IN ('um_dia_antes','vencimento','atraso')),
+    data_envio     DATE NOT NULL,
+    dias_atraso    INTEGER,
+    enviado_em     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(lancamento_id, data_envio)
+  );
 
   CREATE TABLE IF NOT EXISTS whatsapp_conversas (
     id                  SERIAL PRIMARY KEY,
