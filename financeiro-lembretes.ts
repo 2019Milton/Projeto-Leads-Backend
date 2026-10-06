@@ -192,6 +192,39 @@ async function garantirEstrutura(db: Pool) {
     "ALTER TABLE financeiro_lancamentos " +
       "ADD COLUMN IF NOT EXISTS ultimo_lembrete_whatsapp_data DATE"
   );
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS financeiro_lembretes_whatsapp (
+      id SERIAL PRIMARY KEY,
+      lancamento_id INTEGER NOT NULL REFERENCES financeiro_lancamentos(id) ON DELETE CASCADE,
+      tipo TEXT NOT NULL CHECK (tipo IN ('um_dia_antes','vencimento','atraso')),
+      data_envio DATE NOT NULL,
+      dias_atraso INTEGER,
+      enviado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(lancamento_id, data_envio)
+    )
+  `);
+
+  // Registra no histórico qualquer lembrete que já tenha sido enviado antes
+  // da criação desta tabela. A data exata já existia no lançamento; o horário
+  // não era armazenado, então o backfill usa meio-dia apenas como referência.
+  await db.query(`
+    INSERT INTO financeiro_lembretes_whatsapp
+      (lancamento_id, tipo, data_envio, dias_atraso, enviado_em)
+    SELECT
+      id,
+      CASE
+        WHEN ultimo_lembrete_whatsapp_data < mes_referencia THEN 'um_dia_antes'
+        WHEN ultimo_lembrete_whatsapp_data = mes_referencia THEN 'vencimento'
+        ELSE 'atraso'
+      END,
+      ultimo_lembrete_whatsapp_data,
+      GREATEST((ultimo_lembrete_whatsapp_data - mes_referencia)::int, 0),
+      ultimo_lembrete_whatsapp_data::timestamp + INTERVAL '12 hours'
+    FROM financeiro_lancamentos
+    WHERE ultimo_lembrete_whatsapp_data IS NOT NULL
+    ON CONFLICT (lancamento_id, data_envio) DO NOTHING
+  `);
 }
 
 async function verificarLembretes(db: Pool) {
@@ -242,6 +275,21 @@ async function verificarLembretes(db: Pool) {
           "SET ultimo_lembrete_whatsapp_data = $1::date " +
           "WHERE id = $2",
         [hoje, linha.id]
+      );
+
+      const tipoLembrete =
+        diasAtraso === -1
+          ? "um_dia_antes"
+          : diasAtraso === 0
+          ? "vencimento"
+          : "atraso";
+
+      await db.query(
+        `INSERT INTO financeiro_lembretes_whatsapp
+           (lancamento_id, tipo, data_envio, dias_atraso, enviado_em)
+         VALUES ($1, $2, $3::date, $4, NOW())
+         ON CONFLICT (lancamento_id, data_envio) DO NOTHING`,
+        [linha.id, tipoLembrete, hoje, Math.max(diasAtraso, 0)]
       );
 
       await new Promise((resolve) => setTimeout(resolve, 500));
