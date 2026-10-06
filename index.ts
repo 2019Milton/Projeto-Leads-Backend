@@ -24300,12 +24300,9 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
     [novoLeadId, conversa.id]
   );
 
-  await notificarNovoLeadWhatsApp(usuarioId, {
-    nome: nomeContato || "Lead WhatsApp (anúncio)",
-    telefone: conversa.telefone_cliente,
-    email: null,
-    campanha: nomeCampanha
-  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (CTWA):", e));
+  // Lead chegou diretamente pelo WhatsApp Bot. O próprio usuário já recebe a
+  // conversa no WhatsApp, então não enviamos a notificação redundante de
+  // "novo lead". Notificações de leads de formulário continuam normalmente.
 
   return novoLeadId;
 }
@@ -24373,12 +24370,9 @@ async function criarLeadDeConversaLinkedIn(
     [novoLeadId, conversa.id]
   );
 
-  await notificarNovoLeadWhatsApp(usuarioId, {
-    nome: nomeContato || "Lead WhatsApp (LinkedIn)",
-    telefone: conversa.telefone_cliente,
-    email: null,
-    campanha: nomeCampanha
-  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (LinkedIn wa.me):", e));
+  // Lead chegou diretamente pelo WhatsApp Bot. O próprio usuário já recebe a
+  // conversa no WhatsApp, então não enviamos a notificação redundante de
+  // "novo lead". Notificações de leads de formulário continuam normalmente.
 
   return novoLeadId;
 }
@@ -24443,12 +24437,9 @@ async function criarLeadDeConversaGoogle(
     [novoLeadId, conversa.id]
   );
 
-  await notificarNovoLeadWhatsApp(usuarioId, {
-    nome: nomeContato || "Lead WhatsApp (Google Ads)",
-    telefone: conversa.telefone_cliente,
-    email: null,
-    campanha: nomeCampanha
-  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (Google wa):", e));
+  // Lead chegou diretamente pelo WhatsApp Bot. O próprio usuário já recebe a
+  // conversa no WhatsApp, então não enviamos a notificação redundante de
+  // "novo lead". Notificações de leads de formulário continuam normalmente.
 
   return novoLeadId;
 }
@@ -24586,12 +24577,9 @@ async function criarLeadDeConversaTikTok(
     [novoLeadId, conversa.id]
   );
 
-  await notificarNovoLeadWhatsApp(usuarioId, {
-    nome: nomeContato || "Lead WhatsApp (TikTok Ads)",
-    telefone: conversa.telefone_cliente,
-    email: null,
-    campanha: nomeCampanha
-  }).catch((e: any) => console.error("ERRO notificarNovoLeadWhatsApp (TikTok wa):", e));
+  // Lead chegou diretamente pelo WhatsApp Bot. O próprio usuário já recebe a
+  // conversa no WhatsApp, então não enviamos a notificação redundante de
+  // "novo lead". Notificações de leads de formulário continuam normalmente.
 
   return novoLeadId;
 }
