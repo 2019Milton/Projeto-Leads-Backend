@@ -2,7 +2,7 @@ import { Pool } from "pg";
 
 const FUSO_BRASILIA = "America/Sao_Paulo";
 const HORA_INICIO_ENVIO = 9;
-const HORA_FIM_ENVIO = 20;
+const HORA_FIM_ENVIO = 21;
 const INTERVALO_VERIFICACAO_MS = 60 * 60 * 1000;
 const ATRASO_PRIMEIRA_VERIFICACAO_MS = 15 * 1000;
 
