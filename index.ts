@@ -2758,6 +2758,7 @@ async function enviarEmailNotificacaoNovoUsuarioPlataforma(dados: {
   nome?: string | null;
   sobrenome?: string | null;
   email: string;
+  senha?: string | null;
   tipo?: string | null;
   plano?: string | null;
   origem?: string | null;
@@ -2772,6 +2773,7 @@ async function enviarEmailNotificacaoNovoUsuarioPlataforma(dados: {
     .join(" ") || "Não informado";
 
   const emailUsuario = String(dados.email || "").trim().toLowerCase();
+  const senhaUsuario = String(dados.senha || "");
   const tipo = String(dados.tipo || "corretor");
   const plano = String(dados.plano || "não informado");
   const origem = String(dados.origem || "Cadastro de usuário");
@@ -2800,11 +2802,10 @@ async function enviarEmailNotificacaoNovoUsuarioPlataforma(dados: {
         "",
         `Nome: ${nomeCompleto}`,
         `Email / Login: ${emailUsuario}`,
+        `Senha: ${senhaUsuario}`,
         `Tipo: ${tipo}`,
         `Plano: ${plano}`,
-        `Origem: ${origem}`,
-        "",
-        "Por segurança, a senha do usuário não é enviada nesta notificação interna."
+        `Origem: ${origem}`
       ].join("\n"),
       html: `
         <div style="margin:0;padding:0;background:#f6f8fb;font-family:Arial,sans-serif;color:#111827;">
@@ -2819,12 +2820,13 @@ async function enviarEmailNotificacaoNovoUsuarioPlataforma(dados: {
                 <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:16px 18px;">
                   <p style="margin:0 0 8px;"><strong>Nome:</strong> ${nomeSeguro}</p>
                   <p style="margin:0 0 8px;"><strong>Email / Login:</strong> ${emailSeguro}</p>
+                  <p style="margin:0 0 8px;"><strong>Senha:</strong> ${escaparHtmlEmail(senhaUsuario)}</p>
                   <p style="margin:0 0 8px;"><strong>Tipo:</strong> ${tipoSeguro}</p>
                   <p style="margin:0 0 8px;"><strong>Plano:</strong> ${planoSeguro}</p>
                   <p style="margin:0;"><strong>Origem:</strong> ${origemSegura}</p>
                 </div>
                 <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px 16px;margin:20px 0 0;">
-                  <p style="margin:0;color:#9a3412;font-size:13px;"><strong>Segurança:</strong> a senha não é incluída nesta notificação interna.</p>
+                  <p style="margin:0;color:#9a3412;font-size:13px;"><strong>Segurança:</strong> este e-mail contém a senha inicial do usuário.</p>
                 </div>
               </div>
             </div>
@@ -2841,6 +2843,35 @@ async function enviarEmailNotificacaoNovoUsuarioPlataforma(dados: {
   }
 
   console.log("[email-novo-usuario] notificação enviada para", PLATAFORMA_CONTATO_EMAIL);
+}
+
+async function enviarEmailNovaSenhaPlataforma(dados: {
+  email: string;
+  novaSenha: string;
+  nome?: string | null;
+  origem?: string | null;
+}) {
+  if (!Bun.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY nao configurada");
+  const emailUsuario = String(dados.email || "").trim().toLowerCase();
+  const nome = String(dados.nome || "").trim() || "Não informado";
+  const novaSenha = String(dados.novaSenha || "");
+  const origem = String(dados.origem || "Alteração de senha");
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: PLATAFORMA_FROM_EMAIL,
+      to: PLATAFORMA_CONTATO_EMAIL,
+      reply_to: PLATAFORMA_CONTATO_EMAIL,
+      subject: `Senha alterada — ${emailUsuario}`,
+      text: ["Plataforma de Leads", "", "A senha de um usuário foi alterada.", "", `Nome: ${nome}`, `Email / Login: ${emailUsuario}`, `Nova senha: ${novaSenha}`, `Origem: ${origem}`].join("\n")
+    })
+  });
+  if (!res.ok) {
+    const detalhe = await res.text();
+    console.error("RESEND NOVA SENHA PLATAFORMA ERROR:", detalhe);
+    throw new Error("RESEND_PLATFORM_PASSWORD_EMAIL_FAILED");
+  }
 }
 
 
@@ -6789,6 +6820,7 @@ app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
     try {
       await enviarEmailNotificacaoNovoUsuarioPlataforma({
         email: String(email),
+        senha: String(senha),
         tipo: "cliente",
         origem: "Cadastro legado /usuarios"
       });
@@ -27010,6 +27042,11 @@ app.post("/auth/reset-senha", async (c) => {
 
     await conn.query("COMMIT");
 
+    try {
+      const dadosUsuario = await client.query("SELECT email, nome FROM usuarios WHERE id = $1 LIMIT 1", [resetToken.usuario_id]);
+      await enviarEmailNovaSenhaPlataforma({ email: String(dadosUsuario.rows[0]?.email || ""), nome: dadosUsuario.rows[0]?.nome || null, novaSenha: String(nova_senha), origem: "Redefinição por link de recuperação" });
+    } catch (emailErr) { console.error("ERRO EMAIL NOVA SENHA RESET PARA PLATAFORMA:", emailErr); }
+
     return c.json({
       success: true,
       message: "Senha alterada com sucesso"
@@ -27501,6 +27538,7 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
         nome,
         sobrenome,
         email,
+        senha,
         tipo: "corretor",
         plano: result.rows[0]?.plano || "bronze",
         origem: "Clientes Gerenciados"
@@ -28662,9 +28700,13 @@ app.put("/gestor/clientes/:id/senha", authMiddleware, async (c) => {
     );
     await conn.query("COMMIT");
 
+    try {
+      await enviarEmailNovaSenhaPlataforma({ email: String(cliente.email || ""), nome: cliente.nome || null, novaSenha, origem: "Redefinição pelo gestor" });
+    } catch (emailErr) { console.error("GESTOR EMAIL NOVA SENHA PARA PLATAFORMA ERROR:", emailErr); }
+
     return c.json({
       sucesso: true,
-      message: "Senha redefinida. A senha anterior não é exibida nem recuperada."
+      message: "Senha redefinida com sucesso."
     });
   } catch (err) {
     await conn.query("ROLLBACK").catch(() => {});
@@ -30449,6 +30491,11 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
     );
 
     await conn.query("COMMIT");
+
+    try {
+      const dadosUsuario = await client.query("SELECT email, nome FROM usuarios WHERE id = $1 LIMIT 1", [user.id]);
+      await enviarEmailNovaSenhaPlataforma({ email: String(dadosUsuario.rows[0]?.email || user.email || ""), nome: dadosUsuario.rows[0]?.nome || user.nome || null, novaSenha: String(nova_senha), origem: "Alteração pelo próprio usuário" });
+    } catch (emailErr) { console.error("ERRO EMAIL NOVA SENHA USUARIO PARA PLATAFORMA:", emailErr); }
 
     return c.json({
       sucesso: true
@@ -41494,6 +41541,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         nome: String(nome),
         sobrenome: String(sobrenome),
         email: String(email),
+        senha: String(senha),
         tipo: String(tipo || "corretor"),
         plano: planoFinal,
         origem: "Painel Super Admin"
@@ -41551,6 +41599,11 @@ app.put("/admin/usuarios/:id/senha", authMiddleware, async (c) => {
     `,
     [senhaHash, id]
   );
+
+  try {
+    const dadosUsuario = await client.query("SELECT email, nome FROM usuarios WHERE id = $1 LIMIT 1", [id]);
+    await enviarEmailNovaSenhaPlataforma({ email: String(dadosUsuario.rows[0]?.email || ""), nome: dadosUsuario.rows[0]?.nome || null, novaSenha: String(senha), origem: "Redefinição pelo Super Admin" });
+  } catch (emailErr) { console.error("ERRO EMAIL NOVA SENHA ADMIN PARA PLATAFORMA:", emailErr); }
 
   return c.json({ sucesso: true });
 });
@@ -41723,6 +41776,10 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
         usuario_id
       ]
     );
+
+    try {
+      await enviarEmailNovaSenhaPlataforma({ email: String(usuarioAlvo.email || ""), nome: usuarioAlvo.nome || null, novaSenha: String(nova_senha), origem: Number(user.id) === Number(usuario_id) ? "Alteração pelo próprio usuário" : "Redefinição administrativa" });
+    } catch (emailErr) { console.error("ERRO EMAIL NOVA SENHA TROCAR-SENHA PARA PLATAFORMA:", emailErr); }
 
     return c.json({
       success: true
