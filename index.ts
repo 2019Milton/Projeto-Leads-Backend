@@ -5551,6 +5551,7 @@ const authMiddleware = async (c: any, next: any) => {
         COALESCE(u.is_parceiro, false) AS is_parceiro,
         COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
         COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
+        COALESCE(u.whatsapp_multiplos_numeros_habilitado, false) AS whatsapp_multiplos_numeros_habilitado,
         COALESCE(u.voip_habilitado, false) AS voip_habilitado,
         COALESCE(u.voip_status, 'desativado') AS voip_status,
         u.voip_provedor,
@@ -6897,6 +6898,45 @@ app.put("/admin/usuarios/:id/status", authMiddleware, async (c) => {
     return c.json({
       error: "Erro ao alterar status"
     }, 500);
+  }
+});
+
+
+app.put("/admin/usuarios/:id/whatsapp-multiplos-numeros", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    const body = await c.req.json().catch(() => ({}));
+    if (!Number.isInteger(id) || id <= 0) {
+      return c.json({ error: "Usuário inválido" }, 400);
+    }
+
+    const habilitado = body.habilitado === true;
+    const atualizado = await client.query(
+      `UPDATE usuarios
+       SET whatsapp_multiplos_numeros_habilitado = $1
+       WHERE id = $2
+       RETURNING id, whatsapp_multiplos_numeros_habilitado`,
+      [habilitado, id]
+    );
+
+    if (!atualizado.rows.length) {
+      return c.json({ error: "Usuário não encontrado" }, 404);
+    }
+
+    return c.json({
+      ok: true,
+      usuario_id: id,
+      whatsapp_multiplos_numeros_habilitado:
+        atualizado.rows[0].whatsapp_multiplos_numeros_habilitado === true
+    });
+  } catch (err) {
+    console.error("ERRO WHATSAPP MULTIPLOS NUMEROS USUARIO:", err);
+    return c.json({ error: "Erro ao atualizar recurso do usuário" }, 500);
   }
 });
 
@@ -21211,6 +21251,9 @@ app.delete("/conexoes/:plataforma", authMiddleware, async (c) => {
         `DELETE FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = $2`,
         [user.id, plataforma]
       );
+      if (plataforma === "whatsapp") {
+        await client.query(`DELETE FROM whatsapp_numeros WHERE usuario_id=$1`,[user.id]).catch(()=>{});
+      }
     }
 
     return c.json({ sucesso: true });
@@ -21333,13 +21376,70 @@ function diagnosticarPermissoesToken(debugData: any, wabaId: string) {
   };
 }
 
-async function obterTokenWhatsappUsuario(usuarioId: number) {
+async function obterTokenWhatsappUsuario(usuarioId: number, phoneNumberId?: string | null) {
+  const recurso = await client.query(
+    `SELECT COALESCE(whatsapp_multiplos_numeros_habilitado, false) AS habilitado
+     FROM usuarios WHERE id=$1 LIMIT 1`,
+    [usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+
+  if (recurso.rows[0]?.habilitado === true && phoneNumberId) {
+    const numero = await client.query(
+      `SELECT access_token FROM whatsapp_numeros
+       WHERE usuario_id=$1 AND phone_number_id=$2 AND status='conectado' LIMIT 1`,
+      [usuarioId, phoneNumberId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (numero.rows[0]?.access_token) return numero.rows[0].access_token;
+  }
+
+  // Fluxo atual/legado continua sendo a fonte padrão quando o recurso está desligado.
   const resultado = await client.query(
     `SELECT access_token FROM plataforma_conexoes
-     WHERE usuario_id = $1 AND plataforma = 'whatsapp' LIMIT 1`,
+     WHERE usuario_id=$1 AND plataforma='whatsapp' LIMIT 1`,
     [usuarioId]
   );
   return resultado.rows[0]?.access_token || Bun.env.WHATSAPP_SYSTEM_USER_TOKEN || "";
+}
+
+async function obterNumeroWhatsappPorPhoneId(phoneNumberId: string) {
+  // Primeiro preserva exatamente o caminho atual: se este é o número salvo na
+  // plataforma_conexoes e o recurso está desligado, não consulta configuração nova.
+  const legado = await client.query(
+    `SELECT pc.usuario_id, pc.access_token, pc.token_expira_em,
+            pc.dados_conta->>'waba_id' AS waba_id,
+            pc.dados_conta->>'phone_number_id' AS phone_number_id,
+            pc.dados_conta->>'numero' AS numero,
+            pc.dados_conta->>'display_name' AS display_name,
+            TRUE AS principal, TRUE AS bot_ativo,
+            NULL::integer AS nicho_id, NULL::integer AS campanha_id,
+            NULL::integer AS roteiro_id, NULL::integer AS campanha_nicho_id,
+            COALESCE(u.whatsapp_multiplos_numeros_habilitado, false)
+              AS whatsapp_multiplos_numeros_habilitado
+     FROM plataforma_conexoes pc
+     JOIN usuarios u ON u.id=pc.usuario_id
+     WHERE pc.plataforma='whatsapp' AND pc.status='conectado'
+       AND pc.dados_conta->>'phone_number_id'=$1 LIMIT 1`,
+    [phoneNumberId]
+  ).catch(() => ({ rows: [] as any[] }));
+
+  const legadoRow = legado.rows[0];
+  if (legadoRow && legadoRow.whatsapp_multiplos_numeros_habilitado !== true) {
+    return legadoRow;
+  }
+
+  // Só usuários explicitamente habilitados entram na camada de múltiplos números.
+  const numero = await client.query(
+    `SELECT wn.*, c.nicho_id AS campanha_nicho_id,
+            TRUE AS whatsapp_multiplos_numeros_habilitado
+     FROM whatsapp_numeros wn
+     JOIN usuarios u ON u.id=wn.usuario_id
+       AND COALESCE(u.whatsapp_multiplos_numeros_habilitado, false)=TRUE
+     LEFT JOIN campanhas c ON c.id=wn.campanha_id AND c.usuario_id=wn.usuario_id
+     WHERE wn.phone_number_id=$1 AND wn.status='conectado' LIMIT 1`,
+    [phoneNumberId]
+  ).catch(() => ({ rows: [] as any[] }));
+
+  return numero.rows[0] || legadoRow || null;
 }
 
 // Transcreve uma mensagem de áudio do WhatsApp (voz do cliente ou do corretor) via Whisper
@@ -21348,7 +21448,7 @@ async function obterTokenWhatsappUsuario(usuarioId: number) {
 // vazia (entrada), invisível pro classificador. Best-effort: nunca lança, só retorna null se
 // faltar OPENAI_API_KEY, a mídia já tiver expirado no lado da Meta, ou o Whisper falhar —
 // nesses casos a mensagem mantém o placeholder que já existia antes dessa feature.
-async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Promise<string | null> {
+async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string, phoneNumberId?: string | null): Promise<string | null> {
   const openaiKey = Bun.env.OPENAI_API_KEY;
   if (!openaiKey || !mediaId) return null;
 
@@ -21359,7 +21459,7 @@ async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Pro
     const configIA = await buscarConfigIA();
     if (configIA?.status !== "contratado") return null;
 
-    const token = await obterTokenWhatsappUsuario(usuarioId);
+    const token = await obterTokenWhatsappUsuario(usuarioId, phoneNumberId);
     if (!token) return null;
 
     const infoRes = await fetch(
@@ -21424,8 +21524,8 @@ async function transcreverAudioWhatsApp(usuarioId: number, mediaId: string): Pro
 // propósito do fluxo principal: o webhook do WhatsApp precisa responder rápido pra Meta não
 // re-entregar o evento, e transcrição pode levar alguns segundos. Nunca é aguardado por quem
 // chama (fire-and-forget com .catch), só grava se conseguir um texto real.
-async function transcreverEAtualizarMensagemAudio(usuarioId: number, mediaId: string, mensagemLogId: number) {
-  const texto = await transcreverAudioWhatsApp(usuarioId, mediaId);
+async function transcreverEAtualizarMensagemAudio(usuarioId: number, mediaId: string, mensagemLogId: number, phoneNumberId?: string | null) {
+  const texto = await transcreverAudioWhatsApp(usuarioId, mediaId, phoneNumberId);
   if (!texto) return;
   await client.query(
     `UPDATE whatsapp_mensagens_log SET conteudo = $1 WHERE id = $2`,
@@ -21647,23 +21747,80 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
       webhook_subscribed: webhookInscrito,
     };
 
-    await client.query(
-      `INSERT INTO plataforma_conexoes
-         (usuario_id, plataforma, status, access_token, token_expira_em, dados_conta, conectado_em, atualizado_em)
-       VALUES ($1, 'whatsapp', 'conectado', $2, $3, $4, NOW(), NOW())
-       ON CONFLICT (usuario_id, plataforma)
-       DO UPDATE SET
-         status = 'conectado',
-         access_token = $2,
-         token_expira_em = COALESCE($3, plataforma_conexoes.token_expira_em),
-         dados_conta = $4,
-         atualizado_em = NOW()`,
-      [user.id, token, tokenExpiraEm, JSON.stringify(dadosConta)]
+    const multiplosHabilitados = user.whatsapp_multiplos_numeros_habilitado === true;
+
+    if (!multiplosHabilitados) {
+      // Recurso desligado = mantém o comportamento atual sem depender da tabela nova.
+      await client.query(
+        `INSERT INTO plataforma_conexoes
+           (usuario_id, plataforma, status, access_token, token_expira_em, dados_conta, conectado_em, atualizado_em)
+         VALUES ($1, 'whatsapp', 'conectado', $2, $3, $4, NOW(), NOW())
+         ON CONFLICT (usuario_id, plataforma)
+         DO UPDATE SET
+           status = 'conectado',
+           access_token = $2,
+           token_expira_em = COALESCE($3, plataforma_conexoes.token_expira_em),
+           dados_conta = $4,
+           atualizado_em = NOW()`,
+        [user.id, token, tokenExpiraEm, JSON.stringify(dadosConta)]
+      );
+
+      return c.json({
+        ok: true,
+        conta: dadosConta,
+        whatsapp_multiplos_numeros_habilitado: false,
+        diagnostico: {
+          webhook_inscrito: webhookInscrito,
+          conta_aprovada: wabaData.account_review_status === "APPROVED",
+          permissoes_ausentes: permissoes.faltantes,
+        },
+        ...(wabaData.account_review_status !== "APPROVED" ? {
+          aviso: `A conexão foi salva, mas a análise da conta na Meta ainda está ${wabaData.account_review_status || "pendente"}.`,
+        } : {}),
+      });
+    }
+
+    const jaTemNumero = await client.query(
+      `SELECT 1 FROM whatsapp_numeros WHERE usuario_id=$1 LIMIT 1`,
+      [user.id]
     );
+    const ehPrimeiroNumero = jaTemNumero.rows.length === 0;
+
+    const numeroSalvo=await client.query(
+      `INSERT INTO whatsapp_numeros
+       (usuario_id,waba_id,phone_number_id,access_token,token_expira_em,numero,display_name,status,principal,bot_ativo,atualizado_em)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'conectado',$8,$8,NOW())
+       ON CONFLICT (phone_number_id) DO UPDATE SET
+         usuario_id=EXCLUDED.usuario_id,waba_id=EXCLUDED.waba_id,
+         access_token=EXCLUDED.access_token,
+         token_expira_em=COALESCE(EXCLUDED.token_expira_em,whatsapp_numeros.token_expira_em),
+         numero=EXCLUDED.numero,display_name=EXCLUDED.display_name,status='conectado',
+         principal=CASE WHEN $8 THEN TRUE ELSE whatsapp_numeros.principal END,
+         bot_ativo=CASE WHEN $8 THEN TRUE ELSE whatsapp_numeros.bot_ativo END,
+         atualizado_em=NOW()
+       RETURNING id,principal,bot_ativo`,
+      [user.id,waba_id,phone_number_id,token,tokenExpiraEm,
+       numero.display_phone_number||null,numero.verified_name||null,ehPrimeiroNumero]
+    );
+
+    // O primeiro número continua sendo também a conexão atual/principal.
+    if (ehPrimeiroNumero) {
+      await client.query(
+        `INSERT INTO plataforma_conexoes
+         (usuario_id,plataforma,status,access_token,token_expira_em,dados_conta,conectado_em,atualizado_em)
+         VALUES ($1,'whatsapp','conectado',$2,$3,$4,NOW(),NOW())
+         ON CONFLICT (usuario_id,plataforma) DO UPDATE SET
+           status='conectado',access_token=$2,
+           token_expira_em=COALESCE($3,plataforma_conexoes.token_expira_em),
+           dados_conta=$4,atualizado_em=NOW()`,
+        [user.id,token,tokenExpiraEm,JSON.stringify(dadosConta)]
+      );
+    }
 
     return c.json({
       ok: true,
-      conta: dadosConta,
+      conta:{...dadosConta,id:numeroSalvo.rows[0]?.id,bot_ativo:numeroSalvo.rows[0]?.bot_ativo===true},
+      whatsapp_multiplos_numeros_habilitado: true,
       diagnostico: {
         webhook_inscrito: webhookInscrito,
         conta_aprovada: wabaData.account_review_status === "APPROVED",
@@ -21680,6 +21837,60 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
       code: "WHATSAPP_CONNECTION_INTERNAL_ERROR",
     }, 500);
   }
+});
+
+app.get("/whatsapp/numeros",authMiddleware,async(c)=>{
+  const user:any=c.get("user");
+  if (user.whatsapp_multiplos_numeros_habilitado !== true) {
+    return c.json({ numeros: [], habilitado: false });
+  }
+  try{
+    const rows=await client.query(
+      `SELECT wn.id,wn.waba_id,wn.phone_number_id,wn.numero,wn.display_name,wn.status,
+              wn.principal,wn.bot_ativo,wn.nicho_id,wn.campanha_id,wn.roteiro_id,
+              n.nome AS nicho_nome,c.nome AS campanha_nome,r.nome AS roteiro_nome
+       FROM whatsapp_numeros wn
+       LEFT JOIN nichos n ON n.id=wn.nicho_id
+       LEFT JOIN campanhas c ON c.id=wn.campanha_id AND c.usuario_id=wn.usuario_id
+       LEFT JOIN whatsapp_bot_config r ON r.id=wn.roteiro_id AND r.usuario_id=wn.usuario_id
+       WHERE wn.usuario_id=$1 ORDER BY wn.principal DESC,wn.criado_em ASC`,[user.id]);
+    return c.json({numeros:rows.rows});
+  }catch(err){console.error("ERRO GET /whatsapp/numeros:",err);return c.json({error:"Erro ao carregar números do WhatsApp"},500);}
+});
+
+app.put("/whatsapp/numeros/:id",authMiddleware,async(c)=>{
+  const user:any=c.get("user");
+  if (user.whatsapp_multiplos_numeros_habilitado !== true) {
+    return c.json({ error:"Recurso de múltiplos números não habilitado para este usuário" },403);
+  }
+  const id=Number(c.req.param("id"));
+  const body=await c.req.json().catch(()=>({}));
+  if(!Number.isInteger(id)||id<=0)return c.json({error:"Número inválido"},400);
+  const atual=await client.query(`SELECT * FROM whatsapp_numeros WHERE id=$1 AND usuario_id=$2`,[id,user.id]);
+  if(!atual.rows.length)return c.json({error:"Número não encontrado"},404);
+  const val=(v:any)=>v===null||v===undefined||v===""?null:(Number.isInteger(Number(v))&&Number(v)>0?Number(v):NaN);
+  const nichoId=val(body.nicho_id),campanhaId=val(body.campanha_id),roteiroId=val(body.roteiro_id);
+  if([nichoId,campanhaId,roteiroId].some(Number.isNaN))return c.json({error:"Configuração inválida"},400);
+  if(nichoId){const q=await client.query(`SELECT 1 FROM usuario_nichos WHERE usuario_id=$1 AND nicho_id=$2 LIMIT 1`,[user.id,nichoId]);if(!q.rows.length)return c.json({error:"Nicho não permitido"},403);}
+  if(campanhaId){const q=await client.query(`SELECT 1 FROM campanhas WHERE id=$1 AND usuario_id=$2 LIMIT 1`,[campanhaId,user.id]);if(!q.rows.length)return c.json({error:"Campanha não pertence a este usuário"},403);}
+  if(roteiroId){const q=await client.query(`SELECT 1 FROM whatsapp_bot_config WHERE id=$1 AND usuario_id=$2 LIMIT 1`,[roteiroId,user.id]);if(!q.rows.length)return c.json({error:"Roteiro não pertence a este usuário"},403);}
+  const row=await client.query(
+    `UPDATE whatsapp_numeros SET bot_ativo=$1,nicho_id=$2,campanha_id=$3,roteiro_id=$4,atualizado_em=NOW()
+     WHERE id=$5 AND usuario_id=$6
+     RETURNING id,phone_number_id,numero,display_name,status,principal,bot_ativo,nicho_id,campanha_id,roteiro_id`,
+    [body.bot_ativo===true,nichoId,campanhaId,roteiroId,id,user.id]);
+  return c.json({ok:true,numero:row.rows[0]});
+});
+
+app.delete("/whatsapp/numeros/:id",authMiddleware,async(c)=>{
+  const user:any=c.get("user");
+  if (user.whatsapp_multiplos_numeros_habilitado !== true) {
+    return c.json({ error:"Recurso de múltiplos números não habilitado para este usuário" },403);
+  }
+  const id=Number(c.req.param("id"));
+  const row=await client.query(`DELETE FROM whatsapp_numeros WHERE id=$1 AND usuario_id=$2 AND principal=FALSE RETURNING id`,[id,user.id]);
+  if(!row.rows.length)return c.json({error:"Número adicional não encontrado"},404);
+  return c.json({ok:true});
 });
 
 // Checagem ao vivo (via Graph API) do que da pra saber sobre a prontidao da conta
@@ -21835,10 +22046,11 @@ async function iniciarContatoWhatsAppLeadFormulario(
 
   try {
     const cfgRes = await client.query(
-      `SELECT whatsapp_contato_formulario FROM usuarios WHERE id = $1`,
+      `SELECT whatsapp_contato_formulario, COALESCE(whatsapp_multiplos_numeros_habilitado, false) AS whatsapp_multiplos_numeros_habilitado FROM usuarios WHERE id = $1`,
       [usuarioId]
     );
     const config = lerConfigContatoFormulario(cfgRes.rows[0]?.whatsapp_contato_formulario);
+    const multiplosHabilitados = cfgRes.rows[0]?.whatsapp_multiplos_numeros_habilitado === true;
     if (!config.ativo) return;
 
     const leadRes = await client.query(
@@ -21854,14 +22066,20 @@ async function iniciarContatoWhatsAppLeadFormulario(
       return;
     }
 
-    const conexaoRes = await client.query(
-      `SELECT dados_conta->>'phone_number_id' AS phone_number_id
-       FROM plataforma_conexoes
-       WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'
-       LIMIT 1`,
-      [usuarioId]
-    );
-    const phoneNumberId = conexaoRes.rows[0]?.phone_number_id;
+    const conexaoRes = multiplosHabilitados
+      ? await client.query(
+          `SELECT phone_number_id FROM whatsapp_numeros
+           WHERE usuario_id=$1 AND principal=TRUE AND status='conectado' LIMIT 1`,
+          [usuarioId]
+        )
+      : await client.query(
+          `SELECT dados_conta->>'phone_number_id' AS phone_number_id
+           FROM plataforma_conexoes
+           WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'
+           LIMIT 1`,
+          [usuarioId]
+        );
+    const phoneNumberId=conexaoRes.rows[0]?.phone_number_id;
     if (!phoneNumberId) {
       await registrarFalhaContatoFormulario(leadId, usuarioId, "WhatsApp não conectado");
       return;
@@ -21873,12 +22091,10 @@ async function iniciarContatoWhatsAppLeadFormulario(
     // atendimento): não manda o modelo por cima.
     const conversaRecente = await client.query(
       `SELECT id FROM whatsapp_conversas
-       WHERE usuario_id = $1
-         AND telefone_cliente = ANY($2::text[])
-         AND status <> 'encerrada'
-         AND ultima_mensagem_em > NOW() - INTERVAL '24 hours'
-       LIMIT 1`,
-      [usuarioId, variantesTelefoneBR(para)]
+       WHERE usuario_id=$1 AND phone_number_id=$2
+         AND telefone_cliente=ANY($3::text[]) AND status<>'encerrada'
+         AND ultima_mensagem_em>NOW()-INTERVAL '24 hours' LIMIT 1`,
+      [usuarioId,phoneNumberId,variantesTelefoneBR(para)]
     );
     if (conversaRecente.rows.length) {
       await registrarFalhaContatoFormulario(leadId, usuarioId, "Já existe conversa em andamento com esse número");
@@ -21895,7 +22111,7 @@ async function iniciarContatoWhatsAppLeadFormulario(
     );
     if (!reserva.rows.length) return;
 
-    const token = await obterTokenWhatsappUsuario(usuarioId);
+    const token = await obterTokenWhatsappUsuario(usuarioId,phoneNumberId);
     if (!token) {
       await registrarFalhaContatoFormulario(leadId, usuarioId, "Token do WhatsApp ausente");
       return;
@@ -21944,19 +22160,15 @@ async function iniciarContatoWhatsAppLeadFormulario(
     const statusInicial = roteiro.rows.length ? "bot" : "humano";
 
     const conversa = await client.query(
-      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, passo_atual, lead_id, atualizado_em, ultima_mensagem_em)
-       VALUES ($1, $2, $3, 0, $4, NOW(), NOW())
-       ON CONFLICT (usuario_id, telefone_cliente)
-       DO UPDATE SET
-         lead_id = EXCLUDED.lead_id,
-         -- quem já foi atendido por humano nessa conversa continua com o corretor
-         status = CASE WHEN whatsapp_conversas.status = 'humano' THEN 'humano' ELSE EXCLUDED.status END,
-         passo_atual = 0,
-         roteiro_id = NULL,
-         atualizado_em = NOW(),
-         ultima_mensagem_em = NOW()
+      `INSERT INTO whatsapp_conversas
+       (usuario_id,telefone_cliente,phone_number_id,status,passo_atual,lead_id,atualizado_em,ultima_mensagem_em)
+       VALUES ($1,$2,$3,$4,0,$5,NOW(),NOW())
+       ON CONFLICT (usuario_id,phone_number_id,telefone_cliente)
+       DO UPDATE SET lead_id=EXCLUDED.lead_id,
+         status=CASE WHEN whatsapp_conversas.status='humano' THEN 'humano' ELSE EXCLUDED.status END,
+         passo_atual=0,roteiro_id=NULL,atualizado_em=NOW(),ultima_mensagem_em=NOW()
        RETURNING id`,
-      [usuarioId, waId, statusInicial, leadId]
+      [usuarioId,waId,phoneNumberId,statusInicial,leadId]
     );
 
     await client.query(
@@ -23983,26 +24195,26 @@ app.get("/webhook/whatsapp", async (c) => {
   return c.text("Erro verify", 403);
 });
 
-async function obterOuCriarConversaWhatsApp(usuarioId: number, telefoneCliente: string) {
+async function obterOuCriarConversaWhatsApp(usuarioId: number, telefoneCliente: string, phoneNumberId: string) {
   const existente = await client.query(
-    `SELECT * FROM whatsapp_conversas WHERE usuario_id = $1 AND telefone_cliente = $2`,
-    [usuarioId, telefoneCliente]
+    `SELECT * FROM whatsapp_conversas
+     WHERE usuario_id=$1 AND telefone_cliente=$2 AND phone_number_id=$3`,
+    [usuarioId,telefoneCliente,phoneNumberId]
   );
-  const row = existente.rows[0];
-
-  if (!row || row.status === "encerrada") {
-    const criada = await client.query(
-      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, passo_atual, atualizado_em, ultima_mensagem_em)
-       VALUES ($1, $2, 'bot', 0, NOW(), NOW())
-       ON CONFLICT (usuario_id, telefone_cliente)
-       DO UPDATE SET status = 'bot', passo_atual = 0, atualizado_em = NOW(), ultima_mensagem_em = NOW()
+  const row=existente.rows[0];
+  if (!row || row.status==="encerrada") {
+    const criada=await client.query(
+      `INSERT INTO whatsapp_conversas
+       (usuario_id,telefone_cliente,phone_number_id,status,passo_atual,atualizado_em,ultima_mensagem_em)
+       VALUES ($1,$2,$3,'bot',0,NOW(),NOW())
+       ON CONFLICT (usuario_id,phone_number_id,telefone_cliente)
+       DO UPDATE SET status='bot',passo_atual=0,atualizado_em=NOW(),ultima_mensagem_em=NOW()
        RETURNING *`,
-      [usuarioId, telefoneCliente]
+      [usuarioId,telefoneCliente,phoneNumberId]
     );
     return criada.rows[0];
   }
-
-  await client.query(`UPDATE whatsapp_conversas SET ultima_mensagem_em = NOW() WHERE id = $1`, [row.id]);
+  await client.query(`UPDATE whatsapp_conversas SET ultima_mensagem_em=NOW() WHERE id=$1`,[row.id]);
   return row;
 }
 
@@ -24052,20 +24264,24 @@ async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: 
 
 async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId: number | null = null, resposta?: string) {
   if (conversa.status === "humano" || conversa.status === "encerrada") return;
+  const numeroCfg = typeof obterNumeroWhatsappPorPhoneId === "function"
+    ? await obterNumeroWhatsappPorPhoneId(phoneNumberId)
+    : null;
+  if (numeroCfg && numeroCfg.bot_ativo===false) return;
 
-  // Roteiro do nicho exato da conversa tem prioridade; sem isso, so cai pra um
-  // roteiro sem nicho se ele for de antes de CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO
-  // (legado, ver comentario na declaracao da constante). Roteiro sem nicho
-  // criado depois do corte nunca e escolhido aqui — fica so salvo, sem rodar,
-  // ate o corretor escolher um nicho (decisao explicita dele).
-  const configRes = await client.query(
-    `SELECT id, passos FROM whatsapp_bot_config
-     WHERE usuario_id = $1 AND ativo = TRUE
-       AND (nicho_id = $2 OR (nicho_id IS NULL AND criado_em < $3))
-     ORDER BY nicho_id NULLS LAST
-     LIMIT 1`,
-    [conversa.usuario_id, nichoId, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
-  );
+  const configRes=numeroCfg?.roteiro_id
+    ? await client.query(
+        `SELECT id,passos FROM whatsapp_bot_config WHERE id=$1 AND usuario_id=$2 LIMIT 1`,
+        [numeroCfg.roteiro_id,conversa.usuario_id]
+      )
+    : await client.query(
+        `SELECT id, passos FROM whatsapp_bot_config
+         WHERE usuario_id = $1 AND ativo = TRUE
+           AND (nicho_id = $2 OR (nicho_id IS NULL AND criado_em < $3))
+         ORDER BY nicho_id NULLS LAST
+         LIMIT 1`,
+        [conversa.usuario_id, nichoId, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
+      );
   const roteiroAtivo = configRes.rows[0];
   const passos: any[] = roteiroAtivo?.passos || [];
   if (!passos.length) return;
@@ -24688,6 +24904,12 @@ async function resolverNichoConversaWhatsApp(
   const campanhaTikTok = await identificarCampanhaTikTokNaMensagem(usuarioId, textoMensagem);
   if (campanhaTikTok) return campanhaTikTok.nicho_id ?? null;
 
+  const numeroCfg=conversa?.phone_number_id
+    ? await obterNumeroWhatsappPorPhoneId(String(conversa.phone_number_id))
+    : null;
+  if (numeroCfg?.campanha_nicho_id) return Number(numeroCfg.campanha_nicho_id);
+  if (numeroCfg?.nicho_id) return Number(numeroCfg.nicho_id);
+
   if (!leadIdVinculado) return null;
   const leadNicho = await client.query(`SELECT nicho_id FROM leads WHERE id = $1`, [leadIdVinculado])
     .catch(() => ({ rows: [] as any[] }));
@@ -24757,11 +24979,8 @@ async function processarEventoWhatsApp(value: any) {
   const phoneNumberId = value?.metadata?.phone_number_id;
   if (!phoneNumberId) return;
 
-  const conexao = await client.query(
-    `SELECT usuario_id FROM plataforma_conexoes WHERE plataforma = 'whatsapp' AND dados_conta->>'phone_number_id' = $1 LIMIT 1`,
-    [phoneNumberId]
-  );
-  const usuarioId = conexao.rows[0]?.usuario_id;
+  const numeroCfg=await obterNumeroWhatsappPorPhoneId(String(phoneNumberId));
+  const usuarioId=numeroCfg?.usuario_id;
   if (!usuarioId) {
     console.warn(`[whatsapp-webhook] nenhum corretor encontrado pro phone_number_id ${phoneNumberId}`);
     return;
@@ -24803,11 +25022,11 @@ async function processarEventoWhatsApp(value: any) {
       const telefoneCliente = msg.to || null;
       if (!telefoneCliente) continue;
       await client.query(
-        `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, atualizado_em)
-         VALUES ($1, $2, 'humano', NOW())
-         ON CONFLICT (usuario_id, telefone_cliente)
-         DO UPDATE SET status = 'humano', atualizado_em = NOW()`,
-        [usuarioId, telefoneCliente]
+        `INSERT INTO whatsapp_conversas (usuario_id,telefone_cliente,phone_number_id,status,atualizado_em)
+         VALUES ($1,$2,$3,'humano',NOW())
+         ON CONFLICT (usuario_id,phone_number_id,telefone_cliente)
+         DO UPDATE SET status='humano',atualizado_em=NOW()`,
+        [usuarioId,telefoneCliente,String(phoneNumberId)]
       );
       continue;
     }
@@ -24824,7 +25043,7 @@ async function processarEventoWhatsApp(value: any) {
       continue;
     }
 
-    const conversa = await obterOuCriarConversaWhatsApp(usuarioId, telefoneCliente);
+    const conversa = await obterOuCriarConversaWhatsApp(usuarioId, telefoneCliente, String(phoneNumberId));
 
     // Dedupe por wamid: Meta reentrega webhook "pelo menos uma vez". Se o insert
     // conflitar, essa mensagem já foi processada antes — não avança o roteiro de novo.
@@ -24867,7 +25086,7 @@ async function processarEventoWhatsApp(value: any) {
     // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
     if (msg.type === "audio" && msg.audio?.id) {
       console.log(`[transcricao-audio] iniciando transcrição da mensagem ${msg.id} (entrada)`);
-      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logRes.rows[0].id).catch((e: any) =>
+      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logRes.rows[0].id, String(phoneNumberId)).catch((e: any) =>
         console.error("[transcricao-audio] erro entrada:", e)
       );
     }
@@ -24927,6 +25146,13 @@ async function processarEventoWhatsApp(value: any) {
       leadIdVinculado = await garantirLeadWhatsAppSemOrigem(
         client, conversa.id, usuarioId, nomesContatos[String(telefoneCliente)] || null
       );
+    }
+    if(leadIdVinculado&&numeroCfg?.campanha_id){
+      await client.query(
+        `UPDATE leads SET campanha_id=COALESCE(campanha_id,$1),nicho_id=COALESCE(nicho_id,$2)
+         WHERE id=$3 AND usuario_id=$4`,
+        [numeroCfg.campanha_id,numeroCfg.campanha_nicho_id||numeroCfg.nicho_id||null,leadIdVinculado,usuarioId]
+      ).catch((e:any)=>console.error("ERRO aplicar campanha padrão do número:",e));
     }
 
     if (leadIdVinculado) {
@@ -24988,11 +25214,8 @@ async function processarEcoWhatsApp(value: any) {
   const phoneNumberId = value?.metadata?.phone_number_id;
   if (!phoneNumberId) return;
 
-  const conexao = await client.query(
-    `SELECT usuario_id FROM plataforma_conexoes WHERE plataforma = 'whatsapp' AND dados_conta->>'phone_number_id' = $1 LIMIT 1`,
-    [phoneNumberId]
-  );
-  const usuarioId = conexao.rows[0]?.usuario_id;
+  const numeroCfg=await obterNumeroWhatsappPorPhoneId(String(phoneNumberId));
+  const usuarioId=numeroCfg?.usuario_id;
   if (!usuarioId) {
     console.warn(`[whatsapp-echo] nenhum corretor encontrado pro phone_number_id ${phoneNumberId}`);
     return;
@@ -25003,12 +25226,12 @@ async function processarEcoWhatsApp(value: any) {
     if (!telefoneCliente) continue;
 
     const conversaRes = await client.query(
-      `INSERT INTO whatsapp_conversas (usuario_id, telefone_cliente, status, atualizado_em)
-       VALUES ($1, $2, 'humano', NOW())
-       ON CONFLICT (usuario_id, telefone_cliente)
-       DO UPDATE SET status = 'humano', atualizado_em = NOW()
+      `INSERT INTO whatsapp_conversas (usuario_id,telefone_cliente,phone_number_id,status,atualizado_em)
+       VALUES ($1,$2,$3,'humano',NOW())
+       ON CONFLICT (usuario_id,phone_number_id,telefone_cliente)
+       DO UPDATE SET status='humano',atualizado_em=NOW()
        RETURNING id`,
-      [usuarioId, telefoneCliente]
+      [usuarioId,telefoneCliente,String(phoneNumberId)]
     );
     const conversaId = conversaRes.rows[0]?.id;
     if (!conversaId) continue;
@@ -25024,7 +25247,7 @@ async function processarEcoWhatsApp(value: any) {
     // Transcrição roda em segundo plano (não aguardada) — ver transcreverEAtualizarMensagemAudio.
     if (msg.type === "audio" && msg.audio?.id && logEcoRes.rows[0]?.id) {
       console.log(`[transcricao-audio] iniciando transcrição da mensagem ${msg.id} (echo)`);
-      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logEcoRes.rows[0].id).catch((e: any) =>
+      transcreverEAtualizarMensagemAudio(usuarioId, msg.audio.id, logEcoRes.rows[0].id, String(phoneNumberId)).catch((e: any) =>
         console.error("[transcricao-audio] erro echo:", e)
       );
     }
@@ -25414,6 +25637,7 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS painel_slug TEXT,
     ADD COLUMN IF NOT EXISTS painel_atualizado_em TIMESTAMP,
     ADD COLUMN IF NOT EXISTS atendimento_whatsapp_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS whatsapp_multiplos_numeros_habilitado BOOLEAN DEFAULT false,
     ADD COLUMN IF NOT EXISTS voip_habilitado BOOLEAN DEFAULT false,
     ADD COLUMN IF NOT EXISTS voip_status TEXT DEFAULT 'desativado',
     ADD COLUMN IF NOT EXISTS voip_provedor TEXT,
@@ -26324,18 +26548,44 @@ await client.query(`
     UNIQUE(lancamento_id, data_envio)
   );
 
+  CREATE TABLE IF NOT EXISTS whatsapp_numeros (
+    id               SERIAL PRIMARY KEY,
+    usuario_id       INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    waba_id          TEXT NOT NULL,
+    phone_number_id  TEXT NOT NULL UNIQUE,
+    access_token     TEXT,
+    token_expira_em  TIMESTAMP,
+    numero           TEXT,
+    display_name     TEXT,
+    status           TEXT NOT NULL DEFAULT 'conectado'
+                       CHECK (status IN ('conectado','desconectado','erro')),
+    principal        BOOLEAN NOT NULL DEFAULT FALSE,
+    bot_ativo        BOOLEAN NOT NULL DEFAULT FALSE,
+    nicho_id         INTEGER REFERENCES nichos(id) ON DELETE SET NULL,
+    campanha_id      INTEGER REFERENCES campanhas(id) ON DELETE SET NULL,
+    roteiro_id       INTEGER REFERENCES whatsapp_bot_config(id) ON DELETE SET NULL,
+    criado_em        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_whatsapp_numeros_usuario
+    ON whatsapp_numeros(usuario_id, status);
+
   CREATE TABLE IF NOT EXISTS whatsapp_conversas (
     id                  SERIAL PRIMARY KEY,
     usuario_id          INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
     telefone_cliente    TEXT NOT NULL,
+    phone_number_id     TEXT NOT NULL DEFAULT '',
     status              TEXT NOT NULL DEFAULT 'bot'
                            CHECK (status IN ('bot','aguardando_resposta','humano','encerrada')),
     passo_atual         INTEGER NOT NULL DEFAULT 0,
     iniciado_em         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     atualizado_em       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    ultima_mensagem_em  TIMESTAMP,
-    UNIQUE(usuario_id, telefone_cliente)
+    ultima_mensagem_em  TIMESTAMP
   );
+  ALTER TABLE whatsapp_conversas ADD COLUMN IF NOT EXISTS phone_number_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE whatsapp_conversas DROP CONSTRAINT IF EXISTS whatsapp_conversas_usuario_id_telefone_cliente_key;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_conversas_usuario_numero_cliente
+    ON whatsapp_conversas(usuario_id, phone_number_id, telefone_cliente);
   CREATE INDEX IF NOT EXISTS idx_whatsapp_conversas_usuario ON whatsapp_conversas(usuario_id, status);
 
   CREATE TABLE IF NOT EXISTS whatsapp_mensagens_log (
@@ -26455,6 +26705,37 @@ await client.query(`
 
 await client.query(`
   CREATE INDEX IF NOT EXISTS idx_whatsapp_conversas_lead ON whatsapp_conversas(lead_id);
+`);
+
+// Migração compatível: a conexão única existente vira o número principal sem
+// interromper o atendimento que já está em produção.
+await client.query(`
+  INSERT INTO whatsapp_numeros (
+    usuario_id,waba_id,phone_number_id,access_token,token_expira_em,
+    numero,display_name,status,principal,bot_ativo,criado_em,atualizado_em
+  )
+  SELECT pc.usuario_id, pc.dados_conta->>'waba_id', pc.dados_conta->>'phone_number_id',
+         pc.access_token, pc.token_expira_em, pc.dados_conta->>'numero',
+         pc.dados_conta->>'display_name', pc.status, TRUE, TRUE,
+         COALESCE(pc.conectado_em,NOW()), NOW()
+  FROM plataforma_conexoes pc
+  WHERE pc.plataforma='whatsapp'
+    AND pc.dados_conta->>'waba_id' IS NOT NULL
+    AND pc.dados_conta->>'phone_number_id' IS NOT NULL
+  ON CONFLICT (phone_number_id) DO UPDATE SET
+    access_token=COALESCE(EXCLUDED.access_token,whatsapp_numeros.access_token),
+    token_expira_em=COALESCE(EXCLUDED.token_expira_em,whatsapp_numeros.token_expira_em),
+    numero=COALESCE(EXCLUDED.numero,whatsapp_numeros.numero),
+    display_name=COALESCE(EXCLUDED.display_name,whatsapp_numeros.display_name),
+    status=EXCLUDED.status,
+    atualizado_em=NOW();
+`);
+await client.query(`
+  UPDATE whatsapp_conversas wc
+  SET phone_number_id=wn.phone_number_id
+  FROM whatsapp_numeros wn
+  WHERE wc.usuario_id=wn.usuario_id AND wn.principal=TRUE
+    AND COALESCE(wc.phone_number_id,'')='';
 `);
 
 // Marca quando a conversa foi lida pela última vez pelo classificador automático
@@ -27205,6 +27486,8 @@ app.get("/usuarios/me", authMiddleware, async (c) => {
       : null,
     atendimento_whatsapp_habilitado:
       user.atendimento_whatsapp_habilitado === true,
+    whatsapp_multiplos_numeros_habilitado:
+      user.whatsapp_multiplos_numeros_habilitado === true,
     voip_habilitado: user.voip_habilitado === true,
     voip_status: user.voip_habilitado === true
       ? (user.voip_status || "aguardando_configuracao")
@@ -38646,6 +38929,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.parceiro_id,
         parceiro.email AS parceiro_email,
         COALESCE(u.ativo, true) AS ativo,
+        COALESCE(u.whatsapp_multiplos_numeros_habilitado, false) AS whatsapp_multiplos_numeros_habilitado,
         COALESCE(ia.uso_mes, 0) AS ia_uso_mes,
         COALESCE(ia.custo_mes, 0) AS ia_custo_mes,
         COUNT(DISTINCT c.id) AS campanhas,
@@ -38702,6 +38986,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.parceiro_id,
         parceiro.email,
         u.ativo,
+        u.whatsapp_multiplos_numeros_habilitado,
         ia.uso_mes,
         ia.custo_mes
       ORDER BY u.id ASC
@@ -44319,7 +44604,7 @@ async function enviarMensagemWhatsAppOficial(
   texto: string,
   midia?: { tipo: "image" | "audio" | "document"; link: string; nome?: string | null }
 ) {
-  const token = await obterTokenWhatsappUsuario(usuarioId);
+  const token = await obterTokenWhatsappUsuario(usuarioId, phoneNumberId);
   if (!token) {
     console.warn(`⚠️ WhatsApp Oficial: token não configurado para o usuário ${usuarioId}`);
     return;
