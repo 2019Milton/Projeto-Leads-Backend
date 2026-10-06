@@ -21377,23 +21377,22 @@ function diagnosticarPermissoesToken(debugData: any, wabaId: string) {
 }
 
 async function obterTokenWhatsappUsuario(usuarioId: number, phoneNumberId?: string | null) {
-  if (phoneNumberId) {
+  const recurso = await client.query(
+    `SELECT COALESCE(whatsapp_multiplos_numeros_habilitado, false) AS habilitado
+     FROM usuarios WHERE id=$1 LIMIT 1`,
+    [usuarioId]
+  ).catch(() => ({ rows: [] as any[] }));
+
+  if (recurso.rows[0]?.habilitado === true && phoneNumberId) {
     const numero = await client.query(
-      `SELECT wn.access_token
-       FROM whatsapp_numeros wn
-       JOIN usuarios u ON u.id=wn.usuario_id
-       WHERE wn.usuario_id=$1
-         AND wn.phone_number_id=$2
-         AND wn.status='conectado'
-         AND (
-           COALESCE(u.whatsapp_multiplos_numeros_habilitado, false)=TRUE
-           OR wn.principal=TRUE
-         )
-       LIMIT 1`,
+      `SELECT access_token FROM whatsapp_numeros
+       WHERE usuario_id=$1 AND phone_number_id=$2 AND status='conectado' LIMIT 1`,
       [usuarioId, phoneNumberId]
     ).catch(() => ({ rows: [] as any[] }));
     if (numero.rows[0]?.access_token) return numero.rows[0].access_token;
   }
+
+  // Fluxo atual/legado continua sendo a fonte padrão quando o recurso está desligado.
   const resultado = await client.query(
     `SELECT access_token FROM plataforma_conexoes
      WHERE usuario_id=$1 AND plataforma='whatsapp' LIMIT 1`,
@@ -21403,52 +21402,44 @@ async function obterTokenWhatsappUsuario(usuarioId: number, phoneNumberId?: stri
 }
 
 async function obterNumeroWhatsappPorPhoneId(phoneNumberId: string) {
-  const numero = await client.query(
-    `SELECT wn.*, c.nicho_id AS campanha_nicho_id,
+  // Primeiro preserva exatamente o caminho atual: se este é o número salvo na
+  // plataforma_conexoes e o recurso está desligado, não consulta configuração nova.
+  const legado = await client.query(
+    `SELECT pc.usuario_id, pc.access_token, pc.token_expira_em,
+            pc.dados_conta->>'waba_id' AS waba_id,
+            pc.dados_conta->>'phone_number_id' AS phone_number_id,
+            pc.dados_conta->>'numero' AS numero,
+            pc.dados_conta->>'display_name' AS display_name,
+            TRUE AS principal, TRUE AS bot_ativo,
+            NULL::integer AS nicho_id, NULL::integer AS campanha_id,
+            NULL::integer AS roteiro_id, NULL::integer AS campanha_nicho_id,
             COALESCE(u.whatsapp_multiplos_numeros_habilitado, false)
               AS whatsapp_multiplos_numeros_habilitado
+     FROM plataforma_conexoes pc
+     JOIN usuarios u ON u.id=pc.usuario_id
+     WHERE pc.plataforma='whatsapp' AND pc.status='conectado'
+       AND pc.dados_conta->>'phone_number_id'=$1 LIMIT 1`,
+    [phoneNumberId]
+  ).catch(() => ({ rows: [] as any[] }));
+
+  const legadoRow = legado.rows[0];
+  if (legadoRow && legadoRow.whatsapp_multiplos_numeros_habilitado !== true) {
+    return legadoRow;
+  }
+
+  // Só usuários explicitamente habilitados entram na camada de múltiplos números.
+  const numero = await client.query(
+    `SELECT wn.*, c.nicho_id AS campanha_nicho_id,
+            TRUE AS whatsapp_multiplos_numeros_habilitado
      FROM whatsapp_numeros wn
      JOIN usuarios u ON u.id=wn.usuario_id
+       AND COALESCE(u.whatsapp_multiplos_numeros_habilitado, false)=TRUE
      LEFT JOIN campanhas c ON c.id=wn.campanha_id AND c.usuario_id=wn.usuario_id
      WHERE wn.phone_number_id=$1 AND wn.status='conectado' LIMIT 1`,
     [phoneNumberId]
   ).catch(() => ({ rows: [] as any[] }));
 
-  const row = numero.rows[0];
-  if (row?.whatsapp_multiplos_numeros_habilitado === true) {
-    return row;
-  }
-
-  // Feature desligada: a tabela nova funciona apenas como espelho técnico do
-  // número legado principal. Números adicionais e configurações por número
-  // ficam completamente fora do fluxo até a ativação explícita do usuário.
-  if (row?.principal === true) {
-    return {
-      ...row,
-      bot_ativo: true,
-      nicho_id: null,
-      campanha_id: null,
-      roteiro_id: null,
-      campanha_nicho_id: null
-    };
-  }
-
-  const legado = await client.query(
-    `SELECT usuario_id, access_token, token_expira_em,
-            dados_conta->>'waba_id' AS waba_id,
-            dados_conta->>'phone_number_id' AS phone_number_id,
-            dados_conta->>'numero' AS numero,
-            dados_conta->>'display_name' AS display_name,
-            TRUE AS principal, TRUE AS bot_ativo,
-            NULL::integer AS nicho_id, NULL::integer AS campanha_id,
-            NULL::integer AS roteiro_id, NULL::integer AS campanha_nicho_id,
-            FALSE AS whatsapp_multiplos_numeros_habilitado
-     FROM plataforma_conexoes
-     WHERE plataforma='whatsapp' AND status='conectado'
-       AND dados_conta->>'phone_number_id'=$1 LIMIT 1`,
-    [phoneNumberId]
-  );
-  return legado.rows[0] || null;
+  return numero.rows[0] || legadoRow || null;
 }
 
 // Transcreve uma mensagem de áudio do WhatsApp (voz do cliente ou do corretor) via Whisper
@@ -21757,16 +21748,43 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
     };
 
     const multiplosHabilitados = user.whatsapp_multiplos_numeros_habilitado === true;
-    const jaTemNumero = multiplosHabilitados
-      ? await client.query(`SELECT 1 FROM whatsapp_numeros WHERE usuario_id=$1 LIMIT 1`,[user.id])
-      : { rows: [] as any[] };
-    const ehPrimeiroNumero = !multiplosHabilitados || jaTemNumero.rows.length===0;
 
     if (!multiplosHabilitados) {
-      // Fluxo legado: mantém exatamente uma conexão principal. Reconectar troca
-      // o número principal, sem criar números adicionais silenciosamente.
-      await client.query(`DELETE FROM whatsapp_numeros WHERE usuario_id=$1`,[user.id]);
+      // Recurso desligado = mantém o comportamento atual sem depender da tabela nova.
+      await client.query(
+        `INSERT INTO plataforma_conexoes
+           (usuario_id, plataforma, status, access_token, token_expira_em, dados_conta, conectado_em, atualizado_em)
+         VALUES ($1, 'whatsapp', 'conectado', $2, $3, $4, NOW(), NOW())
+         ON CONFLICT (usuario_id, plataforma)
+         DO UPDATE SET
+           status = 'conectado',
+           access_token = $2,
+           token_expira_em = COALESCE($3, plataforma_conexoes.token_expira_em),
+           dados_conta = $4,
+           atualizado_em = NOW()`,
+        [user.id, token, tokenExpiraEm, JSON.stringify(dadosConta)]
+      );
+
+      return c.json({
+        ok: true,
+        conta: dadosConta,
+        whatsapp_multiplos_numeros_habilitado: false,
+        diagnostico: {
+          webhook_inscrito: webhookInscrito,
+          conta_aprovada: wabaData.account_review_status === "APPROVED",
+          permissoes_ausentes: permissoes.faltantes,
+        },
+        ...(wabaData.account_review_status !== "APPROVED" ? {
+          aviso: `A conexão foi salva, mas a análise da conta na Meta ainda está ${wabaData.account_review_status || "pendente"}.`,
+        } : {}),
+      });
     }
+
+    const jaTemNumero = await client.query(
+      `SELECT 1 FROM whatsapp_numeros WHERE usuario_id=$1 LIMIT 1`,
+      [user.id]
+    );
+    const ehPrimeiroNumero = jaTemNumero.rows.length === 0;
 
     const numeroSalvo=await client.query(
       `INSERT INTO whatsapp_numeros
@@ -21785,6 +21803,7 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
        numero.display_phone_number||null,numero.verified_name||null,ehPrimeiroNumero]
     );
 
+    // O primeiro número continua sendo também a conexão atual/principal.
     if (ehPrimeiroNumero) {
       await client.query(
         `INSERT INTO plataforma_conexoes
@@ -21801,7 +21820,7 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
     return c.json({
       ok: true,
       conta:{...dadosConta,id:numeroSalvo.rows[0]?.id,bot_ativo:numeroSalvo.rows[0]?.bot_ativo===true},
-      whatsapp_multiplos_numeros_habilitado: multiplosHabilitados,
+      whatsapp_multiplos_numeros_habilitado: true,
       diagnostico: {
         webhook_inscrito: webhookInscrito,
         conta_aprovada: wabaData.account_review_status === "APPROVED",
@@ -22027,10 +22046,11 @@ async function iniciarContatoWhatsAppLeadFormulario(
 
   try {
     const cfgRes = await client.query(
-      `SELECT whatsapp_contato_formulario FROM usuarios WHERE id = $1`,
+      `SELECT whatsapp_contato_formulario, COALESCE(whatsapp_multiplos_numeros_habilitado, false) AS whatsapp_multiplos_numeros_habilitado FROM usuarios WHERE id = $1`,
       [usuarioId]
     );
     const config = lerConfigContatoFormulario(cfgRes.rows[0]?.whatsapp_contato_formulario);
+    const multiplosHabilitados = cfgRes.rows[0]?.whatsapp_multiplos_numeros_habilitado === true;
     if (!config.ativo) return;
 
     const leadRes = await client.query(
@@ -22046,11 +22066,19 @@ async function iniciarContatoWhatsAppLeadFormulario(
       return;
     }
 
-    const conexaoRes = await client.query(
-      `SELECT phone_number_id FROM whatsapp_numeros
-       WHERE usuario_id=$1 AND principal=TRUE AND status='conectado' LIMIT 1`,
-      [usuarioId]
-    );
+    const conexaoRes = multiplosHabilitados
+      ? await client.query(
+          `SELECT phone_number_id FROM whatsapp_numeros
+           WHERE usuario_id=$1 AND principal=TRUE AND status='conectado' LIMIT 1`,
+          [usuarioId]
+        )
+      : await client.query(
+          `SELECT dados_conta->>'phone_number_id' AS phone_number_id
+           FROM plataforma_conexoes
+           WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'
+           LIMIT 1`,
+          [usuarioId]
+        );
     const phoneNumberId=conexaoRes.rows[0]?.phone_number_id;
     if (!phoneNumberId) {
       await registrarFalhaContatoFormulario(leadId, usuarioId, "WhatsApp não conectado");
@@ -38901,6 +38929,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.parceiro_id,
         parceiro.email AS parceiro_email,
         COALESCE(u.ativo, true) AS ativo,
+        COALESCE(u.whatsapp_multiplos_numeros_habilitado, false) AS whatsapp_multiplos_numeros_habilitado,
         COALESCE(ia.uso_mes, 0) AS ia_uso_mes,
         COALESCE(ia.custo_mes, 0) AS ia_custo_mes,
         COUNT(DISTINCT c.id) AS campanhas,
@@ -38957,6 +38986,7 @@ app.get("/admin/usuarios", authMiddleware, async (c) => {
         u.parceiro_id,
         parceiro.email,
         u.ativo,
+        u.whatsapp_multiplos_numeros_habilitado,
         ia.uso_mes,
         ia.custo_mes
       ORDER BY u.id ASC
