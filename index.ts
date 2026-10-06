@@ -40438,6 +40438,7 @@ const FORMATOS_CRIATIVO_IA: Record<string, { tamanho: string; rotulo: string; di
 };
 
 const OBJETIVOS_CRIATIVO_IA: Record<string, string> = {
+  auto: "Infer the most appropriate campaign objective from the advertiser's description. Prioritize the explicit request and do not invent an objective that conflicts with it.",
   leads: "Lead generation: make the value proposition immediately clear and reduce perceived friction.",
   whatsapp: "WhatsApp conversations: convey approachability, urgency without pressure, and a clear reason to start a conversation.",
   site: "Website traffic or conversion: create curiosity and a clear visual path toward the offer.",
@@ -40468,7 +40469,7 @@ function normalizarBriefingCriativo(body: any, nichoSlug: string | null): Briefi
   return {
     nicho: nichoSlug || limitarTextoCriativo(briefing.nicho, 80) || null,
     formato: FORMATOS_CRIATIVO_IA[formatoPedido] ? formatoPedido : "instagram_feed",
-    objetivo: OBJETIVOS_CRIATIVO_IA[objetivoPedido] ? objetivoPedido : "leads",
+    objetivo: OBJETIVOS_CRIATIVO_IA[objetivoPedido] ? objetivoPedido : "auto",
     estilo: ESTILOS_CRIATIVO_IA[estiloPedido] ? estiloPedido : "auto",
     publico: limitarTextoCriativo(briefing.publico, 500),
     oferta: limitarTextoCriativo(briefing.oferta, 700),
@@ -40512,13 +40513,120 @@ function extrairFontesPesquisaCriativo(data: any): FontePesquisaCriativo[] {
   return fontes;
 }
 
+type NichoCriativoPermitido = {
+  slug: string;
+  nome: string;
+};
+
+async function listarNichosPermitidosCriativo(user: any): Promise<NichoCriativoPermitido[]> {
+  if (["super_admin", "master"].includes(String(user?.tipo || ""))) {
+    const result = await client.query(`SELECT slug, nome FROM nichos ORDER BY id`);
+    return result.rows
+      .map((n: any) => ({
+        slug: limitarTextoCriativo(n.slug, 80).toLowerCase(),
+        nome: limitarTextoCriativo(n.nome, 120)
+      }))
+      .filter((n: NichoCriativoPermitido) => Boolean(n.slug));
+  }
+
+  const nichos = Array.isArray(user?.nichos) ? user.nichos : [];
+  const vistos = new Set<string>();
+
+  return nichos
+    .map((n: any) => ({
+      slug: limitarTextoCriativo(n?.slug, 80).toLowerCase(),
+      nome: limitarTextoCriativo(n?.nome, 120)
+    }))
+    .filter((n: NichoCriativoPermitido) => {
+      if (!n.slug || vistos.has(n.slug)) return false;
+      vistos.add(n.slug);
+      return true;
+    });
+}
+
+function normalizarTextoDeteccaoCriativo(value: unknown) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function detectarNichoPermitidoPorTextoCriativo(
+  texto: string,
+  permitidos: NichoCriativoPermitido[]
+): string | null {
+  if (permitidos.length === 1) return permitidos[0].slug;
+
+  const base = normalizarTextoDeteccaoCriativo(texto);
+  const palavras: Record<string, string[]> = {
+    imoveis: ["imovel", "apartamento", "casa", "terreno", "condominio", "aluguel", "locacao", "corretor"],
+    saude: ["plano de saude", "convenio", "operadora", "beneficiario", "saude familiar"],
+    suplementos: ["suplemento", "fitness", "academia", "proteina", "whey", "creatina", "libido", "desempenho sexual"],
+    saas: ["saas", "software", "plataforma", "sistema", "aplicativo", "app"],
+    higienizacao: ["higienizacao", "limpeza", "sanitizacao", "estofado", "carpete"],
+    telecom: ["telecom", "internet empresarial", "telefonia", "link dedicado", "fibra", "conectividade"],
+    cursos_online: ["curso online", "curso digital", "treinamento online", "infoproduto"],
+    faculdade_universidade: ["faculdade", "universidade", "graduacao", "vestibular", "campus", "curso superior"],
+    dentista: ["dentista", "odontologia", "odontologico", "implante dentario", "clareamento", "clinica dental"],
+    educacao: ["educacao", "escola", "ensino", "aprendizado", "aluno"],
+    auto: ["automovel", "carro", "veiculo", "concessionaria", "seminovo"],
+    consorcio: ["consorcio", "carta de credito", "grupo de consorcio"]
+  };
+
+  let melhor: { slug: string; pontos: number } | null = null;
+
+  for (const nicho of permitidos) {
+    let pontos = 0;
+
+    for (const termo of palavras[nicho.slug] || []) {
+      if (base.includes(normalizarTextoDeteccaoCriativo(termo))) pontos += 3;
+    }
+
+    const tokensNome = normalizarTextoDeteccaoCriativo(nicho.nome)
+      .split(/[^a-z0-9]+/)
+      .filter(token => token.length >= 4);
+
+    for (const token of tokensNome) {
+      if (base.includes(token)) pontos += 1;
+    }
+
+    if (pontos > 0 && (!melhor || pontos > melhor.pontos)) {
+      melhor = { slug: nicho.slug, pontos };
+    }
+  }
+
+  return melhor?.slug || null;
+}
+
 async function pesquisarReferenciasCriativoIA(
   openaiKey: string,
   promptUsuario: string,
-  briefing: BriefingCriativoIA
+  briefing: BriefingCriativoIA,
+  nichosPermitidos: NichoCriativoPermitido[]
 ): Promise<PesquisaCriativoIA> {
-  const nichoInformado = briefing.nicho || "detectar a partir da oferta e da descrição";
-  const fallbackDirecao = (briefing.nicho && DIRECAO_VISUAL_NICHO[briefing.nicho]) || DIRECAO_VISUAL_GENERICA;
+  const permitidos = briefing.nicho
+    ? nichosPermitidos.filter(n => n.slug === briefing.nicho)
+    : nichosPermitidos;
+
+  const slugsPermitidos = permitidos.map(n => n.slug).filter(Boolean);
+  const fallbackNicho =
+    briefing.nicho ||
+    detectarNichoPermitidoPorTextoCriativo(
+      [promptUsuario, briefing.oferta, briefing.publico].filter(Boolean).join(" "),
+      permitidos
+    );
+
+  const fallbackDirecao =
+    (fallbackNicho && DIRECAO_VISUAL_NICHO[fallbackNicho]) ||
+    DIRECAO_VISUAL_GENERICA;
+
+  const nichosDescricao = permitidos
+    .map(n => `${n.slug} = ${n.nome || n.slug}`)
+    .join("; ");
+
+  const nichoInformado = briefing.nicho
+    ? briefing.nicho
+    : `detectar SOMENTE entre: ${nichosDescricao}`;
 
   try {
     const response = await fetchProvedorIA("openai", "criativo_pesquisa", OPENAI_RESPONSES_URL, {
@@ -40528,6 +40636,8 @@ async function pesquisarReferenciasCriativoIA(
         model: modeloResponsesCriativo(),
         instructions:
           "Você é um diretor de arte e estrategista de mídia paga no Brasil. Pesquise na web referências atuais, padrões e abordagens visuais relevantes para o nicho, objetivo e canal pedidos. " +
+          "Quando o nicho não vier escolhido, identifique-o exclusivamente dentro da lista de nichos permitidos recebida no pedido. Nunca invente, troque ou selecione um nicho fora dessa lista. " +
+          "Retorne em nicho_identificado exatamente o slug permitido correspondente. " +
           "Use as referências somente para síntese estratégica: nunca copie literalmente uma campanha, composição, personagem, slogan, identidade visual ou marca de terceiros. " +
           "Priorize fontes confiáveis e exemplos recentes. Diferencie tendências úteis de modismos e evite alegações proibidas ou sem comprovação.",
         input: [{
@@ -40535,11 +40645,12 @@ async function pesquisarReferenciasCriativoIA(
           content: [{
             type: "input_text",
             text:
+              `Nichos permitidos para esta conta: ${nichosDescricao}\n` +
               `Nicho: ${nichoInformado}\n` +
               `Formato/canal: ${FORMATOS_CRIATIVO_IA[briefing.formato].rotulo}\n` +
               `Objetivo: ${briefing.objetivo}\n` +
-              `Público: ${briefing.publico || "não informado"}\n` +
-              `Oferta: ${briefing.oferta || "não informada"}\n` +
+              `Público: ${briefing.publico || "inferir da descrição"}\n` +
+              `Oferta: ${briefing.oferta || "inferir da descrição"}\n` +
               `Descrição do anunciante: ${promptUsuario.slice(0, 3000)}\n\n` +
               "Pesquise referências e entregue uma direção original, específica, prática e visualmente detalhada."
           }]
@@ -40561,7 +40672,10 @@ async function pesquisarReferenciasCriativoIA(
               additionalProperties: false,
               required: ["nicho_identificado", "resumo_mercado", "padroes_visuais", "angulos", "elementos_evitar", "direcao_recomendada"],
               properties: {
-                nicho_identificado: { type: "string" },
+                nicho_identificado: {
+                  type: "string",
+                  enum: slugsPermitidos.length ? slugsPermitidos : ["geral"]
+                },
                 resumo_mercado: { type: "string" },
                 padroes_visuais: { type: "array", items: { type: "string" } },
                 angulos: { type: "array", items: { type: "string" } },
@@ -40575,19 +40689,29 @@ async function pesquisarReferenciasCriativoIA(
         store: false
       })
     });
+
     const data: any = await response.json();
     if (!response.ok) throw new Error(data?.error?.message || "Pesquisa web indisponível");
 
     const texto = extrairTextoRespostaOpenAI(data);
     const resultado = JSON.parse(texto || "{}");
+    const retornado = limitarTextoCriativo(resultado.nicho_identificado, 80).toLowerCase();
+    const nichoDetectado = slugsPermitidos.includes(retornado)
+      ? retornado
+      : (fallbackNicho || "");
+
+    const direcaoFallbackDetectada =
+      (nichoDetectado && DIRECAO_VISUAL_NICHO[nichoDetectado]) ||
+      fallbackDirecao;
+
     return {
       realizada: true,
-      nicho_identificado: limitarTextoCriativo(resultado.nicho_identificado, 140) || briefing.nicho || "geral",
+      nicho_identificado: nichoDetectado,
       resumo_mercado: limitarTextoCriativo(resultado.resumo_mercado, 1000),
       padroes_visuais: Array.isArray(resultado.padroes_visuais) ? resultado.padroes_visuais.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
       angulos: Array.isArray(resultado.angulos) ? resultado.angulos.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
       elementos_evitar: Array.isArray(resultado.elementos_evitar) ? resultado.elementos_evitar.map((v: any) => limitarTextoCriativo(v, 300)).filter(Boolean).slice(0, 8) : [],
-      direcao_recomendada: limitarTextoCriativo(resultado.direcao_recomendada, 1200) || fallbackDirecao,
+      direcao_recomendada: limitarTextoCriativo(resultado.direcao_recomendada, 1200) || direcaoFallbackDetectada,
       fontes: extrairFontesPesquisaCriativo(data),
       aviso: null,
       usage: data?.usage
@@ -40596,14 +40720,16 @@ async function pesquisarReferenciasCriativoIA(
     console.error("PESQUISA CRIATIVO IA:", err);
     return {
       realizada: false,
-      nicho_identificado: briefing.nicho || "geral",
+      nicho_identificado: fallbackNicho || "",
       resumo_mercado: "",
       padroes_visuais: [],
       angulos: [],
       elementos_evitar: [],
       direcao_recomendada: fallbackDirecao,
       fontes: [],
-      aviso: "A pesquisa web não respondeu; o criativo foi produzido com a direção especializada já configurada para o nicho."
+      aviso: fallbackNicho
+        ? "A pesquisa web não respondeu; o criativo foi produzido usando a direção configurada para o nicho permitido."
+        : "A pesquisa web não respondeu; o criativo foi produzido sem assumir outro nicho da sua conta."
     };
   }
 }
@@ -40795,8 +40921,19 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
     if (!prompt) return c.json({ error: "Descreva o criativo antes de gerar." }, 400);
 
     const modoEditar: boolean = body.modo === "editar";
-    const nichoSlug = limitarTextoCriativo(body.nicho, 80) || null;
-    const briefing = normalizarBriefingCriativo(body, nichoSlug);
+    const nichosPermitidos = await listarNichosPermitidosCriativo(user);
+
+    if (!nichosPermitidos.length) {
+      return c.json({ error: "Sua conta não possui um nicho habilitado para gerar criativos." }, 403);
+    }
+
+    const nichoSlug = limitarTextoCriativo(body.nicho, 80).toLowerCase() || null;
+
+    if (nichoSlug && !nichosPermitidos.some(n => n.slug === nichoSlug)) {
+      return c.json({ error: "Este nicho não está habilitado para sua conta." }, 403);
+    }
+
+    const briefingInicial = normalizarBriefingCriativo(body, nichoSlug);
 
     const imagensBase64: Array<{ data: string; tipo: string }> = Array.isArray(body.imagens_base64)
       ? body.imagens_base64.slice(0, modoEditar ? 1 : 4)
@@ -40814,7 +40951,23 @@ app.post("/ia/gerar-banner", authMiddleware, async (c) => {
 
     if (!openaiKey) return c.json({ error: "Geração de imagem não configurada. Configure a chave OpenAI." }, 400);
 
-    const pesquisa = await pesquisarReferenciasCriativoIA(openaiKey, prompt, briefing);
+    const pesquisa = await pesquisarReferenciasCriativoIA(
+      openaiKey,
+      prompt,
+      briefingInicial,
+      nichosPermitidos
+    );
+
+    const nichoEfetivo =
+      briefingInicial.nicho ||
+      pesquisa.nicho_identificado ||
+      (nichosPermitidos.length === 1 ? nichosPermitidos[0].slug : null);
+
+    const briefing: BriefingCriativoIA = {
+      ...briefingInicial,
+      nicho: nichoEfetivo
+    };
+
     const promptFinal = construirPromptCriativoIA(prompt, briefing, pesquisa, modoEditar);
     const tamanho = FORMATOS_CRIATIVO_IA[briefing.formato].tamanho;
 
