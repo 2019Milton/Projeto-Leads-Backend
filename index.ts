@@ -2754,6 +2754,96 @@ async function enviarEmailAcessoInicial(
   );
 }
 
+async function enviarEmailNotificacaoNovoUsuarioPlataforma(dados: {
+  nome?: string | null;
+  sobrenome?: string | null;
+  email: string;
+  tipo?: string | null;
+  plano?: string | null;
+  origem?: string | null;
+}) {
+  if (!Bun.env.RESEND_API_KEY) {
+    throw new Error("RESEND_API_KEY nao configurada");
+  }
+
+  const nomeCompleto = [dados.nome, dados.sobrenome]
+    .map(item => String(item || "").trim())
+    .filter(Boolean)
+    .join(" ") || "Não informado";
+
+  const emailUsuario = String(dados.email || "").trim().toLowerCase();
+  const tipo = String(dados.tipo || "corretor");
+  const plano = String(dados.plano || "não informado");
+  const origem = String(dados.origem || "Cadastro de usuário");
+
+  const nomeSeguro = escaparHtmlEmail(nomeCompleto);
+  const emailSeguro = escaparHtmlEmail(emailUsuario);
+  const tipoSeguro = escaparHtmlEmail(tipo);
+  const planoSeguro = escaparHtmlEmail(plano);
+  const origemSegura = escaparHtmlEmail(origem);
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: PLATAFORMA_FROM_EMAIL,
+      to: PLATAFORMA_CONTATO_EMAIL,
+      reply_to: PLATAFORMA_CONTATO_EMAIL,
+      subject: `Novo usuário criado — ${emailUsuario}`,
+      text: [
+        "Plataforma de Leads",
+        "",
+        "Um novo usuário foi criado na plataforma.",
+        "",
+        `Nome: ${nomeCompleto}`,
+        `Email / Login: ${emailUsuario}`,
+        `Tipo: ${tipo}`,
+        `Plano: ${plano}`,
+        `Origem: ${origem}`,
+        "",
+        "Por segurança, a senha do usuário não é enviada nesta notificação interna."
+      ].join("\n"),
+      html: `
+        <div style="margin:0;padding:0;background:#f6f8fb;font-family:Arial,sans-serif;color:#111827;">
+          <div style="max-width:620px;margin:0 auto;padding:28px 16px;">
+            <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+              <div style="background:#050816;padding:22px 26px;color:#ffffff;">
+                <h1 style="font-size:22px;line-height:1.3;margin:0;">Plataforma de Leads</h1>
+                <p style="margin:6px 0 0;color:#9ca3af;font-size:13px;letter-spacing:.04em;text-transform:uppercase;">Novo usuário criado</p>
+              </div>
+              <div style="padding:28px 26px;line-height:1.6;">
+                <p style="margin:0 0 18px;">Um novo usuário foi criado na plataforma.</p>
+                <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:16px 18px;">
+                  <p style="margin:0 0 8px;"><strong>Nome:</strong> ${nomeSeguro}</p>
+                  <p style="margin:0 0 8px;"><strong>Email / Login:</strong> ${emailSeguro}</p>
+                  <p style="margin:0 0 8px;"><strong>Tipo:</strong> ${tipoSeguro}</p>
+                  <p style="margin:0 0 8px;"><strong>Plano:</strong> ${planoSeguro}</p>
+                  <p style="margin:0;"><strong>Origem:</strong> ${origemSegura}</p>
+                </div>
+                <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px 16px;margin:20px 0 0;">
+                  <p style="margin:0;color:#9a3412;font-size:13px;"><strong>Segurança:</strong> a senha não é incluída nesta notificação interna.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `
+    })
+  });
+
+  if (!res.ok) {
+    const detalhe = await res.text();
+    console.error("RESEND NOVO USUARIO PLATAFORMA ERROR:", detalhe);
+    throw new Error("RESEND_PLATFORM_NEW_USER_EMAIL_FAILED");
+  }
+
+  console.log("[email-novo-usuario] notificação enviada para", PLATAFORMA_CONTATO_EMAIL);
+}
+
+
 // Auditoria de segurança (2026-09): removido o fallback que comparava senha em
 // texto puro (senhaInformada === senhaSalva) para contas sem hash bcrypt.
 // Confirmado antes de remover: as 12 contas em produção já estavam 100% em
@@ -6687,6 +6777,8 @@ app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
     );
 
     let emailEnviado = false;
+    let emailPlataformaEnviado = false;
+
     try {
       await enviarEmailAcessoInicial(String(email), null, String(senha));
       emailEnviado = true;
@@ -6694,9 +6786,22 @@ app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
       console.error("ERRO EMAIL ACESSO /usuarios:", emailErr);
     }
 
+    try {
+      await enviarEmailNotificacaoNovoUsuarioPlataforma({
+        email: String(email),
+        tipo: "cliente",
+        origem: "Cadastro legado /usuarios"
+      });
+      emailPlataformaEnviado = true;
+    } catch (emailErr) {
+      console.error("ERRO EMAIL NOVO USUARIO /usuarios PARA PLATAFORMA:", emailErr);
+    }
+
     return c.json({
       message: "Usuário criado",
-      email_enviado: emailEnviado
+      email_enviado: emailEnviado,
+      email_usuario_enviado: emailEnviado,
+      email_plataforma_enviado: emailPlataformaEnviado
     });
 
   } catch {
@@ -27382,6 +27487,7 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
     );
 
     let emailEnviado = false;
+    let emailPlataformaEnviado = false;
 
     try {
       await enviarEmailAcessoInicial(email, nome, senha);
@@ -27390,10 +27496,26 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
       console.error("GESTOR EMAIL ACESSO CLIENTE ERROR:", emailErr);
     }
 
+    try {
+      await enviarEmailNotificacaoNovoUsuarioPlataforma({
+        nome,
+        sobrenome,
+        email,
+        tipo: "corretor",
+        plano: result.rows[0]?.plano || "bronze",
+        origem: "Clientes Gerenciados"
+      });
+      emailPlataformaEnviado = true;
+    } catch (emailErr) {
+      console.error("GESTOR EMAIL NOVO CLIENTE PARA PLATAFORMA ERROR:", emailErr);
+    }
+
     return c.json({
       sucesso: true,
       cliente: formatarClienteGerenciado(result.rows[0]),
       email_enviado: emailEnviado,
+      email_usuario_enviado: emailEnviado,
+      email_plataforma_enviado: emailPlataformaEnviado,
       aviso: emailEnviado
         ? null
         : "Corretor criado, mas não foi possível enviar o email de acesso."
@@ -41201,6 +41323,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
     }
 
     let emailEnviado = false;
+    let emailPlataformaEnviado = false;
 
     try {
       await enviarEmailAcessoInicial(
@@ -41213,10 +41336,26 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       console.error("ERRO EMAIL ACESSO NOVO USUARIO:", emailErr);
     }
 
+    try {
+      await enviarEmailNotificacaoNovoUsuarioPlataforma({
+        nome: String(nome),
+        sobrenome: String(sobrenome),
+        email: String(email),
+        tipo: String(tipo || "corretor"),
+        plano: planoFinal,
+        origem: "Painel Super Admin"
+      });
+      emailPlataformaEnviado = true;
+    } catch (emailErr) {
+      console.error("ERRO EMAIL NOVO USUARIO PARA PLATAFORMA:", emailErr);
+    }
+
     return c.json({
       sucesso: true,
       id: novoId,
       email_enviado: emailEnviado,
+      email_usuario_enviado: emailEnviado,
+      email_plataforma_enviado: emailPlataformaEnviado,
       aviso: emailEnviado
         ? null
         : "Usuário criado, mas não foi possível enviar o email de acesso."
