@@ -5551,6 +5551,7 @@ const authMiddleware = async (c: any, next: any) => {
         COALESCE(u.is_parceiro, false) AS is_parceiro,
         COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
         COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
+        COALESCE(u.whatsapp_multiplos_numeros_habilitado, false) AS whatsapp_multiplos_numeros_habilitado,
         COALESCE(u.voip_habilitado, false) AS voip_habilitado,
         COALESCE(u.voip_status, 'desativado') AS voip_status,
         u.voip_provedor,
@@ -6897,6 +6898,45 @@ app.put("/admin/usuarios/:id/status", authMiddleware, async (c) => {
     return c.json({
       error: "Erro ao alterar status"
     }, 500);
+  }
+});
+
+
+app.put("/admin/usuarios/:id/whatsapp-multiplos-numeros", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.tipo !== "super_admin") {
+      return c.json({ error: "Acesso negado" }, 403);
+    }
+
+    const id = Number(c.req.param("id"));
+    const body = await c.req.json().catch(() => ({}));
+    if (!Number.isInteger(id) || id <= 0) {
+      return c.json({ error: "Usuário inválido" }, 400);
+    }
+
+    const habilitado = body.habilitado === true;
+    const atualizado = await client.query(
+      `UPDATE usuarios
+       SET whatsapp_multiplos_numeros_habilitado = $1
+       WHERE id = $2
+       RETURNING id, whatsapp_multiplos_numeros_habilitado`,
+      [habilitado, id]
+    );
+
+    if (!atualizado.rows.length) {
+      return c.json({ error: "Usuário não encontrado" }, 404);
+    }
+
+    return c.json({
+      ok: true,
+      usuario_id: id,
+      whatsapp_multiplos_numeros_habilitado:
+        atualizado.rows[0].whatsapp_multiplos_numeros_habilitado === true
+    });
+  } catch (err) {
+    console.error("ERRO WHATSAPP MULTIPLOS NUMEROS USUARIO:", err);
+    return c.json({ error: "Erro ao atualizar recurso do usuário" }, 500);
   }
 });
 
@@ -21685,8 +21725,18 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
       webhook_subscribed: webhookInscrito,
     };
 
-    const jaTemNumero=await client.query(`SELECT 1 FROM whatsapp_numeros WHERE usuario_id=$1 LIMIT 1`,[user.id]);
-    const ehPrimeiroNumero=jaTemNumero.rows.length===0;
+    const multiplosHabilitados = user.whatsapp_multiplos_numeros_habilitado === true;
+    const jaTemNumero = multiplosHabilitados
+      ? await client.query(`SELECT 1 FROM whatsapp_numeros WHERE usuario_id=$1 LIMIT 1`,[user.id])
+      : { rows: [] as any[] };
+    const ehPrimeiroNumero = !multiplosHabilitados || jaTemNumero.rows.length===0;
+
+    if (!multiplosHabilitados) {
+      // Fluxo legado: mantém exatamente uma conexão principal. Reconectar troca
+      // o número principal, sem criar números adicionais silenciosamente.
+      await client.query(`DELETE FROM whatsapp_numeros WHERE usuario_id=$1`,[user.id]);
+    }
+
     const numeroSalvo=await client.query(
       `INSERT INTO whatsapp_numeros
        (usuario_id,waba_id,phone_number_id,access_token,token_expira_em,numero,display_name,status,principal,bot_ativo,atualizado_em)
@@ -21695,11 +21745,15 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
          usuario_id=EXCLUDED.usuario_id,waba_id=EXCLUDED.waba_id,
          access_token=EXCLUDED.access_token,
          token_expira_em=COALESCE(EXCLUDED.token_expira_em,whatsapp_numeros.token_expira_em),
-         numero=EXCLUDED.numero,display_name=EXCLUDED.display_name,status='conectado',atualizado_em=NOW()
+         numero=EXCLUDED.numero,display_name=EXCLUDED.display_name,status='conectado',
+         principal=CASE WHEN $8 THEN TRUE ELSE whatsapp_numeros.principal END,
+         bot_ativo=CASE WHEN $8 THEN TRUE ELSE whatsapp_numeros.bot_ativo END,
+         atualizado_em=NOW()
        RETURNING id,principal,bot_ativo`,
       [user.id,waba_id,phone_number_id,token,tokenExpiraEm,
        numero.display_phone_number||null,numero.verified_name||null,ehPrimeiroNumero]
     );
+
     if (ehPrimeiroNumero) {
       await client.query(
         `INSERT INTO plataforma_conexoes
@@ -21716,6 +21770,7 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
     return c.json({
       ok: true,
       conta:{...dadosConta,id:numeroSalvo.rows[0]?.id,bot_ativo:numeroSalvo.rows[0]?.bot_ativo===true},
+      whatsapp_multiplos_numeros_habilitado: multiplosHabilitados,
       diagnostico: {
         webhook_inscrito: webhookInscrito,
         conta_aprovada: wabaData.account_review_status === "APPROVED",
@@ -21736,6 +21791,9 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
 
 app.get("/whatsapp/numeros",authMiddleware,async(c)=>{
   const user:any=c.get("user");
+  if (user.whatsapp_multiplos_numeros_habilitado !== true) {
+    return c.json({ numeros: [], habilitado: false });
+  }
   try{
     const rows=await client.query(
       `SELECT wn.id,wn.waba_id,wn.phone_number_id,wn.numero,wn.display_name,wn.status,
@@ -21751,7 +21809,11 @@ app.get("/whatsapp/numeros",authMiddleware,async(c)=>{
 });
 
 app.put("/whatsapp/numeros/:id",authMiddleware,async(c)=>{
-  const user:any=c.get("user"); const id=Number(c.req.param("id"));
+  const user:any=c.get("user");
+  if (user.whatsapp_multiplos_numeros_habilitado !== true) {
+    return c.json({ error:"Recurso de múltiplos números não habilitado para este usuário" },403);
+  }
+  const id=Number(c.req.param("id"));
   const body=await c.req.json().catch(()=>({}));
   if(!Number.isInteger(id)||id<=0)return c.json({error:"Número inválido"},400);
   const atual=await client.query(`SELECT * FROM whatsapp_numeros WHERE id=$1 AND usuario_id=$2`,[id,user.id]);
@@ -21771,7 +21833,11 @@ app.put("/whatsapp/numeros/:id",authMiddleware,async(c)=>{
 });
 
 app.delete("/whatsapp/numeros/:id",authMiddleware,async(c)=>{
-  const user:any=c.get("user"); const id=Number(c.req.param("id"));
+  const user:any=c.get("user");
+  if (user.whatsapp_multiplos_numeros_habilitado !== true) {
+    return c.json({ error:"Recurso de múltiplos números não habilitado para este usuário" },403);
+  }
+  const id=Number(c.req.param("id"));
   const row=await client.query(`DELETE FROM whatsapp_numeros WHERE id=$1 AND usuario_id=$2 AND principal=FALSE RETURNING id`,[id,user.id]);
   if(!row.rows.length)return c.json({error:"Número adicional não encontrado"},404);
   return c.json({ok:true});
@@ -25512,6 +25578,7 @@ await client.query(`
     ADD COLUMN IF NOT EXISTS painel_slug TEXT,
     ADD COLUMN IF NOT EXISTS painel_atualizado_em TIMESTAMP,
     ADD COLUMN IF NOT EXISTS atendimento_whatsapp_habilitado BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS whatsapp_multiplos_numeros_habilitado BOOLEAN DEFAULT false,
     ADD COLUMN IF NOT EXISTS voip_habilitado BOOLEAN DEFAULT false,
     ADD COLUMN IF NOT EXISTS voip_status TEXT DEFAULT 'desativado',
     ADD COLUMN IF NOT EXISTS voip_provedor TEXT,
@@ -27360,6 +27427,8 @@ app.get("/usuarios/me", authMiddleware, async (c) => {
       : null,
     atendimento_whatsapp_habilitado:
       user.atendimento_whatsapp_habilitado === true,
+    whatsapp_multiplos_numeros_habilitado:
+      user.whatsapp_multiplos_numeros_habilitado === true,
     voip_habilitado: user.voip_habilitado === true,
     voip_status: user.voip_habilitado === true
       ? (user.voip_status || "aguardando_configuracao")
