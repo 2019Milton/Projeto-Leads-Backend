@@ -24150,11 +24150,12 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
         [numeroCfg.roteiro_id,conversa.usuario_id]
       )
     : await client.query(
-        `SELECT id,passos FROM whatsapp_bot_config
-         WHERE usuario_id=$1 AND ativo=TRUE
-           AND (nicho_id=$2 OR (nicho_id IS NULL AND criado_em<$3))
-         ORDER BY nicho_id NULLS LAST LIMIT 1`,
-        [conversa.usuario_id,nichoId,CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
+        `SELECT id, passos FROM whatsapp_bot_config
+         WHERE usuario_id = $1 AND ativo = TRUE
+           AND (nicho_id = $2 OR (nicho_id IS NULL AND criado_em < $3))
+         ORDER BY nicho_id NULLS LAST
+         LIMIT 1`,
+        [conversa.usuario_id, nichoId, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
       );
   const roteiroAtivo = configRes.rows[0];
   const passos: any[] = roteiroAtivo?.passos || [];
