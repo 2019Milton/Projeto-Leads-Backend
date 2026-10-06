@@ -2,7 +2,7 @@ name: Testes backend
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/whatsapp-multiplos-numeros]
   workflow_dispatch:
 
 jobs:
