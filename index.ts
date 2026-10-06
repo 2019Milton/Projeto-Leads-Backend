@@ -2651,6 +2651,109 @@ async function enviarEmailResetSenha(
   }
 }
 
+async function enviarEmailAcessoInicial(
+  email: string,
+  nome: string | null,
+  senhaTemporaria: string
+) {
+  if (!Bun.env.RESEND_API_KEY) {
+    throw new Error("RESEND_API_KEY nao configurada");
+  }
+
+  const destinatario = String(email || "").trim().toLowerCase();
+  const primeiroNome = String(nome || "").trim() || "Olá";
+  const primeiroNomeSeguro = escaparHtmlEmail(primeiroNome);
+  const emailSeguro = escaparHtmlEmail(destinatario);
+  const senhaSegura = escaparHtmlEmail(senhaTemporaria);
+  const siteUrl = obterFrontendUrl();
+  const siteUrlSeguro = escaparHtmlEmail(siteUrl);
+  const contatoEmailSeguro = escaparHtmlEmail(PLATAFORMA_CONTATO_EMAIL);
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: PLATAFORMA_FROM_EMAIL,
+      to: destinatario,
+      reply_to: PLATAFORMA_CONTATO_EMAIL,
+      subject: "Seu acesso à Plataforma de Leads",
+      text: [
+        "Plataforma de Leads",
+        "Gestão Inteligente de Clientes",
+        "",
+        `Olá, ${primeiroNome}!`,
+        "",
+        "Sua conta na Plataforma de Leads foi criada com sucesso.",
+        "",
+        `Acesse: ${siteUrl}`,
+        `Login: ${destinatario}`,
+        `Senha: ${senhaTemporaria}`,
+        "",
+        "Por segurança, recomendamos trocar a senha após o primeiro acesso.",
+        "",
+        `Contato: ${PLATAFORMA_CONTATO_EMAIL}`
+      ].join("\n"),
+      html: `
+        <div style="margin:0;padding:0;background:#f6f8fb;font-family:Arial,sans-serif;color:#111827;">
+          <div style="max-width:620px;margin:0 auto;padding:28px 16px;">
+            <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+              <div style="background:#050816;padding:22px 26px;color:#ffffff;">
+                <h1 style="font-size:22px;line-height:1.3;margin:0;">Plataforma de Leads</h1>
+                <p style="margin:6px 0 0;color:#9ca3af;font-size:13px;letter-spacing:.04em;text-transform:uppercase;">Gestão Inteligente de Clientes</p>
+              </div>
+
+              <div style="padding:28px 26px;line-height:1.6;">
+                <h2 style="font-size:20px;margin:0 0 14px;color:#111827;">Seu acesso está pronto</h2>
+                <p style="margin:0 0 14px;">Olá, ${primeiroNomeSeguro}!</p>
+                <p style="margin:0 0 18px;">Sua conta na Plataforma de Leads foi criada. Use os dados abaixo para entrar:</p>
+
+                <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:16px 18px;margin:20px 0;">
+                  <p style="margin:0 0 10px;color:#374151;font-size:13px;">LOGIN</p>
+                  <p style="margin:0 0 16px;font-size:16px;font-weight:bold;color:#111827;word-break:break-all;">${emailSeguro}</p>
+                  <p style="margin:0 0 10px;color:#374151;font-size:13px;">SENHA</p>
+                  <p style="margin:0;font-size:16px;font-weight:bold;color:#111827;word-break:break-all;">${senhaSegura}</p>
+                </div>
+
+                <p style="margin:24px 0;">
+                  <a href="${siteUrlSeguro}" style="display:inline-block;background:#2563eb;color:#ffffff;padding:13px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">
+                    Acessar Plataforma de Leads
+                  </a>
+                </p>
+
+                <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px 16px;margin:20px 0;">
+                  <p style="margin:0;color:#9a3412;font-size:13px;"><strong>Segurança:</strong> recomendamos alterar esta senha após o primeiro acesso e não compartilhá-la.</p>
+                </div>
+
+                <p style="margin:0 0 8px;color:#6b7280;font-size:13px;">Se o botão não funcionar, acesse:</p>
+                <p style="margin:0 0 20px;word-break:break-all;font-size:13px;">
+                  <a href="${siteUrlSeguro}" style="color:#2563eb;">${siteUrlSeguro}</a>
+                </p>
+
+                <hr style="border:none;border-top:1px solid #e5e7eb;margin:22px 0;">
+                <p style="margin:0;color:#6b7280;font-size:13px;">Contato: <a href="mailto:${contatoEmailSeguro}" style="color:#2563eb;">${contatoEmailSeguro}</a></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      `
+    })
+  });
+
+  if (!res.ok) {
+    const detalhe = await res.text();
+    console.error("RESEND ACCESS EMAIL ERROR:", detalhe);
+    throw new Error("RESEND_ACCESS_EMAIL_SEND_FAILED");
+  }
+
+  console.log(
+    "[email-acesso] credenciais enviadas para",
+    destinatario.replace(/^(.{2}).*(@.*)$/, "$1***$2")
+  );
+}
+
 // Auditoria de segurança (2026-09): removido o fallback que comparava senha em
 // texto puro (senhaInformada === senhaSalva) para contas sem hash bcrypt.
 // Confirmado antes de remover: as 12 contas em produção já estavam 100% em
@@ -6583,7 +6686,18 @@ app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
       [email, senhaHash]
     );
 
-    return c.json({ message: "Usuário criado" });
+    let emailEnviado = false;
+    try {
+      await enviarEmailAcessoInicial(String(email), null, String(senha));
+      emailEnviado = true;
+    } catch (emailErr) {
+      console.error("ERRO EMAIL ACESSO /usuarios:", emailErr);
+    }
+
+    return c.json({
+      message: "Usuário criado",
+      email_enviado: emailEnviado
+    });
 
   } catch {
     return c.json({ error: "Usuário já existe" }, 400);
@@ -27267,9 +27381,22 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
       ]
     );
 
+    let emailEnviado = false;
+
+    try {
+      await enviarEmailAcessoInicial(email, nome, senha);
+      emailEnviado = true;
+    } catch (emailErr) {
+      console.error("GESTOR EMAIL ACESSO CLIENTE ERROR:", emailErr);
+    }
+
     return c.json({
       sucesso: true,
-      cliente: formatarClienteGerenciado(result.rows[0])
+      cliente: formatarClienteGerenciado(result.rows[0]),
+      email_enviado: emailEnviado,
+      aviso: emailEnviado
+        ? null
+        : "Corretor criado, mas não foi possível enviar o email de acesso."
     }, 201);
   } catch (err: any) {
     if (err?.code === "23505") {
@@ -41073,9 +41200,26 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       }
     }
 
+    let emailEnviado = false;
+
+    try {
+      await enviarEmailAcessoInicial(
+        String(email),
+        String(nome),
+        String(senha)
+      );
+      emailEnviado = true;
+    } catch (emailErr) {
+      console.error("ERRO EMAIL ACESSO NOVO USUARIO:", emailErr);
+    }
+
     return c.json({
       sucesso: true,
-      id: novoId
+      id: novoId,
+      email_enviado: emailEnviado,
+      aviso: emailEnviado
+        ? null
+        : "Usuário criado, mas não foi possível enviar o email de acesso."
     });
 
   } catch (err) {
