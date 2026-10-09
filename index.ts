@@ -21936,10 +21936,12 @@ app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const nome = typeof body.nome === "string" ? body.nome.trim() : "";
     const fonte = String(body.conjunto_origem_id || "");
+    const anuncioOrigemId = String(body.anuncio_origem_id || "");
     const numeroId = Number(body.whatsapp_numero_id);
     const orcamento = body.orcamento_diario_centavos == null
       ? null : Number(body.orcamento_diario_centavos);
     if (nome.length < 3 || nome.length > 120 || !/^\d+$/.test(fonte) ||
+        !/^\d+$/.test(anuncioOrigemId) ||
         !Number.isSafeInteger(numeroId) || numeroId <= 0 ||
         (orcamento !== null && (!Number.isSafeInteger(orcamento) || orcamento <= 0)))
       return c.json({ error: "Dados do novo conjunto inválidos" }, 400);
@@ -21959,7 +21961,7 @@ app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
     if ("erro" in ctx) return c.json({ error: ctx.erro }, ctx.status);
     const resultado = await criarConjuntoWhatsappPausadoMeta({
       campanhaId: ctx.campanhaId!, contaAdsId: ctx.contaAdsId!,
-      fonteId: fonte, numeroWhatsapp: numero, nome,
+      fonteId: fonte, anuncioOrigemId, numeroWhatsapp: numero, nome,
       orcamentoDiarioCentavos: orcamento, token: ctx.token!
     });
     return c.json(resultado, 201);
