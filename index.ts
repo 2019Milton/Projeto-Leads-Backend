@@ -36464,8 +36464,34 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     // criativo antigo.
     let criativoAtualizadoComErro: any = null;
 
-    // 🎨 ATUALIZAR CRIATIVO se campos visuais foram alterados
-    try {
+    // Só recria o criativo quando algo visual realmente mudou.
+    // Alterações de orçamento, público, lance ou agendamento não devem tocar
+    // no anúncio/criativo já publicado.
+    const valorVisual = (obj: any, ...chaves: string[]) => {
+      for (const chave of chaves) {
+        const valor = textoOpcional(obj?.[chave]);
+        if (valor) return valor;
+      }
+      return "";
+    };
+
+    const criativoFoiAlterado =
+      imageHashNovo !== undefined ||
+      imageHashesNovo !== undefined ||
+      videoRemovidoSolicitado ||
+      valorVisual(avancadas, "texto") !== valorVisual(configuracoesBanco, "texto") ||
+      valorVisual(avancadas, "titulo") !== valorVisual(configuracoesBanco, "titulo") ||
+      valorVisual(avancadas, "descricao") !== valorVisual(configuracoesBanco, "descricao") ||
+      valorVisual(avancadas, "link") !== valorVisual(configuracoesBanco, "link") ||
+      valorVisual(avancadas, "cta") !== valorVisual(configuracoesBanco, "cta") ||
+      valorVisual(avancadas, "page_id") !== valorVisual(configuracoesBanco, "page_id") ||
+      valorVisual(avancadas, "video_id", "videoId") !== valorVisual(configuracoesBanco, "video_id", "videoId") ||
+      JSON.stringify(avancadas?.plataformas || []) !== JSON.stringify(configuracoesBanco?.plataformas || []) ||
+      valorVisual(avancadas, "instagram_actor_id") !== valorVisual(configuracoesBanco, "instagram_actor_id");
+
+    if (criativoFoiAlterado) {
+      // 🎨 ATUALIZAR CRIATIVO somente quando imagem/vídeo/texto/CTA etc. mudaram.
+      try {
       const adId = campanhaBanco.rows[0]?.ad_id;
       const formId = campanhaBanco.rows[0]?.form_id;
       const cfgBanco = configuracoesBanco;
@@ -36697,9 +36723,12 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           message: "O anúncio publicado não possui todos os identificadores necessários para remover o vídeo com segurança."
         };
       }
-    } catch (errCreativo: any) {
-      criativoAtualizadoComErro = { message: errCreativo?.message || String(errCreativo) };
-      console.warn("EDITAR CAMPANHA: erro ao atualizar criativo (ignorado):", errCreativo);
+      } catch (errCreativo: any) {
+        criativoAtualizadoComErro = { message: errCreativo?.message || String(errCreativo) };
+        console.warn("EDITAR CAMPANHA: erro ao atualizar criativo (ignorado):", errCreativo);
+      }
+    } else {
+      console.log("EDITAR CAMPANHA: criativo preservado; alteração sem mudança visual.");
     }
 
     if (videoRemovidoSolicitado && criativoAtualizadoComErro) {
