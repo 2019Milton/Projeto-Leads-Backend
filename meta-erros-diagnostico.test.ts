@@ -49,6 +49,9 @@ test("validação Meta de conjunto usa execution_options validate_only sem criar
    const body=new URLSearchParams(String(init.body));
    expect(JSON.parse(String(body.get("execution_options")))).toEqual(["validate_only"]);
    expect(body.get("status")).toBe("PAUSED");
+   expect(JSON.parse(String(body.get("attribution_spec")))).toEqual([
+    {event_type:"CLICK_THROUGH",window_days:1}
+   ]);
    expect(JSON.parse(String(body.get("promoted_object"))).whatsapp_phone_number).toBe("5511959643372");
    postValidacao++;
    return R({success:true});
