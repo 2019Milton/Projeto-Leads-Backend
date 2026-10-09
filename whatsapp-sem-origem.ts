@@ -40,11 +40,20 @@ export async function garantirLeadWhatsAppSemOrigem(pool: any, conversaId: numbe
     if (!numero) throw new Error("Conversa sem telefone");
     const telefone = numero.startsWith("55") ? numero : `55${numero}`;
     // Mesmo critério de normalização usado no vínculo existente da aplicação.
-    const { rows: existentes } = await db.query(`SELECT id FROM leads WHERE usuario_id=$1 AND
-      (CASE WHEN regexp_replace(telefone,'[^0-9]','','g') LIKE '55%'
-       THEN regexp_replace(telefone,'[^0-9]','','g')
-       ELSE '55'||regexp_replace(telefone,'[^0-9]','','g') END)=$2 ORDER BY id LIMIT 1`, [usuarioId, telefone]);
-    let leadId = existentes[0]?.id;
+    // No modo múltiplos, cada par (número receptor, cliente) tem seu próprio lead.
+    // Não reaproveitar lead de outro número por coincidência de telefone.
+    const { rows: [recurso] } = await db.query(
+      "SELECT COALESCE(whatsapp_multiplos_numeros_habilitado,FALSE) AS habilitado FROM usuarios WHERE id=$1",
+      [usuarioId]
+    );
+    let leadId: number | undefined;
+    if (recurso?.habilitado !== true) {
+      const { rows: existentes } = await db.query(`SELECT id FROM leads WHERE usuario_id=$1 AND
+        (CASE WHEN regexp_replace(telefone,'[^0-9]','','g') LIKE '55%'
+         THEN regexp_replace(telefone,'[^0-9]','','g')
+         ELSE '55'||regexp_replace(telefone,'[^0-9]','','g') END)=$2 ORDER BY id LIMIT 1`, [usuarioId, telefone]);
+      leadId = existentes[0]?.id;
+    }
     if (!leadId) {
       const { rows: [lead] } = await db.query(`INSERT INTO leads
         (usuario_id,nome,telefone,origem,plataforma,status,campanha,criado_em)
