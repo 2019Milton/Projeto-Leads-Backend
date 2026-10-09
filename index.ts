@@ -1,4 +1,4 @@
-import { Hono } from "hono@4";
+﻿import { Hono } from "hono@4";
 import { cors } from "hono/cors";
 import { capturaNome, normalizarNome, renderizarTextoBot, salvarNomeBot } from "./whatsapp-bot-variaveis";
 import { Pool } from "pg";
@@ -42,6 +42,7 @@ import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META }
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
+import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 
 import {
   MODELO_SUGERIDO,
@@ -21877,6 +21878,94 @@ app.get("/meta/campanhas/:id/destino-whatsapp", authMiddleware, async (c) => {
   } catch (err) {
     console.error("[meta-destino-whatsapp] consulta falhou:", err instanceof Error ? err.message : "desconhecido");
     return c.json({ error: "Não foi possível consultar os destinos na Meta" }, 502);
+  }
+});
+
+
+// Consulta agregada por campanha, independente de ela ter sido criada na plataforma ou importada.
+// Todas as operações exigem conta Meta vinculada e propriedade da campanha.
+async function contextoConjuntosMeta(usuarioId: number, campanhaLocalId: number) {
+  const dados = await client.query(
+    "SELECT campaign_id,conta_anuncios_id FROM campanhas WHERE id=$1 AND usuario_id=$2 AND LOWER(COALESCE(plataforma,'meta')) IN ('meta','facebook','instagram') LIMIT 1",
+    [campanhaLocalId, usuarioId]
+  );
+  const campanha = dados.rows[0];
+  if (!campanha || !/^\d+$/.test(String(campanha.campaign_id || "")))
+    return { erro: "Campanha Meta não encontrada", status: 404 } as const;
+  const conexao = await client.query(
+    "SELECT access_token,conta_anuncios_id FROM meta_conexoes WHERE usuario_id=$1 ORDER BY id DESC LIMIT 1",
+    [usuarioId]
+  );
+  const meta = conexao.rows[0];
+  if (!meta?.access_token || !meta?.conta_anuncios_id)
+    return { erro: "Conecte a conta Meta", status: 400 } as const;
+  const normalizarConta = (v: unknown) => String(v || "").replace(/^act_/i, "");
+  if (!/^\d+$/.test(normalizarConta(meta.conta_anuncios_id)) ||
+      (campanha.conta_anuncios_id &&
+       normalizarConta(campanha.conta_anuncios_id) !== normalizarConta(meta.conta_anuncios_id)))
+    return { erro: "Campanha pertence a outra conta de anúncios", status: 409 } as const;
+  return {
+    campanhaId: String(campanha.campaign_id),
+    contaAdsId: "act_" + normalizarConta(meta.conta_anuncios_id),
+    token: String(meta.access_token)
+  };
+}
+
+app.get("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
+  const usuario: any = c.get("user");
+  const id = Number(c.req.param("id"));
+  if (!Number.isSafeInteger(id) || id <= 0) return c.json({ error: "Campanha inválida" }, 400);
+  try {
+    const ctx = await contextoConjuntosMeta(usuario.id, id);
+    if ("erro" in ctx) return c.json({ error: ctx.erro }, ctx.status);
+    const dados = await listarConjuntosCampanhaMeta(ctx.campanhaId!, ctx.token!);
+    return c.json(dados);
+  } catch (e) {
+    console.error("[meta-conjuntos] consulta:", e instanceof Error ? e.message : "indisponível");
+    return c.json({ error: "Não foi possível consultar os conjuntos de anúncios da Meta" }, 502);
+  }
+});
+
+// A criação não cria anúncios nem ativa veiculação: o novo conjunto nasce PAUSADO.
+// O usuário escolhe conscientemente um número e um conjunto da campanha para copiar o público.
+app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
+  const usuario: any = c.get("user");
+  const id = Number(c.req.param("id"));
+  if (!Number.isSafeInteger(id) || id <= 0) return c.json({ error: "Campanha inválida" }, 400);
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const nome = typeof body.nome === "string" ? body.nome.trim() : "";
+    const fonte = String(body.conjunto_origem_id || "");
+    const numeroId = Number(body.whatsapp_numero_id);
+    const orcamento = body.orcamento_diario_centavos == null
+      ? null : Number(body.orcamento_diario_centavos);
+    if (nome.length < 3 || nome.length > 120 || !/^\d+$/.test(fonte) ||
+        !Number.isSafeInteger(numeroId) || numeroId <= 0 ||
+        (orcamento !== null && (!Number.isSafeInteger(orcamento) || orcamento <= 0)))
+      return c.json({ error: "Dados do novo conjunto inválidos" }, 400);
+    const habilitado = await client.query(
+      "SELECT whatsapp_multiplos_numeros_habilitado FROM usuarios WHERE id=$1", [usuario.id]
+    );
+    if (habilitado.rows[0]?.whatsapp_multiplos_numeros_habilitado !== true)
+      return c.json({ error: "Múltiplos números não estão habilitados para este usuário" }, 403);
+    const numeroRes = await client.query(
+      "SELECT numero FROM whatsapp_numeros WHERE id=$1 AND usuario_id=$2 AND status='conectado' AND bot_ativo=TRUE LIMIT 1",
+      [numeroId, usuario.id]
+    );
+    const numero = normalizarTelefoneWhatsApp(numeroRes.rows[0]?.numero);
+    if (!/^55\d{10,11}$/.test(numero))
+      return c.json({ error: "Selecione um WhatsApp conectado e com bot ativo" }, 400);
+    const ctx = await contextoConjuntosMeta(usuario.id, id);
+    if ("erro" in ctx) return c.json({ error: ctx.erro }, ctx.status);
+    const resultado = await criarConjuntoWhatsappPausadoMeta({
+      campanhaId: ctx.campanhaId!, contaAdsId: ctx.contaAdsId!,
+      fonteId: fonte, numeroWhatsapp: numero, nome,
+      orcamentoDiarioCentavos: orcamento, token: ctx.token!
+    });
+    return c.json(resultado, 201);
+  } catch (e) {
+    console.error("[meta-conjuntos] criação:", e instanceof Error ? e.message : "indisponível");
+    return c.json({ error: e instanceof Error ? e.message : "Falha ao criar conjunto pausado" }, 400);
   }
 });
 
