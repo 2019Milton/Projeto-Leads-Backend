@@ -150,7 +150,18 @@ export function montarConjuntoWhatsappPausado(
     promoted_object: promovido,
     targeting: fonte.targeting
   };
-  for (const key of ["attribution_spec", "bid_strategy", "bid_amount"]) {
+  // Meta rejeita janelas herdadas de 7 dias ao criar novos conjuntos
+  // Click-to-WhatsApp otimizados para CONVERSATIONS (erro 100/1885423).
+  // Definir explicitamente clique de 1 dia NO NOVO conjunto. Não modifica a
+  // origem, o orçamento ou o estado dos anúncios já existentes.
+  if (payload.optimization_goal === "CONVERSATIONS") {
+    payload.attribution_spec = [{ event_type: "CLICK_THROUGH", window_days: 1 }];
+  } else if (fonte.attribution_spec !== null &&
+             fonte.attribution_spec !== undefined &&
+             fonte.attribution_spec !== "") {
+    payload.attribution_spec = fonte.attribution_spec;
+  }
+  for (const key of ["bid_strategy", "bid_amount"]) {
     if (fonte[key] !== null && fonte[key] !== undefined && fonte[key] !== "") {
       payload[key] = fonte[key];
     }

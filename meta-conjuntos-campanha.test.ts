@@ -62,6 +62,38 @@ test("monta novo conjunto pausado com CBO, copia público e troca o WhatsApp", (
   expect(r.payload.daily_budget).toBeUndefined();
 });
 
+test("CONVERSATIONS usa atribuição de clique em 1 dia em vez da configuração herdada de 7 dias", () => {
+  const fonte = {
+    ...origem,
+    attribution_spec: [
+      {event_type:"CLICK_THROUGH",window_days:7},
+      {event_type:"VIEW_THROUGH",window_days:1}
+    ]
+  };
+  const r=montarConjuntoWhatsappPausado(fonte,{id:"123"},
+    "5511959643372","DHIOR 3372",3500);
+  expect(r.payload.attribution_spec).toEqual([
+    {event_type:"CLICK_THROUGH",window_days:1}
+  ]);
+  expect(r.payload.optimization_goal).toBe("CONVERSATIONS");
+  expect(r.payload.status).toBe("PAUSED");
+  expect(r.payload.daily_budget).toBe(3500);
+  expect(fonte.attribution_spec[0].window_days).toBe(7);
+});
+test("CONVERSATIONS usa janela de 1 dia quando adset original não informa atribuição",()=>{
+  const r=montarConjuntoWhatsappPausado(origem,{id:"123"},
+    "5511980930205","DHIOR 0205",3500);
+  expect(r.payload.attribution_spec).toEqual([
+    {event_type:"CLICK_THROUGH",window_days:1}
+  ]);
+});
+test("não altera atribuição de outros objetivos diferentes de CONVERSATIONS",()=>{
+  const fonte = {...origem,optimization_goal:"LINK_CLICKS",
+    attribution_spec:[{event_type:"CLICK_THROUGH",window_days:7}]};
+  const r=montarConjuntoWhatsappPausado(fonte,{id:"123"},
+    "5511980930205","DIHOR 0205",3500);
+  expect(r.payload.attribution_spec).toEqual(fonte.attribution_spec);
+});
 test("ABO exige orçamento explícito e fonte com WhatsApp dentro da campanha", () => {
   expect(()=>montarConjuntoWhatsappPausado(origem,{id:"123"},
     "5511959643372","DIHOR 3372",2500).payload.daily_budget).not.toThrow();
@@ -90,6 +122,9 @@ test("criação duplica conjunto e anúncio mantendo ambos PAUSADOS e substituin
     if (u.includes("/act_123456/adsets") && init?.method==="POST") {
       const body=new URLSearchParams(String(init.body));
       expect(body.get("status")).toBe("PAUSED");
+      expect(JSON.parse(String(body.get("attribution_spec")))).toEqual([
+        {event_type:"CLICK_THROUGH",window_days:1}
+      ]);
       expect(body.get("daily_budget")).toBeNull();
       expect(JSON.parse(String(body.get("promoted_object"))).whatsapp_phone_number).toBe("5511980930205");
       posts.push("adset");
