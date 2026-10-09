@@ -6,6 +6,7 @@ import bcrypt from "bcryptjs";
 import sharp from "sharp";
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { validarDadosAssistente, sanitizarAcompanhamentoAssistente, criarContaGoogleAssistente } from "./assistente-contas";
 import {
   MINIMO_CONTAS_REDE,
   MINIMO_LEADS_REDE,
@@ -7871,6 +7872,13 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
            atualizado_em = NOW()
        WHERE usuario_id = $3 AND plataforma = 'google'`,
       [customerId, conta.login_customer_id, user.id]
+    );
+    // Libera a operação somente após a API confirmar o acesso à mesma conta.
+    await client.query(
+      `UPDATE assistente_contas_criacoes SET estado = 'vinculada', customer_id = $2, atualizado_em = NOW()
+       WHERE usuario_id = $1 AND plataforma = 'google' AND estado IN ('incerta', 'criada')
+       AND (customer_id = $2 OR (customer_id IS NULL AND dados->>'nome' = $3 AND dados->>'managerCustomerId' = $4))`,
+      [user.id, customerId, conta.nome, conta.login_customer_id]
     );
     return c.json({ sucesso: true });
   } catch (err: any) {
@@ -20761,6 +20769,7 @@ function sanitizarRascunhoAssistente(body: any) {
     etapa: Math.min(3, Math.max(1, Number(body?.etapa) || 1)),
     plataformas: plataformas.length ? plataformas : ["meta"],
     dados,
+    acompanhamento: sanitizarAcompanhamentoAssistente(body?.acompanhamento),
   };
 }
 
@@ -20768,7 +20777,7 @@ app.get("/assistente-contas-anuncios", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const result = await client.query(
-      `SELECT etapa, plataformas, dados, atualizado_em
+      `SELECT etapa, plataformas, dados, acompanhamento, atualizado_em
        FROM assistente_contas_anuncios WHERE usuario_id = $1 LIMIT 1`,
       [user.id]
     );
@@ -20778,6 +20787,7 @@ app.get("/assistente-contas-anuncios", authMiddleware, async (c) => {
         etapa: Number(salvo.etapa),
         plataformas: Array.isArray(salvo.plataformas) ? salvo.plataformas : ["meta"],
         dados: salvo.dados || {},
+        acompanhamento: salvo.acompanhamento || {},
         atualizado_em: salvo.atualizado_em,
       } : null,
     });
@@ -20791,17 +20801,22 @@ app.put("/assistente-contas-anuncios", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const rascunho = sanitizarRascunhoAssistente(await c.req.json());
+    const erros = validarDadosAssistente(rascunho.dados);
+    if (rascunho.etapa === 3 && Object.keys(erros).length) {
+      return c.json({ error: "Revise os dados da empresa antes de continuar.", campos: erros }, 422);
+    }
     const result = await client.query(
       `INSERT INTO assistente_contas_anuncios
-         (usuario_id, etapa, plataformas, dados, criado_em, atualizado_em)
-       VALUES ($1, $2, $3::jsonb, $4::jsonb, NOW(), NOW())
+         (usuario_id, etapa, plataformas, dados, acompanhamento, criado_em, atualizado_em)
+       VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, NOW(), NOW())
        ON CONFLICT (usuario_id) DO UPDATE
        SET etapa = EXCLUDED.etapa,
            plataformas = EXCLUDED.plataformas,
            dados = EXCLUDED.dados,
+           acompanhamento = EXCLUDED.acompanhamento,
            atualizado_em = NOW()
        RETURNING atualizado_em`,
-      [user.id, rascunho.etapa, JSON.stringify(rascunho.plataformas), JSON.stringify(rascunho.dados)]
+      [user.id, rascunho.etapa, JSON.stringify(rascunho.plataformas), JSON.stringify(rascunho.dados), JSON.stringify(rascunho.acompanhamento)]
     );
     return c.json({ sucesso: true, atualizado_em: result.rows[0]?.atualizado_em || null });
   } catch (err) {
@@ -20876,8 +20891,8 @@ app.get("/assistente-contas-anuncios/capacidades", authMiddleware, async (c) => 
           if (gerenciadoras.length) {
             capacidades.google.automatico = true;
             capacidades.google.modo = "automatico";
-            capacidades.google.titulo = "Criação automática disponível";
-            capacidades.google.detalhe = "A conta será criada como cliente da conta de administrador escolhida. Pagamento e eventuais verificações continuam no Google Ads.";
+            capacidades.google.titulo = "Conta de administrador encontrada";
+            capacidades.google.detalhe = "Você pode solicitar a criação. O Google ainda precisa aprovar a elegibilidade e as permissões; pagamento e verificações continuam no Google Ads.";
           } else {
             capacidades.google.titulo = "Conta de administrador necessária";
             capacidades.google.detalhe = "A conta conectada não é uma MCC. Crie ou conecte uma conta de administrador para liberar a criação automática.";
@@ -20960,49 +20975,25 @@ app.post("/assistente-contas-anuncios/google/criar", authMiddleware, async (c) =
       return c.json({ error: "A conta de administrador escolhida não está acessível nesta conexão" }, 403);
     }
 
-    const resposta = await fetch(
-      `${GOOGLE_ADS_API}/customers/${managerCustomerId}:createCustomerClient`,
-      {
-        method: "POST",
-        headers: googleAdsHeaders(accessToken, managerCustomerId),
-        body: JSON.stringify({
-          customerClient: {
-            descriptiveName: nome,
-            currencyCode: moeda,
-            timeZone: fuso,
-          },
-        }),
-      }
-    );
-    const data = await resposta.json() as any;
-    if (!resposta.ok || !data?.resourceName) {
-      const detalhe = data?.error?.details?.[0]?.errors?.[0]?.message
-        || data?.error?.message
-        || "O Google Ads recusou a criação da conta";
-      return c.json({ error: detalhe }, resposta.status >= 400 && resposta.status < 500 ? 400 : 502);
-    }
-
-    const customerId = String(data.resourceName).split("/").pop()?.replace(/\D/g, "");
-    if (!customerId) return c.json({ error: "O Google criou a conta, mas não retornou um identificador válido" }, 502);
-
-    await client.query(
-      `UPDATE plataforma_conexoes
-       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
-             'customer_id', $1::text,
-             'login_customer_id', $2::text,
-             'criada_pelo_assistente', true
-           ),
-           atualizado_em = NOW()
-       WHERE usuario_id = $3 AND plataforma = 'google'`,
-      [customerId, managerCustomerId, user.id]
-    );
-
-    return c.json({
-      sucesso: true,
-      customer_id: customerId,
-      manager_customer_id: managerCustomerId,
-      aviso: "Conta criada e selecionada. Configure o pagamento no Google Ads antes de publicar.",
+    const rascunho = await client.query("SELECT dados FROM assistente_contas_anuncios WHERE usuario_id = $1", [user.id]);
+    const erros = validarDadosAssistente(rascunho.rows[0]?.dados || {});
+    if (Object.keys(erros).length) return c.json({ error: "Revise e salve os dados da empresa antes de criar a conta.", campos: erros }, 422);
+    const resultado = await criarContaGoogleAssistente({
+      usuarioId: Number(user.id), dados: { nome, moeda, fuso, managerCustomerId },
+      query: (sql, params) => client.query(sql, params),
+      criar: async () => {
+        const resposta = await fetch(
+          `${GOOGLE_ADS_API}/customers/${managerCustomerId}:createCustomerClient`, {
+            method: "POST", signal: AbortSignal.timeout(30000),
+            headers: googleAdsHeaders(accessToken, managerCustomerId),
+            body: JSON.stringify({ customerClient: { descriptiveName: nome, currencyCode: moeda, timeZone: fuso } }),
+          }
+        );
+        return { ok: resposta.ok, status: resposta.status, data: await resposta.json() };
+      },
     });
+    return c.json(resultado.data, resultado.status as any);
+
   } catch (err: any) {
     console.error("ERRO /assistente-contas-anuncios/google/criar:", err);
     return c.json({ error: err?.message || "Erro ao criar a conta do Google Ads" }, 500);
@@ -21032,6 +21023,7 @@ app.post("/assistente-contas-anuncios/analisar-tela", authMiddleware, async (c) 
     }
 
     const body = await c.req.json();
+    if (body?.imagem_revisada !== true) return c.json({ error: "Revise a imagem e confirme o envio antes da análise." }, 400);
     const plataforma = limparTextoAssistente(body?.plataforma, 20).toLowerCase();
     if (!ASSISTENTE_CONTAS_PLATAFORMAS.includes(plataforma as any)) {
       return c.json({ error: "Plataforma inválida" }, 400);
@@ -26446,6 +26438,26 @@ await client.query(`
     criado_em       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     atualizado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+`);
+
+await client.query(`ALTER TABLE assistente_contas_anuncios ADD COLUMN IF NOT EXISTS acompanhamento JSONB NOT NULL DEFAULT '{}'::jsonb`);
+await client.query(`
+  CREATE TABLE IF NOT EXISTS assistente_contas_criacoes (
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    plataforma TEXT NOT NULL,
+    chave TEXT NOT NULL,
+    estado TEXT NOT NULL CHECK (estado IN ('em_andamento', 'incerta', 'criada', 'vinculada', 'recusada')),
+    dados JSONB NOT NULL,
+    customer_id TEXT,
+    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (usuario_id, plataforma, chave)
+  )
+`);
+await client.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS assistente_contas_criacao_pendente
+  ON assistente_contas_criacoes (usuario_id, plataforma)
+  WHERE estado IN ('em_andamento', 'incerta', 'criada')
 `);
 
 await client.query(`
