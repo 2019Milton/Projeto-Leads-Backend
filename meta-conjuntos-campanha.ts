@@ -2,6 +2,7 @@
  * Conjuntos de anúncios Meta associados a uma campanha.
  * Consulta de leitura e criação explicitamente pausada, sem alterar campanha original.
  */
+import { verificarAnuncioOriginalWhatsapp, criarAnuncioPausadoMeta } from "./meta-duplicacao-anuncio";
 type Req = (url: string, init?: RequestInit) => Promise<Response>;
 type Dict = Record<string, any>;
 const BASE = "https://graph.facebook.com/v25.0/";
@@ -165,12 +166,13 @@ export function montarConjuntoWhatsappPausado(
 export async function criarConjuntoWhatsappPausadoMeta(
   params: {
     campanhaId: string, contaAdsId: string, fonteId: string,
-    numeroWhatsapp: string, nome: string, orcamentoDiarioCentavos?: number | null, token: string
+    numeroWhatsapp: string, nome: string, anuncioOrigemId: string,
+    orcamentoDiarioCentavos?: number | null, token: string
   },
   req: Req = fetch
 ) {
-  const { campanhaId, contaAdsId, fonteId, numeroWhatsapp, nome, orcamentoDiarioCentavos, token } = params;
-  if (![campanhaId, fonteId].every(idValido) || !/^act_\d+$/.test(contaAdsId))
+  const { campanhaId, contaAdsId, fonteId, anuncioOrigemId, numeroWhatsapp, nome, orcamentoDiarioCentavos, token } = params;
+  if (![campanhaId, fonteId, anuncioOrigemId].every(idValido) || !/^act_\d+$/.test(contaAdsId))
     throw new Error("Identificadores da Meta inválidos");
   const [campanha, fonte] = await Promise.all([
     consultar(BASE + campanhaId + "?fields=id,account_id,daily_budget,lifetime_budget", token, req),
@@ -182,6 +184,13 @@ export async function criarConjuntoWhatsappPausadoMeta(
     throw new Error("A campanha remota pertence a outra conta de anúncios");
   }
   const { payload, cbo } = montarConjuntoWhatsappPausado(fonte, campanha, numeroWhatsapp, nome, orcamentoDiarioCentavos);
+  // Pré-valida o anúncio de origem e prepara um NOVO criativo com o WhatsApp novo
+  // ANTES de qualquer POST para a Meta. Nunca reutiliza um criativo com o número anterior.
+  const copia = await verificarAnuncioOriginalWhatsapp({
+    campanhaId, contaAdsId, conjuntoOrigemId: fonteId, anuncioOrigemId,
+    paginaOrigem: String(objeto(fonte.promoted_object).page_id),
+    numeroDestino: numeroWhatsapp, token
+  }, req);
   const body = new URLSearchParams();
   for (const [key, value] of Object.entries(payload)) {
     body.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
@@ -199,17 +208,70 @@ export async function criarConjuntoWhatsappPausadoMeta(
     const codigo = inteiro(dados?.error?.code) || resposta.status;
     throw new Error("Meta recusou a criação do conjunto (código " + codigo + "). Verifique permissões, orçamento e público.");
   }
+  const conjuntoId = String(dados.id);
   let numeroConfirmado: string | null = null;
+  let statusConfirmado: string | null = null;
+  let verificacaoConjuntoOk = false;
   try {
-    const criado = await consultar(BASE + String(dados.id) +
-      "?fields=id,status,destination_type,promoted_object", token, req);
+    const criado = await consultar(BASE + conjuntoId +
+      "?fields=id,status,campaign_id,destination_type,promoted_object", token, req);
     numeroConfirmado = texto(objeto(criado.promoted_object).whatsapp_phone_number) || null;
-  } catch { /* Mantém a criação pausada; usuário deve conferir na Meta */ }
-  return {
-    id: String(dados.id), nome: payload.name, status: "PAUSED",
+    statusConfirmado = texto(criado.status);
+    verificacaoConjuntoOk =
+      String(criado.campaign_id) === campanhaId &&
+      statusConfirmado === "PAUSED" &&
+      texto(criado.destination_type) === "WHATSAPP" &&
+      numeroConfirmado?.replace(/\D/g,"") === numeroWhatsapp;
+  } catch {
+    // Nenhum anúncio será criado se a Meta não confirmar o status e o WhatsApp.
+  }
+  const parcial = (aviso: string, anuncioId: string | null = null) => ({
+    id: conjuntoId, nome: payload.name,
+    status: statusConfirmado || "NAO_VERIFICADO",
     numero_solicitado: numeroWhatsapp, numero_confirmado: numeroConfirmado,
-    numero_verificado: Boolean(numeroConfirmado && numeroConfirmado.replace(/\D/g, "") === numeroWhatsapp),
-    cbo, anuncio_criado: false,
-    aviso: "Conjunto criado PAUSADO, sem anúncio. É necessário criar ou copiar um anúncio e conferir o destino antes da ativação."
+    numero_verificado: numeroConfirmado?.replace(/\D/g,"") === numeroWhatsapp,
+    cbo, anuncio_criado: Boolean(anuncioId), anuncio_id: anuncioId,
+    parcial: true, aviso
+  });
+  if (!verificacaoConjuntoOk) {
+    return parcial("O conjunto foi criado, mas a Meta não confirmou o destino e o status PAUSADO. Nenhum anúncio foi copiado. Confira o conjunto na Meta antes de qualquer nova tentativa.");
+  }
+  let anuncioId: string;
+  try {
+    anuncioId = await criarAnuncioPausadoMeta({
+      contaAdsId, conjuntoId,
+      nome: copia.nome + " - " + nome,
+      criativo: copia.criativo, token
+    }, req);
+  } catch (e) {
+    return parcial("O conjunto foi criado PAUSADO, mas a Meta recusou copiar o anúncio: " +
+      (e instanceof Error ? e.message : "erro inesperado") +
+      " Não repita a criação; confira o conjunto na Meta.");
+  }
+  let anuncioPausado = false;
+  let destinoCriativoConfirmado = false;
+  try {
+    const a = await consultar(BASE + anuncioId +
+      "?fields=id,status,adset_id,creative{id}", token, req);
+    anuncioPausado = String(a.adset_id) === conjuntoId && texto(a.status) === "PAUSED";
+    const creativeId = String(objeto(a.creative).id || "");
+    if (anuncioPausado && idValido(creativeId)) {
+      const criativoCriado = await consultar(BASE + creativeId +
+        "?fields=id,object_story_spec",token,req);
+      const spec=objeto(criativoCriado.object_story_spec);
+      const conteudo=objeto(spec.link_data || spec.video_data);
+      const numeroLido=texto(objeto(objeto(conteudo.call_to_action).value).whatsapp_number).replace(/\D/g,"");
+      destinoCriativoConfirmado = numeroLido === numeroWhatsapp;
+    }
+  } catch {
+    // Se a Meta não puder confirmar o novo criativo, não sinaliza sucesso completo.
+  }
+  if (!anuncioPausado || !destinoCriativoConfirmado) {
+    return parcial("Conjunto e anúncio foram criados, mas a Meta não confirmou ambos os status e o WhatsApp do novo criativo. Verifique os IDs na Meta antes de ativar.", anuncioId);
+  }
+  return {
+    ...parcial("Conjunto e anúncio PAUSADOS, WhatsApp do conjunto e do criativo confirmados. Faça a última conferência na prévia da Meta.", anuncioId),
+    parcial: false,
+    status: "PAUSED"
   };
 }
