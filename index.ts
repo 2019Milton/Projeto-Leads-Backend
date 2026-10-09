@@ -41,6 +41,7 @@ import {
 import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
+import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 
 import {
   MODELO_SUGERIDO,
@@ -1889,7 +1890,23 @@ function prepararNumeroWhatsappBrasilTikTok(valor: unknown) {
     : "";
 }
 
-async function obterNumeroWhatsappConectadoUsuario(usuarioId: number) {
+async function obterNumeroWhatsappConectadoUsuario(usuarioId: number, numeroIdSelecionado?: number | string | null) {
+  if (numeroIdSelecionado !== null && numeroIdSelecionado !== undefined && numeroIdSelecionado !== "") {
+    // A escolha explícita só vale para quem ativou múltiplos números.
+    const habilitado = await client.query(
+      "SELECT whatsapp_multiplos_numeros_habilitado FROM usuarios WHERE id=$1", [usuarioId]
+    );
+    if (habilitado.rows[0]?.whatsapp_multiplos_numeros_habilitado !== true) return "";
+    const id = Number(numeroIdSelecionado);
+    if (!Number.isSafeInteger(id) || id <= 0) return "";
+    const escolhido = await client.query(
+      `SELECT numero FROM whatsapp_numeros
+       WHERE usuario_id=$1 AND id=$2 AND status='conectado' AND bot_ativo=TRUE LIMIT 1`,
+      [usuarioId, id]
+    );
+    // Nunca substitui silenciosamente um número selecionado pelo principal.
+    return normalizarTelefoneWhatsApp(escolhido.rows[0]?.numero);
+  }
   const conexao = await client.query(
     `SELECT dados_conta->>'numero' AS numero
      FROM plataforma_conexoes
@@ -18122,7 +18139,7 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
 
     if (destino === "whatsapp") {
       const whatsappPhoneNumber =
-        await obterNumeroWhatsappConectadoUsuario(usuarioId);
+        await obterNumeroWhatsappConectadoUsuario(usuarioId, configuracoes_avancadas?.whatsapp_phone_number_id);
 
       if (!whatsappPhoneNumber) {
         return c.json({ error: "Reconecte o WhatsApp da plataforma para confirmar o número que receberá as conversas desta campanha." }, 400);
@@ -18327,7 +18344,7 @@ app.post("/meta/adset", authMiddleware, async (c) => {
 
     const whatsappPhoneNumber =
       destino === "whatsapp"
-        ? await obterNumeroWhatsappConectadoUsuario(usuarioId)
+        ? await obterNumeroWhatsappConectadoUsuario(usuarioId, avancadas.whatsapp_phone_number_id)
         : null;
 
     if (destino === "whatsapp" && !whatsappPhoneNumber) {
@@ -21831,6 +21848,38 @@ app.post("/whatsapp/conectar", authMiddleware, async (c) => {
   }
 });
 
+// Diagnóstico de anúncios importados: consulta a Meta sem persistir ou modificar o anúncio.
+app.get("/meta/campanhas/:id/destino-whatsapp", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  const id = Number(c.req.param("id"));
+  if (!Number.isSafeInteger(id) || id <= 0) return c.json({ error: "Campanha inválida" }, 400);
+  try {
+    const rows = await client.query(
+      `SELECT campaign_id, conta_anuncios_id FROM campanhas
+       WHERE id=$1 AND usuario_id=$2
+         AND LOWER(COALESCE(plataforma,'meta')) IN ('meta','facebook','instagram')
+       LIMIT 1`, [id,user.id]
+    );
+    const campanha = rows.rows[0];
+    if (!campanha || !/^\d+$/.test(String(campanha.campaign_id || "")))
+      return c.json({ error: "Campanha Meta não encontrada" }, 404);
+    const conn = await client.query(
+      `SELECT access_token, conta_anuncios_id FROM meta_conexoes
+       WHERE usuario_id=$1 ORDER BY id DESC LIMIT 1`, [user.id]
+    );
+    const meta = conn.rows[0];
+    if (!meta?.access_token) return c.json({ error: "Reconecte sua conta Meta" }, 400);
+    if (campanha.conta_anuncios_id && meta.conta_anuncios_id &&
+        String(campanha.conta_anuncios_id) !== String(meta.conta_anuncios_id))
+      return c.json({ error: "A conta Meta ativa não é a da campanha" }, 409);
+    const detalhes = await consultarDestinoWhatsappMeta(String(campanha.campaign_id), meta.access_token);
+    return c.json(detalhes);
+  } catch (err) {
+    console.error("[meta-destino-whatsapp] consulta falhou:", err instanceof Error ? err.message : "desconhecido");
+    return c.json({ error: "Não foi possível consultar os destinos na Meta" }, 502);
+  }
+});
+
 app.get("/whatsapp/numeros",authMiddleware,async(c)=>{
   const user:any=c.get("user");
   if (user.whatsapp_multiplos_numeros_habilitado !== true) {
@@ -24393,10 +24442,25 @@ async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise
     return null;
   }
 
-  const leadsUsuario = await client.query(
-    `SELECT id, telefone FROM leads WHERE usuario_id = $1 AND telefone IS NOT NULL`,
+  // Múltiplos números: uma conversa recebida em A nunca reutiliza o card
+  // que pertence à conversa do mesmo cliente em B.
+  const { rows: flags } = await client.query(
+    "SELECT COALESCE(whatsapp_multiplos_numeros_habilitado,FALSE) AS habilitado FROM usuarios WHERE id=$1",
     [usuarioId]
   );
+  const multiplos = flags[0]?.habilitado === true && !!conversa.phone_number_id;
+  const leadsUsuario = multiplos
+    ? await client.query(
+        `SELECT DISTINCT l.id,l.telefone FROM leads l
+         JOIN whatsapp_conversas wc ON wc.lead_id=l.id AND wc.usuario_id=l.usuario_id
+         WHERE l.usuario_id=$1 AND l.telefone IS NOT NULL
+           AND wc.phone_number_id=$2 AND wc.id<>$3`,
+        [usuarioId, String(conversa.phone_number_id), conversa.id]
+      )
+    : await client.query(
+        `SELECT id, telefone FROM leads WHERE usuario_id=$1 AND telefone IS NOT NULL`,
+        [usuarioId]
+      );
 
   const leadEncontrado = leadsUsuario.rows.find((lead: any) =>
     normalizarTelefoneWhatsApp(lead.telefone) === telefoneConversa
@@ -24489,30 +24553,48 @@ async function criarLeadDeConversaCTWA(conversa: any, usuarioId: number, nomeCon
   // conta_anuncios_id precisa vir preenchido: /meta/metricas-campanhas conta os
   // leads de cada campanha filtrando por ele (junto com o nome) — sem isso o
   // card mostra "0 leads" mesmo com o lead certinho no banco.
-  const leadInserido = await client.query(
-    `
-    INSERT INTO leads (
-      usuario_id, lead_id, ctwa_clid, nome, email, telefone,
-      origem, plataforma, rede_origem, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
-    )
-    VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', $5, 'novo', $6, $7, $8, $9, NOW())
-    RETURNING id
-    `,
-    [usuarioId, ctwaClid, nomeContato || "Lead WhatsApp (anúncio)", conversa.telefone_cliente, redeOrigem, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
-  );
-
-  const novoLeadId = leadInserido.rows[0].id;
-
-  await client.query(
-    `UPDATE whatsapp_conversas SET lead_id = $1 WHERE id = $2`,
-    [novoLeadId, conversa.id]
-  );
-
-  // Lead chegou diretamente pelo WhatsApp Bot. O próprio usuário já recebe a
-  // conversa no WhatsApp, então não enviamos a notificação redundante de
-  // "novo lead". Notificações de leads de formulário continuam normalmente.
-
-  return novoLeadId;
+  // Garante exatamente um lead por conversa mesmo se chegarem duas mensagens
+  // simultâneas do mesmo clique: ambas disputam o lock da mesma conversa.
+  const db = await client.connect();
+  try {
+    await db.query("BEGIN");
+    const reserva = await db.query(
+      "SELECT lead_id FROM whatsapp_conversas WHERE id=$1 AND usuario_id=$2 FOR UPDATE",
+      [conversa.id, usuarioId]
+    );
+    if (!reserva.rows.length) {
+      await db.query("ROLLBACK");
+      return null;
+    }
+    if (reserva.rows[0].lead_id) {
+      await db.query("COMMIT");
+      return reserva.rows[0].lead_id;
+    }
+    const leadInserido = await db.query(
+      `
+      INSERT INTO leads (
+        usuario_id, lead_id, ctwa_clid, nome, email, telefone,
+        origem, plataforma, rede_origem, status, campanha, campanha_id, nicho_id, conta_anuncios_id, criado_em
+      )
+      VALUES ($1, NULL, $2, $3, NULL, $4, 'meta', 'whatsapp', $5, 'novo', $6, $7, $8, $9, NOW())
+      RETURNING id
+      `,
+      [usuarioId, ctwaClid, nomeContato || "Lead WhatsApp (anúncio)", conversa.telefone_cliente, redeOrigem, nomeCampanha, campanhaId, nichoId, contaAnunciosId]
+    );
+    const novoLeadId = leadInserido.rows[0].id;
+    await db.query(
+      "UPDATE whatsapp_conversas SET lead_id=$1 WHERE id=$2 AND usuario_id=$3",
+      [novoLeadId, conversa.id, usuarioId]
+    );
+    await db.query("COMMIT");
+    // Mensagem recebida diretamente no bot: não notificar o próprio receptor.
+    return novoLeadId;
+  } catch (e) {
+    await db.query("ROLLBACK");
+    throw e;
+  } finally {
+    db.release();
+  }
 }
 
 // Equivalente LinkedIn de criarLeadDeConversaCTWA — o LinkedIn não manda
@@ -36680,7 +36762,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     if (destino === "whatsapp") {
       whatsappPhoneNumber =
-        await obterNumeroWhatsappConectadoUsuario(user.id);
+        await obterNumeroWhatsappConectadoUsuario(user.id, cfg.whatsapp_phone_number_id);
 
       if (!whatsappPhoneNumber) {
         return await falhar(
@@ -45278,7 +45360,7 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
 
     if (destino === "whatsapp") {
       whatsappPhoneNumber =
-        await obterNumeroWhatsappConectadoUsuario(rascunho.corretor_id);
+        await obterNumeroWhatsappConectadoUsuario(rascunho.corretor_id, cfgCampanha.whatsapp_phone_number_id);
 
       if (!whatsappPhoneNumber) {
         return c.json({ error: "O corretor precisa reconectar o WhatsApp da plataforma para confirmar o número desta campanha." }, 400);
