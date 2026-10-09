@@ -36070,7 +36070,8 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       imageHash: imageHashNovo,
       imageHashes: imageHashesNovo,
       imageUrls: imageUrlsNovo,
-      video_removido
+      video_removido,
+      atualizar_criativo
     } = await c.req.json();
 
     const videoRemovidoSolicitado = Boolean(
@@ -36476,18 +36477,21 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     };
 
     const criativoFoiAlterado =
-      imageHashNovo !== undefined ||
-      imageHashesNovo !== undefined ||
-      videoRemovidoSolicitado ||
-      valorVisual(avancadas, "texto") !== valorVisual(configuracoesBanco, "texto") ||
-      valorVisual(avancadas, "titulo") !== valorVisual(configuracoesBanco, "titulo") ||
-      valorVisual(avancadas, "descricao") !== valorVisual(configuracoesBanco, "descricao") ||
-      valorVisual(avancadas, "link") !== valorVisual(configuracoesBanco, "link") ||
-      valorVisual(avancadas, "cta") !== valorVisual(configuracoesBanco, "cta") ||
-      valorVisual(avancadas, "page_id") !== valorVisual(configuracoesBanco, "page_id") ||
-      valorVisual(avancadas, "video_id", "videoId") !== valorVisual(configuracoesBanco, "video_id", "videoId") ||
-      JSON.stringify(avancadas?.plataformas || []) !== JSON.stringify(configuracoesBanco?.plataformas || []) ||
-      valorVisual(avancadas, "instagram_actor_id") !== valorVisual(configuracoesBanco, "instagram_actor_id");
+      typeof atualizar_criativo === "boolean"
+        ? atualizar_criativo
+        : (
+            imageHashNovo !== undefined ||
+            imageHashesNovo !== undefined ||
+            videoRemovidoSolicitado ||
+            valorVisual(avancadas, "texto") !== valorVisual(configuracoesBanco, "texto") ||
+            valorVisual(avancadas, "titulo") !== valorVisual(configuracoesBanco, "titulo") ||
+            valorVisual(avancadas, "descricao") !== valorVisual(configuracoesBanco, "descricao") ||
+            valorVisual(avancadas, "link") !== valorVisual(configuracoesBanco, "link") ||
+            valorVisual(avancadas, "cta") !== valorVisual(configuracoesBanco, "cta") ||
+            valorVisual(avancadas, "page_id") !== valorVisual(configuracoesBanco, "page_id") ||
+            valorVisual(avancadas, "video_id", "videoId") !== valorVisual(configuracoesBanco, "video_id", "videoId") ||
+            valorVisual(avancadas, "instagram_actor_id") !== valorVisual(configuracoesBanco, "instagram_actor_id")
+          );
 
     if (criativoFoiAlterado) {
       // 🎨 ATUALIZAR CRIATIVO somente quando imagem/vídeo/texto/CTA etc. mudaram.
