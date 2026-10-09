@@ -2,6 +2,7 @@
  * Cópia segura de criativos para anúncios Click-to-WhatsApp.
  * Nunca reutiliza o ID do criativo antigo: ele poderia conter o número de destino original.
  */
+import {detalharErroMetaAdset} from "./meta-erros-diagnostico";
 type Objeto = Record<string, any>;
 type Req = (url: string, init?: RequestInit) => Promise<Response>;
 const BASE = "https://graph.facebook.com/v25.0/";
@@ -108,24 +109,53 @@ export async function verificarAnuncioOriginalWhatsapp(
     criativo: prepararCriativoWhatsappCopia(criativo,paginaOrigem,numeroDestino)};
 }
 
-export async function criarAnuncioPausadoMeta(
-  params:{contaAdsId:string,conjuntoId:string,nome:string,criativo:Objeto,token:string},
-  req:Req=fetch
-) {
-  const {contaAdsId,conjuntoId,nome,criativo,token}=params;
+export type CopiaAnuncioPausadoParams={
+  contaAdsId:string,conjuntoId:string,nome:string,criativo:Objeto,token:string
+};
+function bodyCopia(p:CopiaAnuncioPausadoParams,validar:boolean){
+  const {contaAdsId,conjuntoId,nome,criativo}=p;
   if(!/^act_\d+$/.test(contaAdsId)||!idOk(conjuntoId))
     throw new Error("ID da Meta inválido");
+  if(!nome?.trim()||!obj(criativo.object_story_spec).page_id)
+    throw new Error("Nome ou criativo do anúncio inválido");
   const body=new URLSearchParams({
     name:nome.slice(0,200),adset_id:conjuntoId,status:"PAUSED",
     creative:JSON.stringify(criativo)
   });
-  const response=await req(BASE+contaAdsId+"/ads",{
-    method:"POST",headers:{Authorization:"Bearer "+token,"Content-Type":"application/x-www-form-urlencoded"},
-    body:body.toString()
-  });
-  const data=await response.json().catch(()=>({}));
-  if(!response.ok || data.error || !idOk(data.id)) {
-    throw new Error("Meta recusou copiar o anúncio (código "+(data?.error?.code||response.status)+").");
-  }
-  return String(data.id);
+  if(validar)body.set("execution_options",JSON.stringify(["validate_only"]));
+  return body;
+}
+async function enviarAdPausadoMeta(
+ p:CopiaAnuncioPausadoParams,validar:boolean,req:Req
+) {
+ const body=bodyCopia(p,validar);
+ const response=await req(BASE+p.contaAdsId+"/ads",{
+  method:"POST",headers:{
+   Authorization:"Bearer "+p.token,
+   "Content-Type":"application/x-www-form-urlencoded"
+  },
+  body:body.toString()
+ });
+ const data=await response.json().catch(()=>({}));
+ if(!response.ok||data.error||(!validar&&!idOk(data.id))){
+   throw new Error("Meta recusou copiar o anúncio: "+detalharErroMetaAdset(data,response.status).resumo);
+ }
+ if(validar){
+   if(idOk(data.id))throw new Error(
+      "A Meta retornou um ID durante a validação. Confira o conjunto antes de continuar.");
+   if(data.success!==true)throw new Error("A Meta não confirmou a validação do anúncio.");
+   return {validacao_sem_criacao:true};
+ }
+ return {id:String(data.id)};
+}
+export async function validarAnuncioPausadoMeta(
+ p:CopiaAnuncioPausadoParams,req:Req=fetch
+){
+ return enviarAdPausadoMeta(p,true,req);
+}
+export async function criarAnuncioPausadoMeta(
+ p:CopiaAnuncioPausadoParams,req:Req=fetch
+){
+ const data=await enviarAdPausadoMeta(p,false,req);
+ return String(data.id);
 }

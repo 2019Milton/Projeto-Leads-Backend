@@ -44,6 +44,8 @@ import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsa
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
+import { validarCopiaAnuncioEmConjuntoExistente, copiarAnuncioEmConjuntoExistente }
+  from "./meta-anuncios-conjunto-existente";
 import { validarWhatsappAdsMeta } from "./meta-whatsapp-numeros-ads";
 
 import {
@@ -22017,6 +22019,67 @@ app.post("/meta/campanhas/:id/conjuntos/validar", authMiddleware,
   (c)=>processarNovoConjuntoMeta(c,true));
 app.post("/meta/campanhas/:id/conjuntos", authMiddleware,
   (c)=>processarNovoConjuntoMeta(c,false));
+
+/**
+ * Completar um conjunto já criado na Meta com seu anúncio, sem duplicar conjunto.
+ * As verificações de campanha/conta e de WhatsApp são realizadas também no servidor.
+ */
+async function processarCopiaAnuncioConjuntoExistente(c:any,somenteValidar:boolean){
+ const usuario:any=c.get("user");
+ const campanhaLocalId=Number(c.req.param("id"));
+ const conjuntoDestinoId=String(c.req.param("conjuntoId")||"");
+ if(!Number.isSafeInteger(campanhaLocalId)||campanhaLocalId<=0||
+    !/^\d+$/.test(conjuntoDestinoId))
+   return c.json({error:"Campanha ou conjunto inválido"},400);
+ try {
+   const body=await c.req.json().catch(()=>({}));
+   const conjuntoOrigemId=String(body.conjunto_origem_id||"");
+   const anuncioOrigemId=String(body.anuncio_origem_id||"");
+   if(!/^\d+$/.test(conjuntoOrigemId)||!/^\d+$/.test(anuncioOrigemId))
+     return c.json({error:"Selecione um conjunto e um anúncio de origem válidos"},400);
+   const ctx=await contextoConjuntosMeta(usuario.id,campanhaLocalId);
+   if("erro" in ctx)return c.json({error:ctx.erro},ctx.status);
+   // Conexões próprias do usuário: não aceitar números desconhecidos ou desconectados.
+   const destino=await fetch("https://graph.facebook.com/v25.0/"+conjuntoDestinoId+
+     "?fields=id,campaign_id,account_id,promoted_object,status,destination_type",{
+       headers:{Authorization:"Bearer "+ctx.token!}
+     });
+   const dados=await destino.json().catch(()=>({}));
+   if(!destino.ok||dados.error)
+     return c.json({error:"Não foi possível confirmar o conjunto de destino na Meta"},502);
+   if(String(dados.campaign_id)!==ctx.campanhaId ||
+      String(dados.account_id||"").replace(/^act_/,"")!==ctx.contaAdsId!.slice(4))
+     return c.json({error:"Conjunto não pertence à campanha ou conta Meta vinculada"},403);
+   const numero=normalizarTelefoneWhatsApp(dados.promoted_object?.whatsapp_phone_number);
+   if(!/^55\d{10,11}$/.test(numero))
+     return c.json({error:"WhatsApp do conjunto não pode ser identificado"},400);
+   const numeros=await client.query(
+     "SELECT numero,status FROM whatsapp_numeros WHERE usuario_id=$1 AND status='conectado'",
+     [usuario.id]
+   );
+   const registrado=numeros.rows.some((n:any)=>
+     normalizarTelefoneWhatsApp(n.numero)===numero);
+   if(!registrado)
+     return c.json({error:"WhatsApp do conjunto não está conectado a este usuário"},403);
+   const params={
+     campanhaId:ctx.campanhaId!,contaAdsId:ctx.contaAdsId!,
+     conjuntoDestinoId,conjuntoOrigemId,anuncioOrigemId,
+     numeroWhatsapp:numero,token:ctx.token!
+   };
+   const result=somenteValidar
+     ?await validarCopiaAnuncioEmConjuntoExistente(params)
+     :await copiarAnuncioEmConjuntoExistente(params);
+   return c.json(result,somenteValidar?200:201);
+ }catch(e){
+   const msg=e instanceof Error?e.message:"Falha ao copiar anúncio Meta";
+   console.warn(somenteValidar?"[meta-anuncio] validação":"[meta-anuncio] cópia",msg);
+   return c.json({error:msg,validacao_sem_criacao:somenteValidar},409);
+ }
+}
+app.post("/meta/campanhas/:id/conjuntos/:conjuntoId/copiar-anuncio/validar",
+ authMiddleware,(c)=>processarCopiaAnuncioConjuntoExistente(c,true));
+app.post("/meta/campanhas/:id/conjuntos/:conjuntoId/copiar-anuncio",
+ authMiddleware,(c)=>processarCopiaAnuncioConjuntoExistente(c,false));
 
 app.get("/whatsapp/numeros",authMiddleware,async(c)=>{
   const user:any=c.get("user");
