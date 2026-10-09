@@ -3,6 +3,7 @@
  * Consulta de leitura e criação explicitamente pausada, sem alterar campanha original.
  */
 import { verificarAnuncioOriginalWhatsapp, criarAnuncioPausadoMeta } from "./meta-duplicacao-anuncio";
+import { detalharErroMetaAdset } from "./meta-erros-diagnostico";
 type Req = (url: string, init?: RequestInit) => Promise<Response>;
 type Dict = Record<string, any>;
 const BASE = "https://graph.facebook.com/v25.0/";
@@ -163,13 +164,13 @@ export function montarConjuntoWhatsappPausado(
   return { payload, cbo };
 }
 
-export async function criarConjuntoWhatsappPausadoMeta(
-  params: {
-    campanhaId: string, contaAdsId: string, fonteId: string,
-    numeroWhatsapp: string, nome: string, anuncioOrigemId: string,
-    orcamentoDiarioCentavos?: number | null, token: string
-  },
-  req: Req = fetch
+export type NovoConjuntoMetaParams = {
+  campanhaId: string, contaAdsId: string, fonteId: string,
+  numeroWhatsapp: string, nome: string, anuncioOrigemId: string,
+  orcamentoDiarioCentavos?: number | null, token: string
+};
+async function prepararNovoConjuntoMeta(
+  params: NovoConjuntoMetaParams, req: Req
 ) {
   const { campanhaId, contaAdsId, fonteId, anuncioOrigemId, numeroWhatsapp, nome, orcamentoDiarioCentavos, token } = params;
   if (![campanhaId, fonteId, anuncioOrigemId].every(idValido) || !/^act_\d+$/.test(contaAdsId))
@@ -191,10 +192,54 @@ export async function criarConjuntoWhatsappPausadoMeta(
     paginaOrigem: String(objeto(fonte.promoted_object).page_id),
     numeroDestino: numeroWhatsapp, token
   }, req);
+  return {payload,cbo,copia};
+}
+function corpoConjuntoMeta(payload: Dict) {
   const body = new URLSearchParams();
   for (const [key, value] of Object.entries(payload)) {
     body.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
   }
+  return body;
+}
+
+export async function validarConjuntoWhatsappPausadoMeta(
+  params: NovoConjuntoMetaParams, req: Req=fetch
+) {
+  const { payload } = await prepararNovoConjuntoMeta(params,req);
+  const body = corpoConjuntoMeta(payload);
+  body.set("execution_options",JSON.stringify(["validate_only"]));
+  const resposta = await req(BASE+params.contaAdsId+"/adsets",{
+    method:"POST",
+    headers:{
+      Authorization:"Bearer "+params.token,
+      "Content-Type":"application/x-www-form-urlencoded"
+    },
+    body:body.toString()
+  });
+  const dados = await resposta.json().catch(()=>({}));
+  if(!resposta.ok || dados.error){
+    throw new Error(detalharErroMetaAdset(dados,resposta.status).resumo);
+  }
+  if(idValido(dados.id)) {
+    throw new Error("A Meta retornou um ID inesperado durante validação. Confira os conjuntos na Meta antes de prosseguir; não repita essa validação.");
+  }
+  return {
+    ok:true, validacao_sem_criacao:true,
+    aviso:"A Meta aceitou a validação dos dados do conjunto, sem criar anúncio. A criação efetiva poderá exigir conferências adicionais."
+  };
+}
+
+export async function criarConjuntoWhatsappPausadoMeta(
+  params: {
+    campanhaId: string, contaAdsId: string, fonteId: string,
+    numeroWhatsapp: string, nome: string, anuncioOrigemId: string,
+    orcamentoDiarioCentavos?: number | null, token: string
+  },
+  req: Req = fetch
+) {
+  const {contaAdsId,numeroWhatsapp,campanhaId,nome,token}=params;
+  const {payload,cbo,copia}=await prepararNovoConjuntoMeta(params,req);
+  const body=corpoConjuntoMeta(payload);
   const resposta = await req(BASE + contaAdsId + "/adsets", {
     method: "POST",
     headers: {
@@ -205,8 +250,7 @@ export async function criarConjuntoWhatsappPausadoMeta(
   });
   const dados = await resposta.json().catch(() => ({}));
   if (!resposta.ok || dados.error || !idValido(dados.id)) {
-    const codigo = inteiro(dados?.error?.code) || resposta.status;
-    throw new Error("Meta recusou a criação do conjunto (código " + codigo + "). Verifique permissões, orçamento e público.");
+    throw new Error(detalharErroMetaAdset(dados,resposta.status).resumo);
   }
   const conjuntoId = String(dados.id);
   let numeroConfirmado: string | null = null;

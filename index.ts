@@ -42,7 +42,7 @@ import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META }
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
-import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
+import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
 import { validarWhatsappAdsMeta } from "./meta-whatsapp-numeros-ads";
 
@@ -21961,7 +21961,7 @@ app.post("/meta/campanhas/:id/conjuntos/distribuir-orcamento", authMiddleware, a
   }
 });
 
-app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
+async function processarNovoConjuntoMeta(c:any,somenteValidar:boolean) {
   const usuario: any = c.get("user");
   const id = Number(c.req.param("id"));
   if (!Number.isSafeInteger(id) || id <= 0) return c.json({ error: "Campanha inválida" }, 400);
@@ -21993,21 +21993,30 @@ app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
     const numero = whatsappDestino.numero;
     const ctx = await contextoConjuntosMeta(usuario.id, id);
     if ("erro" in ctx) return c.json({ error: ctx.erro }, ctx.status);
-    const resultado = await criarConjuntoWhatsappPausadoMeta({
+    const params={
       campanhaId: ctx.campanhaId!, contaAdsId: ctx.contaAdsId!,
       fonteId: fonte, anuncioOrigemId, numeroWhatsapp: numero, nome,
       orcamentoDiarioCentavos: orcamento, token: ctx.token!
-    });
+    };
+    const resultado = somenteValidar
+      ? await validarConjuntoWhatsappPausadoMeta(params)
+      : await criarConjuntoWhatsappPausadoMeta(params);
     return c.json({
       ...resultado,
       aviso_bot: whatsappDestino.aviso_bot,
       bot_ativo: whatsappDestino.bot_ativo
-    }, 201);
+    }, somenteValidar ? 200 : 201);
   } catch (e) {
-    console.error("[meta-conjuntos] criação:", e instanceof Error ? e.message : "indisponível");
-    return c.json({ error: e instanceof Error ? e.message : "Falha ao criar conjunto pausado" }, 400);
+    console.error(somenteValidar ? "[meta-conjuntos] validação:" : "[meta-conjuntos] criação:",
+      e instanceof Error ? e.message : "indisponível");
+    return c.json({error: e instanceof Error ? e.message : "Meta não conseguiu validar a configuração",
+      validacao_sem_criacao: somenteValidar},400);
   }
-});
+}
+app.post("/meta/campanhas/:id/conjuntos/validar", authMiddleware,
+  (c)=>processarNovoConjuntoMeta(c,true));
+app.post("/meta/campanhas/:id/conjuntos", authMiddleware,
+  (c)=>processarNovoConjuntoMeta(c,false));
 
 app.get("/whatsapp/numeros",authMiddleware,async(c)=>{
   const user:any=c.get("user");
