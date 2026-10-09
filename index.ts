@@ -43,6 +43,7 @@ import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META }
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
+import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
 
 import {
   MODELO_SUGERIDO,
@@ -21928,6 +21929,37 @@ app.get("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
 
 // A criação não cria anúncios nem ativa veiculação: o novo conjunto nasce PAUSADO.
 // O usuário escolhe conscientemente um número e um conjunto da campanha para copiar o público.
+// Alteração explícita do orçamento ABO de um ou mais conjuntos; nunca muda status de anúncios.
+app.post("/meta/campanhas/:id/conjuntos/distribuir-orcamento", authMiddleware, async (c) => {
+  const usuario: any = c.get("user");
+  const localId = Number(c.req.param("id"));
+  if(!Number.isSafeInteger(localId)||localId<=0)
+    return c.json({error:"Campanha inválida"},400);
+  const body=await c.req.json().catch(()=>({}));
+  if(!Array.isArray(body.itens)||body.itens.length<1||body.itens.length>30)
+    return c.json({error:"Selecione os conjuntos para distribuir o orçamento."},400);
+  try{
+    const ctx=await contextoConjuntosMeta(usuario.id,localId);
+    if("erro" in ctx)return c.json({error:ctx.erro},ctx.status);
+    const itens=body.itens.map((x:any)=>({
+      id:String(x?.id||""),
+      centavos:Number(x?.centavos),
+      esperado_centavos:Number(x?.esperado_centavos),
+      esperado_status:String(x?.esperado_status||"")
+    }));
+    const resultado=await distribuirOrcamentosMeta({
+      campanhaId:ctx.campanhaId!,contaAdsId:ctx.contaAdsId!,
+      itens,totalCentavos:Number(body.total_centavos),token:ctx.token!
+    });
+    if(!resultado.ok)return c.json(resultado,409);
+    return c.json(resultado);
+  }catch(e){
+    const msg=e instanceof Error?e.message:"Erro ao atualizar orçamentos na Meta";
+    console.warn("[meta-orcamento-conjuntos]",msg);
+    return c.json({error:msg},409);
+  }
+});
+
 app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
   const usuario: any = c.get("user");
   const id = Number(c.req.param("id"));
