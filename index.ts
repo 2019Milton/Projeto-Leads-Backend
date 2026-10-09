@@ -44,6 +44,7 @@ import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsa
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
+import { validarWhatsappAdsMeta } from "./meta-whatsapp-numeros-ads";
 
 import {
   MODELO_SUGERIDO,
@@ -21983,12 +21984,13 @@ app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
     if (habilitado.rows[0]?.whatsapp_multiplos_numeros_habilitado !== true)
       return c.json({ error: "Múltiplos números não estão habilitados para este usuário" }, 403);
     const numeroRes = await client.query(
-      "SELECT numero FROM whatsapp_numeros WHERE id=$1 AND usuario_id=$2 AND status='conectado' AND bot_ativo=TRUE LIMIT 1",
+      "SELECT numero,status,bot_ativo FROM whatsapp_numeros WHERE id=$1 AND usuario_id=$2 LIMIT 1",
       [numeroId, usuario.id]
     );
-    const numero = normalizarTelefoneWhatsApp(numeroRes.rows[0]?.numero);
-    if (!/^55\d{10,11}$/.test(numero))
-      return c.json({ error: "Selecione um WhatsApp conectado e com bot ativo" }, 400);
+    const whatsappDestino = validarWhatsappAdsMeta(
+      numeroRes.rows[0], normalizarTelefoneWhatsApp
+    );
+    const numero = whatsappDestino.numero;
     const ctx = await contextoConjuntosMeta(usuario.id, id);
     if ("erro" in ctx) return c.json({ error: ctx.erro }, ctx.status);
     const resultado = await criarConjuntoWhatsappPausadoMeta({
@@ -21996,7 +21998,11 @@ app.post("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
       fonteId: fonte, anuncioOrigemId, numeroWhatsapp: numero, nome,
       orcamentoDiarioCentavos: orcamento, token: ctx.token!
     });
-    return c.json(resultado, 201);
+    return c.json({
+      ...resultado,
+      aviso_bot: whatsappDestino.aviso_bot,
+      bot_ativo: whatsappDestino.bot_ativo
+    }, 201);
   } catch (e) {
     console.error("[meta-conjuntos] criação:", e instanceof Error ? e.message : "indisponível");
     return c.json({ error: e instanceof Error ? e.message : "Falha ao criar conjunto pausado" }, 400);
