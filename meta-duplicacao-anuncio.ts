@@ -61,6 +61,22 @@ export function prepararCriativoWhatsappCopia(
     ? ["message","name","description","caption","link","image_hash","picture","attachment_style","multi_share_end_card","multi_share_optimized"]
     : ["message","title","video_id","image_url","image_hash","link_description"];
   const conteudo=props(base,permitidos);
+  // A leitura de criativos existentes pode retornar simultaneamente image_hash
+  // e image_url (thumbnail do mesmo vídeo). A API de criação de anúncios Meta
+  // rejeita os dois juntos: ObjectStorySpecRedundant, erro 100/1443051.
+  // Para a mesma conta de anúncios, preserva preferencialmente o hash original
+  // e remove a URL redundante. Não troca o vídeo nem o destino do CTA.
+  if(chave==="video_data") {
+    const temHash=typeof conteudo.image_hash==="string" &&
+      conteudo.image_hash.trim().length>0;
+    if(temHash) {
+      delete conteudo.image_url;
+    } else {
+      delete conteudo.image_hash;
+      if(typeof conteudo.image_url!=="string"||!conteudo.image_url.trim())
+        delete conteudo.image_url;
+    }
+  }
   if(chave==="video_data" && !conteudo.video_id)
     throw new Error("O vídeo original não retornou seu ID para cópia segura.");
   if(chave==="link_data" && !conteudo.image_hash && !conteudo.picture)
