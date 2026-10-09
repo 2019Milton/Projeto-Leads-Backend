@@ -1,4 +1,4 @@
-﻿type Req = (url: string, init?: RequestInit) => Promise<Response>;
+type Req = (url: string, init?: RequestInit) => Promise<Response>;
 type Obj = Record<string, any>;
 const obj = (x: unknown): Obj => x && typeof x === "object" && !Array.isArray(x) ? x as Obj : {};
 const txt = (x: unknown): string | null => typeof x === "string" && x.trim() ? x.trim() : null;
@@ -33,7 +33,7 @@ async function coletar(
 ): Promise<Obj[]> {
   const lista: Obj[] = [];
   const vistos = new Set<string>();
-  let url: string | null = "https://graph.facebook.com/v19.0/" +
+  let url: string | null = "https://graph.facebook.com/v25.0/" +
     encodeURIComponent(campanhaId) + "/" + aresta +
     "?fields=" + encodeURIComponent(fields) + "&limit=100";
   while (url && vistos.size < 3 && lista.length < 300) {

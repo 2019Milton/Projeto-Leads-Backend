@@ -1,4 +1,4 @@
-﻿import { Hono } from "hono@4";
+import { Hono } from "hono@4";
 import { cors } from "hono/cors";
 import { capturaNome, normalizarNome, renderizarTextoBot, salvarNomeBot } from "./whatsapp-bot-variaveis";
 import { Pool } from "pg";
@@ -21895,7 +21895,7 @@ app.get("/whatsapp/numeros",authMiddleware,async(c)=>{
        LEFT JOIN campanhas c ON c.id=wn.campanha_id AND c.usuario_id=wn.usuario_id
        LEFT JOIN whatsapp_bot_config r ON r.id=wn.roteiro_id AND r.usuario_id=wn.usuario_id
        WHERE wn.usuario_id=$1 ORDER BY wn.principal DESC,wn.criado_em ASC`,[user.id]);
-    return c.json({numeros:rows.rows});
+    return c.json({numeros:rows.rows, habilitado:true});
   }catch(err){console.error("ERRO GET /whatsapp/numeros:",err);return c.json({error:"Erro ao carregar números do WhatsApp"},500);}
 });
 

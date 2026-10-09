@@ -9,7 +9,7 @@ const source = fs.readFileSync(path.join(__dirname, "index.ts"),"utf8");
 const inicio = source.indexOf("async function obterNumeroWhatsappConectadoUsuario(");
 const fim = source.indexOf("// Objetivo da campanha:",inicio);
 assert.ok(inicio > 0 && fim > inicio);
-const codigo = stripTypeScriptTypes(source.slice(inicio,fim),{mode:"transform"});
+const codigo = typeof Bun !== "undefined" ? new Bun.Transpiler({loader:"ts",target:"node"}).transformSync(source.slice(inicio,fim)) : stripTypeScriptTypes(source.slice(inicio,fim),{mode:"transform"});
 function fixture(enabled = true) {
   const banco = {
     async query(sql,params) {
