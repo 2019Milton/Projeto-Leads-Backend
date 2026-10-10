@@ -44,6 +44,8 @@ import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsa
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
+import { atribuirJanelaSomenteSeSolicitada, erroMetaLimiteChamadas, MENSAGEM_LIMITE_META }
+  from "./meta-edicao-seguranca";
 import { validarCopiaAnuncioEmConjuntoExistente, copiarAnuncioEmConjuntoExistente }
   from "./meta-anuncios-conjunto-existente";
 import { validarWhatsappAdsMeta } from "./meta-whatsapp-numeros-ads";
@@ -927,6 +929,9 @@ async function enviarPayloadMetaComFallbackBid(
   // erro "resolvido" reaparecer na resposta final.
   let payloadAtual = payload;
   let resposta = await enviar(payloadAtual);
+  // Limite de chamadas da Meta (613): não fazer um segundo POST
+  // que pode bloquear ainda mais a integração ou produzir efeitos duplicados.
+  if (erroMetaLimiteChamadas(resposta)) return resposta;
 
   if (erroMetaBidAmount(resposta)) {
     const tinhaStrategy = !!payloadAtual.bid_strategy;
@@ -947,6 +952,7 @@ async function enviarPayloadMetaComFallbackBid(
 
     payloadAtual = retryPayload;
     resposta = await enviar(payloadAtual);
+    if (erroMetaLimiteChamadas(resposta)) return resposta;
   }
 
   if (erroMetaIdade(resposta) && payloadAtual.targeting) {
@@ -36183,7 +36189,8 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       imageHashes: imageHashesNovo,
       imageUrls: imageUrlsNovo,
       video_removido,
-      atualizar_criativo
+      atualizar_criativo,
+      alterar_atribuicao_meta
     } = await c.req.json();
 
     const videoRemovidoSolicitado = Boolean(
@@ -36487,28 +36494,17 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
 
     // Janela de atribuição — mesmo mapeamento usado na criação (POST /meta/adset),
     // antes ausente aqui: o campo existia na tela de edição mas não tinha efeito
-    // nenhum, porque nunca chegava a ser incluído no payload enviado à Meta.
-    const atribuicaoEdicao =
-      textoOpcional(avancadas.attribution_spec);
-
-    if (atribuicaoEdicao) {
-      const janelasValidas: Record<string, object> = {
-        "1d_click": [{ event_type: "CLICK_THROUGH", window_days: 1 }],
-        "7d_click": [{ event_type: "CLICK_THROUGH", window_days: 7 }],
-        "28d_click": [{ event_type: "CLICK_THROUGH", window_days: 28 }],
-        "1d_click_1d_view": [
-          { event_type: "CLICK_THROUGH", window_days: 1 },
-          { event_type: "VIEW_THROUGH", window_days: 1 }
-        ],
-        "7d_click_1d_view": [
-          { event_type: "CLICK_THROUGH", window_days: 7 },
-          { event_type: "VIEW_THROUGH", window_days: 1 }
-        ]
-      };
-
-      if (janelasValidas[atribuicaoEdicao]) {
-        payloadAdset.attribution_spec = janelasValidas[atribuicaoEdicao];
-      }
+    // Não enviar a atribuição herdada do conjunto quando o usuário apenas
+    // abre e salva a campanha. Campanhas antigas podem exibir 7 dias na tela,
+    // mas a Meta exige 1 dia para CONVERSATIONS. Reenviar os 7 dias causava
+    // código 100, depois fallback POST imediato, que ativava rate-limit 613.
+    // Só envia quando houver mudança explícita do seletor pelo usuário.
+    try {
+      Object.assign(payloadAdset,atribuirJanelaSomenteSeSolicitada(
+        avancadas.attribution_spec, alterar_atribuicao_meta
+      ));
+    } catch(e) {
+      return c.json({error:e instanceof Error?e.message:"Atribuição inválida"},400);
     }
 
     let adsetRes = await enviarPayloadMetaComFallbackBid(
@@ -36517,36 +36513,21 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       "EDITAR_ADSET"
     );
 
-    console.log(
-      "EDITAR CAMPANHA PAYLOAD:",
-      JSON.stringify(payloadAdset, null, 2)
-    );
-
-    console.log("EDITAR CAMPANHA RESPONSE:", adsetRes);
-
-    // Mesmo self-healing da criação: se a janela de atribuição for incompatível
-    // com o objetivo/otimização atual do conjunto, tenta de novo sem ela em vez
-    // de devolver o erro cru pro usuário.
-    if (adsetRes.error && payloadAdset.attribution_spec) {
-      const errMsgAtribuicao = String(
-        adsetRes.error?.error_user_msg ||
-        adsetRes.error?.message ||
-        ""
-      ).toLowerCase();
-
-      if (
-        errMsgAtribuicao.includes("attribution") ||
-        errMsgAtribuicao.includes("atribuição") ||
-        errMsgAtribuicao.includes("atribuicao")
-      ) {
-        console.log("EDITAR_ADSET: attribution_spec rejeitada pela Meta, tentando sem ela...");
-        delete payloadAdset.attribution_spec;
-        adsetRes = await enviarPayloadMetaComFallbackBid(
-          `https://graph.facebook.com/v19.0/${adsetId}`,
-          payloadAdset,
-          "EDITAR_ADSET_RETRY_ATTRIBUTION"
-        );
-      }
+    // Nunca registrar payload com access_token ou segmentações completas.
+    console.info("[meta-edicao] retorno do conjunto",{
+      adsetId:String(adsetId),
+      campos:Object.keys(payloadAdset).filter(k=>k!=="access_token"),
+      codigo_erro:adsetRes?.error?.code||null,
+      subcodigo_erro:adsetRes?.error?.error_subcode||null
+    });
+    // Não repetir automaticamente a edição quando Meta recusar atribuição:
+    // a tentativa anterior já foi processada e a repetição pode causar #613.
+    if (erroMetaLimiteChamadas(adsetRes)) {
+      return c.json({
+        error:MENSAGEM_LIMITE_META,
+        codigo_meta:613,
+        esperar_segundos:30
+      },429);
     }
 
     if (adsetRes.error) {
