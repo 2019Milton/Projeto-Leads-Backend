@@ -44,8 +44,10 @@ import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsa
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
+import { anexarResumoCrmPorConjunto } from "./meta-conjuntos-crm-resumo";
+import { consultarResumoConjuntosNoCrm } from "./meta-conjuntos-crm-consulta";
 import {
-  intervaloDistribuicao,mapearConjuntosMeta,agregarDistribuicao
+  intervaloDistribuicao,mapearConjuntosMeta,agregarDistribuicao,dataHojeBrasil
 } from "./meta-distribuicao-leads";
 import { alterarStatusItemMeta } from "./meta-controle-veiculacao";
 import { atribuirJanelaSomenteSeSolicitada, erroMetaLimiteChamadas, MENSAGEM_LIMITE_META }
@@ -22139,6 +22141,26 @@ app.get("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
     const ctx = await contextoConjuntosMeta(usuario.id, id);
     if ("erro" in ctx) return c.json({ error: ctx.erro }, ctx.status);
     const dados = await listarConjuntosCampanhaMeta(ctx.campanhaId!, ctx.token!);
+    const hoje = dataHojeBrasil();
+    try {
+      // Nenhuma chamada extra à Meta; consulta agregada e só de leitura no CRM.
+      const resumo = await consultarResumoConjuntosNoCrm(
+        client,usuario.id,dados.conjuntos,hoje
+      );
+      dados.conjuntos = anexarResumoCrmPorConjunto(dados.conjuntos,resumo,hoje);
+    }catch(erro){
+      // Uma falha isolada de CRM não impede ver status, orçamento e métricas
+      // da Meta. Null aqui = consulta indisponível, nunca 0 inventado.
+      console.warn("[meta-conjuntos-crm] consulta indisponível:",
+        erro instanceof Error ? erro.message : "erro");
+      (dados as any).aviso_crm="Não foi possível consultar os leads do CRM agora.";
+      dados.conjuntos=dados.conjuntos.map((conjunto:any)=>({
+        ...conjunto,metricas_crm:{
+          data_hoje:hoje,leads_whatsapp_hoje:null,
+          leads_anuncio_hoje:null,leads_anuncio_30d:null
+        }
+      }));
+    }
     return c.json(dados);
   } catch (e) {
     console.error("[meta-conjuntos] consulta:", e instanceof Error ? e.message : "indisponível");
