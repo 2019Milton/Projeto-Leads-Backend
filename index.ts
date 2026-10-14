@@ -38139,7 +38139,12 @@ app.get("/leads", authMiddleware, async (c) => {
         COALESCE(l.plataforma, l.origem, 'formulario') AS plataforma,
         l.rede_origem,
         wt.transcricao AS whatsapp_transcricao,
-        wt.transcricao_cliente AS whatsapp_transcricao_cliente
+        wt.transcricao_cliente AS whatsapp_transcricao_cliente,
+        -- Todos os numeros receptores das conversas do lead. Um mesmo
+        -- cliente pode ter conversado com dois WhatsApps; nao escolher um
+        -- numero arbitrario e nao duplicar o lead na resposta do CRM.
+        COALESCE(wa_dest.numeros_whatsapp_recebedores,'[]'::jsonb)
+          AS numeros_whatsapp_recebedores
       FROM leads l
       LEFT JOIN nichos n ON n.id = l.nicho_id
       LEFT JOIN (
@@ -38149,6 +38154,22 @@ app.get("/leads", authMiddleware, async (c) => {
         WHERE wc.lead_id IS NOT NULL AND wml.direcao IN ('entrada', 'echo')
         GROUP BY wc.lead_id
       ) wt ON wt.lead_id = l.id
+      LEFT JOIN (
+        -- Agrega uma vez por lead e usuario, evitando varrer conversas para
+        -- cada card individual em contas com muitos leads.
+        SELECT wc_r.usuario_id,wc_r.lead_id,
+          jsonb_agg(DISTINCT jsonb_build_object(
+            'phone_number_id', wc_r.phone_number_id,
+            'numero', COALESCE(wn.numero, ''),
+            'nome', COALESCE(NULLIF(wn.display_name,''),NULLIF(wn.numero,''),'WhatsApp')
+          )) AS numeros_whatsapp_recebedores
+        FROM whatsapp_conversas wc_r
+        LEFT JOIN whatsapp_numeros wn
+          ON wn.usuario_id=wc_r.usuario_id AND wn.phone_number_id=wc_r.phone_number_id
+        WHERE wc_r.usuario_id=$1 AND wc_r.lead_id IS NOT NULL
+          AND COALESCE(wc_r.phone_number_id,'')<>''
+        GROUP BY wc_r.usuario_id,wc_r.lead_id
+      ) wa_dest ON wa_dest.usuario_id=l.usuario_id AND wa_dest.lead_id=l.id
       WHERE l.usuario_id = $1
       AND (
         COALESCE(l.origem, 'manual') <> 'meta'
@@ -38163,6 +38184,22 @@ app.get("/leads", authMiddleware, async (c) => {
     );
 
     marcarLeadsRecorrentes(result.rows);
+
+    // Opcoes vindas dos numeros conectados deste usuario, incluindo os que
+    // ainda nao receberam leads. Nenhum WhatsApp de outra conta é exposto.
+    const numerosDisponiveisRes=await client.query(
+      `SELECT phone_number_id,numero,display_name
+         FROM whatsapp_numeros
+        WHERE usuario_id=$1 AND status='conectado'
+          AND COALESCE(phone_number_id,'')<>''
+        ORDER BY principal DESC,numero ASC`,
+      [user.id]
+    );
+    const numerosDisponiveis=numerosDisponiveisRes.rows.map((numero:any)=>({
+      phone_number_id:String(numero.phone_number_id),
+      numero:String(numero.numero||""),
+      nome:String(numero.display_name||"WhatsApp")
+    }));
 
     // 🔥 separa por status
     const leads = {
@@ -38238,7 +38275,7 @@ app.get("/leads", authMiddleware, async (c) => {
         }
     }
 
-    return c.json(leads);
+    return c.json({...leads,whatsapp_numeros_disponiveis:numerosDisponiveis});
 
   } catch (err) {
 
