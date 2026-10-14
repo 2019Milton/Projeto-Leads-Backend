@@ -44,6 +44,9 @@ import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsa
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
+import {
+  intervaloDistribuicao,mapearConjuntosMeta,agregarDistribuicao
+} from "./meta-distribuicao-leads";
 import { alterarStatusItemMeta } from "./meta-controle-veiculacao";
 import { atribuirJanelaSomenteSeSolicitada, erroMetaLimiteChamadas, MENSAGEM_LIMITE_META }
   from "./meta-edicao-seguranca";
@@ -21921,6 +21924,178 @@ async function contextoConjuntosMeta(usuarioId: number, campanhaLocalId: number)
     token: String(meta.access_token)
   };
 }
+
+// Leitura do relatório do Dashboard Meta: métricas reais do CRM por número,
+// atribuição a conjunto somente quando source_id do referral coincide com
+// anúncio confirmado na Meta. Nenhum gasto ou lead é inventado por orçamento.
+type SnapshotMetaDistribuicao={
+  ate:number;conjuntos:ReturnType<typeof mapearConjuntosMeta>;
+};
+const cacheMetaDistribuicao=new Map<string,SnapshotMetaDistribuicao>();
+const locksMetaDistribuicao=new Map<string,Promise<ReturnType<typeof mapearConjuntosMeta>>>();
+const ultimaConsultaMetaDistribuicao=new Map<string,number>();
+async function buscarConjuntosDistribuicaoMeta(
+  usuarioId:number,campanhaId:string,token:string,inicio:string,fim:string
+){
+  const chave=[usuarioId,campanhaId,inicio,fim].join(":");
+  const atual=Date.now();
+  const cache=cacheMetaDistribuicao.get(chave);
+  if(cache?.ate&&cache.ate>atual)return cache.conjuntos;
+  const pendente=locksMetaDistribuicao.get(chave);
+  if(pendente)return await pendente;
+  const tarefa=(async()=>{
+    const contaChave=String(usuarioId)+":"+String(campanhaId);
+    const anterior=ultimaConsultaMetaDistribuicao.get(contaChave)||0;
+    const restante=Math.ceil((30000-(Date.now()-anterior))/1000);
+    if(restante>0)
+      throw Object.assign(new Error("Aguarde "+restante+" segundos antes de consultar outro período na Meta. Os leads já vinculados no CRM continuam disponíveis."),{httpStatus:429});
+    ultimaConsultaMetaDistribuicao.set(contaChave,Date.now());
+    if(ultimaConsultaMetaDistribuicao.size>250)ultimaConsultaMetaDistribuicao.clear();
+    const campos=[
+      "id","name","status","daily_budget","promoted_object",
+      "ads.limit(100){id,name}",
+      'insights.time_range({"since":"'+inicio+'","until":"'+fim+'"}){spend}'
+    ].join(",");
+    const url="https://graph.facebook.com/v25.0/"+campanhaId+
+      "/adsets?fields="+encodeURIComponent(campos)+"&limit=100";
+    const response=await fetch(url,{headers:{Authorization:"Bearer "+token}});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok||data.error){
+      const codigo=Number(data?.error?.code||response.status);
+      if(codigo===613){
+        throw Object.assign(new Error("A Meta limitou as consultas. Aguarde 30 segundos e tente novamente."),
+          {httpStatus:429});
+      }
+      throw Object.assign(new Error("A Meta não disponibilizou os conjuntos deste período (código "+
+        codigo+"). Tente atualizar mais tarde."),{httpStatus:502});
+    }
+    const conjuntos=mapearConjuntosMeta(data);
+    // Cache curto também para campanhas com muitos conjuntos; dados sempre
+    // isolados por usuário, campanha e intervalo; jamais persiste token.
+    cacheMetaDistribuicao.set(chave,{ate:Date.now()+120000,conjuntos});
+    if(cacheMetaDistribuicao.size>250)cacheMetaDistribuicao.clear();
+    return conjuntos;
+  })();
+  locksMetaDistribuicao.set(chave,tarefa);
+  try{return await tarefa;}finally{locksMetaDistribuicao.delete(chave);}
+}
+// Lista local: não chama Meta, respeita a conta selecionada e autenticação.
+app.get("/meta/distribuicao-leads/campanhas",authMiddleware,async(c)=>{
+  const usuario:any=c.get("user");
+  try{
+    const conn=await client.query(
+      "SELECT conta_anuncios_id FROM meta_conexoes WHERE usuario_id=$1 ORDER BY id DESC LIMIT 1",
+      [usuario.id]
+    );
+    const conta=String(conn.rows[0]?.conta_anuncios_id||"").replace(/^act_/i,"");
+    if(!/^\d+$/.test(conta))return c.json({campanhas:[],conectado:false});
+    const dados=await client.query(
+      `SELECT id,nome,campaign_id FROM campanhas
+        WHERE usuario_id=$1 AND COALESCE(LOWER(plataforma),'meta') IN ('meta','facebook','instagram')
+          AND REPLACE(COALESCE(conta_anuncios_id,''),'act_','')=$2
+          AND campaign_id ~ '^([0-9]+)$'
+        ORDER BY nome ASC,id ASC LIMIT 150`,
+      [usuario.id,conta]
+    );
+    return c.json({campanhas:dados.rows.map((x:any)=>({
+      id:x.id,nome:x.nome||"Campanha "+x.id,
+      meta_id:String(x.campaign_id)
+    })),conectado:true});
+  }catch(e){
+    console.warn("[meta-distribuicao] lista indisponível",e instanceof Error?e.message:"erro");
+    return c.json({error:"Não foi possível listar campanhas Meta."},502);
+  }
+});
+app.get("/meta/distribuicao-leads",authMiddleware,async(c)=>{
+  const usuario:any=c.get("user");
+  const localId=Number(c.req.query("campanha_id"));
+  if(!Number.isSafeInteger(localId)||localId<=0)
+    return c.json({error:"Selecione uma campanha Meta válida."},400);
+  let periodo:ReturnType<typeof intervaloDistribuicao>;
+  try{
+    periodo=intervaloDistribuicao(
+      String(c.req.query("periodo")||"hoje"),
+      c.req.query("inicio"),c.req.query("fim")
+    );
+  }catch(e){return c.json({error:e instanceof Error?e.message:"Período inválido"},400);}
+  try{
+    const ctx=await contextoConjuntosMeta(usuario.id,localId);
+    if("erro" in ctx)return c.json({error:ctx.erro},ctx.status);
+    let conjuntos:ReturnType<typeof mapearConjuntosMeta>=[];
+    let avisoMeta:string|null=null;
+    try {
+      conjuntos=await buscarConjuntosDistribuicaoMeta(
+        usuario.id,ctx.campanhaId!,ctx.token!,periodo.inicio,periodo.fim
+      );
+    }catch(e){
+      // Falhas de Insights/permissões e rate-limit não devem ocultar os leads
+      // que já estão atribuídos à campanha no CRM. Com mapa Meta ausente,
+      // o relatório é PARCIAL: sem contagem por conjunto/gasto.
+      avisoMeta=e instanceof Error?e.message:"Métricas Meta indisponíveis.";
+    }
+    const [numRes,leadRes]=await Promise.all([
+      client.query(
+        `SELECT DISTINCT ON (phone_number_id)
+              phone_number_id,numero,display_name
+          FROM whatsapp_numeros
+          WHERE usuario_id=$1 AND phone_number_id IS NOT NULL
+          ORDER BY phone_number_id,principal DESC,atualizado_em DESC`,
+        [usuario.id]
+      ),
+      client.query(
+        `SELECT l.id AS lead_id,l.campanha_id,
+              wc.phone_number_id,
+              wc.referral->>'source_id' AS source_id,
+              wc.referral->>'source_type' AS source_type
+           FROM leads l
+           JOIN whatsapp_conversas wc ON wc.lead_id=l.id AND wc.usuario_id=l.usuario_id
+           WHERE l.usuario_id=$1
+             AND (l.criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date
+                 BETWEEN $2::date AND $3::date
+             AND (
+               l.campanha_id=$4
+               OR (wc.referral->>'source_type')='ad'
+             )
+             AND (l.origem='meta' OR (wc.referral->>'source_type')='ad')
+           ORDER BY l.id ASC
+           LIMIT 20001`,
+        [usuario.id,periodo.inicio,periodo.fim,localId]
+      )
+    ]);
+    if(leadRes.rows.length>20000)
+      return c.json({error:"O período possui muitos leads para um relatório completo. Selecione um intervalo menor."},413);
+    const numeros=[...numRes.rows];
+    // Legado da conta principal: enriquecer só quando não houver o ID na tabela
+    // de múltiplos, preservando o número histórico na visão do Dashboard.
+    const legado=await client.query(
+      `SELECT dados_conta->>'phone_number_id' AS phone_number_id,
+              dados_conta->>'numero' AS numero,
+              dados_conta->>'display_name' AS display_name
+        FROM plataforma_conexoes WHERE usuario_id=$1 AND plataforma='whatsapp'
+          AND dados_conta->>'phone_number_id' IS NOT NULL LIMIT 1`,
+      [usuario.id]
+    ).catch(()=>({rows:[] as any[]}));
+    for(const l of legado.rows){
+      if(!numeros.some((n:any)=>String(n.phone_number_id)===String(l.phone_number_id)))
+        numeros.push(l);
+    }
+    const dados=agregarDistribuicao(leadRes.rows,conjuntos,numeros,localId);
+    return c.json({
+      campanha_id:localId,meta_campanha_id:ctx.campanhaId,
+      periodo,atualizado_em:new Date().toISOString(),
+      parcial:!!avisoMeta,aviso_meta:avisoMeta,
+      gasto_fonte:"Meta Ads (Insights por conjunto)",
+      leads_fonte:"CRM (contatos únicos vinculados a conversas WhatsApp)",
+      ...dados,
+      observacao:"Leads sem source_id reconhecido aparecem separados. Gasto e CPL podem ficar indisponíveis quando a Meta não informa Insights."
+    });
+  }catch(e){
+    const erro=e as Error&{httpStatus?:number};
+    console.warn("[meta-distribuicao] indisponível",erro?.message||"erro");
+    return c.json({error:erro?.message||"Relatório indisponível."},
+      [400,429,502].includes(Number(erro?.httpStatus))?Number(erro.httpStatus):502);
+  }
+});
 
 // Ativação/pausa individual de adset/anúncio, separada da edição da campanha.
 // Nunca modifica orçamento, criativos ou o status de toda a campanha.
