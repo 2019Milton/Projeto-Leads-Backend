@@ -44,6 +44,7 @@ import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsa
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
+import { alterarStatusItemMeta } from "./meta-controle-veiculacao";
 import { atribuirJanelaSomenteSeSolicitada, erroMetaLimiteChamadas, MENSAGEM_LIMITE_META }
   from "./meta-edicao-seguranca";
 import { validarCopiaAnuncioEmConjuntoExistente, copiarAnuncioEmConjuntoExistente }
@@ -21920,6 +21921,40 @@ async function contextoConjuntosMeta(usuarioId: number, campanhaLocalId: number)
     token: String(meta.access_token)
   };
 }
+
+// Ativação/pausa individual de adset/anúncio, separada da edição da campanha.
+// Nunca modifica orçamento, criativos ou o status de toda a campanha.
+app.post("/meta/campanhas/:id/status-item",authMiddleware,async(c)=>{
+  const usuario:any=c.get("user");
+  const id=Number(c.req.param("id"));
+  if(!Number.isSafeInteger(id)||id<=0)
+    return c.json({error:"Campanha inválida."},400);
+  try {
+    const body=await c.req.json().catch(()=>({}));
+    const ctx=await contextoConjuntosMeta(usuario.id,id);
+    if("erro" in ctx)return c.json({error:ctx.erro},ctx.status);
+    const result=await alterarStatusItemMeta({
+      campanhaId:ctx.campanhaId!,contaAdsId:ctx.contaAdsId!,
+      itemId:String(body.item_id||""),tipo:body.tipo,
+      statusDesejado:body.status_desejado,
+      statusEsperado:body.status_esperado,
+      token:ctx.token!
+    });
+    console.info("[meta-controle-veiculacao] Meta confirmou solicitação",{
+      item_id:result.item_id,tipo:result.tipo,
+      status_solicitado:result.status_solicitado
+    });
+    return c.json(result);
+  }catch(e){
+    const err=e as Error&{httpStatus?:number};
+    const code=[400,403,409,429,502].includes(Number(err?.httpStatus))
+      ?Number(err.httpStatus):502;
+    console.warn("[meta-controle-veiculacao] solicitação recusada",{
+      status:code,descricao:err?.message||"Erro"
+    });
+    return c.json({error:err?.message||"Meta não confirmou a operação."},code);
+  }
+});
 
 app.get("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
   const usuario: any = c.get("user");
