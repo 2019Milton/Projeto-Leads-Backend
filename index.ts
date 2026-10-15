@@ -22137,10 +22137,15 @@ app.get("/meta/campanhas/:id/conjuntos", authMiddleware, async (c) => {
   const usuario: any = c.get("user");
   const id = Number(c.req.param("id"));
   if (!Number.isSafeInteger(id) || id <= 0) return c.json({ error: "Campanha inválida" }, 400);
+  const periodoSolicitado = c.req.query("periodo") || "30d";
+  if(periodoSolicitado!=="hoje" && periodoSolicitado!=="30d")
+    return c.json({error:"Periodo invalido. Use hoje ou 30d."},400);
   try {
     const ctx = await contextoConjuntosMeta(usuario.id, id);
     if ("erro" in ctx) return c.json({ error: ctx.erro }, ctx.status);
-    const dados = await listarConjuntosCampanhaMeta(ctx.campanhaId!, ctx.token!);
+    const dados = await listarConjuntosCampanhaMeta(
+      ctx.campanhaId!, ctx.token!, fetch, periodoSolicitado
+    );
     const hoje = dataHojeBrasil();
     try {
       // Nenhuma chamada extra à Meta; consulta agregada e só de leitura no CRM.
