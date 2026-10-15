@@ -54,9 +54,12 @@ function numCriativo(criativo: Dict): string | null {
 }
 
 export async function listarConjuntosCampanhaMeta(
-  campanhaId: string, token: string, req: Req = fetch
+  campanhaId: string, token: string, req: Req = fetch,
+  periodo: "hoje" | "30d" = "30d"
 ) {
   if (!idValido(campanhaId)) throw new Error("Campanha inválida");
+  if (periodo !== "hoje" && periodo !== "30d")
+    throw new Error("Período de métricas inválido.");
   const [campanha, conjuntos, anuncios] = await Promise.all([
     consultar(BASE + campanhaId + "?fields=id,name,objective,status,daily_budget,lifetime_budget", token, req),
     listar(campanhaId + "/adsets",
@@ -67,10 +70,13 @@ export async function listarConjuntosCampanhaMeta(
   ]);
   let dadosMetricas: Dict[] = [];
   let avisoMetricas: string | null = null;
+  // Somente leitura: mesmos insights já consultados, com data_preset explícito.
+  // Hoje usa o fuso da conta de anúncios, conforme reportado pela própria Meta.
+  const preset = periodo === "hoje" ? "today" : "last_30d";
   try {
     dadosMetricas = await listar(campanhaId + "/insights",
       "adset_id,spend,impressions,clicks,ctr,actions", token,
-      (u, init) => req(u.replace("?fields=", "?level=adset&date_preset=last_30d&fields="), init));
+      (u, init) => req(u.replace("?fields=", "?level=adset&date_preset=" + preset + "&fields="), init));
   } catch {
     avisoMetricas = "Métricas por conjunto temporariamente indisponíveis na Meta.";
   }
@@ -89,7 +95,8 @@ export async function listarConjuntosCampanhaMeta(
       orcamento_diario_centavos: inteiro(campanha.daily_budget),
       orcamento_total_centavos: inteiro(campanha.lifetime_budget)
     },
-    periodo_metricas: "Últimos 30 dias",
+    periodo_metricas: periodo === "hoje" ? "Hoje (fuso da conta Meta)" : "Últimos 30 dias",
+    periodo_query: periodo,
     aviso_metricas: avisoMetricas,
     conjuntos: conjuntos.map(c => {
       const m = porId.get(String(c.id)) || {};
@@ -110,8 +117,12 @@ export async function listarConjuntosCampanhaMeta(
         orcamento_total_centavos: inteiro(c.lifetime_budget),
         otimizacao: texto(c.optimization_goal),
         metricas: {
-          gasto: dinheiro(m.spend), impressoes: inteiro(m.impressions),
-          cliques: inteiro(m.clicks), ctr: dinheiro(m.ctr), conversas_meta: conversas
+          // Quando a consulta ao Insights falha, "—" é honesto; não usar 0.
+          gasto: avisoMetricas ? null : dinheiro(m.spend),
+          impressoes: avisoMetricas ? null : inteiro(m.impressions),
+          cliques: avisoMetricas ? null : inteiro(m.clicks),
+          ctr: avisoMetricas ? null : dinheiro(m.ctr),
+          conversas_meta: avisoMetricas ? null : conversas
         },
         anuncios: ads.map(a => ({
           id: String(a.id), nome: texto(a.name),
