@@ -730,6 +730,29 @@ function textoOpcional(value: unknown) {
   return String(value ?? "").trim();
 }
 
+// O CDN da Meta (fbcdn/cdninstagram) devolve o MESMO arquivo com host regional
+// e assinatura (oh/oe/_nc_*) diferentes a cada consulta. Dedupe pela URL
+// inteira deixava a lista de imagens crescer a cada abertura do editor (visto:
+// 30 cópias da capa de um vídeo). Fora desse CDN a query pode identificar o
+// arquivo, então mantém a URL inteira.
+function chaveArquivoImagemUrl(url: string) {
+  try {
+    const u = new URL(url);
+    if (/(^|\.)(fbcdn\.net|cdninstagram\.com)$/i.test(u.hostname)) return u.pathname;
+  } catch {}
+  return url;
+}
+
+function deduplicarUrlsImagem(urls: string[]) {
+  const vistas = new Set<string>();
+  return urls.filter(url => {
+    const chave = chaveArquivoImagemUrl(url);
+    if (vistas.has(chave)) return false;
+    vistas.add(chave);
+    return true;
+  });
+}
+
 // Corta no limite de caracteres sem partir uma palavra ao meio (ex: "vale a pena!"
 // virando "vale a pen"), usado nos campos curtos de anúncio/formulário Google Ads
 // que rejeitam texto acima do limite (TOO_LONG). Só corta na última palavra inteira
@@ -36261,10 +36284,10 @@ app.get("/meta/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => 
               (indice === 0 ? urlsCriativo[0] || urlsLocais[0] : "")
             )
             .filter(Boolean)
-        : Array.from(new Set([
+        : deduplicarUrlsImagem([
             ...urlsCriativo,
             ...urlsLocais
-          ]));
+          ]);
 
       if (hashes.length) {
         configuracoes.imageHashes = hashes;
@@ -37481,10 +37504,10 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     // dedupe aqui, cada URL vira um card de carrossel repetido e a Meta
     // rejeita com "(#105) param child_attachments has too many elements".
     const imageUrls =
-      [...new Set([
+      deduplicarUrlsImagem([
         ...(Array.isArray(cfg.imagens_urls) ? cfg.imagens_urls : []),
         ...(Array.isArray(cfg.image_urls) ? cfg.image_urls : [])
-      ].filter(Boolean))];
+      ].filter(Boolean).map(String));
 
     const instagramSelecionado =
       Array.isArray(cfg.plataformas) && cfg.plataformas.includes("instagram");
