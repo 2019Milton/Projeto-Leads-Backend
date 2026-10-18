@@ -697,8 +697,21 @@ function decodificarTokenUsuario(token: string) {
       : "conta",
     gestor_id: tokenAssinadoContextual && partes[7]
       ? Number(partes[7])
-      : null
+      : null,
+    // emitido em = expira_em - TOKEN_TTL_SECONDS (usado para derrubar sessões antigas)
+    expira_em: expiraEm
   };
+}
+
+// Sessão emitida antes da última troca de senha não vale mais. 5 s de folga para diferença
+// de relógio entre o banco e o servidor: o token novo que a própria troca devolve nunca cai
+// aqui. senhaAlteradaEpoch vem de FLOOR(EXTRACT(EPOCH FROM usuarios.senha_alterada_em)).
+function tokenEmitidoAntesDaTrocaDeSenha(user: any, senhaAlteradaEpoch: unknown) {
+  if (senhaAlteradaEpoch === null || senhaAlteradaEpoch === undefined) return false;
+  const senhaAlteradaEm = Number(senhaAlteradaEpoch);
+  const emitidoEm = Number(user?.expira_em) - TOKEN_TTL_SECONDS;
+  if (!Number.isFinite(senhaAlteradaEm) || !Number.isFinite(emitidoEm)) return false;
+  return emitidoEm < senhaAlteradaEm - 5;
 }
 
 function senhaPareceHash(senhaSalva: string | null | undefined) {
@@ -2953,6 +2966,45 @@ async function enviarEmailNotificacaoNovoUsuarioPlataforma(dados: {
   }
 
   console.log("[email-novo-usuario] notificação enviada para", PLATAFORMA_CONTATO_EMAIL);
+}
+
+// Avisa o DONO da conta que a senha dele foi redefinida por outra pessoa (gestor ou
+// administrador). Sem a senha: quem redefiniu combina a entrega por um canal seguro.
+async function enviarEmailAvisoSenhaRedefinida(dados: {
+  email: string;
+  nome?: string | null;
+  quem: string;
+}) {
+  if (!Bun.env.RESEND_API_KEY) throw new Error("RESEND_API_KEY nao configurada");
+  const destinatario = String(dados.email || "").trim().toLowerCase();
+  if (!destinatario) return;
+  const nome = String(dados.nome || "").trim();
+  const quem = String(dados.quem || "o administrador da plataforma");
+  const saudacao = nome ? `Olá, ${nome}.` : "Olá.";
+  const linhas = [
+    saudacao,
+    "",
+    `A senha da sua conta na Plataforma de Leads foi redefinida por ${quem}.`,
+    "Todas as sessões abertas foram encerradas. Para entrar, use a nova senha combinada com quem fez a alteração.",
+    "",
+    "Se você não reconhece essa alteração, responda este e-mail."
+  ];
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${Bun.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: PLATAFORMA_FROM_EMAIL,
+      to: destinatario,
+      reply_to: PLATAFORMA_CONTATO_EMAIL,
+      subject: "Sua senha da Plataforma de Leads foi redefinida",
+      text: linhas.join("\n"),
+      html: `<div style="font-family:Arial,sans-serif;color:#111827;line-height:1.6;max-width:560px">${linhas.map((l) => l ? `<p style="margin:0 0 10px">${escaparHtmlEmail(l)}</p>` : "").join("")}</div>`
+    })
+  });
+  if (!res.ok) {
+    console.error("RESEND AVISO SENHA REDEFINIDA ERROR:", await res.text());
+    throw new Error("RESEND_PASSWORD_RESET_NOTICE_FAILED");
+  }
 }
 
 async function enviarEmailNovaSenhaPlataforma(dados: {
@@ -5576,7 +5628,8 @@ async function tokenPodeOperarContaCompleta(user: any) {
       id,
       admin_id,
       COALESCE(ativo, true) AS ativo,
-      COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado
+      COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      FLOOR(EXTRACT(EPOCH FROM senha_alterada_em)) AS senha_alterada_epoch
     FROM usuarios
     WHERE id = $1
     LIMIT 1
@@ -5586,6 +5639,10 @@ async function tokenPodeOperarContaCompleta(user: any) {
   const alvo = alvoResult.rows[0];
 
   if (!alvo?.ativo) return false;
+  if (
+    normalizarContextoAcesso(user.contexto_acesso) !== "gestor" &&
+    tokenEmitidoAntesDaTrocaDeSenha(user, alvo.senha_alterada_epoch)
+  ) return false;
 
   const contexto = normalizarContextoAcesso(user.contexto_acesso);
 
@@ -5597,7 +5654,8 @@ async function tokenPodeOperarContaCompleta(user: any) {
 
     const gestorResult = await client.query(
       `
-      SELECT id, tipo, COALESCE(ativo, true) AS ativo
+      SELECT id, tipo, COALESCE(ativo, true) AS ativo,
+             FLOOR(EXTRACT(EPOCH FROM senha_alterada_em)) AS senha_alterada_epoch
       FROM usuarios
       WHERE id = $1
       LIMIT 1
@@ -5605,6 +5663,7 @@ async function tokenPodeOperarContaCompleta(user: any) {
       [gestorId]
     );
     const gestor = gestorResult.rows[0];
+    if (gestor && tokenEmitidoAntesDaTrocaDeSenha(user, gestor.senha_alterada_epoch)) return false;
 
     return Boolean(
       gestor?.ativo &&
@@ -5673,6 +5732,7 @@ const authMiddleware = async (c: any, next: any) => {
         COALESCE(u.voip_limite_minutos_mensal, 100) AS voip_limite_minutos_mensal,
         COALESCE(u.voip_gravacao_habilitada, false) AS voip_gravacao_habilitada,
         u.painel_slug,
+        FLOOR(EXTRACT(EPOCH FROM u.senha_alterada_em)) AS senha_alterada_epoch,
         COALESCE(
           (
             SELECT json_agg(json_build_object(
@@ -5701,6 +5761,15 @@ const authMiddleware = async (c: any, next: any) => {
       return c.json({ error: "Usuário inativo ou não encontrado" }, 401);
     }
 
+    // Conta e painel: vale a senha do dono. No contexto "gestor" a credencial é do gestor:
+    // vale a senha dele (conferida abaixo, junto com o resto do gestor).
+    if (
+      normalizarContextoAcesso(user.contexto_acesso) !== "gestor" &&
+      tokenEmitidoAntesDaTrocaDeSenha(user, userBanco.senha_alterada_epoch)
+    ) {
+      return c.json({ error: "A senha desta conta foi alterada. Entre novamente." }, 401);
+    }
+
     const modoAcesso: ContextoAcessoUsuario =
       normalizarContextoAcesso(user.contexto_acesso);
     let gestorAutenticado: any = null;
@@ -5714,7 +5783,8 @@ const authMiddleware = async (c: any, next: any) => {
 
       const gestorResult = await client.query(
         `
-        SELECT id, email, tipo, nome, sobrenome, COALESCE(ativo, true) AS ativo
+        SELECT id, email, tipo, nome, sobrenome, COALESCE(ativo, true) AS ativo,
+               FLOOR(EXTRACT(EPOCH FROM senha_alterada_em)) AS senha_alterada_epoch
         FROM usuarios
         WHERE id = $1
         LIMIT 1
@@ -5723,6 +5793,10 @@ const authMiddleware = async (c: any, next: any) => {
       );
 
       gestorAutenticado = gestorResult.rows[0];
+
+      if (gestorAutenticado && tokenEmitidoAntesDaTrocaDeSenha(user, gestorAutenticado.senha_alterada_epoch)) {
+        return c.json({ error: "A sua senha foi alterada. Entre novamente." }, 401);
+      }
 
       const gestorElevado =
         ["super_admin", "master"].includes(gestorAutenticado?.tipo);
@@ -5797,7 +5871,11 @@ const authMiddleware = async (c: any, next: any) => {
     // Dentro da conta do cliente o gestor age como o cliente. Trocar a senha por esta rota
     // apareceria como se o próprio cliente tivesse trocado; o gestor tem a rota dele
     // (Clientes gerenciados → Redefinir senha), que fica registrada e avisa o cliente.
-    if (modoAcesso === "gestor" && c.req.method === "PUT" && c.req.path === "/usuarios/me/senha") {
+    if (
+      modoAcesso === "gestor" &&
+      c.req.method !== "GET" &&
+      (c.req.path === "/usuarios/me/senha" || c.req.path === "/admin/trocar-senha")
+    ) {
       return c.json({
         error: "Dentro da conta do cliente não dá para trocar a senha dele por aqui. Use \"Redefinir senha\" em Clientes gerenciados."
       }, 403);
@@ -26357,6 +26435,13 @@ await client.query(`
   END $$;
 `);
 
+// Momento da última troca de senha. O token não tem versão: antes, trocar ou redefinir a
+// senha não derrubava quem já estava logado (sessão de 7 dias continuava valendo, inclusive
+// a de quem tivesse a senha antiga). O authMiddleware recusa token emitido antes disso.
+await client.query(`
+  ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_alterada_em TIMESTAMPTZ;
+`);
+
 await client.query(`
   CREATE TABLE IF NOT EXISTS gestor_acessos (
     id SERIAL PRIMARY KEY,
@@ -28048,7 +28133,7 @@ app.post("/auth/reset-senha", async (c) => {
     await conn.query(
       `
       UPDATE usuarios
-      SET senha = $1
+      SET senha = $1, senha_alterada_em = NOW()
       WHERE id = $2
       `,
       [
@@ -29788,7 +29873,7 @@ app.put("/gestor/clientes/:id/senha", authMiddleware, async (c) => {
     await conn.query("BEGIN");
     await registrarSenhaAnterior(conn, clienteId, cliente.senha);
     await conn.query(
-      "UPDATE usuarios SET senha = $1 WHERE id = $2",
+      "UPDATE usuarios SET senha = $1, senha_alterada_em = NOW() WHERE id = $2",
       [await gerarHashSenha(novaSenha), clienteId]
     );
     await conn.query("COMMIT");
@@ -29796,6 +29881,15 @@ app.put("/gestor/clientes/:id/senha", authMiddleware, async (c) => {
     try {
       await enviarEmailNovaSenhaPlataforma({ email: String(cliente.email || ""), nome: cliente.nome || null, origem: "Redefinição pelo gestor" });
     } catch (emailErr) { console.error("GESTOR EMAIL NOVA SENHA PARA PLATAFORMA ERROR:", emailErr); }
+
+    try {
+      const nomeGestor = `${gestor.nome || ""} ${gestor.sobrenome || ""}`.trim();
+      await enviarEmailAvisoSenhaRedefinida({
+        email: String(cliente.email || ""),
+        nome: cliente.nome || null,
+        quem: nomeGestor ? `seu gestor de tráfego (${nomeGestor})` : "seu gestor de tráfego"
+      });
+    } catch (emailErr) { console.error("GESTOR EMAIL AVISO SENHA PARA CLIENTE ERROR:", emailErr); }
 
     return c.json({
       sucesso: true,
@@ -31636,7 +31730,7 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
     await conn.query(
       `
       UPDATE usuarios
-      SET senha = $1
+      SET senha = $1, senha_alterada_em = NOW()
       WHERE id = $2
       `,
       [novaSenhaHash, user.id]
@@ -31649,8 +31743,11 @@ app.put("/usuarios/me/senha", authMiddleware, async (c) => {
       await enviarEmailNovaSenhaPlataforma({ email: String(dadosUsuario.rows[0]?.email || user.email || ""), nome: dadosUsuario.rows[0]?.nome || user.nome || null, origem: "Alteração pelo próprio usuário" });
     } catch (emailErr) { console.error("ERRO EMAIL NOVA SENHA USUARIO PARA PLATAFORMA:", emailErr); }
 
+    // A troca encerra as sessões antigas (inclusive esta); devolve um token novo, no mesmo
+    // contexto (o gestor nem chega aqui: o authMiddleware recusa), para quem trocou seguir logado.
     return c.json({
-      sucesso: true
+      sucesso: true,
+      token: criarTokenUsuario(user, user.modo_acesso === "painel" ? "painel" : "conta")
     });
 
   } catch (err) {
@@ -42975,7 +43072,7 @@ app.put("/admin/usuarios/:id/senha", authMiddleware, async (c) => {
   await client.query(
     `
     UPDATE usuarios
-    SET senha = $1
+    SET senha = $1, senha_alterada_em = NOW()
     WHERE id = $2
     `,
     [senhaHash, id]
@@ -42984,9 +43081,16 @@ app.put("/admin/usuarios/:id/senha", authMiddleware, async (c) => {
   try {
     const dadosUsuario = await client.query("SELECT email, nome FROM usuarios WHERE id = $1 LIMIT 1", [id]);
     await enviarEmailNovaSenhaPlataforma({ email: String(dadosUsuario.rows[0]?.email || ""), nome: dadosUsuario.rows[0]?.nome || null, origem: "Redefinição pelo Super Admin" });
+    if (Number(id) !== Number(user.id)) {
+      await enviarEmailAvisoSenhaRedefinida({ email: String(dadosUsuario.rows[0]?.email || ""), nome: dadosUsuario.rows[0]?.nome || null, quem: "o administrador da plataforma" });
+    }
   } catch (emailErr) { console.error("ERRO EMAIL NOVA SENHA ADMIN PARA PLATAFORMA:", emailErr); }
 
-  return c.json({ sucesso: true });
+  // A troca encerra as sessões antigas; quem trocou a PRÓPRIA senha segue logado com um token novo.
+  return c.json({
+    sucesso: true,
+    ...(Number(id) === Number(user.id) ? { token: criarTokenUsuario(user, "conta") } : {})
+  });
 });
 
 
@@ -43149,7 +43253,7 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
     await client.query(
       `
       UPDATE usuarios
-      SET senha = $1
+      SET senha = $1, senha_alterada_em = NOW()
       WHERE id = $2
       `,
       [
@@ -43162,8 +43266,20 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
       await enviarEmailNovaSenhaPlataforma({ email: String(usuarioAlvo.email || ""), nome: usuarioAlvo.nome || null, origem: Number(user.id) === Number(usuario_id) ? "Alteração pelo próprio usuário" : "Redefinição administrativa" });
     } catch (emailErr) { console.error("ERRO EMAIL NOVA SENHA TROCAR-SENHA PARA PLATAFORMA:", emailErr); }
 
+    const trocouAPropria = Number(user.id) === Number(usuario_id);
+    if (!trocouAPropria) {
+      try {
+        await enviarEmailAvisoSenhaRedefinida({
+          email: String(usuarioAlvo.email || ""),
+          nome: usuarioAlvo.nome || null,
+          quem: user.tipo === "super_admin" ? "o administrador da plataforma" : "o administrador da sua equipe"
+        });
+      } catch (emailErr) { console.error("ERRO EMAIL AVISO SENHA TROCAR-SENHA:", emailErr); }
+    }
+
     return c.json({
-      success: true
+      success: true,
+      ...(trocouAPropria ? { token: criarTokenUsuario(user, "conta") } : {})
     });
 
   } catch (err) {
