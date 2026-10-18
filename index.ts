@@ -6504,15 +6504,25 @@ function campanhaTemOrigemNativa(origem: unknown): boolean {
   );
 }
 
+const STATUS_CAMPANHA_EXCLUIDA = [
+  "DELETED",
+  "REMOVED",
+  "ARCHIVED",
+  "DELETE",
+  "CAMPAIGN_STATUS_DELETE",
+];
+
 function statusCampanhaRemotaExcluida(status: unknown): boolean {
   const normalizado = String(status || "").trim().toUpperCase();
-  return [
-    "DELETED",
-    "REMOVED",
-    "ARCHIVED",
-    "DELETE",
-    "CAMPAIGN_STATUS_DELETE",
-  ].includes(normalizado);
+  return STATUS_CAMPANHA_EXCLUIDA.includes(normalizado);
+}
+
+// Condição SQL "a campanha não foi apagada" para contadores e listas mostrados ao gestor e
+// ao cliente. Antes o total contava REMOVED/DELETED (produção tinha 28 removidas só do
+// Google) e o painel do cliente listava campanhas apagadas em "recentes". Só constantes
+// entram na string — nada vindo de requisição.
+function sqlCampanhaNaoExcluida(coluna = "status") {
+  return `UPPER(COALESCE(${coluna}, '')) NOT IN (${STATUS_CAMPANHA_EXCLUIDA.map((s) => `'${s}'`).join(", ")})`;
 }
 
 async function registrarIdCampanhaNativa(
@@ -27698,7 +27708,8 @@ app.post("/auth/solicitar-reset-senha", async (c) => {
 
   const conn = await client.connect();
   try {
-    const { email } = await c.req.json();
+    const { email: emailInformado } = await c.req.json();
+    const email = normalizarEmailLogin(emailInformado);
 
     if (!email) {
       return c.json({
@@ -28367,7 +28378,10 @@ app.get("/gestor/clientes", authMiddleware, async (c) => {
       COALESCE(u.voip_limite_minutos_mensal, 100) AS voip_limite_minutos_mensal,
       COALESCE(u.voip_gravacao_habilitada, false) AS voip_gravacao_habilitada,
       u.painel_slug,
-      (SELECT COUNT(*)::int FROM campanhas c WHERE c.usuario_id = u.id) AS campanhas_total,
+      (
+        SELECT COUNT(*)::int FROM campanhas c
+        WHERE c.usuario_id = u.id AND ${sqlCampanhaNaoExcluida("c.status")}
+      ) AS campanhas_total,
       (
         SELECT COUNT(*)::int
         FROM campanhas c
@@ -31290,7 +31304,7 @@ app.get("/painel-cliente/resumo", authMiddleware, async (c) => {
           )::int AS pausadas,
           MAX(COALESCE(atualizado_em, criado_em)) AS ultima_atualizacao
         FROM campanhas
-        WHERE usuario_id = $1
+        WHERE usuario_id = $1 AND ${sqlCampanhaNaoExcluida()}
         `,
         [usuarioId]
       ),
@@ -31298,7 +31312,7 @@ app.get("/painel-cliente/resumo", authMiddleware, async (c) => {
         `
         SELECT id, nome, status, origem, criado_em, atualizado_em
         FROM campanhas
-        WHERE usuario_id = $1
+        WHERE usuario_id = $1 AND ${sqlCampanhaNaoExcluida()}
         ORDER BY COALESCE(atualizado_em, criado_em) DESC NULLS LAST, id DESC
         LIMIT 8
         `,
@@ -31308,7 +31322,7 @@ app.get("/painel-cliente/resumo", authMiddleware, async (c) => {
         `
         SELECT LOWER(COALESCE(origem, 'plataforma')) AS plataforma, COUNT(*)::int AS total
         FROM campanhas
-        WHERE usuario_id = $1
+        WHERE usuario_id = $1 AND ${sqlCampanhaNaoExcluida()}
         GROUP BY LOWER(COALESCE(origem, 'plataforma'))
         ORDER BY total DESC, plataforma
         `,
