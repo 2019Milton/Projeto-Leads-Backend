@@ -2778,7 +2778,8 @@ async function enviarEmailResetSenha(
 async function enviarEmailAcessoInicial(
   email: string,
   nome: string | null,
-  senhaTemporaria: string
+  senhaTemporaria: string,
+  acessoUrl: string | null = null
 ) {
   if (!Bun.env.RESEND_API_KEY) {
     throw new Error("RESEND_API_KEY nao configurada");
@@ -2789,7 +2790,8 @@ async function enviarEmailAcessoInicial(
   const primeiroNomeSeguro = escaparHtmlEmail(primeiroNome);
   const emailSeguro = escaparHtmlEmail(destinatario);
   const senhaSegura = escaparHtmlEmail(senhaTemporaria);
-  const siteUrl = obterFrontendUrl();
+  // Cliente "só painel" recebe o link do painel; os demais, o endereço da plataforma.
+  const siteUrl = acessoUrl || obterFrontendUrl();
   const siteUrlSeguro = escaparHtmlEmail(siteUrl);
   const contatoEmailSeguro = escaparHtmlEmail(PLATAFORMA_CONTATO_EMAIL);
 
@@ -5629,6 +5631,7 @@ async function tokenPodeOperarContaCompleta(user: any) {
       admin_id,
       COALESCE(ativo, true) AS ativo,
       COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      COALESCE(somente_painel, false) AS somente_painel,
       FLOOR(EXTRACT(EPOCH FROM senha_alterada_em)) AS senha_alterada_epoch
     FROM usuarios
     WHERE id = $1
@@ -5647,6 +5650,7 @@ async function tokenPodeOperarContaCompleta(user: any) {
   const contexto = normalizarContextoAcesso(user.contexto_acesso);
 
   if (contexto === "painel") return false;
+  if (contexto === "conta" && alvo.somente_painel === true) return false;
 
   if (contexto === "gestor") {
     const gestorId = Number(user.gestor_id);
@@ -5717,6 +5721,7 @@ const authMiddleware = async (c: any, next: any) => {
         COALESCE(u.ativo, true) AS ativo,
         COALESCE(u.is_parceiro, false) AS is_parceiro,
         COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+        COALESCE(u.somente_painel, false) AS somente_painel,
         COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
         COALESCE(u.whatsapp_multiplos_numeros_habilitado, false) AS whatsapp_multiplos_numeros_habilitado,
         COALESCE(u.voip_habilitado, false) AS voip_habilitado,
@@ -5814,6 +5819,10 @@ const authMiddleware = async (c: any, next: any) => {
       if (!userBanco.painel_cliente_habilitado) {
         return c.json({ error: "Painel do cliente desabilitado" }, 403);
       }
+    } else if (userBanco.somente_painel === true) {
+      // Conta "só painel": token de conta completa não vale (inclusive o emitido antes de o
+      // gestor ligar a opção). 401 faz o front voltar ao login, que leva ao painel.
+      return c.json({ error: "Esta conta acessa só o painel do cliente. Entre de novo.", codigo: "SOMENTE_PAINEL" }, 401);
     }
 
     if (modoAcesso === "painel") {
@@ -26442,6 +26451,13 @@ await client.query(`
   ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_alterada_em TIMESTAMPTZ;
 `);
 
+// "Só painel" (cliente gerenciado): as credenciais do corretor abrem só o painel de
+// acompanhamento. Antes o mesmo e-mail e senha, sem ?painel=, entravam na conta completa
+// (apagar campanha, desconectar a Meta...). Contas antigas ficam como estavam (false).
+await client.query(`
+  ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS somente_painel BOOLEAN NOT NULL DEFAULT false;
+`);
+
 await client.query(`
   CREATE TABLE IF NOT EXISTS gestor_acessos (
     id SERIAL PRIMARY KEY,
@@ -28197,6 +28213,7 @@ app.post("/login-test", async (c) => {
       SELECT
         id, email, senha, tipo, nome, sobrenome, plano,
         COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+        COALESCE(somente_painel, false) AS somente_painel,
         painel_slug
       FROM usuarios
       WHERE LOWER(email) = $1
@@ -28219,6 +28236,22 @@ app.post("/login-test", async (c) => {
       )
     ) {
       return c.json({ error: "Login inválido" }, 401);
+    }
+
+    // Conta "só painel": mesmo entrando pela tela normal, a credencial é de painel. O front
+    // usa painel_slug para abrir o painel; front antigo em cache também cai no painel (o
+    // init abre o painel quando /usuarios/me responde modo_acesso "painel").
+    if (!painelSlug && user.somente_painel === true) {
+      if (!user.painel_cliente_habilitado || !user.painel_slug) {
+        return c.json({ error: "O acesso desta conta está desligado. Fale com quem gerencia a sua conta." }, 403);
+      }
+      return c.json({
+        message: "Login OK",
+        token: criarTokenUsuario(user, "painel"),
+        somente_painel: true,
+        painel_slug: user.painel_slug,
+        painel_url: montarPainelClienteUrl(user.painel_slug)
+      });
     }
 
     const token = criarTokenUsuario(
@@ -28258,6 +28291,7 @@ app.post("/login", async (c) => {
     SELECT
       id, email, senha, tipo, nome, sobrenome, plano,
       COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      COALESCE(somente_painel, false) AS somente_painel,
       painel_slug
     FROM usuarios
     WHERE LOWER(email) = $1
@@ -28284,6 +28318,22 @@ app.post("/login", async (c) => {
   }
 
   limparFalhasLogin(email);
+
+  // Conta "só painel": mesmo entrando pela tela normal, a credencial é de painel. O front
+  // usa painel_slug para abrir o painel; front antigo em cache também cai no painel (o
+  // init abre o painel quando /usuarios/me responde modo_acesso "painel").
+  if (!painelSlug && user.somente_painel === true) {
+    if (!user.painel_cliente_habilitado || !user.painel_slug) {
+      return c.json({ error: "O acesso desta conta está desligado. Fale com quem gerencia a sua conta." }, 403);
+    }
+    return c.json({
+      message: "Login OK",
+      token: criarTokenUsuario(user, "painel"),
+      somente_painel: true,
+      painel_slug: user.painel_slug,
+      painel_url: montarPainelClienteUrl(user.painel_slug)
+    });
+  }
 
   const token = criarTokenUsuario(
     user,
@@ -28380,6 +28430,14 @@ function usuarioGestorElevado(user: any) {
   return ["super_admin", "master"].includes(String(user?.tipo || ""));
 }
 
+// Quantos clientes um gestor de tráfego pode ter vinculados (super admin e master: sem limite).
+const GESTOR_LIMITE_CLIENTES = (() => {
+  const valor = Number(Bun.env.GESTOR_LIMITE_CLIENTES);
+  return Number.isInteger(valor) && valor > 0 ? valor : 50;
+})();
+// Mesmo teto da criação de usuário pelo super admin.
+const LIMITE_NICHOS_CLIENTE_GERENCIADO = 3;
+
 async function buscarClienteGerenciado(
   gestor: any,
   clienteId: number
@@ -28399,7 +28457,6 @@ async function buscarClienteGerenciado(
     SELECT
       u.id,
       u.email,
-      u.senha,
       u.tipo,
       u.nome,
       u.sobrenome,
@@ -28407,6 +28464,7 @@ async function buscarClienteGerenciado(
       u.admin_id,
       COALESCE(u.ativo, true) AS ativo,
       COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      COALESCE(u.somente_painel, false) AS somente_painel,
       COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
       COALESCE(u.voip_habilitado, false) AS voip_habilitado,
       COALESCE(u.voip_status, 'desativado') AS voip_status,
@@ -28456,6 +28514,7 @@ function formatarClienteGerenciado(row: any) {
     painel_url: row.painel_cliente_habilitado
       ? montarPainelClienteUrl(row.painel_slug)
       : null,
+    somente_painel: row.somente_painel === true,
     atendimento_whatsapp_habilitado:
       row.atendimento_whatsapp_habilitado === true,
     atendimento_whatsapp_status:
@@ -28518,6 +28577,7 @@ app.get("/gestor/clientes", authMiddleware, async (c) => {
       u.criado_em,
       COALESCE(u.ativo, true) AS ativo,
       COALESCE(u.painel_cliente_habilitado, false) AS painel_cliente_habilitado,
+      COALESCE(u.somente_painel, false) AS somente_painel,
       COALESCE(u.atendimento_whatsapp_habilitado, false) AS atendimento_whatsapp_habilitado,
       COALESCE(u.voip_habilitado, false) AS voip_habilitado,
       COALESCE(u.voip_status, 'desativado') AS voip_status,
@@ -28598,6 +28658,12 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
   const senha = String(body.senha || "");
   const senhaForte =
     /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#._-]).{8,}$/;
+  // Padrão: o corretor entra só pelo painel (o que a tela promete). O gestor libera a
+  // plataforma completa em "Configurar recursos" quando quiser.
+  const somentePainel = body.somente_painel !== false;
+  const nichoIds: number[] = Array.isArray(body.nicho_ids)
+    ? [...new Set<number>(body.nicho_ids.map((id: any) => Number(id)))]
+    : [];
 
   if (!nome || !email || !senha) {
     return c.json({ error: "Nome, email e senha são obrigatórios" }, 400);
@@ -28613,9 +28679,57 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
     }, 400);
   }
 
+  // Antes o cliente nascia sem nicho: campanhas e relatórios por nicho ficavam vazios até
+  // alguém entrar na conta e escolher.
+  if (
+    !nichoIds.length ||
+    nichoIds.length > LIMITE_NICHOS_CLIENTE_GERENCIADO ||
+    nichoIds.some((id) => !Number.isInteger(id) || id <= 0)
+  ) {
+    return c.json({ error: `Escolha de 1 a ${LIMITE_NICHOS_CLIENTE_GERENCIADO} nichos para o corretor.` }, 400);
+  }
+
+  const nichosValidos = await client.query(
+    `SELECT id FROM nichos WHERE id = ANY($1::int[])`,
+    [nichoIds]
+  );
+  if (nichosValidos.rows.length !== nichoIds.length) {
+    return c.json({ error: "Nicho inválido" }, 400);
+  }
+
+  const senhaHash = await gerarHashSenha(senha);
+  const slug = gerarPainelSlug();
+  const conn = await client.connect();
+  let novo: any = null;
+
   try {
-    const slug = gerarPainelSlug();
-    const result = await client.query(
+    await conn.query("BEGIN");
+
+    // Limite por gestor. A trava serializa duas criações simultâneas do mesmo gestor, para
+    // a contagem não deixar passar uma a mais.
+    if (!usuarioGestorElevado(gestor)) {
+      await conn.query(
+        "SELECT pg_advisory_xact_lock(hashtext('gestor_clientes'), $1::int)",
+        [Number(gestor.id)]
+      );
+      const total = await conn.query(
+        `
+        SELECT COUNT(*)::int AS n
+        FROM usuarios
+        WHERE admin_id = $1
+          AND tipo IN ('corretor', 'corretor_receptor')
+        `,
+        [Number(gestor.id)]
+      );
+      if (Number(total.rows[0]?.n || 0) >= GESTOR_LIMITE_CLIENTES) {
+        await conn.query("ROLLBACK");
+        return c.json({
+          error: `Você chegou ao limite de ${GESTOR_LIMITE_CLIENTES} clientes. Desvincule quem você não atende mais ou fale com o suporte para ampliar.`
+        }, 409);
+      }
+    }
+
+    const result = await conn.query(
       `
       INSERT INTO usuarios (
         nome,
@@ -28626,73 +28740,95 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
         admin_id,
         ativo,
         painel_cliente_habilitado,
+        somente_painel,
         atendimento_whatsapp_habilitado,
         voip_habilitado,
         voip_status,
         painel_slug,
         painel_atualizado_em
       )
-      VALUES ($1, $2, $3, $4, 'corretor', $5, true, true, false, false, 'desativado', $6, NOW())
+      VALUES ($1, $2, $3, $4, 'corretor', $5, true, true, $7, false, false, 'desativado', $6, NOW())
       RETURNING
         id, email, tipo, nome, sobrenome, plano, admin_id, ativo,
         painel_cliente_habilitado, atendimento_whatsapp_habilitado,
         voip_habilitado, voip_status, voip_provedor, voip_numero,
         voip_numero_sid, voip_ddd, voip_identity, voip_ativado_em, voip_desativado_em,
         voip_ultimo_erro, voip_limite_minutos_mensal, voip_gravacao_habilitada,
-        painel_slug, criado_em
+        painel_slug, somente_painel, criado_em
       `,
       [
         nome,
         sobrenome || null,
         email,
-        await gerarHashSenha(senha),
+        senhaHash,
         Number(gestor.id),
-        slug
+        slug,
+        somentePainel
       ]
     );
+    novo = result.rows[0];
 
-    let emailEnviado = false;
-    let emailPlataformaEnviado = false;
-
-    try {
-      await enviarEmailAcessoInicial(email, nome, senha);
-      emailEnviado = true;
-    } catch (emailErr) {
-      console.error("GESTOR EMAIL ACESSO CLIENTE ERROR:", emailErr);
+    for (const nichoId of nichoIds) {
+      await conn.query(
+        `INSERT INTO usuario_nichos (usuario_id, nicho_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [novo.id, nichoId]
+      );
     }
 
-    try {
-      await enviarEmailNotificacaoNovoUsuarioPlataforma({
-        nome,
-        sobrenome,
-        email,
-        tipo: "corretor",
-        plano: result.rows[0]?.plano || "bronze",
-        origem: "Clientes Gerenciados"
-      });
-      emailPlataformaEnviado = true;
-    } catch (emailErr) {
-      console.error("GESTOR EMAIL NOVO CLIENTE PARA PLATAFORMA ERROR:", emailErr);
-    }
-
-    return c.json({
-      sucesso: true,
-      cliente: formatarClienteGerenciado(result.rows[0]),
-      email_enviado: emailEnviado,
-      email_usuario_enviado: emailEnviado,
-      email_plataforma_enviado: emailPlataformaEnviado,
-      aviso: emailEnviado
-        ? null
-        : "Corretor criado, mas não foi possível enviar o email de acesso."
-    }, 201);
+    await conn.query("COMMIT");
   } catch (err: any) {
+    await conn.query("ROLLBACK").catch(() => {});
+
     if (err?.code === "23505") {
       return c.json({ error: "Este email já está cadastrado" }, 409);
     }
 
     console.error("GESTOR CRIAR CLIENTE ERROR:", err);
     return c.json({ error: "Não foi possível criar o corretor" }, 500);
+  } finally {
+    conn.release();
   }
+
+  let emailEnviado = false;
+  let emailPlataformaEnviado = false;
+
+  try {
+    await enviarEmailAcessoInicial(
+      email,
+      nome,
+      senha,
+      somentePainel ? montarPainelClienteUrl(slug) : null
+    );
+    emailEnviado = true;
+  } catch (emailErr) {
+    console.error("GESTOR EMAIL ACESSO CLIENTE ERROR:", emailErr);
+  }
+
+  try {
+    await enviarEmailNotificacaoNovoUsuarioPlataforma({
+      nome,
+      sobrenome,
+      email,
+      tipo: "corretor",
+      plano: novo?.plano || "bronze",
+      origem: "Clientes Gerenciados"
+    });
+    emailPlataformaEnviado = true;
+  } catch (emailErr) {
+    console.error("GESTOR EMAIL NOVO CLIENTE PARA PLATAFORMA ERROR:", emailErr);
+  }
+
+  return c.json({
+    sucesso: true,
+    cliente: formatarClienteGerenciado(novo),
+    email_enviado: emailEnviado,
+    email_usuario_enviado: emailEnviado,
+    email_plataforma_enviado: emailPlataformaEnviado,
+    aviso: emailEnviado
+      ? null
+      : "Corretor criado, mas não foi possível enviar o email de acesso."
+  }, 201);
 });
 
 app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
@@ -28807,6 +28943,35 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
     adicionar("ativo", body.ativo);
   }
 
+  if (Object.prototype.hasOwnProperty.call(body, "somente_painel")) {
+    if (typeof body.somente_painel !== "boolean") {
+      return c.json({ error: "Informe se o corretor entra só pelo painel (true) ou também na plataforma (false)" }, 400);
+    }
+    adicionar("somente_painel", body.somente_painel);
+
+    if (body.somente_painel && !cliente.painel_cliente_habilitado &&
+        !Object.prototype.hasOwnProperty.call(body, "painel_cliente_habilitado")) {
+      adicionar("painel_cliente_habilitado", true);
+      if (!cliente.painel_slug) adicionar("painel_slug", gerarPainelSlug());
+      adicionarExpressao("painel_atualizado_em = NOW()");
+    }
+  }
+
+  // Só painel com o painel desligado = conta sem acesso nenhum, sem aviso. Para cortar o
+  // acesso existe "Desativar conta".
+  const somentePainelFinal = Object.prototype.hasOwnProperty.call(body, "somente_painel")
+    ? body.somente_painel === true
+    : cliente.somente_painel === true;
+  const posicaoPainel = posicoesColunas.get("painel_cliente_habilitado");
+  const painelFinal = posicaoPainel
+    ? valores[posicaoPainel - 1] === true
+    : cliente.painel_cliente_habilitado === true;
+  if (somentePainelFinal && !painelFinal) {
+    return c.json({
+      error: "Este corretor entra só pelo painel; desligar o painel deixaria a conta sem acesso nenhum. Para cortar o acesso use \"Desativar conta\", ou libere a plataforma completa antes."
+    }, 409);
+  }
+
   if (!atualizacoes.length) {
     return c.json({ error: "Nenhuma alteração informada" }, 400);
   }
@@ -28825,7 +28990,7 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
         voip_habilitado, voip_status, voip_provedor, voip_numero,
         voip_numero_sid, voip_ddd, voip_identity, voip_ativado_em, voip_desativado_em,
         voip_ultimo_erro, voip_limite_minutos_mensal, voip_gravacao_habilitada,
-        painel_slug, criado_em
+        painel_slug, somente_painel, criado_em
       `,
       valores
     );
@@ -29609,6 +29774,15 @@ app.post("/gestor/clientes/:id/voip/ativar", authMiddleware, async (c) => {
     return c.json({ error: "Informe um DDD brasileiro válido." }, 400);
   }
 
+  const limiteDoCorpo = body.limite_minutos_mensal;
+  if (limiteDoCorpo !== undefined && limiteDoCorpo !== null && limiteDoCorpo !== "") {
+    const valor = Number(limiteDoCorpo);
+    if (!Number.isInteger(valor) || valor < 10 || valor > 10000) {
+      // Antes virava 100 sem avisar.
+      return c.json({ error: "O limite de minutos precisa ser um número inteiro entre 10 e 10.000." }, 400);
+    }
+  }
+
   const limiteInformado = Number(
     body.limite_minutos_mensal ??
     clienteGerenciado.voip_limite_minutos_mensal ??
@@ -29871,7 +30045,9 @@ app.put("/gestor/clientes/:id/senha", authMiddleware, async (c) => {
 
   try {
     await conn.query("BEGIN");
-    await registrarSenhaAnterior(conn, clienteId, cliente.senha);
+    // O hash não sai de buscarClienteGerenciado (que alimenta várias rotas); só aqui é preciso.
+    const senhaAtual = await conn.query("SELECT senha FROM usuarios WHERE id = $1", [clienteId]);
+    await registrarSenhaAnterior(conn, clienteId, senhaAtual.rows[0]?.senha);
     await conn.query(
       "UPDATE usuarios SET senha = $1, senha_alterada_em = NOW() WHERE id = $2",
       [await gerarHashSenha(novaSenha), clienteId]
