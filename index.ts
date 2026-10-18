@@ -774,6 +774,13 @@ function textoOpcional(value: unknown) {
   return String(value ?? "").trim();
 }
 
+// E-mail de login: sem espaços nas pontas e em minúsculas. O gestor e o reset de senha já
+// gravavam/comparavam assim, mas o /login comparava o texto cru — "Fulano@x.com " (colado do
+// e-mail de acesso, ou com a 1ª letra maiúscula do teclado do celular) dava "Login inválido".
+function normalizarEmailLogin(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
 // O CDN da Meta (fbcdn/cdninstagram) devolve o MESMO arquivo com host regional
 // e assinatura (oh/oe/_nc_*) diferentes a cada consulta. Dedupe pela URL
 // inteira deixava a lista de imagens crescer a cada abertura do editor (visto:
@@ -6904,7 +6911,8 @@ async function sincronizarTodasCampanhas() {
 app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
   const body = await c.req.json();
 
-  const { email, senha } = body;
+  const { senha } = body;
+  const email = normalizarEmailLogin(body.email);
 
   try {
     const senhaHash = await gerarHashSenha(senha);
@@ -7167,7 +7175,7 @@ app.put("/usuarios/:id", authMiddleware, masterMiddleware, async (c) => {
 
   await client.query(
     "UPDATE usuarios SET email=$1 WHERE id=$2",
-    [body.email, id]
+    [normalizarEmailLogin(body.email), id]
   );
 
   return c.json({ message: "Usuário atualizado" });
@@ -26611,6 +26619,8 @@ await client.query(`
 await client.query(`
   CREATE INDEX IF NOT EXISTS idx_usuarios_email
     ON usuarios(email);
+  CREATE INDEX IF NOT EXISTS idx_usuarios_email_lower
+    ON usuarios(LOWER(email));
   CREATE INDEX IF NOT EXISTS idx_leads_usuario_id
     ON leads(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_leads_usuario_criado_em
@@ -27989,7 +27999,7 @@ app.post("/login-test", async (c) => {
 
   try {
     const body = await c.req.json().catch(() => ({}));
-    const email = body.email;
+    const email = normalizarEmailLogin(body.email);
     const senha = body.senha;
     const painelSlug = textoOpcional(body.painel_slug);
 
@@ -28004,7 +28014,7 @@ app.post("/login-test", async (c) => {
         COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
         painel_slug
       FROM usuarios
-      WHERE email=$1
+      WHERE LOWER(email) = $1
       AND COALESCE(ativo, true) = true
       `,
       [email]
@@ -28048,7 +28058,8 @@ app.post("/login", async (c) => {
 
   if (limite) return limite;
 
-  const { email, senha, painel_slug } = await c.req.json().catch(() => ({} as any));
+  const { email: emailInformado, senha, painel_slug } = await c.req.json().catch(() => ({} as any));
+  const email = normalizarEmailLogin(emailInformado);
   const painelSlug = textoOpcional(painel_slug);
 
   const esperarSegundos = loginBloqueadoPorFalhas(email);
@@ -28064,7 +28075,7 @@ app.post("/login", async (c) => {
       COALESCE(painel_cliente_habilitado, false) AS painel_cliente_habilitado,
       painel_slug
     FROM usuarios
-    WHERE email=$1
+    WHERE LOWER(email) = $1
     AND COALESCE(ativo, true) = true
     `,
     [email]
@@ -42582,7 +42593,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
     const {
       nome,
       sobrenome,
-      email,
+      email: emailInformado,
       senha,
       tipo,
       admin_id,
@@ -42590,6 +42601,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       nicho_ids,
       whatsapp
     } = await c.req.json();
+    const email = normalizarEmailLogin(emailInformado);
 
     if (
       !nome ||
@@ -42615,7 +42627,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       `
       SELECT id
       FROM usuarios
-      WHERE email = $1
+      WHERE LOWER(email) = $1
       `,
       [email]
     );
