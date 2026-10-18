@@ -306,15 +306,59 @@ function negarAcessoConta(c: any) {
 const rateLimitMemoria =
   new Map<string, { total: number; expiraEm: number }>();
 
+// A API fica direto atrás da borda da Railway (resposta `Server: railway-hikari`, sem
+// Cloudflare). A borda preenche o X-Real-IP com o IP de quem conectou (docs da Railway,
+// "Request Headers"). Antes o cf-connecting-ip era lido primeiro — sem Cloudflare na frente,
+// qualquer cliente manda esse cabeçalho com o valor que quiser, e cada valor novo virava
+// uma chave nova no limitador (login, reset de senha, formulário de leads). Só é aceito com
+// CONFIAR_CF_CONNECTING_IP=true, se um dia houver Cloudflare de verdade na frente.
 function obterIpRequisicao(c: any) {
-  return String(
-    c.req.header("cf-connecting-ip") ||
-    c.req.header("x-real-ip") ||
-    c.req.header("x-forwarded-for") ||
-    "ip-desconhecido"
-  )
-    .split(",")[0]
-    .trim();
+  if (Bun.env.CONFIAR_CF_CONNECTING_IP === "true") {
+    const cloudflare = String(c.req.header("cf-connecting-ip") || "").trim();
+    if (cloudflare) return cloudflare;
+  }
+
+  const ipReal = String(c.req.header("x-real-ip") || "").split(",")[0].trim();
+  if (ipReal) return ipReal;
+
+  // Cada proxy acrescenta no FIM do X-Forwarded-For; o começo é o que o cliente mandou.
+  const encaminhado = String(c.req.header("x-forwarded-for") || "")
+    .split(",")
+    .map((parte) => parte.trim())
+    .filter(Boolean);
+  return encaminhado[encaminhado.length - 1] || "ip-desconhecido";
+}
+
+// Falhas de login por CONTA, independente de IP: mesmo que alguém consiga variar o IP
+// de origem, não passa de LOGIN_FALHAS_MAX senhas erradas por e-mail a cada janela. Só
+// falha conta (login certo zera), então o dono da conta não é travado por entrar
+// normalmente. Custo aceito: quem errar de propósito 10 vezes trava aquele e-mail por 15 min.
+const LOGIN_FALHAS_MAX = 10;
+const LOGIN_FALHAS_JANELA_MS = 15 * 60 * 1000;
+
+function chaveFalhasLogin(email: string) {
+  return `login-falhas:${String(email || "").trim().toLowerCase()}`;
+}
+
+function loginBloqueadoPorFalhas(email: string) {
+  const atual = rateLimitMemoria.get(chaveFalhasLogin(email));
+  if (!atual || atual.expiraEm <= Date.now() || atual.total < LOGIN_FALHAS_MAX) return 0;
+  return Math.ceil((atual.expiraEm - Date.now()) / 1000);
+}
+
+function registrarFalhaLogin(email: string) {
+  const chave = chaveFalhasLogin(email);
+  const agora = Date.now();
+  const atual = rateLimitMemoria.get(chave);
+  if (!atual || atual.expiraEm <= agora) {
+    rateLimitMemoria.set(chave, { total: 1, expiraEm: agora + LOGIN_FALHAS_JANELA_MS });
+  } else {
+    atual.total += 1;
+  }
+}
+
+function limparFalhasLogin(email: string) {
+  rateLimitMemoria.delete(chaveFalhasLogin(email));
 }
 
 function verificarRateLimit(
@@ -28004,8 +28048,14 @@ app.post("/login", async (c) => {
 
   if (limite) return limite;
 
-  const { email, senha, painel_slug } = await c.req.json();
+  const { email, senha, painel_slug } = await c.req.json().catch(() => ({} as any));
   const painelSlug = textoOpcional(painel_slug);
+
+  const esperarSegundos = loginBloqueadoPorFalhas(email);
+  if (esperarSegundos > 0) {
+    c.header("Retry-After", String(esperarSegundos));
+    return c.json({ error: "Muitas tentativas com este e-mail. Tente novamente em alguns minutos." }, 429);
+  }
 
   const result = await client.query(
     `
@@ -28033,8 +28083,11 @@ app.post("/login", async (c) => {
       )
     )
   ) {
+    registrarFalhaLogin(email);
     return c.json({ error: "Login inválido" }, 401);
   }
+
+  limparFalhasLogin(email);
 
   const token = criarTokenUsuario(
     user,
