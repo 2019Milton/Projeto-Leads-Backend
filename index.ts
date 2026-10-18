@@ -141,6 +141,7 @@ import {
 
 import {
   aplicarAjusteManual,
+  aplicarDescontoInicial,
   competenciaAnterior,
   competenciaValida,
   itensVisiveisAoGestor,
@@ -152,6 +153,17 @@ import {
   vencimentoDaCompetencia,
   type ItemCobranca,
 } from "./cobranca-gestor";
+
+import {
+  antesDoInicioDaCobranca,
+  mesDoDescontoInicial,
+  montarContrato,
+  normalizarCondicoesContrato,
+  previsaoMensalidade,
+  type CondicoesContrato,
+  type DadosContrato,
+  type PerfilContrato,
+} from "./contrato-plataforma";
 
 const app = new Hono();
 
@@ -23827,7 +23839,11 @@ app.get("/admin/financeiro/usuarios", authMiddleware, async (c) => {
          u.id, u.nome, u.sobrenome, u.email,
          ultimo.mes_referencia AS ultimo_mes_referencia,
          ultimo.valor AS ultimo_valor,
-         ultimo.status AS ultimo_status
+         ultimo.status AS ultimo_status,
+         EXISTS (SELECT 1 FROM contrato_condicoes cc WHERE cc.usuario_id = u.id) AS contrato_respondido,
+         EXISTS (
+           SELECT 1 FROM usuarios g WHERE g.id = u.admin_id AND g.tipo = 'trafego_pago'
+         ) AS cliente_gerenciado
        FROM usuarios u
        LEFT JOIN LATERAL (
          SELECT mes_referencia, valor, status
@@ -23844,6 +23860,8 @@ app.get("/admin/financeiro/usuarios", authMiddleware, async (c) => {
       id: linha.id,
       nome: [linha.nome, linha.sobrenome].filter(Boolean).join(" ") || linha.email,
       email: linha.email,
+      contrato_respondido: linha.contrato_respondido === true,
+      cliente_gerenciado: linha.cliente_gerenciado === true,
       ultimo_lancamento: linha.ultimo_mes_referencia
         ? {
             mes_referencia: linha.ultimo_mes_referencia,
@@ -24136,13 +24154,17 @@ async function clientesCobradosDoGestor(gestorId: number, competencia: string) {
 }
 
 async function calcularCobrancaGestor(gestorId: number, competencia: string) {
-  const [padrao, especificaRes, clientes] = await Promise.all([
+  const [padrao, especificaRes, clientes, condicoes] = await Promise.all([
     obterPadraoCobrancaGestor(),
     client.query("SELECT * FROM cobranca_gestor_config WHERE gestor_id = $1", [gestorId]),
-    clientesCobradosDoGestor(gestorId, competencia)
+    clientesCobradosDoGestor(gestorId, competencia),
+    obterCondicoesContrato(gestorId)
   ]);
   const especifica = especificaRes.rows[0] || null;
   const config = resolverConfigCobrancaGestor(padrao, especifica);
+  // Contrato: antes do primeiro mês cobrado não há fatura; nos primeiros meses, desconto.
+  const antesDoInicio = antesDoInicioDaCobranca(competencia, condicoes);
+  const mesDesconto = mesDoDescontoInicial(competencia, condicoes);
 
   const ids = clientes.map((cliente) => cliente.cliente_id);
   const usuariosVoip: any[] = ids.length
@@ -24160,9 +24182,19 @@ async function calcularCobrancaGestor(gestorId: number, competencia: string) {
   }));
 
   const isento = especifica?.isento === true;
-  const { itens, total } = isento
-    ? { itens: [] as ItemCobranca[], total: 0 }
-    : montarItensCobrancaGestor({ competencia, config, clientes, voip });
+  let itens: ItemCobranca[] = [];
+  if (!isento && !antesDoInicio) {
+    itens = montarItensCobrancaGestor({ competencia, config, clientes, voip }).itens;
+    if (mesDesconto && condicoes && condicoes.desconto_tipo !== "nenhum") {
+      itens = aplicarDescontoInicial(itens, {
+        tipo: condicoes.desconto_tipo,
+        valor: Number(condicoes.desconto_valor || 0),
+        mes: mesDesconto,
+        meses: Number(condicoes.desconto_meses || 0)
+      });
+    }
+  }
+  const total = totalItens(itens);
 
   return {
     competencia,
@@ -24170,6 +24202,7 @@ async function calcularCobrancaGestor(gestorId: number, competencia: string) {
     config,
     especifica: configCobrancaParaJson(especifica),
     isento,
+    antes_do_inicio: antesDoInicio,
     clientes,
     itens,
     total,
@@ -24192,6 +24225,7 @@ async function gravarCobrancaGestor(gestorId: number, competencia: string, orige
   await sincronizarCustosVoipPendentes(30).catch(() => {});
   const calculo = await calcularCobrancaGestor(gestorId, competencia);
   if (calculo.isento) return { situacao: "isento" as const };
+  if (calculo.antes_do_inicio) return { situacao: "antes_do_inicio" as const };
 
   const competenciaData = `${competencia}-01`;
   const conn = await client.connect();
@@ -24276,6 +24310,7 @@ const MENSAGEM_GERACAO_COBRANCA: Record<string, string> = {
   ja_existe: "Outra geração dessa fatura terminou ao mesmo tempo. Recarregue a lista.",
   sem_valor: "Nada a cobrar nessa competência (sem mensalidade, clientes ou VoIP com valor).",
   isento: "Este gestor está marcado como isento.",
+  antes_do_inicio: "Pelo contrato, a cobrança deste gestor só começa depois desta competência (Financeiro dos Usuários → Condições do contrato).",
   conflito_vencimento: "Já existe um lançamento manual para este gestor na data de vencimento. Mude a data dele ou exclua antes de gerar."
 };
 
@@ -24461,6 +24496,7 @@ app.get("/admin/cobranca-gestores/:id/previa", authMiddleware, async (c) => {
     competencia_nome: nomeCompetencia(competencia),
     vencimento: calculo.vencimento,
     isento: calculo.isento,
+    antes_do_inicio: calculo.antes_do_inicio,
     config: calculo.config,
     itens: calculo.itens,
     total: calculo.total
@@ -24603,6 +24639,409 @@ async function gerarCobrancasGestoresAutomaticas() {
     geracaoCobrancaGestoresEmAndamento = false;
   }
 }
+
+/* =========================
+   📄 CONTRATO DE UTILIZAÇÃO — texto em contrato-plataforma.ts
+========================= */
+
+function condicoesContratoParaJson(linha: any): CondicoesContrato | null {
+  if (!linha) return null;
+  const numero = (v: any) => (v === null || v === undefined ? null : Number(v));
+  return {
+    forma: linha.forma,
+    valor_mensal: numero(linha.valor_mensal),
+    desconto_tipo: linha.desconto_tipo || "nenhum",
+    desconto_valor: numero(linha.desconto_valor),
+    desconto_meses: numero(linha.desconto_meses),
+    inicio_cobranca: linha.inicio_cobranca_mes || null,
+    dia_vencimento: numero(linha.dia_vencimento),
+    condicoes_extras: linha.condicoes_extras || null
+  };
+}
+
+async function obterLinhaCondicoesContrato(usuarioId: number) {
+  const result = await client.query(
+    `SELECT *, TO_CHAR(inicio_cobranca, 'YYYY-MM') AS inicio_cobranca_mes
+     FROM contrato_condicoes WHERE usuario_id = $1`,
+    [usuarioId]
+  );
+  return result.rows[0] || null;
+}
+
+async function obterCondicoesContrato(usuarioId: number) {
+  return condicoesContratoParaJson(await obterLinhaCondicoesContrato(usuarioId));
+}
+
+// No gestor, valor normal/diferenciado/isento é o que está na Cobrança dos Gestores (a tabela
+// de lá também edita): diferenciado = mensalidade ou valor por cliente próprios.
+function formaCobrancaGestor(especifica: any) {
+  if (especifica?.isento === true) return "isento" as const;
+  const proprio = (v: any) => v !== null && v !== undefined;
+  return proprio(especifica?.mensalidade_brl) || proprio(especifica?.valor_por_cliente_brl)
+    ? "diferenciado" as const
+    : "normal" as const;
+}
+
+async function dadosContratoUsuario(usuarioId: number) {
+  const usuarioRes = await client.query(
+    `SELECT u.id, u.nome, u.sobrenome, u.email, u.whatsapp, u.tipo, u.plano,
+            COALESCE(u.atendimento_whatsapp_habilitado, false) AS whatsapp_habilitado,
+            COALESCE(u.voip_habilitado, false) AS voip_habilitado,
+            g.id AS gestor_id, g.nome AS gestor_nome, g.sobrenome AS gestor_sobrenome, g.email AS gestor_email
+     FROM usuarios u
+     LEFT JOIN usuarios g ON g.id = u.admin_id AND g.tipo = 'trafego_pago'
+     WHERE u.id = $1`,
+    [usuarioId]
+  );
+  const u = usuarioRes.rows[0];
+  if (!u) return null;
+  if (usuarioGestorElevado(u)) return { aplicavel: false as const, usuario: u };
+
+  const perfil: PerfilContrato = usuarioEhGestorVinculado(u.tipo)
+    ? "gestor"
+    : u.gestor_id ? "cliente_gerenciado" : "usuario";
+  const linhaCondicoes = perfil === "cliente_gerenciado" ? null : await obterLinhaCondicoesContrato(Number(u.id));
+  let condicoes = condicoesContratoParaJson(linhaCondicoes);
+
+  const dados: DadosContrato = {
+    perfil,
+    contratante: {
+      nome: [u.nome, u.sobrenome].filter(Boolean).join(" "),
+      email: u.email,
+      telefone: u.whatsapp || null,
+      plano: normalizarPlano(u.plano)
+    },
+    recursos: { whatsapp: u.whatsapp_habilitado === true, voip: u.voip_habilitado === true },
+    condicoes,
+    pix: null
+  };
+
+  let gestorCobranca: any = null;
+  if (perfil === "gestor") {
+    const [padrao, especificaRes] = await Promise.all([
+      obterPadraoCobrancaGestor(),
+      client.query("SELECT * FROM cobranca_gestor_config WHERE gestor_id = $1", [u.id])
+    ]);
+    const especifica = configCobrancaParaJson(especificaRes.rows[0]);
+    const efetiva = resolverConfigCobrancaGestor(padrao, especifica);
+    const forma = formaCobrancaGestor(especifica);
+    if (condicoes) condicoes = { ...condicoes, forma };
+    dados.condicoes = condicoes;
+    dados.gestor = {
+      mensalidade_brl: efetiva.mensalidade_brl,
+      valor_por_cliente_brl: efetiva.valor_por_cliente_brl,
+      dia_vencimento: padrao.dia_vencimento
+    };
+    dados.pix = padrao.pix_chave ? { chave: padrao.pix_chave, tipo_label: padrao.pix_tipo_label } : null;
+    gestorCobranca = { padrao, especifica, efetiva, forma };
+  } else if (perfil === "usuario") {
+    dados.pix = linhaCondicoes?.pix_chave
+      ? { chave: linhaCondicoes.pix_chave, tipo_label: CHAVE_PIX_TIPO_LABEL[linhaCondicoes.pix_tipo] || null }
+      : null;
+  } else {
+    // Só lê: obterConfigFinanceiroCliente cria a linha com os padrões de sugestão.
+    const cfg = (await client.query(
+      `SELECT plano_nome, valor_plano_mensal, dia_vencimento, valor_whatsapp_mensal,
+              valor_ia_extra_mensal, outros_descricao, valor_outros_mensal, observacoes, configurado_em
+       FROM cliente_financeiro_config WHERE usuario_id = $1`,
+      [u.id]
+    )).rows[0];
+    const adicionais: { descricao: string; valor: number }[] = [];
+    if (cfg) {
+      if (u.whatsapp_habilitado === true && Number(cfg.valor_whatsapp_mensal) > 0) {
+        adicionais.push({ descricao: "Uso do WhatsApp Business oficial", valor: Number(cfg.valor_whatsapp_mensal) });
+      }
+      if (Number(cfg.valor_ia_extra_mensal) > 0) {
+        adicionais.push({ descricao: "Créditos adicionais de inteligência artificial", valor: Number(cfg.valor_ia_extra_mensal) });
+      }
+      if (Number(cfg.valor_outros_mensal) > 0) {
+        adicionais.push({ descricao: cfg.outros_descricao || "Serviços adicionais", valor: Number(cfg.valor_outros_mensal) });
+      }
+    }
+    dados.gerenciado = {
+      gestor_nome: [u.gestor_nome, u.gestor_sobrenome].filter(Boolean).join(" ") || u.gestor_email || "responsável",
+      gestor_email: u.gestor_email || null,
+      configurado: Boolean(cfg?.configurado_em),
+      plano_nome: cfg?.plano_nome || "Plano Gestão de Tráfego",
+      valor_plano_mensal: Number(cfg?.valor_plano_mensal || 0),
+      dia_vencimento: Number(cfg?.dia_vencimento || 10),
+      adicionais,
+      observacoes: cfg?.observacoes || null
+    };
+  }
+
+  const contrato = montarContrato(dados);
+  const aceite = (await client.query(
+    `SELECT hash, versao, aceito_em, ip FROM contrato_aceites
+     WHERE usuario_id = $1 ORDER BY aceito_em DESC, id DESC LIMIT 1`,
+    [u.id]
+  )).rows[0] || null;
+
+  return {
+    aplicavel: true as const,
+    usuario: u,
+    perfil,
+    linhaCondicoes,
+    condicoes,
+    gestorCobranca,
+    contrato,
+    aceite,
+    aceito_vigente: Boolean(aceite && aceite.hash === contrato.hash)
+  };
+}
+
+const MOTIVO_ACEITE_GESTOR = "Só o próprio cliente pode aceitar o contrato dele.";
+
+// 🔹 Contrato do próprio usuário (Configurações → Contrato).
+app.get("/contrato", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const dados = await dadosContratoUsuario(Number(user.id));
+    if (!dados) return c.json({ error: "Usuário não encontrado" }, 404);
+    if (!dados.aplicavel) return c.json({ aplicavel: false });
+
+    const bloqueio = user.modo_acesso === "gestor"
+      ? MOTIVO_ACEITE_GESTOR
+      : dados.contrato.pendencias.length
+        ? "O aceite fica disponível quando as pendências forem resolvidas."
+        : null;
+
+    return c.json({
+      aplicavel: true,
+      perfil: dados.perfil,
+      contrato: dados.contrato,
+      aceite: dados.aceite ? { aceito_em: dados.aceite.aceito_em, versao: dados.aceite.versao } : null,
+      aceito_vigente: dados.aceito_vigente,
+      pode_aceitar: !dados.aceito_vigente && !bloqueio,
+      motivo_bloqueio: dados.aceito_vigente ? null : bloqueio
+    });
+  } catch (err) {
+    console.error("ERRO GET /contrato:", err);
+    return c.json({ error: "Erro ao carregar o contrato" }, 500);
+  }
+});
+
+app.post("/contrato/aceitar", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    if (user.modo_acesso === "gestor") return c.json({ error: MOTIVO_ACEITE_GESTOR }, 403);
+
+    const body = await c.req.json().catch(() => ({}));
+    const dados = await dadosContratoUsuario(Number(user.id));
+    if (!dados) return c.json({ error: "Usuário não encontrado" }, 404);
+    if (!dados.aplicavel) return c.json({ error: "Contas administrativas não têm contrato." }, 400);
+    if (dados.contrato.pendencias.length) {
+      return c.json({ error: "O contrato ainda tem pendências.", pendencias: dados.contrato.pendencias }, 409);
+    }
+    // O aceite vale para o texto que a pessoa leu: se mudou nesse meio-tempo, ela lê de novo.
+    if (String(body?.hash || "") !== dados.contrato.hash) {
+      return c.json({ error: "O contrato mudou desde que você abriu. Leia a versão atual antes de aceitar.", codigo: "CONTRATO_MUDOU" }, 409);
+    }
+    if (dados.aceito_vigente) {
+      return c.json({ sucesso: true, aceito_em: dados.aceite?.aceito_em || null });
+    }
+
+    const inserido = await client.query(
+      `INSERT INTO contrato_aceites (usuario_id, versao, hash, conteudo, ip, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING aceito_em`,
+      [
+        Number(user.id), dados.contrato.versao, dados.contrato.hash, JSON.stringify(dados.contrato),
+        obterIpRequisicao(c), String(c.req.header("user-agent") || "").slice(0, 300) || null
+      ]
+    );
+
+    return c.json({ sucesso: true, aceito_em: inserido.rows[0]?.aceito_em || null });
+  } catch (err) {
+    console.error("ERRO POST /contrato/aceitar:", err);
+    return c.json({ error: "Erro ao registrar o aceite" }, 500);
+  }
+});
+
+function competenciaComDeslocamento(competencia: string, meses: number) {
+  const [ano, mes] = competencia.split("-").map(Number);
+  const indice = ano * 12 + (mes - 1) + meses;
+  return `${Math.floor(indice / 12)}-${String((indice % 12) + 1).padStart(2, "0")}`;
+}
+
+async function respostaAdminContrato(usuarioId: number) {
+  const dados = await dadosContratoUsuario(usuarioId);
+  if (!dados) return null;
+  if (!dados.aplicavel) return { aplicavel: false };
+
+  const u = dados.usuario;
+  const linha = dados.linhaCondicoes;
+  // Valor sugerido ao lançar a cobrança do usuário comum, por mês de vencimento (1 ano para
+  // trás e 2 para frente), já com o desconto inicial.
+  const mesAtual = normalizarMesVoip(null);
+  const previsoes = dados.perfil === "usuario" && dados.condicoes
+    ? Array.from({ length: 37 }, (_, i) => {
+        const mes = competenciaComDeslocamento(mesAtual, i - 12);
+        return { mes, ...previsaoMensalidade(dados.condicoes, mes) };
+      })
+    : [];
+
+  return {
+    aplicavel: true,
+    perfil: dados.perfil,
+    usuario: {
+      id: Number(u.id),
+      nome: [u.nome, u.sobrenome].filter(Boolean).join(" ") || u.email,
+      email: u.email,
+      telefone: u.whatsapp || null,
+      tipo: u.tipo,
+      plano: normalizarPlano(u.plano)
+    },
+    respondido: Boolean(linha),
+    condicoes: dados.condicoes,
+    pix_chave: linha?.pix_chave || null,
+    previsoes,
+    gestor: dados.gestorCobranca
+      ? {
+          forma: dados.gestorCobranca.forma,
+          padrao: {
+            mensalidade_brl: dados.gestorCobranca.padrao.mensalidade_brl,
+            valor_por_cliente_brl: dados.gestorCobranca.padrao.valor_por_cliente_brl,
+            dia_vencimento: dados.gestorCobranca.padrao.dia_vencimento,
+            pix_chave: dados.gestorCobranca.padrao.pix_chave
+          },
+          especifica: dados.gestorCobranca.especifica,
+          efetiva: dados.gestorCobranca.efetiva
+        }
+      : null,
+    gerenciado: dados.perfil === "cliente_gerenciado"
+      ? {
+          gestor_nome: [u.gestor_nome, u.gestor_sobrenome].filter(Boolean).join(" ") || u.gestor_email,
+          gestor_email: u.gestor_email || null
+        }
+      : null,
+    contrato: dados.contrato,
+    aceite: dados.aceite
+      ? { aceito_em: dados.aceite.aceito_em, versao: dados.aceite.versao, ip: dados.aceite.ip }
+      : null,
+    aceito_vigente: dados.aceito_vigente
+  };
+}
+
+// 🔹 Admin — condições e contrato de um usuário (Financeiro dos Usuários → Gerenciar).
+app.get("/admin/contratos/:usuarioId", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  try {
+    const usuarioId = Number(c.req.param("usuarioId"));
+    if (!Number.isInteger(usuarioId) || usuarioId <= 0) return c.json({ error: "Usuário inválido" }, 400);
+    const resposta = await respostaAdminContrato(usuarioId);
+    if (!resposta) return c.json({ error: "Usuário não encontrado" }, 404);
+    return c.json(resposta);
+  } catch (err) {
+    console.error("ERRO GET /admin/contratos/:usuarioId:", err);
+    return c.json({ error: "Erro ao carregar o contrato" }, 500);
+  }
+});
+
+app.put("/admin/contratos/:usuarioId/condicoes", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  try {
+    const usuarioId = Number(c.req.param("usuarioId"));
+    if (!Number.isInteger(usuarioId) || usuarioId <= 0) return c.json({ error: "Usuário inválido" }, 400);
+
+    const alvo = (await client.query(
+      `SELECT u.id, u.tipo, g.id AS gestor_id
+       FROM usuarios u
+       LEFT JOIN usuarios g ON g.id = u.admin_id AND g.tipo = 'trafego_pago'
+       WHERE u.id = $1`,
+      [usuarioId]
+    )).rows[0];
+    if (!alvo) return c.json({ error: "Usuário não encontrado" }, 404);
+    if (usuarioGestorElevado(alvo)) return c.json({ error: "Contas administrativas não têm contrato." }, 400);
+    const gestor = usuarioEhGestorVinculado(alvo.tipo);
+    if (!gestor && alvo.gestor_id) {
+      return c.json({ error: "Conta gerenciada: quem cobra é o gestor, pelo Financeiro do card do cliente." }, 409);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const normalizado = normalizarCondicoesContrato(body, { gestor });
+    if ("erro" in normalizado) return c.json({ error: normalizado.erro }, 400);
+    const condicoes = normalizado.condicoes;
+
+    let chavePix: { tipo: string; valor: string } | null = null;
+    if (!gestor) {
+      const texto = textoOpcional(body.pix_chave);
+      chavePix = texto ? identificarChavePix(texto) : null;
+      if (texto && !chavePix) {
+        return c.json({ error: "Chave PIX em formato inválido (use CPF, CNPJ, e-mail, telefone ou chave aleatória)" }, 400);
+      }
+    }
+
+    let mensalidadeGestor: number | null = null;
+    let porClienteGestor: number | null = null;
+    if (gestor && condicoes.forma === "diferenciado") {
+      mensalidadeGestor = numeroConfigCobranca(body.gestor_mensalidade_brl, 1000000);
+      porClienteGestor = numeroConfigCobranca(body.gestor_valor_por_cliente_brl, 1000000);
+      if (Number.isNaN(mensalidadeGestor) || Number.isNaN(porClienteGestor)) {
+        return c.json({ error: "Valores do gestor inválidos: use números a partir de 0." }, 400);
+      }
+      if (mensalidadeGestor === null && porClienteGestor === null) {
+        return c.json({ error: "Informe a mensalidade ou o valor por cliente diferenciado (o vazio usa o padrão)." }, 400);
+      }
+    }
+
+    const conn = await client.connect();
+    try {
+      await conn.query("BEGIN");
+      await conn.query(
+        `INSERT INTO contrato_condicoes
+           (usuario_id, forma, valor_mensal, desconto_tipo, desconto_valor, desconto_meses,
+            inicio_cobranca, dia_vencimento, pix_chave, pix_tipo, condicoes_extras, atualizado_em)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::date, $8, $9, $10, $11, NOW())
+         ON CONFLICT (usuario_id) DO UPDATE SET
+           forma = EXCLUDED.forma, valor_mensal = EXCLUDED.valor_mensal,
+           desconto_tipo = EXCLUDED.desconto_tipo, desconto_valor = EXCLUDED.desconto_valor,
+           desconto_meses = EXCLUDED.desconto_meses, inicio_cobranca = EXCLUDED.inicio_cobranca,
+           dia_vencimento = EXCLUDED.dia_vencimento, pix_chave = EXCLUDED.pix_chave,
+           pix_tipo = EXCLUDED.pix_tipo, condicoes_extras = EXCLUDED.condicoes_extras,
+           atualizado_em = NOW()`,
+        [
+          usuarioId, condicoes.forma, condicoes.valor_mensal, condicoes.desconto_tipo,
+          condicoes.desconto_valor, condicoes.desconto_meses,
+          condicoes.inicio_cobranca ? `${condicoes.inicio_cobranca}-01` : null,
+          condicoes.dia_vencimento, chavePix?.valor || null, chavePix?.tipo || null,
+          condicoes.condicoes_extras
+        ]
+      );
+
+      // Gestor: a mesma resposta vale para a fatura automática. Normal = volta ao padrão;
+      // isento mantém os valores próprios guardados (para quando deixar de ser).
+      if (gestor) {
+        await conn.query(
+          `INSERT INTO cobranca_gestor_config (gestor_id, mensalidade_brl, valor_por_cliente_brl, isento, atualizado_em)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (gestor_id) DO UPDATE SET
+             mensalidade_brl = CASE WHEN EXCLUDED.isento THEN cobranca_gestor_config.mensalidade_brl ELSE EXCLUDED.mensalidade_brl END,
+             valor_por_cliente_brl = CASE WHEN EXCLUDED.isento THEN cobranca_gestor_config.valor_por_cliente_brl ELSE EXCLUDED.valor_por_cliente_brl END,
+             isento = EXCLUDED.isento,
+             atualizado_em = NOW()`,
+          [usuarioId, mensalidadeGestor, porClienteGestor, condicoes.forma === "isento"]
+        );
+      }
+
+      await conn.query("COMMIT");
+    } catch (erroQuery) {
+      await conn.query("ROLLBACK").catch(() => {});
+      throw erroQuery;
+    } finally {
+      conn.release();
+    }
+
+    return c.json({ sucesso: true, ...(await respostaAdminContrato(usuarioId)) });
+  } catch (err) {
+    console.error("ERRO PUT /admin/contratos/:usuarioId/condicoes:", err);
+    return c.json({ error: "Erro ao salvar as condições do contrato" }, 500);
+  }
+});
 
 // 🔹 Admin sobe a Nota Fiscal de um lançamento — isso confirma o pagamento.
 app.post("/admin/financeiro/lancamentos/:id/nf", authMiddleware, async (c) => {
@@ -28182,6 +28621,56 @@ await client.query(`
       ALTER TABLE financeiro_lancamentos DROP CONSTRAINT IF EXISTS financeiro_lancamentos_status_check;
       ALTER TABLE financeiro_lancamentos ADD CONSTRAINT financeiro_lancamentos_status_check
         CHECK (status IN ('rascunho','aguardando_pagamento','comprovante_enviado','pago'));
+    END IF;
+  END $$;
+`);
+
+// 📄 Contrato de utilização (contrato-plataforma.ts). As condições são as respostas do super
+// admin em Financeiro dos Usuários; para o gestor, mensalidade/por cliente/isento continuam em
+// cobranca_gestor_config e aqui ficam só desconto inicial, início e condições extras. O aceite
+// guarda o texto aceito (conteudo) e o hash das cláusulas: condição nova = hash novo = aceite
+// pendente de novo.
+await client.query(`
+  CREATE TABLE IF NOT EXISTS contrato_condicoes (
+    usuario_id        INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    forma             TEXT NOT NULL DEFAULT 'normal' CHECK (forma IN ('normal','diferenciado','isento')),
+    valor_mensal      NUMERIC(12, 2) CHECK (valor_mensal >= 0),
+    desconto_tipo     TEXT NOT NULL DEFAULT 'nenhum' CHECK (desconto_tipo IN ('nenhum','percentual','valor')),
+    desconto_valor    NUMERIC(12, 2) CHECK (desconto_valor >= 0),
+    desconto_meses    INTEGER CHECK (desconto_meses BETWEEN 1 AND 36),
+    inicio_cobranca   DATE,
+    dia_vencimento    INTEGER CHECK (dia_vencimento BETWEEN 1 AND 28),
+    pix_chave         TEXT,
+    pix_tipo          TEXT,
+    condicoes_extras  TEXT,
+    atualizado_em     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS contrato_aceites (
+    id          SERIAL PRIMARY KEY,
+    usuario_id  INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    versao      TEXT NOT NULL,
+    hash        TEXT NOT NULL,
+    conteudo    JSONB NOT NULL,
+    ip          TEXT,
+    user_agent  TEXT,
+    aceito_em   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_contrato_aceites_usuario
+    ON contrato_aceites(usuario_id, aceito_em DESC);
+
+  -- Desconto inicial do contrato vira um item próprio da fatura do gestor.
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'financeiro_lancamento_itens_tipo_check'
+        AND pg_get_constraintdef(oid) LIKE '%desconto%'
+    ) THEN
+      ALTER TABLE financeiro_lancamento_itens DROP CONSTRAINT IF EXISTS financeiro_lancamento_itens_tipo_check;
+      ALTER TABLE financeiro_lancamento_itens ADD CONSTRAINT financeiro_lancamento_itens_tipo_check
+        CHECK (tipo IN ('mensalidade','clientes','desconto','voip','ajuste'));
     END IF;
   END $$;
 `);

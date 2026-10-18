@@ -39,7 +39,7 @@ export type VoipClienteMes = {
   custos_estimados: number;
 };
 
-export type TipoItemCobranca = "mensalidade" | "clientes" | "voip" | "ajuste";
+export type TipoItemCobranca = "mensalidade" | "clientes" | "desconto" | "voip" | "ajuste";
 
 export type ItemCobranca = {
   tipo: TipoItemCobranca;
@@ -202,6 +202,48 @@ export function montarItensCobrancaGestor(params: {
   }
 
   return { itens, total: totalItens(itens) };
+}
+
+// Quanto sai de desconto (em % ou R$) sobre uma base, nunca mais que a própria base.
+export function valorDescontoSobre(base: number, tipo: string, valor: number | null | undefined) {
+  const valorBase = Math.max(Number(base) || 0, 0);
+  const bruto = tipo === "percentual"
+    ? valorBase * Number(valor || 0) / 100
+    : tipo === "valor" ? Number(valor || 0) : 0;
+  return arredondarCentavos(Math.min(Math.max(bruto, 0), valorBase));
+}
+
+// Desconto inicial do contrato (contrato-plataforma.ts): incide sobre mensalidade + clientes
+// e entra logo depois deles. O VoIP é custo repassado e fica fora. `mes` = qual mês do
+// desconto é esta competência (1 = primeiro).
+export function aplicarDescontoInicial(
+  itens: ItemCobranca[],
+  desconto: { tipo: "percentual" | "valor"; valor: number; mes: number; meses: number }
+) {
+  const base = arredondarCentavos(
+    itens
+      .filter((item) => item.tipo === "mensalidade" || item.tipo === "clientes")
+      .reduce((soma, item) => soma + Number(item.valor_total || 0), 0)
+  );
+  const valor = valorDescontoSobre(base, desconto.tipo, desconto.valor);
+  if (valor <= 0) return itens;
+
+  const quanto = desconto.tipo === "percentual" ? ` · ${String(desconto.valor).replace(".", ",")}%` : "";
+  const item: ItemCobranca = {
+    tipo: "desconto",
+    descricao: `Desconto inicial (mês ${desconto.mes} de ${desconto.meses}${quanto})`,
+    cliente_id: null,
+    quantidade: 1,
+    valor_unitario: -valor,
+    valor_total: -valor,
+    detalhes: { mes: desconto.mes, meses: desconto.meses, tipo: desconto.tipo, valor: desconto.valor },
+    interno: null,
+  };
+  const ultimaBase = itens.reduce(
+    (posicao, atual, indice) => (atual.tipo === "mensalidade" || atual.tipo === "clientes" ? indice : posicao),
+    -1
+  );
+  return [...itens.slice(0, ultimaBase + 1), item, ...itens.slice(ultimaBase + 1)];
 }
 
 // Ajuste feito pelo super admin (desconto ou acréscimo): vira um item "ajuste" com a
