@@ -26292,6 +26292,26 @@ await client.query(`
     WHERE painel_slug IS NOT NULL;
 `);
 
+// admin_id (gestor de tráfego ou admin corretor do usuário) não tinha chave estrangeira:
+// apagar um gestor deixava os clientes apontando para um id que não existe mais. Com a FK,
+// apagar o gestor só desvincula os clientes. NOT VALID para não varrer nem alterar linhas
+// antigas (em produção não havia nenhum vínculo quebrado em 2026-10-17); vale para tudo
+// que for gravado daqui em diante.
+await client.query(`
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint WHERE conname = 'usuarios_admin_id_fkey'
+    ) THEN
+      ALTER TABLE usuarios
+        ADD CONSTRAINT usuarios_admin_id_fkey
+        FOREIGN KEY (admin_id) REFERENCES usuarios(id)
+        ON DELETE SET NULL
+        NOT VALID;
+    END IF;
+  END $$;
+`);
+
 await client.query(`
   CREATE TABLE IF NOT EXISTS gestor_acessos (
     id SERIAL PRIMARY KEY,
@@ -28258,6 +28278,7 @@ async function buscarClienteGerenciado(
 function formatarClienteGerenciado(row: any) {
   return {
     id: Number(row.id),
+    admin_id: row.admin_id ? Number(row.admin_id) : null,
     nome: row.nome || "",
     sobrenome: row.sobrenome || "",
     nome_completo: `${row.nome || ""} ${row.sobrenome || ""}`.trim(),
@@ -28603,6 +28624,21 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
     adicionarExpressao("painel_atualizado_em = NOW()");
   }
 
+  // Desativar bloqueia o login do corretor, do painel e o acesso do gestor à conta (o
+  // authMiddleware recusa usuário inativo); é reversível e não apaga nada. As campanhas
+  // continuam nas plataformas de anúncio — desativar aqui não pausa nada lá.
+  if (Object.prototype.hasOwnProperty.call(body, "ativo")) {
+    if (typeof body.ativo !== "boolean") {
+      return c.json({ error: "Informe se a conta fica ativa (true) ou inativa (false)" }, 400);
+    }
+    if (body.ativo === false && cliente.voip_numero) {
+      return c.json({
+        error: "Este corretor ainda possui um número VoIP contratado. Libere a linha antes de desativar a conta, para a cobrança externa ser encerrada."
+      }, 409);
+    }
+    adicionar("ativo", body.ativo);
+  }
+
   if (!atualizacoes.length) {
     return c.json({ error: "Nenhuma alteração informada" }, 400);
   }
@@ -28640,6 +28676,42 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
     console.error("GESTOR ATUALIZAR CLIENTE ERROR:", err);
     return c.json({ error: "Não foi possível atualizar o corretor" }, 500);
   }
+});
+
+// Desvincula o corretor do gestor (admin_id = NULL). A conta continua existindo e o
+// corretor continua entrando normalmente; quem desvinculou perde o acesso na hora (no
+// contexto "gestor" o authMiddleware confere o admin_id a cada requisição). Exclusão
+// definitiva fica fora do alcance do gestor de propósito: apaga leads, campanhas e
+// conexões em cascata — continua só com o super admin.
+app.post("/gestor/clientes/:id/desvincular", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const cliente = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!cliente || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  if (!cliente.admin_id) {
+    return c.json({ error: "Este corretor não está vinculado a nenhum gestor." }, 409);
+  }
+
+  if (cliente.voip_numero) {
+    return c.json({
+      error: "Este corretor ainda possui um número VoIP contratado. Libere a linha antes de desvincular, para a cobrança externa não ficar sem responsável."
+    }, 409);
+  }
+
+  const resultado = await client.query(
+    `UPDATE usuarios SET admin_id = NULL WHERE id = $1 AND admin_id = $2`,
+    [clienteId, Number(cliente.admin_id)]
+  );
+
+  if (!resultado.rowCount) {
+    return c.json({ error: "O vínculo deste corretor mudou enquanto isso. Atualize a lista." }, 409);
+  }
+
+  return c.json({ sucesso: true, cliente_id: clienteId });
 });
 
 
