@@ -139,6 +139,20 @@ import {
   normalizarMesVoip,
 } from "./voip-custos";
 
+import {
+  aplicarAjusteManual,
+  competenciaAnterior,
+  competenciaValida,
+  itensVisiveisAoGestor,
+  manterAjusteAoRecalcular,
+  montarItensCobrancaGestor,
+  nomeCompetencia,
+  resolverConfigCobrancaGestor,
+  totalItens,
+  vencimentoDaCompetencia,
+  type ItemCobranca,
+} from "./cobranca-gestor";
+
 const app = new Hono();
 
 const WHATSAPP_CLOUD_API_VERSION =
@@ -23626,8 +23640,73 @@ function linhaFinanceiroParaJson(linha: any) {
     pix_tipo: linha.pix_tipo,
     pix_tipo_label: linha.pix_tipo ? (CHAVE_PIX_TIPO_LABEL[linha.pix_tipo] || linha.pix_tipo) : null,
     lembretes_whatsapp: Array.isArray(linha.lembretes_whatsapp) ? linha.lembretes_whatsapp : [],
+    origem: linha.origem || "manual",
+    competencia: linha.competencia || null,
+    gerado_em: linha.gerado_em || null,
+    liberado_em: linha.liberado_em || null,
     criado_em: linha.criado_em
   };
+}
+
+// Itens da fatura (só os lançamentos automáticos do gestor têm). incluirInterno: custo do
+// provedor e margem do VoIP — só para o super admin.
+async function itensDosLancamentos(ids: number[], incluirInterno: boolean) {
+  const mapa = new Map<number, any[]>();
+  const validos = Array.from(new Set(ids.map(Number).filter((id) => Number.isInteger(id) && id > 0)));
+  if (!validos.length) return mapa;
+
+  const result = await client.query(
+    `SELECT lancamento_id, tipo, descricao, cliente_id, quantidade,
+            valor_unitario, valor_total, detalhes, interno
+     FROM financeiro_lancamento_itens
+     WHERE lancamento_id = ANY($1::int[])
+     ORDER BY lancamento_id, ordem, id`,
+    [validos]
+  );
+
+  for (const linha of result.rows) {
+    const id = Number(linha.lancamento_id);
+    const lista = mapa.get(id) || [];
+    lista.push({
+      tipo: linha.tipo,
+      descricao: linha.descricao,
+      cliente_id: linha.cliente_id === null ? null : Number(linha.cliente_id),
+      quantidade: Number(linha.quantidade),
+      valor_unitario: Number(linha.valor_unitario),
+      valor_total: Number(linha.valor_total),
+      detalhes: linha.detalhes || null,
+      ...(incluirInterno ? { interno: linha.interno || null } : {})
+    });
+    mapa.set(id, lista);
+  }
+
+  return mapa;
+}
+
+async function lancamentosComItens(linhas: any[], incluirInterno: boolean) {
+  const itens = await itensDosLancamentos(linhas.map((l: any) => Number(l.id)), incluirInterno);
+  return linhas.map((linha: any) => ({
+    ...linhaFinanceiroParaJson(linha),
+    itens: itens.get(Number(linha.id)) || []
+  }));
+}
+
+async function substituirItensLancamento(db: any, lancamentoId: number, itens: ItemCobranca[]) {
+  await db.query("DELETE FROM financeiro_lancamento_itens WHERE lancamento_id = $1", [lancamentoId]);
+  for (const [ordem, item] of itens.entries()) {
+    await db.query(
+      `INSERT INTO financeiro_lancamento_itens
+         (lancamento_id, ordem, tipo, descricao, cliente_id, quantidade,
+          valor_unitario, valor_total, detalhes, interno)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        lancamentoId, ordem, item.tipo, item.descricao, item.cliente_id,
+        item.quantidade, item.valor_unitario, item.valor_total,
+        item.detalhes ? JSON.stringify(item.detalhes) : null,
+        item.interno ? JSON.stringify(item.interno) : null
+      ]
+    );
+  }
 }
 
 // 🔹 Usuário comum — vê só os próprios lançamentos.
@@ -23639,6 +23718,7 @@ app.get("/financeiro/meus-lancamentos", authMiddleware, async (c) => {
       `SELECT f.id, f.usuario_id, f.mes_referencia, f.valor, f.status,
               f.comprovante_dados, f.comprovante_enviado_em, f.nf_dados, f.nf_enviada_em,
               f.observacao, f.pix_chave, f.pix_tipo, f.criado_em,
+              f.origem, TO_CHAR(f.competencia, 'YYYY-MM') AS competencia, f.gerado_em, f.liberado_em,
               COALESCE((
                 SELECT json_agg(
                   json_build_object(
@@ -23654,11 +23734,12 @@ app.get("/financeiro/meus-lancamentos", authMiddleware, async (c) => {
               ), '[]'::json) AS lembretes_whatsapp
        FROM financeiro_lancamentos f
        WHERE f.usuario_id = $1
+         AND f.status <> 'rascunho'
        ORDER BY f.mes_referencia DESC`,
       [user.id]
     );
 
-    return c.json(result.rows.map(linhaFinanceiroParaJson));
+    return c.json(await lancamentosComItens(result.rows, false));
   } catch (err) {
     console.error("ERRO GET /financeiro/meus-lancamentos:", err);
     return c.json({ error: "Erro ao carregar lançamentos" }, 500);
@@ -23673,7 +23754,7 @@ app.post("/financeiro/lancamentos/:id/comprovante", authMiddleware, async (c) =>
     if (!Number.isFinite(id)) return c.json({ error: "Lançamento inválido" }, 400);
 
     const dono = await client.query(
-      `SELECT usuario_id FROM financeiro_lancamentos WHERE id = $1`,
+      `SELECT usuario_id FROM financeiro_lancamentos WHERE id = $1 AND status <> 'rascunho'`,
       [id]
     );
     if (!dono.rows.length || dono.rows[0].usuario_id !== user.id) {
@@ -23792,6 +23873,7 @@ app.get("/admin/financeiro/usuarios/:usuarioId/lancamentos", authMiddleware, asy
       `SELECT f.id, f.usuario_id, f.mes_referencia, f.valor, f.status,
               f.comprovante_dados, f.comprovante_enviado_em, f.nf_dados, f.nf_enviada_em,
               f.observacao, f.pix_chave, f.pix_tipo, f.criado_em,
+              f.origem, TO_CHAR(f.competencia, 'YYYY-MM') AS competencia, f.gerado_em, f.liberado_em,
               COALESCE((
                 SELECT json_agg(
                   json_build_object(
@@ -23811,7 +23893,7 @@ app.get("/admin/financeiro/usuarios/:usuarioId/lancamentos", authMiddleware, asy
       [usuarioId]
     );
 
-    return c.json(result.rows.map(linhaFinanceiroParaJson));
+    return c.json(await lancamentosComItens(result.rows, true));
   } catch (err) {
     console.error("ERRO GET /admin/financeiro/usuarios/:usuarioId/lancamentos:", err);
     return c.json({ error: "Erro ao carregar lançamentos" }, 500);
@@ -23859,12 +23941,17 @@ app.post("/admin/financeiro/lancamentos", authMiddleware, async (c) => {
        ON CONFLICT (usuario_id, mes_referencia)
        DO UPDATE SET valor = EXCLUDED.valor, observacao = EXCLUDED.observacao,
                      pix_chave = EXCLUDED.pix_chave, pix_tipo = EXCLUDED.pix_tipo
+       WHERE financeiro_lancamentos.origem = 'manual'
        RETURNING id, usuario_id, mes_referencia, valor, status,
                  comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
                  observacao, pix_chave, pix_tipo, criado_em`,
       [usuarioId, dataReferencia, valorNumero, textoOpcional(observacao) || null,
        chavePix?.valor || null, chavePix?.tipo || null]
     );
+
+    if (!result.rows.length) {
+      return c.json({ error: "Nessa data já existe a fatura automática deste gestor. Edite a fatura em vez de lançar outra." }, 409);
+    }
 
     return c.json(linhaFinanceiroParaJson(result.rows[0]));
   } catch (err) {
@@ -23903,23 +23990,40 @@ app.put("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
       ? String(mes_referencia)
       : `${String(mes_referencia)}-01`;
 
-    let result;
+    const conn = await client.connect();
+    let result: any;
     try {
-      result = await client.query(
+      await conn.query("BEGIN");
+      result = await conn.query(
         `UPDATE financeiro_lancamentos
          SET mes_referencia = $1, valor = $2, observacao = $3, pix_chave = $4, pix_tipo = $5
          WHERE id = $6
          RETURNING id, usuario_id, mes_referencia, valor, status,
                    comprovante_dados, comprovante_enviado_em, nf_dados, nf_enviada_em,
-                   observacao, pix_chave, pix_tipo, criado_em`,
+                   observacao, pix_chave, pix_tipo, criado_em, origem,
+                   TO_CHAR(competencia, 'YYYY-MM') AS competencia, gerado_em, liberado_em`,
         [dataReferencia, valorNumero, textoOpcional(observacao) || null,
          chavePix?.valor || null, chavePix?.tipo || null, id]
       );
+
+      // Fatura do gestor: o valor é a soma dos itens. Valor novo vira um item "ajuste" com a
+      // diferença (desconto ou acréscimo), para o detalhe que o gestor vê continuar fechando.
+      if (result.rows[0]?.origem === "cobranca_gestor") {
+        const itensAtuais = (await itensDosLancamentos([id], true)).get(id) || [];
+        if (itensAtuais.length && totalItens(itensAtuais) !== Number(valorNumero.toFixed(2))) {
+          await substituirItensLancamento(conn, id, aplicarAjusteManual(itensAtuais as ItemCobranca[], valorNumero));
+        }
+      }
+
+      await conn.query("COMMIT");
     } catch (erroQuery: any) {
+      await conn.query("ROLLBACK").catch(() => {});
       if (erroQuery?.code === "23505") {
         return c.json({ error: "Já existe um lançamento desse usuário nessa data de referência" }, 409);
       }
       throw erroQuery;
+    } finally {
+      conn.release();
     }
 
     if (!result.rows.length) return c.json({ error: "Lançamento não encontrado" }, 404);
@@ -23955,6 +24059,550 @@ app.delete("/admin/financeiro/lancamentos/:id", authMiddleware, async (c) => {
     return c.json({ error: "Erro ao excluir lançamento" }, 500);
   }
 });
+
+/* =========================
+   🧾 COBRANÇA DOS GESTORES — mensalidade + clientes + VoIP (cobranca-gestor.ts)
+========================= */
+
+function numeroConfigCobranca(valor: unknown, maximo: number) {
+  if (valor === null || valor === undefined || valor === "") return null;
+  const n = Number(valor);
+  return Number.isFinite(n) && n >= 0 && n <= maximo ? Number(n.toFixed(2)) : NaN;
+}
+
+async function obterPadraoCobrancaGestor() {
+  const result = await client.query(
+    `SELECT mensalidade_brl, valor_por_cliente_brl, voip_margem_percentual, voip_taxa_fixa_brl,
+            dia_geracao, dia_vencimento, pix_chave, pix_tipo, geracao_automatica,
+            TO_CHAR(cobrar_a_partir_de, 'YYYY-MM') AS cobrar_a_partir_de, atualizado_em
+     FROM cobranca_gestor_padrao WHERE id = 1`
+  );
+  const linha = result.rows[0] || {};
+  return {
+    mensalidade_brl: Number(linha.mensalidade_brl || 0),
+    valor_por_cliente_brl: Number(linha.valor_por_cliente_brl || 0),
+    voip_margem_percentual: Number(linha.voip_margem_percentual || 0),
+    voip_taxa_fixa_brl: Number(linha.voip_taxa_fixa_brl || 0),
+    dia_geracao: Number(linha.dia_geracao || 1),
+    dia_vencimento: Number(linha.dia_vencimento || 10),
+    pix_chave: linha.pix_chave || null,
+    pix_tipo: linha.pix_tipo || null,
+    pix_tipo_label: linha.pix_tipo ? (CHAVE_PIX_TIPO_LABEL[linha.pix_tipo] || linha.pix_tipo) : null,
+    geracao_automatica: linha.geracao_automatica !== false,
+    cobrar_a_partir_de: linha.cobrar_a_partir_de || normalizarMesVoip(null),
+    atualizado_em: linha.atualizado_em || null
+  };
+}
+
+function configCobrancaParaJson(linha: any) {
+  const valor = (v: any) => (v === null || v === undefined ? null : Number(v));
+  return {
+    mensalidade_brl: valor(linha?.mensalidade_brl),
+    valor_por_cliente_brl: valor(linha?.valor_por_cliente_brl),
+    voip_margem_percentual: valor(linha?.voip_margem_percentual),
+    voip_taxa_fixa_brl: valor(linha?.voip_taxa_fixa_brl),
+    isento: linha?.isento === true,
+    observacoes: linha?.observacoes || null
+  };
+}
+
+// Todo cliente que esteve vinculado ao gestor em qualquer momento do mês (calendário de
+// São Paulo), uma vez cada, com o nome atual (ou o da época, se a conta foi apagada).
+async function clientesCobradosDoGestor(gestorId: number, competencia: string) {
+  const { inicio, fim } = intervaloMesVoip(competencia);
+  const result = await client.query(
+    `
+    SELECT DISTINCT ON (v.cliente_id)
+      v.cliente_id,
+      COALESCE(
+        NULLIF(TRIM(COALESCE(u.nome, '') || ' ' || COALESCE(u.sobrenome, '')), ''),
+        v.cliente_nome, u.email, v.cliente_email
+      ) AS nome,
+      COALESCE(u.email, v.cliente_email) AS email
+    FROM gestor_vinculos v
+    LEFT JOIN usuarios u ON u.id = v.cliente_id
+    WHERE v.gestor_id = $1
+      AND v.inicio < $3::timestamptz
+      AND (v.fim IS NULL OR v.fim > $2::timestamptz)
+    ORDER BY v.cliente_id, v.inicio
+    `,
+    [gestorId, inicio.toISOString(), fim.toISOString()]
+  );
+  return result.rows.map((linha: any) => ({
+    cliente_id: Number(linha.cliente_id),
+    nome: linha.nome || `Cliente ${linha.cliente_id}`,
+    email: linha.email || null
+  }));
+}
+
+async function calcularCobrancaGestor(gestorId: number, competencia: string) {
+  const [padrao, especificaRes, clientes] = await Promise.all([
+    obterPadraoCobrancaGestor(),
+    client.query("SELECT * FROM cobranca_gestor_config WHERE gestor_id = $1", [gestorId]),
+    clientesCobradosDoGestor(gestorId, competencia)
+  ]);
+  const especifica = especificaRes.rows[0] || null;
+  const config = resolverConfigCobrancaGestor(padrao, especifica);
+
+  const ids = clientes.map((cliente) => cliente.cliente_id);
+  const usuariosVoip: any[] = ids.length
+    ? (await resumoCustosVoipUsuarios(ids, competencia, false)).usuarios
+    : [];
+  const voip = usuariosVoip.map((item: any) => ({
+    cliente_id: Number(item.id),
+    nome: item.nome,
+    linhas: Number(item.voip?.linhas_no_mes || 0),
+    chamadas: Number(item.consumo?.chamadas || 0),
+    minutos: Number(item.consumo?.minutos || 0),
+    numero_brl: Number(item.custos?.numero_brl || 0),
+    chamadas_brl: Number(item.custos?.chamadas_brl || 0),
+    custos_estimados: Number(item.consumo?.custos_estimados || 0)
+  }));
+
+  const isento = especifica?.isento === true;
+  const { itens, total } = isento
+    ? { itens: [] as ItemCobranca[], total: 0 }
+    : montarItensCobrancaGestor({ competencia, config, clientes, voip });
+
+  return {
+    competencia,
+    padrao,
+    config,
+    especifica: configCobrancaParaJson(especifica),
+    isento,
+    clientes,
+    itens,
+    total,
+    vencimento: vencimentoDaCompetencia(competencia, padrao.dia_vencimento)
+  };
+}
+
+function observacaoFaturaGestor(calculo: { competencia: string; itens: ItemCobranca[] }) {
+  const partes: string[] = [];
+  const clientes = calculo.itens.find((item) => item.tipo === "clientes");
+  if (calculo.itens.some((item) => item.tipo === "mensalidade")) partes.push("mensalidade");
+  if (clientes) partes.push(`${clientes.quantidade} ${clientes.quantidade === 1 ? "cliente" : "clientes"}`);
+  if (calculo.itens.some((item) => item.tipo === "voip")) partes.push("VoIP");
+  return `Fatura de ${nomeCompetencia(calculo.competencia)}${partes.length ? `: ${partes.join(", ").replace(/, ([^,]*)$/, " e $1")}` : ""}.`;
+}
+
+// Cria (ou recalcula, se ainda for rascunho) a fatura do gestor para a competência.
+// Fatura já liberada não muda: para corrigir, o super admin edita o valor (vira ajuste).
+async function gravarCobrancaGestor(gestorId: number, competencia: string, origem: "automatica" | "manual") {
+  await sincronizarCustosVoipPendentes(30).catch(() => {});
+  const calculo = await calcularCobrancaGestor(gestorId, competencia);
+  if (calculo.isento) return { situacao: "isento" as const };
+
+  const competenciaData = `${competencia}-01`;
+  const conn = await client.connect();
+
+  try {
+    await conn.query("BEGIN");
+    const existente = (await conn.query(
+      `SELECT id, status FROM financeiro_lancamentos
+       WHERE usuario_id = $1 AND origem = 'cobranca_gestor' AND competencia = $2::date
+       FOR UPDATE`,
+      [gestorId, competenciaData]
+    )).rows[0];
+
+    if (existente && existente.status !== "rascunho") {
+      await conn.query("ROLLBACK");
+      return { situacao: "ja_liberada" as const, lancamento_id: Number(existente.id) };
+    }
+
+    let itens = calculo.itens;
+    if (existente) {
+      const anteriores = (await itensDosLancamentos([Number(existente.id)], true)).get(Number(existente.id)) || [];
+      itens = manterAjusteAoRecalcular(itens, anteriores as ItemCobranca[]);
+    }
+    const total = totalItens(itens);
+
+    if (total <= 0) {
+      if (existente) await conn.query("DELETE FROM financeiro_lancamentos WHERE id = $1", [existente.id]);
+      await conn.query("COMMIT");
+      return { situacao: "sem_valor" as const, removido: Boolean(existente) };
+    }
+
+    let lancamentoId: number;
+    if (existente) {
+      lancamentoId = Number(existente.id);
+      await conn.query(
+        "UPDATE financeiro_lancamentos SET valor = $1, gerado_em = NOW() WHERE id = $2",
+        [total, lancamentoId]
+      );
+    } else {
+      const inserido = await conn.query(
+        `INSERT INTO financeiro_lancamentos
+           (usuario_id, mes_referencia, valor, status, observacao, pix_chave, pix_tipo,
+            origem, competencia, gerado_em)
+         VALUES ($1, $2::date, $3, 'rascunho', $4, $5, $6, 'cobranca_gestor', $7::date, NOW())
+         RETURNING id`,
+        [gestorId, calculo.vencimento, total, observacaoFaturaGestor({ competencia, itens }),
+         calculo.padrao.pix_chave, calculo.padrao.pix_tipo, competenciaData]
+      );
+      lancamentoId = Number(inserido.rows[0].id);
+    }
+
+    await substituirItensLancamento(conn, lancamentoId, itens);
+
+    if (origem === "automatica") {
+      await conn.query(
+        `INSERT INTO cobranca_gestor_geracoes (gestor_id, competencia, situacao, lancamento_id)
+         VALUES ($1, $2::date, 'criada', $3) ON CONFLICT DO NOTHING`,
+        [gestorId, competenciaData, lancamentoId]
+      );
+    }
+
+    await conn.query("COMMIT");
+    return { situacao: existente ? "recalculada" as const : "criada" as const, lancamento_id: lancamentoId, total };
+  } catch (err: any) {
+    await conn.query("ROLLBACK").catch(() => {});
+    if (err?.code === "23505") {
+      if (err?.constraint === "idx_financeiro_lancamentos_cobranca_gestor") {
+        return { situacao: "ja_existe" as const };
+      }
+      return { situacao: "conflito_vencimento" as const, vencimento: calculo.vencimento };
+    }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+const MENSAGEM_GERACAO_COBRANCA: Record<string, string> = {
+  criada: "Rascunho criado. O gestor só vê depois que você liberar.",
+  recalculada: "Rascunho recalculado com os dados atuais (o ajuste manual foi mantido).",
+  ja_liberada: "Essa fatura já foi liberada para o gestor e não é recalculada. Para corrigir, edite o valor (vira um ajuste).",
+  ja_existe: "Outra geração dessa fatura terminou ao mesmo tempo. Recarregue a lista.",
+  sem_valor: "Nada a cobrar nessa competência (sem mensalidade, clientes ou VoIP com valor).",
+  isento: "Este gestor está marcado como isento.",
+  conflito_vencimento: "Já existe um lançamento manual para este gestor na data de vencimento. Mude a data dele ou exclua antes de gerar."
+};
+
+async function gestoresCobraveis(competencia: string) {
+  const { fim } = intervaloMesVoip(competencia);
+  const result = await client.query(
+    `SELECT id FROM usuarios
+     WHERE tipo = 'trafego_pago'
+       AND COALESCE(ativo, true) = true
+       AND (criado_em IS NULL OR criado_em < ($1::timestamptz AT TIME ZONE 'UTC'))
+     ORDER BY id`,
+    [fim.toISOString()]
+  );
+  return result.rows.map((linha: any) => Number(linha.id));
+}
+
+function exigirSuperAdmin(c: any) {
+  const user: any = c.get("user");
+  return user?.tipo === "super_admin" ? null : c.json({ error: "Acesso negado" }, 403);
+}
+
+// 🔹 Admin — configuração padrão + gestores, com a fatura da competência (padrão: mês passado).
+app.get("/admin/cobranca-gestores", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  const competencia = competenciaValida(c.req.query("competencia"))
+    ? String(c.req.query("competencia"))
+    : competenciaAnterior(normalizarMesVoip(null));
+
+  const [padrao, gestores] = await Promise.all([
+    obterPadraoCobrancaGestor(),
+    client.query(
+      `
+      SELECT g.id, g.nome, g.sobrenome, g.email, COALESCE(g.ativo, true) AS ativo,
+             cfg.mensalidade_brl, cfg.valor_por_cliente_brl, cfg.voip_margem_percentual,
+             cfg.voip_taxa_fixa_brl, cfg.isento, cfg.observacoes,
+             (SELECT COUNT(*)::int FROM gestor_vinculos v WHERE v.gestor_id = g.id AND v.fim IS NULL) AS clientes_agora,
+             f.id AS lancamento_id, f.status AS lancamento_status, f.valor AS lancamento_valor,
+             TO_CHAR(f.mes_referencia, 'YYYY-MM-DD') AS lancamento_vencimento
+      FROM usuarios g
+      LEFT JOIN cobranca_gestor_config cfg ON cfg.gestor_id = g.id
+      LEFT JOIN financeiro_lancamentos f
+        ON f.usuario_id = g.id AND f.origem = 'cobranca_gestor' AND f.competencia = $1::date
+      WHERE g.tipo = 'trafego_pago'
+      ORDER BY g.nome NULLS LAST, g.email
+      `,
+      [`${competencia}-01`]
+    )
+  ]);
+
+  return c.json({
+    competencia,
+    competencia_nome: nomeCompetencia(competencia),
+    vencimento: vencimentoDaCompetencia(competencia, padrao.dia_vencimento),
+    padrao,
+    gestores: gestores.rows.map((linha: any) => {
+      const especifica = configCobrancaParaJson(linha);
+      return {
+        id: Number(linha.id),
+        nome: [linha.nome, linha.sobrenome].filter(Boolean).join(" ") || linha.email,
+        email: linha.email,
+        ativo: linha.ativo !== false,
+        clientes_agora: Number(linha.clientes_agora || 0),
+        especifica,
+        efetiva: resolverConfigCobrancaGestor(padrao, especifica),
+        fatura: linha.lancamento_id
+          ? {
+              id: Number(linha.lancamento_id),
+              status: linha.lancamento_status,
+              valor: Number(linha.lancamento_valor),
+              vencimento: linha.lancamento_vencimento
+            }
+          : null
+      };
+    })
+  });
+});
+
+app.put("/admin/cobranca-gestores/padrao", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  const body = await c.req.json().catch(() => ({}));
+  const mensalidade = numeroConfigCobranca(body.mensalidade_brl ?? 0, 1000000);
+  const porCliente = numeroConfigCobranca(body.valor_por_cliente_brl ?? 0, 1000000);
+  const margem = numeroConfigCobranca(body.voip_margem_percentual ?? 0, 500);
+  const taxa = numeroConfigCobranca(body.voip_taxa_fixa_brl ?? 0, 100000);
+  const diaGeracao = Number(body.dia_geracao ?? 1);
+  const diaVencimento = Number(body.dia_vencimento ?? 10);
+  const aPartirDe = String(body.cobrar_a_partir_de || "");
+
+  if ([mensalidade, porCliente, margem, taxa].some((v) => v === null || Number.isNaN(v))) {
+    return c.json({ error: "Valores inválidos: use números a partir de 0 (margem até 500%)." }, 400);
+  }
+  if (![diaGeracao, diaVencimento].every((d) => Number.isInteger(d) && d >= 1 && d <= 28)) {
+    return c.json({ error: "Os dias de geração e de vencimento vão de 1 a 28." }, 400);
+  }
+  if (!competenciaValida(aPartirDe)) {
+    return c.json({ error: "Informe o primeiro mês cobrado (AAAA-MM)." }, 400);
+  }
+
+  const chavePixTexto = textoOpcional(body.pix_chave);
+  const chavePix = chavePixTexto ? identificarChavePix(chavePixTexto) : null;
+  if (chavePixTexto && !chavePix) {
+    return c.json({ error: "Chave PIX em formato inválido (use CPF, CNPJ, e-mail, telefone ou chave aleatória)" }, 400);
+  }
+
+  await client.query(
+    `UPDATE cobranca_gestor_padrao SET
+       mensalidade_brl = $1, valor_por_cliente_brl = $2, voip_margem_percentual = $3,
+       voip_taxa_fixa_brl = $4, dia_geracao = $5, dia_vencimento = $6,
+       pix_chave = $7, pix_tipo = $8, geracao_automatica = $9,
+       cobrar_a_partir_de = $10::date, atualizado_em = NOW()
+     WHERE id = 1`,
+    [mensalidade, porCliente, margem, taxa, diaGeracao, diaVencimento,
+     chavePix?.valor || null, chavePix?.tipo || null, body.geracao_automatica !== false,
+     `${aPartirDe}-01`]
+  );
+
+  return c.json({ sucesso: true, padrao: await obterPadraoCobrancaGestor() });
+});
+
+app.put("/admin/cobranca-gestores/:id", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  const gestorId = Number(c.req.param("id"));
+  const gestor = await client.query(
+    "SELECT id FROM usuarios WHERE id = $1 AND tipo = 'trafego_pago'",
+    [gestorId]
+  );
+  if (!gestor.rows.length) return c.json({ error: "Gestor não encontrado" }, 404);
+
+  const body = await c.req.json().catch(() => ({}));
+  const valores = [
+    numeroConfigCobranca(body.mensalidade_brl, 1000000),
+    numeroConfigCobranca(body.valor_por_cliente_brl, 1000000),
+    numeroConfigCobranca(body.voip_margem_percentual, 500),
+    numeroConfigCobranca(body.voip_taxa_fixa_brl, 100000)
+  ];
+  if (valores.some((v) => Number.isNaN(v))) {
+    return c.json({ error: "Valores inválidos: deixe vazio para usar o padrão ou use números a partir de 0 (margem até 500%)." }, 400);
+  }
+
+  const result = await client.query(
+    `INSERT INTO cobranca_gestor_config
+       (gestor_id, mensalidade_brl, valor_por_cliente_brl, voip_margem_percentual,
+        voip_taxa_fixa_brl, isento, observacoes, atualizado_em)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (gestor_id) DO UPDATE SET
+       mensalidade_brl = EXCLUDED.mensalidade_brl,
+       valor_por_cliente_brl = EXCLUDED.valor_por_cliente_brl,
+       voip_margem_percentual = EXCLUDED.voip_margem_percentual,
+       voip_taxa_fixa_brl = EXCLUDED.voip_taxa_fixa_brl,
+       isento = EXCLUDED.isento,
+       observacoes = EXCLUDED.observacoes,
+       atualizado_em = NOW()
+     RETURNING *`,
+    [gestorId, ...valores, body.isento === true, textoOpcional(body.observacoes).slice(0, 500) || null]
+  );
+
+  const padrao = await obterPadraoCobrancaGestor();
+  const especifica = configCobrancaParaJson(result.rows[0]);
+  return c.json({ sucesso: true, especifica, efetiva: resolverConfigCobrancaGestor(padrao, especifica) });
+});
+
+app.get("/admin/cobranca-gestores/:id/previa", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  const gestorId = Number(c.req.param("id"));
+  const existe = await client.query("SELECT id FROM usuarios WHERE id = $1 AND tipo = 'trafego_pago'", [gestorId]);
+  if (!existe.rows.length) return c.json({ error: "Gestor não encontrado" }, 404);
+
+  const competencia = competenciaValida(c.req.query("competencia"))
+    ? String(c.req.query("competencia"))
+    : normalizarMesVoip(null);
+  const calculo = await calcularCobrancaGestor(gestorId, competencia);
+
+  return c.json({
+    competencia,
+    competencia_nome: nomeCompetencia(competencia),
+    vencimento: calculo.vencimento,
+    isento: calculo.isento,
+    config: calculo.config,
+    itens: calculo.itens,
+    total: calculo.total
+  });
+});
+
+app.post("/admin/cobranca-gestores/:id/gerar", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  const gestorId = Number(c.req.param("id"));
+  const existe = await client.query("SELECT id FROM usuarios WHERE id = $1 AND tipo = 'trafego_pago'", [gestorId]);
+  if (!existe.rows.length) return c.json({ error: "Gestor não encontrado" }, 404);
+
+  const body = await c.req.json().catch(() => ({}));
+  if (!competenciaValida(body.competencia)) {
+    return c.json({ error: "Informe a competência (AAAA-MM)." }, 400);
+  }
+
+  try {
+    const resultado = await gravarCobrancaGestor(gestorId, String(body.competencia), "manual");
+    const status = resultado.situacao === "conflito_vencimento" ? 409 : 200;
+    return c.json({ ...resultado, mensagem: MENSAGEM_GERACAO_COBRANCA[resultado.situacao] }, status);
+  } catch (err) {
+    console.error("ERRO POST /admin/cobranca-gestores/:id/gerar:", err);
+    return c.json({ error: "Erro ao gerar a fatura" }, 500);
+  }
+});
+
+app.post("/admin/cobranca-gestores/gerar-todos", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  const body = await c.req.json().catch(() => ({}));
+  if (!competenciaValida(body.competencia)) {
+    return c.json({ error: "Informe a competência (AAAA-MM)." }, 400);
+  }
+
+  const competencia = String(body.competencia);
+  const resultados: any[] = [];
+  for (const gestorId of await gestoresCobraveis(competencia)) {
+    try {
+      resultados.push({ gestor_id: gestorId, ...(await gravarCobrancaGestor(gestorId, competencia, "manual")) });
+    } catch (err) {
+      console.error("ERRO gerar cobrança do gestor", gestorId, err);
+      resultados.push({ gestor_id: gestorId, situacao: "erro" });
+    }
+  }
+
+  return c.json({ competencia, resultados });
+});
+
+// 🔹 Admin libera o rascunho: a partir daqui o gestor vê, paga e recebe os lembretes.
+app.post("/admin/financeiro/lancamentos/:id/liberar", authMiddleware, async (c) => {
+  const negado = exigirSuperAdmin(c);
+  if (negado) return negado;
+
+  const id = Number(c.req.param("id"));
+  const result = await client.query(
+    `UPDATE financeiro_lancamentos
+     SET status = 'aguardando_pagamento', liberado_em = NOW()
+     WHERE id = $1 AND status = 'rascunho'
+     RETURNING id`,
+    [id]
+  );
+  if (!result.rows.length) return c.json({ error: "Rascunho não encontrado (talvez já tenha sido liberado)." }, 404);
+  return c.json({ sucesso: true });
+});
+
+// 🔹 Gestor: prévia da fatura do mês corrente (o que já entrou até agora).
+app.get("/gestor/cobranca/previa", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  if (!usuarioEhGestorVinculado(gestor?.tipo) || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Acesso restrito ao gestor de tráfego" }, 403);
+  }
+
+  const competencia = normalizarMesVoip(null);
+  const calculo = await calcularCobrancaGestor(Number(gestor.id), competencia);
+
+  return c.json({
+    competencia,
+    competencia_nome: nomeCompetencia(competencia),
+    vencimento: calculo.vencimento,
+    isento: calculo.isento,
+    mensalidade_brl: calculo.isento ? 0 : calculo.config.mensalidade_brl,
+    valor_por_cliente_brl: calculo.isento ? 0 : calculo.config.valor_por_cliente_brl,
+    itens: itensVisiveisAoGestor(calculo.itens),
+    total: calculo.total
+  });
+});
+
+// Agendador: a partir do dia de geração, monta o rascunho do mês que fechou para cada
+// gestor que ainda não teve (uma vez por gestor e competência — apagar não faz voltar).
+let geracaoCobrancaGestoresEmAndamento = false;
+async function gerarCobrancasGestoresAutomaticas() {
+  if (geracaoCobrancaGestoresEmAndamento) return;
+  geracaoCobrancaGestoresEmAndamento = true;
+  try {
+    const padrao = await obterPadraoCobrancaGestor();
+    if (!padrao.geracao_automatica) return;
+
+    const hoje = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Sao_Paulo", day: "2-digit" }).format(new Date());
+    if (Number(hoje) < padrao.dia_geracao) return;
+
+    const competencia = competenciaAnterior(normalizarMesVoip(null));
+    if (competencia < padrao.cobrar_a_partir_de) return;
+
+    // Já gerada antes (mesmo que o rascunho tenha sido apagado) ou já existe fatura dessa
+    // competência (gerada à mão): não mexe.
+    const jaGerados = new Set(
+      (await client.query(
+        `SELECT gestor_id FROM cobranca_gestor_geracoes WHERE competencia = $1::date
+         UNION
+         SELECT usuario_id FROM financeiro_lancamentos
+         WHERE origem = 'cobranca_gestor' AND competencia = $1::date`,
+        [`${competencia}-01`]
+      )).rows.map((linha: any) => Number(linha.gestor_id))
+    );
+
+    for (const gestorId of await gestoresCobraveis(competencia)) {
+      if (jaGerados.has(gestorId)) continue;
+      try {
+        const resultado = await gravarCobrancaGestor(gestorId, competencia, "automatica");
+        if (resultado.situacao === "conflito_vencimento") {
+          // Registra para não tentar de novo a cada hora; o super admin resolve à mão.
+          await client.query(
+            `INSERT INTO cobranca_gestor_geracoes (gestor_id, competencia, situacao)
+             VALUES ($1, $2::date, 'conflito_vencimento') ON CONFLICT DO NOTHING`,
+            [gestorId, `${competencia}-01`]
+          );
+          console.warn("COBRANCA GESTOR: lançamento manual na data de vencimento", gestorId, competencia);
+        }
+      } catch (err) {
+        console.error("ERRO cobrança automática do gestor", gestorId, err);
+      }
+    }
+  } catch (err) {
+    console.error("ERRO agendador de cobrança dos gestores:", err);
+  } finally {
+    geracaoCobrancaGestoresEmAndamento = false;
+  }
+}
 
 // 🔹 Admin sobe a Nota Fiscal de um lançamento — isso confirma o pagamento.
 app.post("/admin/financeiro/lancamentos/:id/nf", authMiddleware, async (c) => {
@@ -27432,6 +28080,165 @@ await client.query(`
     conteudo    TEXT,
     criado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+`);
+
+// 🧾 Cobrança dos gestores de tráfego (cálculo em cobranca-gestor.ts). A fatura mensal de
+// cada gestor é um financeiro_lancamentos com origem 'cobranca_gestor' e itens detalhados;
+// nasce como 'rascunho' (o gestor não vê e os lembretes de WhatsApp ignoram) até o super
+// admin liberar. Lançamento manual continua igual (origem 'manual', sem itens).
+await client.query(`
+  CREATE TABLE IF NOT EXISTS cobranca_gestor_padrao (
+    id                     INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    mensalidade_brl        NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (mensalidade_brl >= 0),
+    valor_por_cliente_brl  NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (valor_por_cliente_brl >= 0),
+    voip_margem_percentual NUMERIC(8, 2) NOT NULL DEFAULT 0 CHECK (voip_margem_percentual >= 0),
+    voip_taxa_fixa_brl     NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (voip_taxa_fixa_brl >= 0),
+    dia_geracao            INTEGER NOT NULL DEFAULT 1 CHECK (dia_geracao BETWEEN 1 AND 28),
+    dia_vencimento         INTEGER NOT NULL DEFAULT 10 CHECK (dia_vencimento BETWEEN 1 AND 28),
+    pix_chave              TEXT,
+    pix_tipo               TEXT,
+    geracao_automatica     BOOLEAN NOT NULL DEFAULT true,
+    -- Primeira competência cobrada: sem isso, ligar a cobrança geraria faturas de meses já
+    -- passados. Começa no mês em que a tabela foi criada.
+    cobrar_a_partir_de     DATE NOT NULL DEFAULT (date_trunc('month', NOW() AT TIME ZONE 'America/Sao_Paulo'))::date,
+    atualizado_em          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  INSERT INTO cobranca_gestor_padrao (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+  -- Valores próprios de um gestor; NULL = usa o padrão.
+  CREATE TABLE IF NOT EXISTS cobranca_gestor_config (
+    gestor_id              INTEGER PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    mensalidade_brl        NUMERIC(12, 2) CHECK (mensalidade_brl >= 0),
+    valor_por_cliente_brl  NUMERIC(12, 2) CHECK (valor_por_cliente_brl >= 0),
+    voip_margem_percentual NUMERIC(8, 2) CHECK (voip_margem_percentual >= 0),
+    voip_taxa_fixa_brl     NUMERIC(12, 2) CHECK (voip_taxa_fixa_brl >= 0),
+    isento                 BOOLEAN NOT NULL DEFAULT false,
+    observacoes            TEXT,
+    atualizado_em          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  -- Faturas que o agendador já gerou: apagar o rascunho não faz ele voltar sozinho.
+  CREATE TABLE IF NOT EXISTS cobranca_gestor_geracoes (
+    gestor_id      INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    competencia    DATE NOT NULL,
+    situacao       TEXT NOT NULL,
+    lancamento_id  INTEGER,
+    criado_em      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (gestor_id, competencia)
+  );
+
+  -- Histórico de quem esteve vinculado a quem (usuarios.admin_id só guarda o agora). Sem FK
+  -- no cliente de propósito: apagar a conta não apaga o mês em que ela foi gerenciada.
+  CREATE TABLE IF NOT EXISTS gestor_vinculos (
+    id             SERIAL PRIMARY KEY,
+    gestor_id      INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    cliente_id     INTEGER NOT NULL,
+    cliente_nome   TEXT,
+    cliente_email  TEXT,
+    inicio         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    fim            TIMESTAMPTZ
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_gestor_vinculos_gestor
+    ON gestor_vinculos(gestor_id, inicio);
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_gestor_vinculos_aberto
+    ON gestor_vinculos(cliente_id) WHERE fim IS NULL;
+
+  ALTER TABLE financeiro_lancamentos
+    ADD COLUMN IF NOT EXISTS origem TEXT NOT NULL DEFAULT 'manual',
+    ADD COLUMN IF NOT EXISTS competencia DATE,
+    ADD COLUMN IF NOT EXISTS gerado_em TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS liberado_em TIMESTAMPTZ;
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_financeiro_lancamentos_cobranca_gestor
+    ON financeiro_lancamentos(usuario_id, competencia) WHERE origem = 'cobranca_gestor';
+
+  CREATE TABLE IF NOT EXISTS financeiro_lancamento_itens (
+    id              SERIAL PRIMARY KEY,
+    lancamento_id   INTEGER NOT NULL REFERENCES financeiro_lancamentos(id) ON DELETE CASCADE,
+    ordem           INTEGER NOT NULL DEFAULT 0,
+    tipo            TEXT NOT NULL CHECK (tipo IN ('mensalidade','clientes','voip','ajuste')),
+    descricao       TEXT NOT NULL,
+    cliente_id      INTEGER,
+    quantidade      NUMERIC(12, 2) NOT NULL DEFAULT 1,
+    valor_unitario  NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    valor_total     NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    detalhes        JSONB,
+    interno         JSONB
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_financeiro_lancamento_itens
+    ON financeiro_lancamento_itens(lancamento_id, ordem);
+
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'financeiro_lancamentos_status_check'
+        AND pg_get_constraintdef(oid) LIKE '%rascunho%'
+    ) THEN
+      ALTER TABLE financeiro_lancamentos DROP CONSTRAINT IF EXISTS financeiro_lancamentos_status_check;
+      ALTER TABLE financeiro_lancamentos ADD CONSTRAINT financeiro_lancamentos_status_check
+        CHECK (status IN ('rascunho','aguardando_pagamento','comprovante_enviado','pago'));
+    END IF;
+  END $$;
+`);
+
+// O histórico de vínculos é mantido pelo próprio banco: pega toda forma de mudar admin_id
+// (criação pelo gestor, desvincular, edição pelo super admin, exclusão da conta, FK que zera
+// o admin_id quando o gestor é apagado) sem depender de cada rota lembrar de registrar.
+await client.query(`
+  CREATE OR REPLACE FUNCTION registrar_gestor_vinculo() RETURNS trigger AS $$
+  BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') AND OLD.admin_id IS NOT NULL AND (
+      TG_OP = 'DELETE'
+      OR OLD.admin_id IS DISTINCT FROM NEW.admin_id
+      OR NEW.tipo NOT IN ('corretor', 'corretor_receptor')
+    ) THEN
+      UPDATE gestor_vinculos SET fim = NOW() WHERE cliente_id = OLD.id AND fim IS NULL;
+    END IF;
+
+    IF TG_OP IN ('INSERT', 'UPDATE')
+      AND NEW.admin_id IS NOT NULL
+      AND NEW.tipo IN ('corretor', 'corretor_receptor')
+      AND (
+        TG_OP = 'INSERT'
+        OR OLD.admin_id IS DISTINCT FROM NEW.admin_id
+        OR OLD.tipo NOT IN ('corretor', 'corretor_receptor')
+      )
+    THEN
+      INSERT INTO gestor_vinculos (gestor_id, cliente_id, cliente_nome, cliente_email)
+      VALUES (
+        NEW.admin_id,
+        NEW.id,
+        NULLIF(TRIM(COALESCE(NEW.nome, '') || ' ' || COALESCE(NEW.sobrenome, '')), ''),
+        NEW.email
+      )
+      ON CONFLICT (cliente_id) WHERE fim IS NULL DO NOTHING;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+  END
+  $$ LANGUAGE plpgsql;
+
+  CREATE OR REPLACE TRIGGER trg_gestor_vinculo
+    AFTER INSERT OR DELETE OR UPDATE OF admin_id, tipo ON usuarios
+    FOR EACH ROW EXECUTE FUNCTION registrar_gestor_vinculo();
+
+  -- Vínculos que já existiam antes do histórico (idempotente).
+  INSERT INTO gestor_vinculos (gestor_id, cliente_id, cliente_nome, cliente_email, inicio)
+  SELECT u.admin_id, u.id,
+         NULLIF(TRIM(COALESCE(u.nome, '') || ' ' || COALESCE(u.sobrenome, '')), ''),
+         u.email,
+         COALESCE(u.criado_em AT TIME ZONE 'UTC', NOW())
+  FROM usuarios u
+  JOIN usuarios g ON g.id = u.admin_id
+  WHERE u.tipo IN ('corretor', 'corretor_receptor')
+    AND NOT EXISTS (SELECT 1 FROM gestor_vinculos v WHERE v.cliente_id = u.id AND v.fim IS NULL)
+  ON CONFLICT DO NOTHING;
 `);
 
 // Preenche o token opaco (ver coluna adicionada acima) de qualquer mídia de
@@ -31613,6 +32420,7 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
            (nf_dados IS NOT NULL) AS tem_nf
     FROM financeiro_lancamentos
     WHERE usuario_id = $1
+      AND status <> 'rascunho'
     ORDER BY mes_referencia DESC
     LIMIT 12
     `,
@@ -46960,6 +47768,12 @@ function agendarRankingPlataformas() {
 }
 
 agendarRankingPlataformas();
+
+// Cobrança dos gestores: confere de hora em hora (COBRANCA_GESTORES_AUTO=0 desliga).
+if (Bun.env.COBRANCA_GESTORES_AUTO !== "0") {
+  setInterval(gerarCobrancasGestoresAutomaticas, 60 * 60 * 1000);
+  setTimeout(gerarCobrancasGestoresAutomaticas, 3 * 60 * 1000);
+}
 
 
 /* =========================
