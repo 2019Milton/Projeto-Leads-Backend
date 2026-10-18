@@ -26364,6 +26364,21 @@ await client.query(`
   );
 `);
 
+// A linha acima nasce com padrões (R$ 800, dia 10) só de alguém ABRIR o financeiro — e o
+// painel do cliente mostrava esse R$ 800 como mensalidade ativa sem o gestor ter definido
+// nada. configurado_em marca o primeiro "Salvar valores" de verdade. Backfill: linha que foi
+// salva antes desta coluna existir tem atualizado_em depois do criado_em (o PATCH atualiza);
+// as que só foram abertas têm os dois iguais. Em 2026-10-17 as 2 linhas de produção eram
+// do segundo tipo.
+await client.query(`
+  ALTER TABLE cliente_financeiro_config
+    ADD COLUMN IF NOT EXISTS configurado_em TIMESTAMP;
+  UPDATE cliente_financeiro_config
+    SET configurado_em = atualizado_em
+    WHERE configurado_em IS NULL
+      AND atualizado_em > criado_em;
+`);
+
 // Estrutura de telefonia preparada sem contratar operadora ou reservar número.
 // Enquanto `voip_status` não for "ativo", nenhuma chamada externa é iniciada.
 await client.query(`
@@ -29798,7 +29813,7 @@ async function obterConfigFinanceiroCliente(usuarioId: number) {
       usuario_id, plano_nome, valor_plano_mensal, dia_vencimento,
       valor_voip_mensal, valor_whatsapp_mensal, valor_ia_extra_mensal,
       valor_gravacao_mensal, outros_descricao, valor_outros_mensal,
-      observacoes, atualizado_em
+      observacoes, atualizado_em, configurado_em
     FROM cliente_financeiro_config
     WHERE usuario_id = $1
     LIMIT 1
@@ -29819,7 +29834,10 @@ async function obterConfigFinanceiroCliente(usuarioId: number) {
     outros_descricao: row.outros_descricao || "",
     valor_outros_mensal: Number(row.valor_outros_mensal || 0),
     observacoes: row.observacoes || "",
-    atualizado_em: row.atualizado_em || null
+    atualizado_em: row.atualizado_em || null,
+    // false = ninguém salvou ainda: os valores acima são só a sugestão padrão
+    configurado: Boolean(row.configurado_em),
+    configurado_em: row.configurado_em || null
   };
 }
 
@@ -29907,6 +29925,7 @@ app.patch("/gestor/clientes/:id/financeiro", authMiddleware, async (c) => {
 
   if (!atualizacoes.length) return c.json({ error: "Nenhuma alteração financeira informada" }, 400);
   atualizacoes.push("atualizado_em = NOW()");
+  atualizacoes.push("configurado_em = COALESCE(configurado_em, NOW())");
   parametros.push(clienteId);
 
   await client.query(
@@ -31163,6 +31182,7 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
   const usuarioId = Number(user.id);
   const configuracao = await obterConfigFinanceiroCliente(usuarioId);
   const whatsappAtivo = user.atendimento_whatsapp_habilitado === true;
+  const mensalidadeConfigurada = configuracao.configurado === true;
 
   // A mensalidade base da plataforma e o VoIP são deliberadamente separados.
   // Nenhum consumo de telefonia entra no total_mensal da plataforma.
@@ -31200,6 +31220,9 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
     });
   }
 
+  // Sem configuração do gestor não há mensalidade a mostrar — nada de R$ 800 de sugestão.
+  if (!mensalidadeConfigurada) itens.length = 0;
+
   const totalMensalPlataforma = itens.reduce(
     (total, item) => total + (item.status === "ativo" ? Number(item.valor || 0) : 0),
     0
@@ -31225,12 +31248,15 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
   );
 
   return c.json({
-    plano: {
-      nome: configuracao.plano_nome,
-      valor_mensal: configuracao.valor_plano_mensal,
-      dia_vencimento: configuracao.dia_vencimento,
-      investimento_anuncios_incluso: false
-    },
+    configurado: mensalidadeConfigurada,
+    plano: mensalidadeConfigurada
+      ? {
+          nome: configuracao.plano_nome,
+          valor_mensal: configuracao.valor_plano_mensal,
+          dia_vencimento: configuracao.dia_vencimento,
+          investimento_anuncios_incluso: false
+        }
+      : null,
     itens,
     total_mensal: Number(totalMensalPlataforma.toFixed(2)),
     total_mensal_plataforma: Number(totalMensalPlataforma.toFixed(2)),
@@ -31276,7 +31302,7 @@ app.get("/painel-cliente/financeiro", authMiddleware, async (c) => {
       observacao: linha.observacao,
       criado_em: linha.criado_em
     })),
-    observacoes: configuracao.observacoes || null,
+    observacoes: mensalidadeConfigurada ? (configuracao.observacoes || null) : null,
     atualizado_em: configuracao.atualizado_em || new Date().toISOString()
   });
 });
