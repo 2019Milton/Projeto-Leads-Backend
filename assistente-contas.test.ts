@@ -72,6 +72,24 @@ test("repetições com mesma empresa recuperam a mesma conta sem criar de novo",
   expect(criacoes).toBe(1);
   expect(repo.vinculos[0]).toEqual(["2222222222","1111111111",1]);
 });
+
+test("MCC ancestral é preservada no vínculo e mudar acesso não duplica criação anterior", async () => {
+  const repo=repositorio();let criacoes=0;
+  const executar=(loginCustomerId?:string)=>criarContaGoogleAssistente({query:repo.query,usuarioId:1,dados:conta,loginCustomerId,criar:async()=>{criacoes++;return sucesso;}});
+  repo.falharVinculo(true);expect((await executar()).data.vinculo_pendente).toBe(true);
+  repo.falharVinculo(false);expect((await executar('9999999999')).data.reutilizada).toBe(true);
+  expect(criacoes).toBe(1);expect(repo.vinculos[0]).toEqual(['2222222222','9999999999',1]);
+});
+
+test("nova criação registra o contexto ancestral sem alterar a identidade da solicitação", async () => {
+  const repo=repositorio();let criacoes=0;
+  const executar=(loginCustomerId:string)=>criarContaGoogleAssistente({query:repo.query,usuarioId:1,dados:conta,loginCustomerId,criar:async()=>{criacoes++;return sucesso;}});
+  expect((await executar('9999999999')).status).toBe(200);
+  expect(repo.registros[0].dados.loginCustomerId).toBe('9999999999');
+  expect(repo.vinculos[0][1]).toBe('9999999999');
+  expect((await executar('8888888888')).data.reutilizada).toBe(true);
+  expect(repo.vinculos[1][1]).toBe('8888888888');expect(criacoes).toBe(1);
+});
 test("falha no vínculo não duplica e permite recuperação em outra chamada", async () => {
   const repo=repositorio();let criacoes=0;
   const executar=()=>criarContaGoogleAssistente({query:repo.query,usuarioId:1,dados:conta,criar:async()=>{criacoes++;return sucesso;}});

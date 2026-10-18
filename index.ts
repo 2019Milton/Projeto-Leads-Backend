@@ -13782,15 +13782,36 @@ app.post("/tiktok/selecionar-anunciante", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const { advertiser_id } = await c.req.json();
-    if (!advertiser_id) return c.json({ error: "advertiser_id obrigatorio" }, 400);
+    // IDs TikTok excedem a precisão de Number; aceitar somente texto numérico.
+    if (typeof advertiser_id !== "string" || !/^\d{1,30}$/.test(advertiser_id.trim())) {
+      return c.json({ error: "Informe um advertiser_id válido" }, 400);
+    }
+    const advertiserId = advertiser_id.trim();
+    const conn = await client.query(
+      `SELECT access_token FROM plataforma_conexoes
+       WHERE usuario_id = $1 AND plataforma = 'tiktok' AND status = 'conectado' LIMIT 1`,
+      [user.id]
+    );
+    const token = conn.rows[0]?.access_token;
+    if (!token) return c.json({ error: "Conecte o TikTok antes de selecionar uma conta" }, 400);
 
-    await client.query(
+    const parametros = new URLSearchParams({ advertiser_ids: JSON.stringify([advertiserId]), fields: JSON.stringify(["advertiser_id"]) });
+    const acesso = await tiktokFetch(`/advertiser/info/?${parametros}`, token);
+    if (!acesso.ok) return c.json({ error: "Não foi possível confirmar acesso ao anunciante. Confira a autorização do TikTok e tente novamente." }, 502);
+    const anunciantes = acesso.data?.data?.list;
+    if (!Array.isArray(anunciantes) || !anunciantes.some((conta: any) => String(conta?.advertiser_id) === advertiserId)) {
+      return c.json({ error: "A conta de anunciante não está acessível nesta conexão" }, 403);
+    }
+
+    const vinculo = await client.query(
       `UPDATE plataforma_conexoes
        SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object('advertiser_id', $1::text),
            atualizado_em = NOW()
-       WHERE usuario_id = $2 AND plataforma = 'tiktok'`,
-      [String(advertiser_id), user.id]
+       WHERE usuario_id = $2 AND plataforma = 'tiktok' AND status = 'conectado'
+         AND access_token = $3 RETURNING usuario_id`,
+      [advertiserId, user.id, token]
     );
+    if (!vinculo.rows.length) return c.json({ error: "A conexão mudou durante a verificação. Atualize a integração e tente novamente." }, 409);
     return c.json({ sucesso: true });
   } catch (err: any) {
     console.error("ERRO /tiktok/selecionar-anunciante:", err);
@@ -21035,14 +21056,16 @@ app.post("/assistente-contas-anuncios/google/criar", authMiddleware, async (c) =
     const rascunho = await client.query("SELECT dados FROM assistente_contas_anuncios WHERE usuario_id = $1", [user.id]);
     const erros = validarDadosAssistente(rascunho.rows[0]?.dados || {});
     if (Object.keys(erros).length) return c.json({ error: "Revise e salve os dados da empresa antes de criar a conta.", campos: erros }, 422);
+    const loginCustomerId = gerenciadora.login_customer_id || managerCustomerId;
     const resultado = await criarContaGoogleAssistente({
       usuarioId: Number(user.id), dados: { nome, moeda, fuso, managerCustomerId },
+      loginCustomerId,
       query: (sql, params) => client.query(sql, params),
       criar: async () => {
         const resposta = await fetch(
           `${GOOGLE_ADS_API}/customers/${managerCustomerId}:createCustomerClient`, {
             method: "POST", signal: AbortSignal.timeout(30000),
-            headers: googleAdsHeaders(accessToken, managerCustomerId),
+            headers: googleAdsHeaders(accessToken, loginCustomerId),
             body: JSON.stringify({ customerClient: { descriptiveName: nome, currencyCode: moeda, timeZone: fuso } }),
           }
         );

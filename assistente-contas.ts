@@ -68,9 +68,12 @@ type ContaGoogle = { nome: string; moeda: string; fuso: string; managerCustomerI
 // outra criação. Repetições com um ID conhecido refazem somente o vínculo local.
 export async function criarContaGoogleAssistente(deps: {
   query: Query; usuarioId: number; dados: ContaGoogle;
+  loginCustomerId?: string;
   criar: () => Promise<{ ok: boolean; status: number; data: any }>;
 }) {
   const { query, usuarioId, dados } = deps;
+  const loginCustomerId = deps.loginCustomerId || dados.managerCustomerId;
+  // O caminho de acesso pode mudar; não deve mudar a chave nem recriar a conta.
   const chave = createHash("sha256").update(JSON.stringify(dados)).digest("hex");
   const pendente = (id?: string | null) => ({ status: 409, data: {
     error: "Existe uma criação que precisa ser conferida. Abra o Google Ads e selecione a conta criada nos detalhes da integração. Se não encontrar a conta, solicite a revisão pelo suporte antes de tentar criar outra.",
@@ -79,7 +82,7 @@ export async function criarContaGoogleAssistente(deps: {
   const reserva = await query(
     `INSERT INTO assistente_contas_criacoes (usuario_id, plataforma, chave, estado, dados)
      VALUES ($1, 'google', $2, 'em_andamento', $3::jsonb)
-     ON CONFLICT DO NOTHING RETURNING *`, [usuarioId, chave, JSON.stringify(dados)]
+     ON CONFLICT DO NOTHING RETURNING *`, [usuarioId, chave, JSON.stringify({ ...dados, loginCustomerId })]
   );
   let operacao = reserva.rows[0];
   let executar = Boolean(operacao);
@@ -133,7 +136,7 @@ export async function criarContaGoogleAssistente(deps: {
       `UPDATE plataforma_conexoes SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
        'customer_id', $1::text, 'login_customer_id', $2::text, 'criada_pelo_assistente', true), atualizado_em = NOW()
        WHERE usuario_id = $3 AND plataforma = 'google' AND status = 'conectado' RETURNING usuario_id`,
-      [customerId, dados.managerCustomerId, usuarioId]
+      [customerId, loginCustomerId, usuarioId]
     );
     if (!vinculo.rows.length) throw new Error("Conexão indisponível para vínculo");
     await query(`UPDATE assistente_contas_criacoes SET estado = 'vinculada', atualizado_em = NOW() WHERE usuario_id = $1 AND chave = $2`, [usuarioId, chave]);
