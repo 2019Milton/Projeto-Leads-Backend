@@ -5794,14 +5794,49 @@ const authMiddleware = async (c: any, next: any) => {
       )
     };
 
+    // Dentro da conta do cliente o gestor age como o cliente. Trocar a senha por esta rota
+    // apareceria como se o próprio cliente tivesse trocado; o gestor tem a rota dele
+    // (Clientes gerenciados → Redefinir senha), que fica registrada e avisa o cliente.
+    if (modoAcesso === "gestor" && c.req.method === "PUT" && c.req.path === "/usuarios/me/senha") {
+      return c.json({
+        error: "Dentro da conta do cliente não dá para trocar a senha dele por aqui. Use \"Redefinir senha\" em Clientes gerenciados."
+      }, 403);
+    }
+
     c.set("user", userAutenticado);
 
     await next();
+
+    if (modoAcesso === "gestor" && !["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
+      registrarAcaoGestor(
+        Number(gestorAutenticado?.id),
+        Number(userBanco.id),
+        c.req.method,
+        c.req.path,
+        c.res?.status ?? null
+      );
+    }
   } catch (err) {
     console.error("AUTH ERROR:", err);
     return c.json({ error: "Token inválido" }, 401);
   }
 };
+
+// Grava em segundo plano: uma falha aqui nunca derruba a ação do gestor que já aconteceu.
+function registrarAcaoGestor(
+  gestorId: number,
+  clienteId: number,
+  metodo: string,
+  rota: string,
+  statusHttp: number | null
+) {
+  if (!Number.isInteger(gestorId) || gestorId <= 0 || !Number.isInteger(clienteId) || clienteId <= 0) return;
+  client.query(
+    `INSERT INTO gestor_acoes (gestor_id, cliente_id, metodo, rota, status_http)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [gestorId, clienteId, String(metodo).slice(0, 10), String(rota).slice(0, 300), statusHttp]
+  ).catch((err: any) => console.error("ERRO ao registrar ação do gestor:", err?.message || err));
+}
 
 const masterMiddleware = async (c: any, next: any) => {
   const user = c.get("user");
@@ -26337,6 +26372,25 @@ await client.query(`
     ON gestor_acessos(cliente_id, criado_em DESC);
 `);
 
+// Cada requisição que ALTERA algo feita pelo gestor dentro da conta do cliente (contexto
+// "gestor"). Antes só existia gestor_acessos — uma linha por "Abrir plataforma", sem dizer
+// o que foi feito lá dentro, e para o sistema tudo parecia ação do próprio cliente. Guarda
+// só método, rota e status: nada do corpo da requisição (pode ter dado de lead).
+await client.query(`
+  CREATE TABLE IF NOT EXISTS gestor_acoes (
+    id SERIAL PRIMARY KEY,
+    gestor_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    cliente_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    metodo TEXT NOT NULL,
+    rota TEXT NOT NULL,
+    status_http INTEGER,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_gestor_acoes_cliente
+    ON gestor_acoes(cliente_id, criado_em DESC);
+`);
+
 // Configuração comercial exclusiva dos clientes atendidos pelo gestor de tráfego.
 // Os adicionais começam zerados e só entram no total quando o recurso correspondente
 // estiver efetivamente ativo, evitando cobranças antecipadas.
@@ -29754,6 +29808,54 @@ app.put("/gestor/clientes/:id/senha", authMiddleware, async (c) => {
   } finally {
     conn.release();
   }
+});
+
+// Histórico do que foi feito na conta do cliente por quem a gerencia: aberturas ("Abrir
+// plataforma") e ações que alteraram algo. Mostra também ações de outro gestor/admin que
+// tenha mexido na mesma conta.
+app.get("/gestor/clientes/:id/historico", authMiddleware, async (c) => {
+  const gestor: any = c.get("user");
+  const clienteId = Number(c.req.param("id"));
+  const cliente = await buscarClienteGerenciado(gestor, clienteId);
+
+  if (!cliente || gestor.modo_acesso !== "conta") {
+    return c.json({ error: "Corretor não encontrado ou não autorizado" }, 404);
+  }
+
+  const result = await client.query(
+    `
+    SELECT * FROM (
+      SELECT 'acesso' AS tipo, a.criado_em AT TIME ZONE 'UTC' AS quando, NULL::text AS metodo,
+             NULL::text AS rota, NULL::int AS status_http, a.gestor_id,
+             TRIM(COALESCE(g.nome, '') || ' ' || COALESCE(g.sobrenome, '')) AS gestor_nome
+      FROM gestor_acessos a
+      LEFT JOIN usuarios g ON g.id = a.gestor_id
+      WHERE a.cliente_id = $1
+      UNION ALL
+      SELECT 'acao', x.criado_em, x.metodo, x.rota, x.status_http, x.gestor_id,
+             TRIM(COALESCE(g.nome, '') || ' ' || COALESCE(g.sobrenome, ''))
+      FROM gestor_acoes x
+      LEFT JOIN usuarios g ON g.id = x.gestor_id
+      WHERE x.cliente_id = $1
+    ) h
+    ORDER BY quando DESC
+    LIMIT 200
+    `,
+    [clienteId]
+  );
+
+  return c.json({
+    cliente_id: clienteId,
+    itens: result.rows.map((linha: any) => ({
+      tipo: linha.tipo,
+      quando: linha.quando,
+      metodo: linha.metodo,
+      rota: linha.rota,
+      status_http: linha.status_http,
+      gestor_id: Number(linha.gestor_id),
+      gestor_nome: linha.gestor_nome || null
+    }))
+  });
 });
 
 app.post("/gestor/clientes/:id/acessar", authMiddleware, async (c) => {
