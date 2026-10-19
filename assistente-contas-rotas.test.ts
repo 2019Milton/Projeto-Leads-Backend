@@ -6,7 +6,7 @@ const source=readFileSync(new URL('./index.ts',import.meta.url),'utf8');
 const start=source.indexOf('const ASSISTENTE_CONTAS_PLATAFORMAS =');
 const code=new Bun.Transpiler({loader:'ts'}).transformSync(source.slice(start,source.indexOf('app.get("/conexoes"',start)));
 const dados={nome_legal:'Empresa teste',email:'qa@example.invalid',telefone:'11900000000',moeda:'BRL',fuso:'America/Sao_Paulo'};
-function rotas(draft:any=dados) {
+function rotas(draft:any=dados,conflito=false) {
   const handlers:any={},queries:any[]=[],requests:any[]=[];
   const ctx=createContext({
     app:Object.fromEntries(['get','post','put'].map(method=>[method,(url:string,...fns:any[])=>handlers[method+' '+url]=fns.at(-1)])),
@@ -16,7 +16,8 @@ function rotas(draft:any=dados) {
       queries.push({sql,params});
       if(sql.includes('SELECT dados FROM'))return {rows:[{dados:draft}]};
       if(sql.includes('SELECT refresh_token'))return {rows:[{refresh_token:'teste'}]};
-      return {rows:[{atualizado_em:'2026-10-08T00:00:00Z'}]};
+      if(conflito && sql.includes('INSERT INTO assistente_contas_anuncios'))return {rows:[]};
+      return {rows:[{atualizado_em:'2026-10-08T00:00:00Z',versao:'2026-10-08 00:00:00'}]};
     }},
     obterAccessTokenGoogle:async()=> 'teste',listarContasGoogleAds:async()=>({contas:[{gerenciadora:true,customer_id:'1111111111'}]}),
     criarContaGoogleAssistente:async(deps:any)=>{const r=await deps.criar();return {status:r.status,data:{sucesso:true,customer_id:'2222222222'}};},
@@ -31,11 +32,30 @@ function rotas(draft:any=dados) {
 }
 test('rota bloqueia avanço com cadastro inválido mas preserva edição incompleta',async()=>{
   const r=rotas();expect((await r.call('put','',{etapa:3,dados:{email:'invalido'}})).status).toBe(422);expect(r.queries.length).toBe(0);
-  expect((await r.call('put','',{etapa:2,dados:{email:'invalido'}})).status).toBe(200);
+  expect((await r.call('put','',{etapa:2,dados:{email:'invalido'},versao_base:null})).status).toBe(200);
 });
 test('rascunho inclui acompanhamento sanitizado e usa identidade autenticada',async()=>{
-  const r=rotas();await r.call('put','',{etapa:3,dados,usuario_id:999,acompanhamento:{meta:{imagem:'privada',historico:[{etapa:'Conta',concluido:true}]}}},7);
+  const r=rotas();await r.call('put','',{etapa:3,dados,usuario_id:999,versao_base:null,acompanhamento:{meta:{imagem:'privada',historico:[{etapa:'Conta',concluido:true}]}}},7);
   expect(r.queries[0].params[0]).toBe(7);expect(JSON.parse(r.queries[0].params[4]).meta.historico).toEqual([{etapa:'Conta'}]);expect(r.queries[0].params[4]).not.toContain('privada');
+});
+
+test('rascunho exige revisão de origem e recusa cliente antigo antes de escrever',async()=>{
+ const r=rotas();
+ for(const versao_base of [undefined,{},'',5]) {
+   const body:any={etapa:2,dados};if(versao_base!==undefined)body.versao_base=versao_base;
+   expect((await r.call('put','',body)).status).toBe(428);
+ }
+ expect(r.queries.length).toBe(0);
+});
+
+test('rascunho desatualizado responde conflito sem confirmação de salvamento',async()=>{
+ const r=rotas(dados,true);const result=await r.call('put','',{etapa:2,dados,versao_base:'2026-10-08 00:00:00'});
+ expect(result.status).toBe(409);expect(result.data.codigo).toBe('CONFLITO_RASCUNHO');expect(result.data.sucesso).not.toBe(true);
+});
+
+test('rascunho confirmado devolve dados normalizados e a revisão exata',async()=>{
+ const r=rotas();const result=await r.call('put','',{etapa:2,dados:{...dados,nome_legal:'  Empresa teste  '},versao_base:null});
+ expect(result.status).toBe(200);expect(result.data.rascunho.dados.nome_legal).toBe('Empresa teste');expect(result.data.rascunho.versao).toBe('2026-10-08 00:00:00');
 });
 test('análise sem revisão expressa não chama provedor',async()=>{
   const r=rotas();const result=await r.call('post','/analisar-tela',{plataforma:'meta',imagem:'data:image/png;base64,dGVzdGU='});expect(result.status).toBe(400);expect(r.requests.length).toBe(0);

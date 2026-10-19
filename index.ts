@@ -8084,7 +8084,7 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
 
     const conn = await client.query(
       `SELECT refresh_token FROM plataforma_conexoes
-       WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+       WHERE usuario_id = $1 AND plataforma = 'google' AND status = 'conectado' LIMIT 1`,
       [user.id]
     );
     if (!conn.rows.length || !conn.rows[0].refresh_token) {
@@ -8128,16 +8128,18 @@ app.post("/google/selecionar-conta", authMiddleware, async (c) => {
       }, 400);
     }
 
-    await client.query(
+    const vinculo = await client.query(
       `UPDATE plataforma_conexoes
        SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object(
              'customer_id', $1::text,
              'login_customer_id', $2::text
            ),
            atualizado_em = NOW()
-       WHERE usuario_id = $3 AND plataforma = 'google'`,
-      [customerId, conta.login_customer_id, user.id]
+       WHERE usuario_id = $3 AND plataforma = 'google' AND status = 'conectado'
+         AND refresh_token = $4 RETURNING usuario_id`,
+      [customerId, conta.login_customer_id, user.id, conn.rows[0].refresh_token]
     );
+    if (!vinculo.rows.length) return c.json({ error: "A conexão Google mudou durante a seleção. Reconecte ou tente novamente." }, 409);
     // Libera a operação somente após a API confirmar o acesso à mesma conta.
     await client.query(
       `UPDATE assistente_contas_criacoes SET estado = 'vinculada', customer_id = $2, atualizado_em = NOW()
@@ -21063,7 +21065,8 @@ app.get("/assistente-contas-anuncios", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
     const result = await client.query(
-      `SELECT etapa, plataformas, dados, acompanhamento, atualizado_em
+      `SELECT etapa, plataformas, dados, acompanhamento, atualizado_em,
+              COALESCE(atualizado_em::text, 'sem-data') AS versao
        FROM assistente_contas_anuncios WHERE usuario_id = $1 LIMIT 1`,
       [user.id]
     );
@@ -21075,6 +21078,7 @@ app.get("/assistente-contas-anuncios", authMiddleware, async (c) => {
         dados: salvo.dados || {},
         acompanhamento: salvo.acompanhamento || {},
         atualizado_em: salvo.atualizado_em,
+        versao: salvo.versao,
       } : null,
     });
   } catch (err) {
@@ -21086,25 +21090,37 @@ app.get("/assistente-contas-anuncios", authMiddleware, async (c) => {
 app.put("/assistente-contas-anuncios", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
-    const rascunho = sanitizarRascunhoAssistente(await c.req.json());
+    const body = await c.req.json();
+    const rascunho = sanitizarRascunhoAssistente(body);
     const erros = validarDadosAssistente(rascunho.dados);
     if (rascunho.etapa === 3 && Object.keys(erros).length) {
       return c.json({ error: "Revise os dados da empresa antes de continuar.", campos: erros }, 422);
     }
+    // Clientes antigos não podem sobrescrever silenciosamente uma revisão nova.
+    if (!Object.prototype.hasOwnProperty.call(body, "versao_base") ||
+        (body.versao_base !== null && (typeof body.versao_base !== "string" || !body.versao_base.length || body.versao_base.length > 100))) {
+      return c.json({ error: "Atualize a página e carregue o cadastro antes de salvar.", codigo: "VERSAO_OBRIGATORIA" }, 428);
+    }
     const result = await client.query(
       `INSERT INTO assistente_contas_anuncios
          (usuario_id, etapa, plataformas, dados, acompanhamento, criado_em, atualizado_em)
-       VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, NOW(), NOW())
+       SELECT $1, $2, $3::jsonb, $4::jsonb, $5::jsonb, NOW(), NOW()
+       WHERE $6::text IS NULL OR EXISTS (
+         SELECT 1 FROM assistente_contas_anuncios
+         WHERE usuario_id = $1 AND COALESCE(atualizado_em::text, 'sem-data') = $6
+       )
        ON CONFLICT (usuario_id) DO UPDATE
        SET etapa = EXCLUDED.etapa,
            plataformas = EXCLUDED.plataformas,
            dados = EXCLUDED.dados,
            acompanhamento = EXCLUDED.acompanhamento,
-           atualizado_em = NOW()
-       RETURNING atualizado_em`,
-      [user.id, rascunho.etapa, JSON.stringify(rascunho.plataformas), JSON.stringify(rascunho.dados), JSON.stringify(rascunho.acompanhamento)]
+           atualizado_em = GREATEST(NOW(), assistente_contas_anuncios.atualizado_em + INTERVAL '1 microsecond')
+       WHERE COALESCE(assistente_contas_anuncios.atualizado_em::text, 'sem-data') = $6
+       RETURNING atualizado_em, atualizado_em::text AS versao`,
+      [user.id, rascunho.etapa, JSON.stringify(rascunho.plataformas), JSON.stringify(rascunho.dados), JSON.stringify(rascunho.acompanhamento), body.versao_base]
     );
-    return c.json({ sucesso: true, atualizado_em: result.rows[0]?.atualizado_em || null });
+    if (!result.rows.length) return c.json({ error: "O cadastro foi alterado em outra aba ou dispositivo. Revise as alterações antes de salvar.", codigo: "CONFLITO_RASCUNHO" }, 409);
+    return c.json({ sucesso: true, atualizado_em: result.rows[0].atualizado_em, rascunho: { ...rascunho, versao: result.rows[0].versao } });
   } catch (err) {
     console.error("ERRO PUT /assistente-contas-anuncios:", err);
     return c.json({ error: "Erro ao salvar o assistente" }, 500);
