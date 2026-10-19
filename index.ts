@@ -4908,20 +4908,29 @@ async function validarLimiteIAUsuario(user: any) {
 // aparecia nem no teto global nem no consumo por provider do admin. Usada tanto por
 // motivoBloqueioIA quanto pelo sweep de classificacao (antes cada um tinha sua propria
 // cópia da mesma consulta) e por /admin/ia/saldos.
+// `chamadasManuais` é o que o limite global de CHAMADAS compara: só o que os usuários
+// pedem. Usos automáticos (TIPOS_USO_IA_AUTOMATICOS e o job do ranking) ficam fora —
+// em 13/10/2026 eles eram 1865 de 1889 chamadas e o teto de 1000 bloqueou a IA de todo
+// mundo. O limite de CUSTO continua somando tudo (`custo`).
 async function usoGlobalIAMesAtual() {
   const resultado = await client.query(`
-    SELECT COUNT(*) AS chamadas, COALESCE(SUM(custo_estimado), 0) AS custo
+    SELECT
+      COUNT(*) AS chamadas,
+      COUNT(*) FILTER (WHERE NOT automatica) AS chamadas_manuais,
+      COALESCE(SUM(custo_estimado), 0) AS custo
     FROM (
-      SELECT custo_estimado FROM ia_usos
+      SELECT custo_estimado, COALESCE(tipo = ANY($1::text[]), false) AS automatica
+      FROM ia_usos
       WHERE criado_em >= date_trunc('month', CURRENT_DATE)
       UNION ALL
-      SELECT custo_estimado FROM ranking_mercado_execucoes
+      SELECT custo_estimado, true AS automatica FROM ranking_mercado_execucoes
       WHERE criado_em >= date_trunc('month', CURRENT_DATE)
         AND (tokens_entrada > 0 OR tokens_saida > 0)
     ) chamadas_ia
-  `);
+  `, [TIPOS_USO_IA_AUTOMATICOS]);
   return {
     chamadas: Number(resultado.rows[0]?.chamadas || 0),
+    chamadasManuais: Number(resultado.rows[0]?.chamadas_manuais || 0),
     custo: Number(resultado.rows[0]?.custo || 0)
   };
 }
@@ -4944,12 +4953,13 @@ async function motivoBloqueioIA(user: any) {
       : "IA nao configurada pelo administrador.";
   }
 
-  // Verifica limites globais (somados de todos os usuarios no mes)
+  // Verifica limites globais (somados de todos os usuarios no mes): chamadas só as
+  // pedidas pelos usuarios, custo com tudo (ver usoGlobalIAMesAtual)
   const limReq = Number(configIA?.limite_mensal_requisicoes || 0);
   const limCusto = Number(configIA?.limite_mensal_custo || 0);
   if (limReq > 0 || limCusto > 0) {
     const usoGlobal = await usoGlobalIAMesAtual();
-    if (limReq > 0 && usoGlobal.chamadas >= limReq) {
+    if (limReq > 0 && usoGlobal.chamadasManuais >= limReq) {
       return "Limite mensal global de chamadas atingido.";
     }
     if (limCusto > 0 && usoGlobal.custo >= limCusto) {
@@ -40941,6 +40951,8 @@ app.get("/admin/ia", authMiddleware, async (c) => {
       { value: "claude-opus-4-8",           label: "Claude Opus — Melhor qualidade" }
     ];
 
+    const usoGlobal = await usoGlobalIAMesAtual();
+
     return c.json({
       config: {
         ...configAtual,
@@ -40953,6 +40965,13 @@ app.get("/admin/ia", authMiddleware, async (c) => {
       modelos_disponiveis,
       anthropic_modelos_disponiveis,
       resumo: resumo.rows[0],
+      // O mesmo número que os limites globais comparam (chamadas_manuais vs. limite de
+      // chamadas; custo, com automáticas e ranking, vs. limite de custo).
+      uso_global: {
+        chamadas: usoGlobal.chamadas,
+        chamadas_manuais: usoGlobal.chamadasManuais,
+        custo: usoGlobal.custo
+      },
       usuarios: usuarios.rows
     });
 
@@ -48053,15 +48072,16 @@ async function processarClassificacaoStatusLeadIA() {
     const configIA = await buscarConfigIA();
     if (configIA?.status !== "contratado") return;
 
-    // Teto global de custo/chamadas (mesma soma usada em motivoBloqueioIA) —
-    // rede de segurança pra esse classificador não gerar gasto sem limite;
-    // se estourou, pula o sweep inteiro e tenta de novo no próximo.
-    const limReq = Number(configIA?.limite_mensal_requisicoes || 0);
+    // Teto global de custo (mesma soma usada em motivoBloqueioIA) — rede de
+    // segurança pra esse classificador não gerar gasto sem limite; se estourou,
+    // pula o sweep inteiro e tenta de novo no próximo. O limite de chamadas não
+    // vale aqui: ele conta só o que os usuários pedem, e esta classificação é
+    // automática (antes ela parava junto quando as automáticas estouravam o teto).
     const limCusto = Number(configIA?.limite_mensal_custo || 0);
-    if (limReq > 0 || limCusto > 0) {
+    if (limCusto > 0) {
       const usoGlobal = await usoGlobalIAMesAtual();
-      if ((limReq > 0 && usoGlobal.chamadas >= limReq) || (limCusto > 0 && usoGlobal.custo >= limCusto)) {
-        console.warn("[classificacao-status-ia] teto global de IA atingido, pulando este sweep");
+      if (usoGlobal.custo >= limCusto) {
+        console.warn("[classificacao-status-ia] teto global de custo de IA atingido, pulando este sweep");
         return;
       }
     }
