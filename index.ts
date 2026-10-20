@@ -144,6 +144,7 @@ import {
   aplicarDescontoInicial,
   competenciaAnterior,
   competenciaValida,
+  inicioCobrancaGestor,
   itensVisiveisAoGestor,
   manterAjusteAoRecalcular,
   montarItensCobrancaGestor,
@@ -24188,8 +24189,11 @@ async function calcularCobrancaGestor(gestorId: number, competencia: string) {
   ]);
   const especifica = especificaRes.rows[0] || null;
   const config = resolverConfigCobrancaGestor(padrao, especifica);
-  // Contrato: antes do primeiro mês cobrado não há fatura; nos primeiros meses, desconto.
-  const antesDoInicio = antesDoInicioDaCobranca(competencia, condicoes);
+  // Antes do primeiro mês cobrado não há fatura — o mais tardio entre o "Cobrar a partir de"
+  // e o início do contrato (antes só o contrato valia aqui, e os botões manuais e a prévia
+  // geravam meses que o agendador pula). Nos primeiros meses do contrato, desconto.
+  const inicioCobranca = inicioCobrancaGestor(padrao.cobrar_a_partir_de, condicoes?.inicio_cobranca);
+  const antesDoInicio = antesDoInicioDaCobranca(competencia, { inicio_cobranca: inicioCobranca });
   const mesDesconto = mesDoDescontoInicial(competencia, condicoes);
 
   const ids = clientes.map((cliente) => cliente.cliente_id);
@@ -24229,6 +24233,7 @@ async function calcularCobrancaGestor(gestorId: number, competencia: string) {
     especifica: configCobrancaParaJson(especifica),
     isento,
     antes_do_inicio: antesDoInicio,
+    inicio_cobranca: inicioCobranca,
     clientes,
     itens,
     total,
@@ -24251,7 +24256,7 @@ async function gravarCobrancaGestor(gestorId: number, competencia: string, orige
   await sincronizarCustosVoipPendentes(30).catch(() => {});
   const calculo = await calcularCobrancaGestor(gestorId, competencia);
   if (calculo.isento) return { situacao: "isento" as const };
-  if (calculo.antes_do_inicio) return { situacao: "antes_do_inicio" as const };
+  if (calculo.antes_do_inicio) return { situacao: "antes_do_inicio" as const, inicio_cobranca: calculo.inicio_cobranca };
 
   const competenciaData = `${competencia}-01`;
   const conn = await client.connect();
@@ -24336,7 +24341,7 @@ const MENSAGEM_GERACAO_COBRANCA: Record<string, string> = {
   ja_existe: "Outra geração dessa fatura terminou ao mesmo tempo. Recarregue a lista.",
   sem_valor: "Nada a cobrar nessa competência (sem mensalidade, clientes ou VoIP com valor).",
   isento: "Este gestor está marcado como isento.",
-  antes_do_inicio: "Pelo contrato, a cobrança deste gestor só começa depois desta competência (Financeiro dos Usuários → Condições do contrato).",
+  antes_do_inicio: "A cobrança deste gestor só começa depois desta competência (\"Cobrar a partir de\" da Cobrança dos Gestores ou Condições do contrato em Financeiro dos Usuários).",
   conflito_vencimento: "Já existe um lançamento manual para este gestor na data de vencimento. Mude a data dele ou exclua antes de gerar."
 };
 
@@ -24523,6 +24528,7 @@ app.get("/admin/cobranca-gestores/:id/previa", authMiddleware, async (c) => {
     vencimento: calculo.vencimento,
     isento: calculo.isento,
     antes_do_inicio: calculo.antes_do_inicio,
+    inicio_cobranca: calculo.inicio_cobranca,
     config: calculo.config,
     itens: calculo.itens,
     total: calculo.total
@@ -24545,7 +24551,11 @@ app.post("/admin/cobranca-gestores/:id/gerar", authMiddleware, async (c) => {
   try {
     const resultado = await gravarCobrancaGestor(gestorId, String(body.competencia), "manual");
     const status = resultado.situacao === "conflito_vencimento" ? 409 : 200;
-    return c.json({ ...resultado, mensagem: MENSAGEM_GERACAO_COBRANCA[resultado.situacao] }, status);
+    const inicio = "inicio_cobranca" in resultado ? resultado.inicio_cobranca : null;
+    const mensagem = resultado.situacao === "antes_do_inicio" && inicio
+      ? `A cobrança deste gestor começa em ${nomeCompetencia(inicio)}: nada é gerado antes disso ("Cobrar a partir de" da Cobrança dos Gestores ou Condições do contrato em Financeiro dos Usuários).`
+      : MENSAGEM_GERACAO_COBRANCA[resultado.situacao];
+    return c.json({ ...resultado, mensagem }, status);
   } catch (err) {
     console.error("ERRO POST /admin/cobranca-gestores/:id/gerar:", err);
     return c.json({ error: "Erro ao gerar a fatura" }, 500);

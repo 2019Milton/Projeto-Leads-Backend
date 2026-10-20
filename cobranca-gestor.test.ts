@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   aplicarAjusteManual,
   competenciaAnterior,
+  inicioCobrancaGestor,
   itensVisiveisAoGestor,
   manterAjusteAoRecalcular,
   montarItensCobrancaGestor,
@@ -28,6 +29,15 @@ test("competência: mês anterior, nome e vencimento no mês seguinte", () => {
   expect(vencimentoDaCompetencia("2026-10", 10)).toBe("2026-11-10");
   expect(vencimentoDaCompetencia("2026-12", 5)).toBe("2027-01-05");
   expect(vencimentoDaCompetencia("2026-02", 31)).toBe("2026-03-28");
+});
+
+test("início da cobrança: o mais tardio entre o padrão e o contrato", () => {
+  expect(inicioCobrancaGestor("2026-10", null)).toBe("2026-10");
+  expect(inicioCobrancaGestor("2026-10", "2026-12")).toBe("2026-12");
+  expect(inicioCobrancaGestor("2026-10", "2026-09")).toBe("2026-10");
+  expect(inicioCobrancaGestor("2027-01", "2026-12")).toBe("2027-01");
+  expect(inicioCobrancaGestor(null, "2026-11")).toBe("2026-11");
+  expect(inicioCobrancaGestor("", "x", undefined)).toBe(null);
 });
 
 test("fatura: mensalidade + clientes (cada um uma vez) + VoIP com margem", () => {

@@ -107,6 +107,14 @@ export function nomeCompetencia(competencia: string) {
   return `${MESES[mes - 1] || mes} de ${ano}`;
 }
 
+// Primeiro mês cobrado do gestor: o mais tardio entre o "Cobrar a partir de" da plataforma e
+// o início do contrato dele (o que não for competência válida é ignorado). Vale para a
+// geração automática, para os botões manuais e para a prévia.
+export function inicioCobrancaGestor(...inicios: (string | null | undefined)[]): string | null {
+  const validos = inicios.filter(competenciaValida).sort();
+  return validos.length ? validos[validos.length - 1] : null;
+}
+
 // A fatura da competência vence no mês seguinte, no dia configurado (1 a 28).
 export function vencimentoDaCompetencia(competencia: string, diaVencimento: unknown) {
   const dia = Math.min(Math.max(Math.trunc(Number(diaVencimento) || 10), 1), 28);
