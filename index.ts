@@ -166,6 +166,18 @@ import {
   type PerfilContrato,
 } from "./contrato-plataforma";
 
+import {
+  SQL_TABELAS_AVISOS_WHATSAPP,
+  destinatariosAvisoAdministracao,
+  montarPainelAvisosWhatsApp,
+  registrarEnvioAvisoWhatsApp,
+  textoMotivoAvisoWhatsApp,
+  validarEscolhaAvisoWhatsApp,
+  verificarAvisoWhatsApp,
+  type ChaveAvisoWhatsApp,
+  type MotivoAvisoWhatsApp,
+} from "./avisos-whatsapp";
+
 const app = new Hono();
 
 const WHATSAPP_CLOUD_API_VERSION =
@@ -3747,7 +3759,7 @@ async function gravarAlertaProvedorIA(
   );
   if (!podeNotificar.rows.length) return;
 
-  const admins = await client.query(`SELECT id, whatsapp FROM usuarios WHERE tipo = 'super_admin'`);
+  const admins = await client.query(`SELECT id FROM usuarios WHERE tipo = 'super_admin'`);
   const texto = textoAlertaProvedorIA(provider, falha.tipo);
 
   // Sem crédito é o único tipo com link de recarga útil — os outros exigem mexer em
@@ -3763,11 +3775,11 @@ async function gravarAlertaProvedorIA(
        VALUES ($1, 'ia_provedor_alerta', $2, $3)`,
       [admin.id, texto.titulo, texto.mensagem]
     );
-    if (mensagemWhatsApp && admin.whatsapp) {
-      enviarLembreteWhatsApp(admin.whatsapp, mensagemWhatsApp).catch((e: any) =>
-        console.error("[ia-provedor] erro ao enviar WhatsApp de saldo baixo:", e?.message || e)
-      );
-    }
+  }
+  if (mensagemWhatsApp) {
+    enviarAvisoWhatsAppAdministracao("ia_sem_credito", mensagemWhatsApp).catch((e: any) =>
+      console.error("[ia-provedor] erro ao enviar WhatsApp de sem crédito:", e?.message || e)
+    );
   }
 }
 
@@ -6451,13 +6463,6 @@ async function verificarSaldoMetaEAlertar(
       if (horasDesdeUltimo < ALERTA_SALDO_META_INTERVALO_HORAS) return;
     }
 
-    const usuarioRow = await client.query(
-      `SELECT whatsapp FROM usuarios WHERE id = $1`,
-      [usuarioId]
-    );
-    const telefone = usuarioRow.rows[0]?.whatsapp;
-    if (!telefone) return;
-
     // Mesmos 2 badges do card "💳 Status de Pagamento Meta" no frontend
     // (index.html — pagamento-modos), pra dar o mesmo contexto completo no
     // WhatsApp, não só o percentual do limite.
@@ -6488,7 +6493,8 @@ async function verificarSaldoMetaEAlertar(
       `🏦 Manual/pré-pago (${saldoTexto}): ${badgeManualPrePago}\n\n` +
       `Resolva agora sem precisar entrar na plataforma:\n${link}`;
 
-    await enviarLembreteWhatsApp(telefone, msg);
+    const envio = await enviarAvisoWhatsApp("limite_gastos_meta", usuarioId, msg);
+    if (!envio.permitido) return;
 
     await client.query(
       `INSERT INTO alerta_saldo_meta (usuario_id, conta_anuncios_id, ultimo_alerta_em)
@@ -26080,19 +26086,13 @@ async function conversaAvancouBastante(conversa: any): Promise<boolean> {
 // direto pro corretor, então sem esse aviso a mensagem passaria despercebida.
 async function notificarRetornoLeadAvancado(usuarioId: number, telefoneCliente: string) {
   try {
-    const row = await client.query(
-      `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
-      [usuarioId]
-    );
-    const u = row.rows[0];
-    if (!u?.whatsapp || u?.notif_whatsapp_lead === false) return;
     const msg =
       `🔥 *Lead quente voltou a falar!*\n\n` +
       `📞 *Telefone:* ${telefoneCliente}\n` +
       `Essa conversa já tinha avançado bastante antes, e o roteiro do bot mudou desde então — ` +
       `por isso pulei direto pra você em vez de tentar continuar o bot do jeito errado.\n\n` +
       `Acesse a plataforma para responder.`;
-    await enviarLembreteWhatsApp(u.whatsapp, msg);
+    await enviarAvisoWhatsApp("lead_quente_voltou", usuarioId, msg);
   } catch (e) {
     console.error("Erro notif retorno lead avançado:", e);
   }
@@ -26871,7 +26871,7 @@ async function processarEventoWhatsApp(value: any) {
     const numeroOrigem = String(msg.from || "").replace(/\D/g, "");
 
     // Mensagens vindas do nosso próprio número de notificações internas (Z-API, usado por
-    // enviarLembreteWhatsApp — ex: o resumo semanal enviado pro próprio número do WhatsApp
+    // enviarAvisoWhatsApp — ex: o resumo semanal enviado pro próprio número do WhatsApp
     // Bot) não são de um cliente de verdade: a Meta entrega isso como mensagem recebida
     // igual a qualquer outra, mas processar normalmente criaria uma conversa/lead fantasma
     // e poderia disparar o roteiro automático respondendo de volta pra esse número.
@@ -28660,6 +28660,9 @@ await client.query(`
     END IF;
   END $$;
 `);
+
+// 📲 Avisos por WhatsApp (avisos-whatsapp.ts): quem recebe cada aviso e o registro dos envios.
+await client.query(SQL_TABELAS_AVISOS_WHATSAPP);
 
 // 📄 Contrato de utilização (contrato-plataforma.ts). As condições são as respostas do super
 // admin em Financeiro dos Usuários; para o gestor, mensalidade/por cliente/isento continuam em
@@ -41194,19 +41197,22 @@ async function situacaoSaldosIA() {
   return saida;
 }
 
-async function notificarSuperAdminsIA(tipo: string, titulo: string, mensagemWhatsApp: string) {
-  const admins = await client.query(`SELECT id, whatsapp FROM usuarios WHERE tipo = 'super_admin'`);
+async function notificarSuperAdminsIA(
+  tipo: string,
+  aviso: ChaveAvisoWhatsApp,
+  titulo: string,
+  mensagemWhatsApp: string
+) {
+  const admins = await client.query(`SELECT id FROM usuarios WHERE tipo = 'super_admin'`);
   for (const admin of admins.rows) {
     await client.query(
       `INSERT INTO notificacoes (usuario_id, tipo, titulo, mensagem) VALUES ($1, $2, $3, $4)`,
       [admin.id, tipo, titulo, mensagemWhatsApp.replace(/\*/g, "")]
     );
-    if (admin.whatsapp) {
-      enviarLembreteWhatsApp(admin.whatsapp, mensagemWhatsApp).catch((e: any) =>
-        console.error("[ia-saldo] erro ao enviar WhatsApp:", e?.message || e)
-      );
-    }
   }
+  enviarAvisoWhatsAppAdministracao(aviso, mensagemWhatsApp).catch((e: any) =>
+    console.error("[ia-saldo] erro ao enviar WhatsApp:", e?.message || e)
+  );
 }
 
 // Roda a cada 10 min e depois de o admin informar o saldo. O UPDATE com a
@@ -41244,8 +41250,10 @@ async function verificarSaldosIA() {
       if (!marcado.rows.length) continue;
 
       console.log(`[ia-saldo] ${provider}: ${avaliacao.acao} (estimado US$ ${avaliacao.estimadoUsd.toFixed(2)})`);
+      const recarga = avaliacao.acao === "recarga_automatica";
       await notificarSuperAdminsIA(
-        avaliacao.acao === "recarga_automatica" ? "ia_saldo_recarga" : "ia_saldo_baixo",
+        recarga ? "ia_saldo_recarga" : "ia_saldo_baixo",
+        recarga ? "ia_recarga_automatica" : "ia_saldo_baixo",
         texto.titulo,
         texto.whatsapp
       );
@@ -45028,15 +45036,10 @@ app.post("/chat/mensagem", authMiddleware, async (c: any) => {
     const suporteAtivo = vistoEm && (Date.now() - new Date(vistoEm).getTime()) < 2 * 60 * 1000;
 
     if (!suporteAtivo) {
-      const admins = await client.query(
-        `SELECT whatsapp FROM usuarios WHERE tipo = 'super_admin' AND whatsapp IS NOT NULL AND whatsapp <> ''`
-      );
       const nomeRemetente = `${user.nome || ""} ${user.sobrenome || ""}`.trim() || user.email;
       const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
       const msgWpp = `🔔 *Plataforma de Leads — Nova mensagem*\n\n👤 *Cliente:* ${nomeRemetente}\n💬 *Mensagem:* ${conteudo.trim()}\n⏰ *Horário:* ${agora}\n\nAcesse o painel de suporte para responder.`;
-      for (const admin of admins.rows) {
-        await enviarLembreteWhatsApp(admin.whatsapp, msgWpp);
-      }
+      await enviarAvisoWhatsAppAdministracao("suporte_nova_mensagem", msgWpp);
     }
   } catch (e) {
     console.error("ERRO notif chat WhatsApp:", e);
@@ -46717,13 +46720,6 @@ async function notificarNovoLeadWhatsApp(
   dados: { nome?: string | null; telefone?: string | null; email?: string | null; campanha?: string | null }
 ) {
   try {
-    const row = await client.query(
-      `SELECT whatsapp, notif_whatsapp_lead FROM usuarios WHERE id = $1`,
-      [usuarioId]
-    );
-    const u = row.rows[0];
-    if (!u?.whatsapp || u?.notif_whatsapp_lead === false) return;
-    console.log(`[notif-lead] enviando para usuário ${usuarioId} (${u.whatsapp})`);
     const agora = new Date().toLocaleString("pt-BR", {
       timeZone: "America/Sao_Paulo",
       day: "2-digit", month: "2-digit",
@@ -46737,7 +46733,7 @@ async function notificarNovoLeadWhatsApp(
       (dados.campanha ? `📣 *Campanha:* ${dados.campanha}\n` : "") +
       `⏰ *Horário:* ${agora}\n\n` +
       `Acesse a plataforma para ver todos os detalhes.`;
-    await enviarLembreteWhatsApp(u.whatsapp, msg);
+    await enviarAvisoWhatsApp("novo_lead", usuarioId, msg);
   } catch (e) {
     console.error("Erro notif lead WhatsApp:", e);
   }
@@ -46796,19 +46792,21 @@ function normalizarTelefoneWhatsApp(valor: unknown): string {
   return numero ? (numero.startsWith("55") ? numero : `55${numero}`) : "";
 }
 
-async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
+// Só enviarAvisoWhatsApp e enviarAvisoWhatsAppAdministracao chamam isto: todo aviso passa
+// pelo painel Admin → Avisos por WhatsApp (avisos-whatsapp.ts) antes de sair.
+async function enviarTextoZapi(telefone: string, mensagem: string): Promise<boolean> {
   const instanceId = Bun.env.ZAPI_INSTANCE_ID;
   const token      = Bun.env.ZAPI_TOKEN;
 
   if (!instanceId || !token) {
     console.warn("⚠️ Z-API: ZAPI_INSTANCE_ID ou ZAPI_TOKEN não configurados");
-    return;
+    return false;
   }
 
   const phone = normalizarTelefoneWhatsApp(telefone);
   if (!phone) {
     console.warn("⚠️ Z-API: número vazio, envio cancelado");
-    return;
+    return false;
   }
 
   const clientToken = Bun.env.ZAPI_CLIENT_TOKEN || "";
@@ -46822,19 +46820,128 @@ async function enviarLembreteWhatsApp(telefone: string, mensagem: string) {
       },
       body: JSON.stringify({ phone, message: mensagem })
     });
-    const body = await res.json();
+    const body = await res.json().catch(() => null);
     if (res.ok) {
       console.log(`[z-api] ✅ enviado para ${mascararTelefone(phone)}`);
-    } else {
-      console.error(`[z-api] ❌ erro ${res.status}:`, JSON.stringify(body));
+      return true;
     }
+    console.error(`[z-api] ❌ erro ${res.status}:`, JSON.stringify(body));
+    return false;
   } catch (e) {
     console.error("[z-api] ❌ exceção:", e);
+    return false;
   }
 }
 
+// Aviso para o dono da conta. A mensagem pode ser uma função quando montá-la custa caro
+// (resumo semanal consulta as APIs de anúncio): só roda se o usuário recebe o aviso.
+// telefoneDestino: só quando não é o WhatsApp do perfil (resumo semanal → número do bot).
+async function enviarAvisoWhatsApp(
+  chave: ChaveAvisoWhatsApp,
+  usuarioId: number,
+  mensagem: string | (() => Promise<string>),
+  telefoneDestino?: string | null
+): Promise<{ permitido: boolean; enviado: boolean; motivo: MotivoAvisoWhatsApp | "erro" }> {
+  try {
+    const decisao = await verificarAvisoWhatsApp(client, chave, usuarioId, telefoneDestino);
+    if (!decisao.envia) return { permitido: false, enviado: false, motivo: decisao.motivo };
+    const texto = typeof mensagem === "function" ? await mensagem() : mensagem;
+    const enviado = await enviarTextoZapi(decisao.telefone, texto);
+    await registrarEnvioAvisoWhatsApp(client, chave, usuarioId, enviado);
+    return { permitido: true, enviado, motivo: decisao.motivo };
+  } catch (e: any) {
+    console.error(`[aviso-whatsapp] ${chave} (usuário ${usuarioId}):`, e?.message || e);
+    return { permitido: false, enviado: false, motivo: "erro" };
+  }
+}
+
+// Aviso da administração: vai para quem está marcado no painel (padrão: super admins).
+async function enviarAvisoWhatsAppAdministracao(chave: ChaveAvisoWhatsApp, mensagem: string) {
+  const destinatarios = await destinatariosAvisoAdministracao(client, chave);
+  for (const destinatario of destinatarios) {
+    const enviado = await enviarTextoZapi(destinatario.telefone, mensagem);
+    await registrarEnvioAvisoWhatsApp(client, chave, destinatario.usuarioId, enviado);
+  }
+}
+
+async function carregarPainelAvisosWhatsApp() {
+  const [usuarios, escolhas, envios] = await Promise.all([
+    client.query(`
+      SELECT id, nome, sobrenome, email, tipo, COALESCE(ativo, true) AS ativo, whatsapp, notif_whatsapp_lead
+      FROM usuarios
+      ORDER BY COALESCE(ativo, true) DESC, COALESCE(tipo = 'super_admin', false) DESC, LOWER(COALESCE(nome, email)), id
+    `),
+    client.query(`SELECT aviso, usuario_id, recebe FROM whatsapp_avisos_destinatarios`),
+    client.query(`
+      SELECT aviso,
+             COUNT(*) FILTER (WHERE resultado = 'enviado')::int AS enviados,
+             COUNT(*) FILTER (WHERE resultado = 'erro')::int AS falhas,
+             MAX(criado_em) FILTER (WHERE resultado = 'enviado') AS ultimo_envio_em
+      FROM whatsapp_avisos_envios
+      WHERE criado_em > NOW() - INTERVAL '30 days'
+      GROUP BY aviso
+    `),
+  ]);
+  return montarPainelAvisosWhatsApp(usuarios.rows, escolhas.rows, envios.rows);
+}
+
+app.get("/admin/avisos-whatsapp", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
+  try {
+    return c.json(await carregarPainelAvisosWhatsApp());
+  } catch (err) {
+    console.error("ERRO GET /admin/avisos-whatsapp:", err);
+    return c.json({ error: "Erro ao carregar os avisos" }, 500);
+  }
+});
+
+// Marca/desmarca usuários num aviso. recebe null = volta ao padrão (apaga a escolha).
+app.put("/admin/avisos-whatsapp/:aviso", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  if (user.tipo !== "super_admin") return c.json({ error: "Acesso negado" }, 403);
+  try {
+    const corpo = await c.req.json().catch(() => ({}));
+    const escolha = validarEscolhaAvisoWhatsApp(c.req.param("aviso"), corpo);
+    if ("erro" in escolha) return c.json({ error: escolha.erro }, 400);
+
+    const existentes = await client.query(`SELECT id FROM usuarios WHERE id = ANY($1::int[])`, [escolha.usuarioIds]);
+    if (existentes.rows.length !== escolha.usuarioIds.length) {
+      return c.json({ error: "Usuário não encontrado" }, 400);
+    }
+
+    if (escolha.recebe === null) {
+      await client.query(
+        `DELETE FROM whatsapp_avisos_destinatarios WHERE aviso = $1 AND usuario_id = ANY($2::int[])`,
+        [escolha.aviso.chave, escolha.usuarioIds]
+      );
+    } else {
+      await client.query(
+        `
+        INSERT INTO whatsapp_avisos_destinatarios (aviso, usuario_id, recebe, atualizado_por)
+        SELECT $1, id, $3, $4 FROM UNNEST($2::int[]) AS id
+        ON CONFLICT (aviso, usuario_id)
+        DO UPDATE SET recebe = EXCLUDED.recebe, atualizado_por = EXCLUDED.atualizado_por, atualizado_em = NOW()
+        `,
+        [escolha.aviso.chave, escolha.usuarioIds, escolha.recebe, user.id]
+      );
+    }
+    return c.json(await carregarPainelAvisosWhatsApp());
+  } catch (err) {
+    console.error("ERRO PUT /admin/avisos-whatsapp/:aviso:", err);
+    return c.json({ error: "Erro ao salvar" }, 500);
+  }
+});
+
+// O registro de envios só alimenta a contagem dos últimos 30 dias do painel.
+setInterval(() => {
+  client
+    .query(`DELETE FROM whatsapp_avisos_envios WHERE criado_em < NOW() - INTERVAL '180 days'`)
+    .catch((e: any) => console.error("[aviso-whatsapp] erro ao limpar registro:", e?.message || e));
+}, 24 * 60 * 60 * 1000);
+
 // Número WhatsApp conectado à nossa instância Z-API (a partir de onde
-// enviarLembreteWhatsApp manda notificações internas — novo lead, resumo semanal etc.).
+// enviarAvisoWhatsApp manda notificações internas — novo lead, resumo semanal etc.).
 // Usado por processarEventoWhatsApp pra reconhecer e ignorar essas mensagens quando elas
 // chegam como "recebidas" no WhatsApp Bot de algum corretor (destinatário = número do
 // bot dele), evitando criar conversa/lead fantasma ou disparar o roteiro automático de volta
@@ -46864,7 +46971,7 @@ async function obterNumeroZAPI(): Promise<string | null> {
 // =========================
 // 📊 RESUMO SEMANAL POR WHATSAPP — só para corretores com o WhatsApp Bot conectado
 // =========================
-// Mesmo canal de envio do aviso de "novo lead chegou" (enviarLembreteWhatsApp, via Z-API) —
+// Mesmo canal de envio do aviso de "novo lead chegou" (enviarAvisoWhatsApp, via Z-API) —
 // o que muda é o destinatário: em vez do número pessoal de notificação (usuarios.whatsapp),
 // vai pro número que o próprio corretor cadastrou no WhatsApp Bot (plataforma_conexoes,
 // plataforma='whatsapp', dados_conta.numero).
@@ -47034,7 +47141,11 @@ function formatarTendenciaSemanal(atual: number, anterior: number): string {
   return atual > anterior ? ` (↑ era ${anterior})` : ` (↓ era ${anterior})`;
 }
 
-async function enviarResumoSemanalCorretor(usuarioId: number, numeroBot: string) {
+function enviarResumoSemanalCorretor(usuarioId: number, numeroBot: string) {
+  return enviarAvisoWhatsApp("resumo_semanal", usuarioId, () => montarMensagemResumoSemanal(usuarioId), numeroBot);
+}
+
+async function montarMensagemResumoSemanal(usuarioId: number) {
   const resumo = await montarResumoSemanalCorretor(usuarioId);
   const cpl = resumo.leads_semana > 0 ? resumo.gasto_total / resumo.leads_semana : null;
 
@@ -47055,7 +47166,7 @@ async function enviarResumoSemanalCorretor(usuarioId: number, numeroBot: string)
       : "") +
     `\nAcesse a plataforma para ver todos os detalhes.`;
 
-  await enviarLembreteWhatsApp(numeroBot, msg);
+  return msg;
 }
 
 function diaEHoraBrasilAgora() {
@@ -47085,14 +47196,14 @@ async function verificarResumosSemanaisWhatsApp() {
       SELECT u.id, pc.dados_conta->>'numero' AS numero_bot
       FROM usuarios u
       JOIN plataforma_conexoes pc ON pc.usuario_id = u.id AND pc.plataforma = 'whatsapp' AND pc.status = 'conectado'
-      WHERE COALESCE(u.notif_whatsapp_lead, true) = true
-        AND pc.dados_conta->>'numero' IS NOT NULL
+      WHERE pc.dados_conta->>'numero' IS NOT NULL
         AND (u.resumo_semanal_enviado_em IS NULL OR u.resumo_semanal_enviado_em < NOW() - INTERVAL '6 days')
     `);
 
     for (const usuario of usuarios.rows) {
       try {
-        await enviarResumoSemanalCorretor(usuario.id, usuario.numero_bot);
+        const envio = await enviarResumoSemanalCorretor(usuario.id, usuario.numero_bot);
+        if (!envio.permitido) continue;
         await client.query(`UPDATE usuarios SET resumo_semanal_enviado_em = NOW() WHERE id = $1`, [usuario.id]);
         console.log(`[resumo-semanal] enviado para usuário ${usuario.id}`);
       } catch (e) {
@@ -47121,7 +47232,11 @@ app.post("/whatsapp-bot/resumo-semanal/testar", authMiddleware, async (c) => {
     if (!numero) {
       return c.json({ error: "WhatsApp Bot não conectado ou sem número cadastrado." }, 400);
     }
-    await enviarResumoSemanalCorretor(user.id, numero);
+    const envio = await enviarResumoSemanalCorretor(user.id, numero);
+    if (!envio.permitido) {
+      const erro = envio.motivo === "erro" ? "Erro ao enviar resumo de teste" : textoMotivoAvisoWhatsApp(envio.motivo);
+      return c.json({ error: erro }, envio.motivo === "erro" ? 500 : 409);
+    }
     return c.json({ sucesso: true, numero });
   } catch (err: any) {
     console.error("ERRO teste resumo semanal:", err);
@@ -47241,10 +47356,7 @@ async function processarLembretesContato() {
         [lead.usuario_id, lead.id, titulo, mensagem]
       );
 
-      // WhatsApp
-      if (lead.corretor_whatsapp) {
-        await enviarLembreteWhatsApp(lead.corretor_whatsapp, mensagem);
-      }
+      await enviarAvisoWhatsApp("lembrete_contato_amanha", lead.usuario_id, mensagem);
 
       await client.query(
         `UPDATE leads SET lembrete_1dia_enviado = TRUE WHERE id = $1`,
@@ -47276,10 +47388,7 @@ async function processarLembretesContato() {
         [lead.usuario_id, lead.id, titulo, mensagem]
       );
 
-      // WhatsApp
-      if (lead.corretor_whatsapp) {
-        await enviarLembreteWhatsApp(lead.corretor_whatsapp, mensagem);
-      }
+      await enviarAvisoWhatsApp("lembrete_contato_hoje", lead.usuario_id, mensagem);
 
       await client.query(
         `UPDATE leads SET lembrete_dia_enviado = TRUE WHERE id = $1`,
@@ -47335,9 +47444,7 @@ async function processarLembretesFimCampanha() {
         [campanha.usuario_id, titulo, mensagem]
       );
 
-      if (campanha.usuario_whatsapp) {
-        await enviarLembreteWhatsApp(campanha.usuario_whatsapp, mensagem);
-      }
+      await enviarAvisoWhatsApp("campanha_fim_amanha", campanha.usuario_id, mensagem);
 
       await client.query(
         `UPDATE campanhas SET fim_lembrete_1dia_enviado = TRUE WHERE id = $1`,
@@ -47368,9 +47475,7 @@ async function processarLembretesFimCampanha() {
         [campanha.usuario_id, titulo, mensagem]
       );
 
-      if (campanha.usuario_whatsapp) {
-        await enviarLembreteWhatsApp(campanha.usuario_whatsapp, mensagem);
-      }
+      await enviarAvisoWhatsApp("campanha_fim_hoje", campanha.usuario_id, mensagem);
 
       await client.query(
         `UPDATE campanhas SET fim_lembrete_dia_enviado = TRUE WHERE id = $1`,

@@ -1,4 +1,9 @@
 import { Pool } from "pg";
+import {
+  SQL_TABELAS_AVISOS_WHATSAPP,
+  registrarEnvioAvisoWhatsApp,
+  verificarAvisoWhatsApp,
+} from "./avisos-whatsapp";
 
 const FUSO_BRASILIA = "America/Sao_Paulo";
 const HORA_INICIO_ENVIO = 9;
@@ -225,6 +230,9 @@ async function garantirEstrutura(db: Pool) {
     WHERE ultimo_lembrete_whatsapp_data IS NOT NULL
     ON CONFLICT (lancamento_id, data_envio) DO NOTHING
   `);
+
+  // Também criadas pelo index.ts; aqui para o caso de este módulo rodar antes.
+  await db.query(SQL_TABELAS_AVISOS_WHATSAPP);
 }
 
 async function verificarLembretes(db: Pool) {
@@ -262,11 +270,19 @@ async function verificarLembretes(db: Pool) {
       const diasAtraso = Number(linha.dias_atraso);
       if (!Number.isFinite(diasAtraso) || diasAtraso < -1) continue;
 
+      // Quem recebe cada lembrete é escolhido em Admin → Avisos por WhatsApp.
+      const aviso =
+        diasAtraso === -1
+          ? "financeiro_vence_amanha"
+          : diasAtraso === 0
+          ? "financeiro_vence_hoje"
+          : "financeiro_atraso";
+      const decisao = await verificarAvisoWhatsApp(db, aviso, Number(linha.usuario_id));
+      if (!decisao.envia) continue;
+
       const mensagem = montarMensagem(linha);
-      const enviado = await enviarWhatsAppFinanceiro(
-        String(linha.whatsapp || ""),
-        mensagem
-      );
+      const enviado = await enviarWhatsAppFinanceiro(decisao.telefone, mensagem);
+      await registrarEnvioAvisoWhatsApp(db, aviso, Number(linha.usuario_id), enviado);
 
       if (!enviado) continue;
 
