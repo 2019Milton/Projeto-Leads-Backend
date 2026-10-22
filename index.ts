@@ -19412,7 +19412,10 @@ async function aguardarVideoMetaReady(
 }
 
 app.post("/meta/anuncio", authMiddleware, async (c) => {
-
+  // Depois do envio à Meta, uma falha local não autoriza desfazer a campanha.
+  let anuncioEnviado = false;
+  let anuncioCriadoId: string | null = null;
+  let recursosMeta: Record<string, any> = {};
   try {
     const user: any = c.get("user");
 
@@ -19587,6 +19590,10 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       ctaPayload: montarCallToActionMeta(destino, ctaType, form_id, linkDestino)
     });
 
+    const isCarrossel = Array.isArray(conteudoCriativo.link_data?.child_attachments)
+      && conteudoCriativo.link_data.child_attachments.length > 0;
+    const tipoCriativo = isCarrossel ? "carrossel" : conteudoCriativo.video_data ? "video" : "imagem";
+
     const objectStorySpec: Record<string, any> = {
       page_id,
       ...conteudoCriativo
@@ -19656,6 +19663,8 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
     }
 
     // 🔥 ANÚNCIO
+    recursosMeta = { campaign_id, adset_id, creative_id: creative.id };
+    anuncioEnviado = true;
     const adRes = await fetch(
       `https://graph.facebook.com/v19.0/${adAccountId}/ads`,
       {
@@ -19684,6 +19693,10 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
     );
 
     const ad = await adRes.json();
+    anuncioCriadoId = ad?.id || null;
+    if (!anuncioCriadoId && !ad?.error) {
+      throw new Error("Resposta da Meta sem confirmação do anúncio");
+    }
 
     console.log("AD RESPONSE:", ad);
 
@@ -19708,6 +19721,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
 
         const configuracoesPersistidas = {
           ...(configuracoes_avancadas || {}),
+          criativo_tipo: tipoCriativo,
           texto,
           cta,
           page_id,
@@ -19731,14 +19745,14 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
             video_id: videoMetaId || null,
             video_url: videoMetaUrl || null,
             carrossel: isCarrossel,
-            tipo: videoMetaId ? "video" : isCarrossel ? "carrossel" : "imagem",
+            tipo: tipoCriativo,
             titulo: tituloAnuncio,
             descricao: descricaoAnuncio,
             link: linkDestino
           }
         };
 
-        await client.query(
+        const update = await client.query(
           `
           UPDATE campanhas
           SET
@@ -19761,6 +19775,8 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
           ]
         );
 
+        if (update.rowCount !== 1) throw new Error("Campanha não atualizada após resposta da Meta");
+
         return c.json({
           sem_forma_pagamento: true,
           mensagem:
@@ -19769,8 +19785,11 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       }
 
       return c.json({
-        error: "Erro ao criar anúncio",
-        detalhe: ad
+        error: ad.error?.error_user_msg || ad.error?.message || "Erro ao criar anúncio",
+        codigo_meta: ad.error?.code ?? null,
+        preservar_campanha: true,
+        ...recursosMeta,
+        detalhe: ad.error
       }, 400);
     }
 
@@ -19784,27 +19803,10 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       }
     );
 
-    const campanhasBanco =
-      await client.query(
-        `
-        SELECT
-          id,
-          nome,
-          campaign_id
-        FROM campanhas
-        ORDER BY id DESC
-        LIMIT 5
-        `
-      );
-
-    console.log(
-      "CAMPANHAS BANCO:",
-      campanhasBanco.rows
-    );
-
     // 💾 UPDATE CAMPANHA
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
+      criativo_tipo: tipoCriativo,
       texto,
       cta,
       page_id,
@@ -19829,7 +19831,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
         video_id: videoMetaId || null,
         video_url: videoMetaUrl || null,
         carrossel: isCarrossel,
-        tipo: videoMetaId ? "video" : isCarrossel ? "carrossel" : "imagem",
+        tipo: tipoCriativo,
         titulo: tituloAnuncio,
         descricao: descricaoAnuncio,
         link: linkDestino
@@ -19861,10 +19863,7 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
       ]
     );
 
-    console.log(
-      "UPDATED ROWS:",
-      update.rowCount
-    );
+    if (update.rowCount !== 1) throw new Error("Campanha não atualizada após criação do anúncio");
 
     return c.json(ad);
 
@@ -19876,9 +19875,16 @@ app.post("/meta/anuncio", authMiddleware, async (c) => {
     );
 
     return c.json({
-      error: "Erro ao criar anúncio",
-      detalhe:
-        err?.message || err
+      error: anuncioCriadoId
+        ? "A Meta criou o anúncio, mas a plataforma não conseguiu salvar a confirmação. Confira a campanha antes de publicar novamente."
+        : anuncioEnviado
+          ? "Não foi possível concluir a confirmação do anúncio. Confira a campanha na Meta antes de publicar novamente."
+          : "Não foi possível preparar o anúncio. Tente novamente após verificar a configuração da campanha.",
+      preservar_campanha: anuncioEnviado,
+      publicacao_pendente: anuncioEnviado,
+      anuncio_criado: Boolean(anuncioCriadoId),
+      ad_id: anuncioCriadoId,
+      ...recursosMeta
     }, 500);
   }
 });
