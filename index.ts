@@ -20170,10 +20170,8 @@ app.get(
       SELECT COUNT(*) as total
       FROM leads
       WHERE usuario_id = $1
-      AND (
-        COALESCE(origem, 'manual') <> 'meta'
-        OR conta_anuncios_id = $2
-      )
+      AND LOWER(TRIM(COALESCE(origem, ''))) IN ('meta','facebook','instagram')
+      AND conta_anuncios_id = $2
       AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
       `,
       [usuario_id, adAccountId]
@@ -20196,7 +20194,7 @@ app.get(
       FROM leads l
       LEFT JOIN campanhas c ON c.id = l.campanha_id
       WHERE l.usuario_id = $1
-      AND COALESCE(l.origem, 'manual') = 'meta'
+      AND LOWER(TRIM(COALESCE(l.origem, ''))) IN ('meta','facebook','instagram')
       AND l.conta_anuncios_id = $2
       AND (l.criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date
       GROUP BY 1
@@ -34714,13 +34712,22 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
         SELECT COUNT(*) AS total
         FROM leads
         WHERE usuario_id = $1
-        AND campanha = $2
-        AND conta_anuncios_id = $3
+        AND (
+          campanha_id = $4
+          OR (campanha_id IS NULL AND campanha = $2 AND conta_anuncios_id = $3)
+        )
+        AND (
+          LOWER(TRIM(COALESCE(origem, ''))) IN
+            ('meta','facebook','instagram','google','tiktok','linkedin','kwai','pinterest','snapchat','microsoft')
+          OR (plataforma = 'site' AND campanha_id = $4
+              AND NULLIF(atribuicao->>'utm_campaign', '') IS NOT NULL)
+        )
         `,
         [
           user.id,
           campanha.nome,
-          campanha.conta_anuncios_id
+          campanha.conta_anuncios_id,
+          campanha.id
         ]
       );
 
@@ -40023,6 +40030,11 @@ app.post("/teste/notif-whatsapp", authMiddleware, async (c) => {
 app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
+    // Filtro opt-in usado pelo Dashboard de anúncios; outros consumidores mantêm os totais gerais.
+    const somenteAtribuidos = c.req.query("somente_atribuidos") === "1";
+    const contaMetaSelecionada = somenteAtribuidos
+      ? await obterContaAnunciosSelecionadaIdUsuario(user.id)
+      : null;
     // Mesmo NULLIF já usado em /leads/meta-conversao/estatisticas: leads criados a partir
     // de uma conversa (CTWA da Meta, wa.me do LinkedIn etc.) gravam plataforma='whatsapp'
     // (o canal de conversão) mesmo vindo de um anúncio real — quem diz a rede de anúncio
@@ -40041,6 +40053,10 @@ app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
     const result = await client.query(
       `SELECT
          CASE
+           WHEN l.plataforma = 'site' AND l.campanha_id IS NOT NULL
+             AND NULLIF(l.atribuicao->>'utm_campaign', '') IS NOT NULL
+             AND LOWER(COALESCE(l.origem, '')) NOT IN ('meta','facebook','instagram','google','tiktok','linkedin','kwai','pinterest','snapchat','microsoft')
+           THEN COALESCE(c.plataforma, 'formulario')
            WHEN COALESCE(NULLIF(NULLIF(l.plataforma, 'whatsapp'), 'site'), l.origem, 'formulario') = 'meta'
            THEN COALESCE(
              CASE
@@ -40052,13 +40068,31 @@ app.get("/leads/stats/plataformas", authMiddleware, async (c) => {
            ELSE COALESCE(NULLIF(NULLIF(l.plataforma, 'whatsapp'), 'site'), l.origem, 'formulario')
          END AS plataforma,
          (l.plataforma = 'whatsapp') AS canal_whatsapp,
-         COUNT(*)::int AS total
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE COALESCE(l.status, 'novo') = 'novo')::int AS novos
        FROM leads l
        LEFT JOIN campanhas c ON c.id = l.campanha_id
        WHERE l.usuario_id = $1
+       AND (
+         NOT $2::boolean
+         OR (
+           (
+             LOWER(TRIM(COALESCE(l.origem, ''))) IN
+               ('meta','facebook','instagram','google','tiktok','linkedin','kwai','pinterest','snapchat','microsoft')
+             OR (l.plataforma = 'site' AND l.campanha_id IS NOT NULL
+                 AND NULLIF(l.atribuicao->>'utm_campaign', '') IS NOT NULL)
+           )
+           AND (
+             LOWER(TRIM(COALESCE(l.origem, ''))) NOT IN ('meta','facebook','instagram')
+             OR l.conta_anuncios_id = $3
+             OR (l.plataforma = 'site' AND l.campanha_id IS NOT NULL
+                 AND NULLIF(l.atribuicao->>'utm_campaign', '') IS NOT NULL)
+           )
+         )
+       )
        GROUP BY 1, 2
        ORDER BY total DESC`,
-      [user.id]
+      [user.id, somenteAtribuidos, contaMetaSelecionada]
     );
     return c.json(result.rows);
   } catch (err) {
