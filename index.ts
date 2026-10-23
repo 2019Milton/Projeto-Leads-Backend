@@ -26206,8 +26206,11 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
           { conversaId: conversa.id, roteiroId: roteiroAtivo.id, passo: conversa.passo_atual, tipo: "validacao_nome" }
         );
         if (wamid) await client.query(
-          `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3) ON CONFLICT (wamid) DO NOTHING`,
-          [conversa.id, wamid, texto]);
+          `INSERT INTO whatsapp_mensagens_log
+            (conversa_id, wamid, direcao, conteudo, bot_roteiro_id, bot_passo, bot_tipo)
+           VALUES ($1, $2, 'saida', $3, $4, $5, 'validacao_nome')
+           ON CONFLICT (wamid) DO NOTHING`,
+          [conversa.id, wamid, texto, roteiroAtivo.id, conversa.passo_atual]);
         return;
       }
       if (!await salvarNomeBot(client, conversa, resposta)) return;
@@ -26262,9 +26265,11 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
       : textoEnviado;
 
     await client.query(
-      `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3)
+      `INSERT INTO whatsapp_mensagens_log
+        (conversa_id, wamid, direcao, conteudo, bot_roteiro_id, bot_passo, bot_tipo)
+       VALUES ($1, $2, 'saida', $3, $4, $5, $6)
        ON CONFLICT (wamid) DO NOTHING`,
-      [conversa.id, wamid, conteudoLog]
+      [conversa.id, wamid, conteudoLog, roteiroAtivo.id, indice, passo.tipo]
     ).catch((e) => console.error("ERRO log saida whatsapp:", e));
 
     const ultimoPasso = indice === passos.length - 1;
@@ -26931,6 +26936,34 @@ async function processarEventoWhatsApp(value: any) {
     return;
   }
 
+  // A Meta pode aceitar um POST /messages e só comunicar a falha depois,
+  // em statuses[]. Neste caso o wamid existe, mas o cliente não recebeu.
+  // Registrar a falha sem alterar status de conversa (o cliente pode já ter respondido).
+  for (const entrega of value.statuses || []) {
+    if (String(entrega?.status || "").toLowerCase() !== "failed" || !entrega?.id) continue;
+    const envio = await client.query(
+      `SELECT m.conversa_id, m.bot_roteiro_id, m.bot_passo, m.bot_tipo
+       FROM whatsapp_mensagens_log m
+       INNER JOIN whatsapp_conversas wc ON wc.id = m.conversa_id AND wc.usuario_id = $2
+       WHERE m.wamid = $1 AND m.direcao = 'saida' AND m.bot_tipo IS NOT NULL
+       LIMIT 1`,
+      [entrega.id, usuarioId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (!envio.rows.length) continue;
+    const falha = entrega.errors?.[0] || {};
+    const codigo = `META_ENTREGA_${falha.code ?? "FALHOU"}`;
+    await registrarFalhaEnvioBotWhatsApp(
+      usuarioId,
+      { conversaId: envio.rows[0].conversa_id, roteiroId: envio.rows[0].bot_roteiro_id,
+        passo: envio.rows[0].bot_passo, tipo: `entrega_${envio.rows[0].bot_tipo}` },
+      codigo,
+      String(falha.message || falha.error_data?.details || "Meta informou falha na entrega da mensagem")
+    );
+    console.warn("[whatsapp-bot] Entrega de mensagem falhou na Meta", {
+      conversa_id: envio.rows[0].conversa_id, codigo
+    });
+  }
+
   const numeroBusiness = String(value.metadata?.display_phone_number || "").replace(/\D/g, "");
 
   // Nome de exibição do WhatsApp do cliente (só vem no payload junto da
@@ -27133,7 +27166,7 @@ async function processarEventoWhatsApp(value: any) {
             );
             if (!wamid) throw new Error("Triagem não enviada");
             await client.query(
-              "INSERT INTO whatsapp_mensagens_log (conversa_id,wamid,direcao,conteudo) VALUES ($1,$2,'saida',$3) ON CONFLICT (wamid) DO NOTHING",
+              "INSERT INTO whatsapp_mensagens_log (conversa_id,wamid,direcao,conteudo,bot_tipo) VALUES ($1,$2,'saida',$3,'triagem_nicho') ON CONFLICT (wamid) DO NOTHING",
               [conversa.id, wamid, triagem.pergunta]
             );
           } catch (error) {
@@ -28634,6 +28667,11 @@ await client.query(`
     conteudo    TEXT,
     criado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+  -- Identifica apenas os envios feitos pelo roteiro ou triagem para relacionar
+  -- um erro de entrega assíncrono da Meta ao passo enviado pelo bot.
+  ALTER TABLE whatsapp_mensagens_log ADD COLUMN IF NOT EXISTS bot_roteiro_id INTEGER;
+  ALTER TABLE whatsapp_mensagens_log ADD COLUMN IF NOT EXISTS bot_passo INTEGER;
+  ALTER TABLE whatsapp_mensagens_log ADD COLUMN IF NOT EXISTS bot_tipo TEXT;
   -- Auditoria restrita a falhas de envio do bot, sem texto de conversa nem telefone.
   CREATE TABLE IF NOT EXISTS whatsapp_bot_falhas_envio (
     id BIGSERIAL PRIMARY KEY,
