@@ -190,6 +190,7 @@ const WHATSAPP_PERMISSOES_OBRIGATORIAS = [
 const DEFAULT_TOKEN_SECRET = "troque-esta-chave-em-producao";
 
 const syncEmAndamento = new Set<number>();
+const publicacaoMetaEmAndamento = new Set<number>();
 
 const TOKEN_SECRET =
   Bun.env.JWT_SECRET ||
@@ -39228,6 +39229,13 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       }, 400);
     }
 
+    if (publicacaoMetaEmAndamento.has(campanhaId)) {
+      return c.json({
+        error: "Esta campanha já está sendo publicada. Aguarde a conclusão antes de tentar novamente."
+      }, 409);
+    }
+    publicacaoMetaEmAndamento.add(campanhaId);
+
     const campanhaRes = await client.query(
       `
       SELECT c.*
@@ -39247,6 +39255,26 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     }
 
     const campanha = campanhaRes.rows[0];
+
+    // Idempotência: um clique repetido/retry nunca pode criar outra campanha
+    // remota para o mesmo registro local.
+    if (campanha.campaign_id) {
+      if (campanha.adset_id || campanha.ad_id) {
+        return c.json({
+          sucesso: true,
+          ja_publicada: true,
+          campaign_id: campanha.campaign_id,
+          adset_id: campanha.adset_id || null,
+          ad_id: campanha.ad_id || null,
+          form_id: campanha.form_id || null
+        });
+      }
+      return c.json({
+        error: "Esta campanha já possui um ID na Meta, mas a publicação ainda está incompleta. Sincronize a conta antes de tentar publicar novamente.",
+        campaign_id: campanha.campaign_id
+      }, 409);
+    }
+
     const cfg = campanha.configuracoes_avancadas || {};
     const destino = resolverDestinoCampanha(cfg.destino);
     let whatsappPhoneNumber: string | null = null;
@@ -39878,6 +39906,10 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       err,
       500
     );
+  } finally {
+    if (campanhaId) {
+      publicacaoMetaEmAndamento.delete(campanhaId);
+    }
   }
 });
 
