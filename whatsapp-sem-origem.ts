@@ -79,7 +79,12 @@ export async function prepararTriagemWhatsApp(pool: any, conversaId: number, usu
   if (!nichos.length) return null;
   const anterior = conversa.variaveis?.triagem_nichos;
   const menu = Array.isArray(anterior) ? anterior : [];
-  const nicho = escolherNichoWhatsApp(texto, nichos, menu);
+  // Evita triagem com uma unica opcao: quando existe exatamente um nicho com
+  // roteiro ativo, usa esse nicho para o atendimento sem inventar campanha.
+  // Com mais de um nicho, mantem a identificacao por mensagem/menu.
+  const nicho = nichos.length === 1
+    ? Number(nichos[0].id)
+    : escolherNichoWhatsApp(texto, nichos, menu);
   if (nicho) {
     await pool.query("UPDATE leads SET nicho_id=$1 WHERE id=$2 AND usuario_id=$3 AND nicho_id IS NULL", [nicho, conversa.lead_id, usuarioId]);
     return { nicho_id: nicho, pergunta: null, opcoes: [] };
