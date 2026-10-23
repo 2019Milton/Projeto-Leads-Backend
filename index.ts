@@ -6644,6 +6644,27 @@ function campanhaPertenceContaAnuncios(
   return Boolean(campanha && selecionada && campanha === selecionada);
 }
 
+// Datas escolhidas no editor chegam sem timezone (YYYY-MM-DDTHH:mm) e representam
+// o horário local do usuário no Brasil. Railway roda em UTC; interpretar a string
+// diretamente deslocaria 17:00 para 14:00 em São Paulo. Para Meta, convertemos
+// explicitamente de UTC-3 para ISO UTC. Strings que já trazem Z/offset são preservadas.
+function dataHoraBrasilParaIsoMeta(valor: unknown): string | null {
+  const texto = textoOpcional(valor);
+  if (!texto) return null;
+
+  let candidato = texto;
+  const temTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(texto);
+  if (
+    !temTimezone &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(texto)
+  ) {
+    candidato = `${texto}-03:00`;
+  }
+
+  const data = new Date(candidato);
+  return Number.isFinite(data.getTime()) ? data.toISOString() : null;
+}
+
 function erroCampanhaOutraConta(plataforma: string): string {
   return `Esta campanha não pertence à conta de anúncios ${plataforma} selecionada. Sincronize a conta correta e tente novamente.`;
 }
@@ -39178,15 +39199,22 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     token = conn.rows[0].access_token;
 
+    // Um rascunho duplicado para outra conta precisa publicar exatamente na
+    // conta gravada nele, independentemente da conta que estiver selecionada
+    // na integração Meta no momento do clique em Publicar.
+    const contaDestinoRascunho =
+      textoOpcional(campanha.conta_anuncios_id) ||
+      textoOpcional(conn.rows[0].conta_anuncios_id);
+
     const contaAds =
       await obterContaAnuncios(
         token,
-        conn.rows[0].conta_anuncios_id
+        contaDestinoRascunho
       );
 
     if (!contaAds) {
       return await falhar(
-        "Nenhuma conta de anúncios encontrada na Meta conectada."
+        "A conta de anúncios vinculada a este rascunho não está disponível na conexão Meta atual."
       );
     }
 
@@ -39361,12 +39389,34 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
         cfg.bid_amount
       );
 
+    const inicioSolicitado =
+      textoOpcional(cfg.inicio);
+    const inicioProgramado =
+      inicioSolicitado
+        ? dataHoraBrasilParaIsoMeta(inicioSolicitado)
+        : null;
+
+    if (inicioSolicitado && !inicioProgramado) {
+      return await falhar(
+        "A data de início do rascunho é inválida. Edite a campanha e escolha a data novamente."
+      );
+    }
+
+    // Se não houver agendamento futuro (ou ele já tiver passado), mantém o
+    // comportamento anterior: começa assim que a Meta aceitar o conjunto.
+    const inicioMinimoMs = Date.now() + 60000;
+    const inicioMeta =
+      inicioProgramado &&
+      new Date(inicioProgramado).getTime() > inicioMinimoMs
+        ? inicioProgramado
+        : new Date(inicioMinimoMs).toISOString();
+
     const payloadAdset: any = {
       name: `AdSet ${campanha.nome || "Leads"} ${Date.now()}`,
       campaign_id: campanhaMeta.id,
       billing_event: "IMPRESSIONS",
       ...montarDestinoAdsetMeta(destino, pageId, whatsappPhoneNumber),
-      start_time: new Date(Date.now() + 60000).toISOString(),
+      start_time: inicioMeta,
       targeting,
       status: "ACTIVE",
       access_token: token
@@ -39393,8 +39443,18 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
       textoOpcional(cfg.fim);
 
     if (fim) {
-      payloadAdset.end_time =
-        new Date(fim).toISOString();
+      const fimMeta = dataHoraBrasilParaIsoMeta(fim);
+      if (!fimMeta) {
+        return await falhar(
+          "A data de término do rascunho é inválida. Edite a campanha e escolha a data novamente."
+        );
+      }
+      if (new Date(fimMeta).getTime() <= new Date(inicioMeta).getTime()) {
+        return await falhar(
+          "A data de término precisa ser posterior à data de início."
+        );
+      }
+      payloadAdset.end_time = fimMeta;
     }
 
     const adsetMeta = await criarAdSetMetaParaDestino(
