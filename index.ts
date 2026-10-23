@@ -36998,7 +36998,40 @@ app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: an
         };
       });
 
-    campanhas.sort((a: any, b: any) => b.gasto - a.gasto);
+    // Inclui o que chegou ao CRM mesmo quando a Meta nao devolveu Insights para o dia.
+    // Mesmo escopo/criterio temporal usado no resumo diario deste painel.
+    const leadsDia = await client.query(
+      `SELECT COALESCE(c.campaign_id, '') AS campaign_id,
+              COALESCE(NULLIF(l.campanha, ''), c.nome, 'Sem campanha identificada') AS nome,
+              COUNT(*)::int AS total
+       FROM leads l
+       LEFT JOIN campanhas c ON c.id = l.campanha_id AND c.usuario_id = l.usuario_id
+       WHERE l.usuario_id = $1 AND l.conta_anuncios_id = $2
+         AND DATE(l.criado_em) = $3::date
+       GROUP BY 1, 2`,
+      [user.id, adAccountId, data]
+    );
+
+    for (const row of leadsDia.rows) {
+      const id = String(row.campaign_id || "");
+      const nome = String(row.nome || "");
+      const total = Number(row.total || 0);
+      const correspondencia = campanhas.find((camp: any) =>
+        (id && String(camp.campaign_id) === id) ||
+        (!id && camp.nome.trim().toLowerCase() === nome.trim().toLowerCase())
+      );
+      if (correspondencia) {
+        correspondencia.leads_plataforma = (correspondencia.leads_plataforma || 0) + total;
+      } else {
+        campanhas.push({
+          campaign_id: id || null, nome,
+          gasto: 0, leads: 0, leads_plataforma: total,
+          cliques: 0, impressoes: 0, custo_por_lead: null
+        });
+      }
+    }
+
+    campanhas.sort((a: any, b: any) => b.gasto - a.gasto || (b.leads_plataforma || 0) - (a.leads_plataforma || 0));
 
     return c.json({ data, campanhas });
 
