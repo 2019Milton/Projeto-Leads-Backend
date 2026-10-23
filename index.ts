@@ -23386,6 +23386,30 @@ app.post("/site-formulario/nova-chave", authMiddleware, async (c) => {
   }
 });
 
+// Diagnostico das ultimas falhas de envio do bot (nao altera conversas/roteiros).
+// Apenas o dono autenticado consulta suas falhas; não retorna token, conteúdo ou telefone.
+app.get("/whatsapp/bot/falhas", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const result = await client.query(
+      `SELECT f.id, f.criado_em, f.conversa_id, f.roteiro_id, r.nome AS roteiro_nome,
+              f.passo, f.tipo, f.codigo, f.detalhe,
+              wc.status AS conversa_status, wc.phone_number_id
+       FROM whatsapp_bot_falhas_envio f
+       INNER JOIN whatsapp_conversas wc ON wc.id = f.conversa_id AND wc.usuario_id = f.usuario_id
+       LEFT JOIN whatsapp_bot_config r ON r.id = f.roteiro_id AND r.usuario_id = f.usuario_id
+       WHERE f.usuario_id = $1
+       ORDER BY f.criado_em DESC, f.id DESC
+       LIMIT 30`,
+      [user.id]
+    );
+    return c.json({ falhas: result.rows });
+  } catch (err) {
+    console.error("[whatsapp-bot] Falha ao consultar erros de envio:", err);
+    return c.json({ error: "Nao foi possivel consultar as falhas de envio" }, 500);
+  }
+});
+
 app.get("/whatsapp/bot", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
@@ -26153,7 +26177,7 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
   // não faz sentido — pode cair numa pergunta sem nada a ver com o que já foi
   // perguntado.
   const trocouDeRoteiro =
-    conversa.status === "aguardando_resposta" &&
+    (conversa.status === "aguardando_resposta" || conversa.status === "bot") &&
     conversa.roteiro_id &&
     conversa.roteiro_id !== roteiroAtivo.id;
 
@@ -26177,7 +26201,10 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
     if (conversa.status === "aguardando_resposta" && conversa.roteiro_id === roteiroAtivo.id && capturaNome(anterior)) {
       if (!normalizarNome(resposta)) {
         const texto = "Por favor, escreva seu nome em uma mensagem de texto (por exemplo: João Silva).";
-        const wamid = await enviarMensagemWhatsAppOficial(conversa.usuario_id, phoneNumberId, conversa.telefone_cliente, texto);
+        const wamid = await enviarMensagemWhatsAppOficial(
+          conversa.usuario_id, phoneNumberId, conversa.telefone_cliente, texto, undefined,
+          { conversaId: conversa.id, roteiroId: roteiroAtivo.id, passo: conversa.passo_atual, tipo: "validacao_nome" }
+        );
         if (wamid) await client.query(
           `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3) ON CONFLICT (wamid) DO NOTHING`,
           [conversa.id, wamid, texto]);
@@ -26209,21 +26236,36 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
       phoneNumberId,
       conversa.telefone_cliente,
       textoEnviado,
-      midia
+      midia,
+      { conversaId: conversa.id, roteiroId: roteiroAtivo.id, passo: indice, tipo: passo.tipo }
     );
+
+    if (!wamid) {
+      // Não marcar pergunta como enviada, não transferir para humano e nem
+      // avançar para o próximo passo quando a Meta rejeitou o envio.
+      // O próximo webhook de mensagem recebida poderá repetir este mesmo passo.
+      await client.query(
+        `UPDATE whatsapp_conversas
+         SET status = 'bot', passo_atual = $1, roteiro_id = $2, atualizado_em = NOW()
+         WHERE id = $3 AND usuario_id = $4 AND status NOT IN ('humano','encerrada')`,
+        [indice, roteiroAtivo.id, conversa.id, conversa.usuario_id]
+      );
+      console.warn("[whatsapp-bot] Etapa nao enviada; roteiro mantido para nova tentativa", {
+        conversa_id: conversa.id, roteiro_id: roteiroAtivo.id, passo: indice
+      });
+      return;
+    }
 
     const conteudoLog =
       passo.tipo === "imagem" ? `[imagem]${textoEnviado ? " " + textoEnviado : ""}`
       : passo.tipo === "audio" ? "[audio]"
       : textoEnviado;
 
-    if (wamid) {
-      await client.query(
-        `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3)
-         ON CONFLICT (wamid) DO NOTHING`,
-        [conversa.id, wamid, conteudoLog]
-      ).catch((e) => console.error("ERRO log saida whatsapp:", e));
-    }
+    await client.query(
+      `INSERT INTO whatsapp_mensagens_log (conversa_id, wamid, direcao, conteudo) VALUES ($1, $2, 'saida', $3)
+       ON CONFLICT (wamid) DO NOTHING`,
+      [conversa.id, wamid, conteudoLog]
+    ).catch((e) => console.error("ERRO log saida whatsapp:", e));
 
     const ultimoPasso = indice === passos.length - 1;
 
@@ -26241,6 +26283,14 @@ async function avancarBotWhatsApp(conversa: any, phoneNumberId: string, nichoId:
       );
       return;
     }
+    // Mensagens seguidas (MSG, imagem, áudio): persiste o progresso após cada
+    // envio confirmado. Se a etapa seguinte falhar, não reenvia as anteriores.
+    await client.query(
+      `UPDATE whatsapp_conversas
+       SET status = 'bot', passo_atual = $1, roteiro_id = $2, atualizado_em = NOW()
+       WHERE id = $3 AND usuario_id = $4 AND status NOT IN ('humano','encerrada')`,
+      [indice + 1, roteiroAtivo.id, conversa.id, conversa.usuario_id]
+    );
     indice += 1;
   }
 }
@@ -27077,7 +27127,10 @@ async function processarEventoWhatsApp(value: any) {
         );
         if (reserva.rows.length) {
           try {
-            const wamid = await enviarMensagemWhatsAppOficial(usuarioId, phoneNumberId, telefoneCliente, triagem.pergunta);
+            const wamid = await enviarMensagemWhatsAppOficial(
+              usuarioId, phoneNumberId, telefoneCliente, triagem.pergunta, undefined,
+              { conversaId: conversa.id, tipo: "triagem_nicho" }
+            );
             if (!wamid) throw new Error("Triagem não enviada");
             await client.query(
               "INSERT INTO whatsapp_mensagens_log (conversa_id,wamid,direcao,conteudo) VALUES ($1,$2,'saida',$3) ON CONFLICT (wamid) DO NOTHING",
@@ -28581,6 +28634,20 @@ await client.query(`
     conteudo    TEXT,
     criado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+  -- Auditoria restrita a falhas de envio do bot, sem texto de conversa nem telefone.
+  CREATE TABLE IF NOT EXISTS whatsapp_bot_falhas_envio (
+    id BIGSERIAL PRIMARY KEY,
+    usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    conversa_id INTEGER NOT NULL REFERENCES whatsapp_conversas(id) ON DELETE CASCADE,
+    roteiro_id INTEGER,
+    passo INTEGER,
+    tipo TEXT,
+    codigo TEXT NOT NULL,
+    detalhe TEXT,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_whatsapp_bot_falhas_usuario
+    ON whatsapp_bot_falhas_envio(usuario_id, criado_em DESC);
 `);
 
 // 🧾 Cobrança dos gestores de tráfego (cálculo em cobranca-gestor.ts). A fatura mensal de
@@ -47578,6 +47645,37 @@ app.post("/whatsapp-bot/resumo-semanal/testar", authMiddleware, async (c) => {
   }
 });
 
+type ContextoFalhaEnvioBot = {
+  conversaId: number;
+  roteiroId?: number | null;
+  passo?: number | null;
+  tipo?: string;
+};
+
+async function registrarFalhaEnvioBotWhatsApp(
+  usuarioId: number,
+  contexto: ContextoFalhaEnvioBot | undefined,
+  codigo: string,
+  detalhe: string
+) {
+  if (!contexto?.conversaId) return;
+  try {
+    await client.query(
+      `INSERT INTO whatsapp_bot_falhas_envio
+         (usuario_id, conversa_id, roteiro_id, passo, tipo, codigo, detalhe)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        usuarioId, contexto.conversaId, contexto.roteiroId ?? null,
+        contexto.passo ?? null, contexto.tipo || null,
+        String(codigo || "FALHA_DESCONHECIDA").slice(0, 80),
+        String(detalhe || "Envio nao concluido").slice(0, 350)
+      ]
+    );
+  } catch (e) {
+    console.error("[whatsapp-bot] Erro ao registrar falha de envio:", e);
+  }
+}
+
 // Envio pela API oficial do WhatsApp (Cloud API) — caminho separado do Z-API acima.
 // Prefere o token limitado à WABA salvo no Embedded Signup. O token geral de sistema
 // só é usado como compatibilidade para conexões antigas do mesmo Business Manager.
@@ -47589,18 +47687,21 @@ async function enviarMensagemWhatsAppOficial(
   phoneNumberId: string,
   telefoneDestino: string,
   texto: string,
-  midia?: { tipo: "image" | "audio" | "document"; link: string; nome?: string | null }
+  midia?: { tipo: "image" | "audio" | "document"; link: string; nome?: string | null },
+  contextoBot?: ContextoFalhaEnvioBot
 ) {
   const token = await obterTokenWhatsappUsuario(usuarioId, phoneNumberId);
   if (!token) {
     console.warn(`⚠️ WhatsApp Oficial: token não configurado para o usuário ${usuarioId}`);
-    return;
+    await registrarFalhaEnvioBotWhatsApp(usuarioId, contextoBot, "TOKEN_AUSENTE", "Token do WhatsApp nao encontrado para o numero conectado");
+    return null;
   }
 
   const to = normalizarTelefoneWhatsApp(telefoneDestino);
   if (!to) {
     console.warn("⚠️ WhatsApp Oficial: número vazio, envio cancelado");
-    return;
+    await registrarFalhaEnvioBotWhatsApp(usuarioId, contextoBot, "DESTINO_INVALIDO", "Numero de destino vazio ou invalido");
+    return null;
   }
 
   let payload: any;
@@ -47644,14 +47745,27 @@ async function enviarMensagemWhatsAppOficial(
     );
     const body = await res.json() as any;
     if (res.ok) {
+      const wamid = body?.messages?.[0]?.id ?? null;
+      if (!wamid) {
+        console.error("[whatsapp-oficial] API respondeu OK mas sem ID da mensagem:", res.status);
+        await registrarFalhaEnvioBotWhatsApp(usuarioId, contextoBot, "META_SEM_WAMID", "Resposta aceita pela Meta sem identificador de mensagem; estado mantido para verificacao");
+        return null;
+      }
       console.log(`[whatsapp-oficial] ✅ enviado para ${mascararTelefone(to)}`);
-      return body?.messages?.[0]?.id ?? null;
+      return wamid;
     } else {
+      const erro = body?.error || {};
       console.error(`[whatsapp-oficial] ❌ erro ${res.status}:`, JSON.stringify(body));
+      await registrarFalhaEnvioBotWhatsApp(
+        usuarioId, contextoBot,
+        `META_${res.status}_${erro.code ?? "SEM_CODIGO"}`,
+        String(erro.message || erro.error_data?.details || "WhatsApp Cloud API rejeitou o envio")
+      );
       return null;
     }
-  } catch (e) {
+  } catch (e: any) {
     console.error("[whatsapp-oficial] ❌ exceção:", e);
+    await registrarFalhaEnvioBotWhatsApp(usuarioId, contextoBot, "ERRO_REDE_ENVIO", String(e?.message || "Erro de conexao com a Meta"));
     return null;
   }
 }
