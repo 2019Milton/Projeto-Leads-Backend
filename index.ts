@@ -46033,6 +46033,66 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
 
     const novoNome = body.nome?.trim() || `Cópia de ${orig.nome}`;
 
+    // A duplicação pode preparar um rascunho Meta em OUTRA conta de anúncios sem
+    // alterar a conta atualmente selecionada do usuário e sem publicar nada na Meta.
+    // A conta informada precisa estar disponível no MESMO token/conexão Meta.
+    let contaAnunciosDestino = orig.conta_anuncios_id ?? null;
+    let contaDestinoAlterada = false;
+    const contaDestinoInformada =
+      body.conta_anuncios_id_destino !== undefined &&
+      body.conta_anuncios_id_destino !== null &&
+      String(body.conta_anuncios_id_destino).trim() !== "";
+
+    if (contaDestinoInformada) {
+      if (!["meta", "facebook", "instagram"].includes(plataformaOrigem)) {
+        return c.json({
+          error: "A escolha de outra conta de anúncios no rascunho está disponível apenas para campanhas Meta."
+        }, 400);
+      }
+
+      const contaDestinoNormalizada =
+        normalizarIdContaAnuncios(body.conta_anuncios_id_destino);
+
+      if (!/^\d{5,}$/.test(contaDestinoNormalizada)) {
+        return c.json({ error: "Conta de anúncios Meta de destino inválida." }, 400);
+      }
+
+      const conexaoMeta = await client.query(
+        `SELECT access_token
+         FROM meta_conexoes
+         WHERE usuario_id = $1
+         ORDER BY id DESC
+         LIMIT 1`,
+        [user.id]
+      );
+
+      if (!conexaoMeta.rows.length || !conexaoMeta.rows[0]?.access_token) {
+        return c.json({ error: "Meta não conectada para validar a conta de destino." }, 400);
+      }
+
+      const contasDisponiveis = await listarContasAnuncios(
+        conexaoMeta.rows[0].access_token
+      );
+
+      const contaDestino = contasDisponiveis.find(
+        (conta: any) =>
+          normalizarIdContaAnuncios(conta?.id) === contaDestinoNormalizada
+      );
+
+      if (!contaDestino) {
+        return c.json({
+          error: "A conta de anúncios Meta de destino não está disponível nesta conexão."
+        }, 403);
+      }
+
+      contaAnunciosDestino = String(contaDestino.id);
+      contaDestinoAlterada =
+        !campanhaPertenceContaAnuncios(
+          orig.conta_anuncios_id,
+          contaAnunciosDestino
+        );
+    }
+
     // Google: o nome da cópia precisa ser diferente do da original e de qualquer outra
     // campanha Google do usuário nessa conta. (O Google exige nome único; a plataforma já
     // acrescenta um sufixo interno ao publicar, mas o nome que o usuário vê tem que ser distinto.)
@@ -46099,13 +46159,25 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
       }
     }
 
+    if (contaDestinoAlterada) {
+      configuracoesFinais = {
+        ...configuracoesFinais,
+        duplicada_para_conta_meta: {
+          conta_origem: orig.conta_anuncios_id ?? null,
+          conta_destino: contaAnunciosDestino,
+          campaign_id_origem: orig.campaign_id ?? null,
+          campanha_local_origem_id: campanhaId
+        }
+      };
+    }
+
     const novaRes = await client.query(
       `INSERT INTO campanhas
          (usuario_id, nome, status, origem, nicho_id, daily_budget, configuracoes_avancadas, conta_anuncios_id, plataforma)
        VALUES ($1, $2, 'PAUSED', 'manual', $3, $4, $5, $6, $7)
        RETURNING id`,
       [user.id, novoNome, orig.nicho_id ?? null, dailyBudgetFinal,
-       JSON.stringify(configuracoesFinais), orig.conta_anuncios_id ?? null, orig.plataforma || "meta"]
+       JSON.stringify(configuracoesFinais), contaAnunciosDestino, orig.plataforma || "meta"]
     );
     const novaId = novaRes.rows[0].id;
 
@@ -46118,6 +46190,15 @@ app.post("/campanhas/:id/duplicar", authMiddleware, async (c) => {
 
     return c.json({
       id: novaId,
+      status: "PAUSED",
+      rascunho: true,
+      conta_anuncios_id: contaAnunciosDestino,
+      ...(contaDestinoAlterada
+        ? {
+            aviso_conta_destino:
+              "Rascunho local criado na conta Meta de destino. Nada foi publicado na Meta; revise página, formulário, criativo e destino antes de publicar."
+          }
+        : {}),
       ...(copiado.length || naoCopiado.length
         ? {
             copiado,
