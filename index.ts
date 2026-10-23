@@ -23679,7 +23679,7 @@ app.delete("/whatsapp/bot/:id", authMiddleware, async (c) => {
 // Meta busca ao enviar um passo de imagem/audio (por isso a rota GET abaixo
 // nao pode ter authMiddleware).
 const URL_BACKEND_PUBLICA =
-  (Bun.env.URL_BACKEND_PUBLICA || "https://function-bun-production-446a.up.railway.app")
+  (Bun.env.URL_BACKEND_PUBLICA || "https://api.plataformadeleads.com.br")
     .replace(/\/+$/g, "");
 
 const WHATSAPP_BOT_MIDIA_MIME_PERMITIDOS: Record<string, string[]> = {
