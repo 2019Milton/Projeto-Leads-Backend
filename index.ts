@@ -34391,6 +34391,32 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       [user.id, contaAnunciosId, contaAnunciosIdGoogle, contaAnunciosIdTikTok, contaAnunciosIdLinkedIn, contaAnunciosIdKwai]
     );
 
+    // Defesa adicional de leitura: se já existir uma duplicata histórica
+    // para o mesmo objeto remoto, exibe apenas a linha mais completa. Campanhas
+    // locais sem campaign_id continuam independentes.
+    const campanhasConsolidadas = Array.from(
+      (campanhas.rows as any[]).reduce((mapa: Map<string, any>, row: any) => {
+        const plataforma = normalizarPlataformaRegistroCampanha(row.plataforma);
+        const conta = normalizarIdContaAnuncios(row.conta_anuncios_id);
+        const chave = row.campaign_id
+          ? `${plataforma}:${conta}:${String(row.campaign_id)}`
+          : `local:${row.id}`;
+
+        const atual = mapa.get(chave);
+        const pontuar = (item: any) =>
+          (item.ad_id ? 8 : 0) +
+          (item.adset_id ? 4 : 0) +
+          (item.form_id ? 2 : 0) +
+          (item.page_id ? 1 : 0) +
+          (campanhaTemOrigemNativa(item.origem) ? 1 : 0);
+
+        if (!atual || pontuar(row) > pontuar(atual)) {
+          mapa.set(chave, row);
+        }
+        return mapa;
+      }, new Map<string, any>()).values()
+    ).sort((a: any, b: any) => Number(b.id) - Number(a.id));
+
     const periodoMetricas = intervaloMetricasCampanhas(30);
     const [metricasGoogle, metricasTikTok, metricasLinkedIn, metricasKwai] = await Promise.all([
       carregarMetricasGoogleCampanhas(
@@ -34533,13 +34559,13 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
     }
 
     // Somente o nicho salvo na campanha define sua classificação.
-    for (const campanha of campanhas.rows as any[]) {
+    for (const campanha of campanhasConsolidadas as any[]) {
       campanha.nicho_confirmado = Boolean(campanha.nicho_id);
     }
 
     const metricas = [];
 
-    for (const campanha of campanhas.rows) {
+    for (const campanha of campanhasConsolidadas) {
 
       let dados: any = {};
       let grafico: any[] = [];
@@ -36985,7 +37011,11 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
         AND usuario_id = $2
         AND (conta_anuncios_id = $3 OR conta_anuncios_id IS NULL)
         AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
-        ORDER BY CASE WHEN conta_anuncios_id = $3 THEN 0 ELSE 1 END
+        ORDER BY
+          CASE WHEN conta_anuncios_id = $3 THEN 0 ELSE 1 END,
+          CASE WHEN ad_id IS NOT NULL THEN 0 ELSE 1 END,
+          CASE WHEN adset_id IS NOT NULL THEN 0 ELSE 1 END,
+          id ASC
         LIMIT 1
         `,
         [campanha.id, user.id, adAccountId]
@@ -37010,6 +37040,42 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
             existe.rows[0].id
           ]
         );
+
+        // Remove somente duplicatas incompletas do mesmo objeto remoto.
+        // O caso típico é o sync correr no intervalo entre a Meta criar a
+        // campanha e o endpoint terminar de preencher adset/ad no rascunho.
+        const duplicadosIncompletos = await client.query(
+          `SELECT id
+           FROM campanhas
+           WHERE usuario_id = $1
+             AND id <> $2
+             AND campaign_id = $3
+             AND (conta_anuncios_id = $4 OR conta_anuncios_id IS NULL)
+             AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta', 'facebook', 'instagram')
+             AND adset_id IS NULL
+             AND ad_id IS NULL`,
+          [user.id, existe.rows[0].id, campanha.id, adAccountId]
+        );
+
+        const idsDuplicados = duplicadosIncompletos.rows
+          .map((row: any) => Number(row.id))
+          .filter((id: number) => Number.isFinite(id));
+
+        if (idsDuplicados.length) {
+          await client.query(
+            `UPDATE leads SET campanha_id = $1 WHERE campanha_id = ANY($2::int[])`,
+            [existe.rows[0].id, idsDuplicados]
+          );
+          await client.query(
+            `DELETE FROM campanhas WHERE id = ANY($1::int[])`,
+            [idsDuplicados]
+          );
+          console.warn(
+            "🧹 Duplicatas locais consolidadas:",
+            campanha.id,
+            idsDuplicados
+          );
+        }
 
         console.log(
           "♻️ Atualizada:",
@@ -39106,6 +39172,7 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
   let campanhaId = 0;
   let campaignMetaId: string | null = null;
   let token = "";
+  let campaignIdReservadoNoBanco = false;
 
   const falhar = async (
     mensagem: string,
@@ -39124,6 +39191,21 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ access_token: token })
         }
+      ).catch(() => null);
+    }
+
+    // A publicação reserva o campaign_id no rascunho assim que a Meta cria a
+    // campanha. Se uma etapa posterior falhar e a campanha remota for apagada,
+    // desfaz a reserva para o registro continuar sendo um rascunho reutilizável.
+    if (campaignIdReservadoNoBanco && campanhaId && campaignMetaId) {
+      await client.query(
+        `UPDATE campanhas
+         SET campaign_id = NULL,
+             status = 'PAUSED',
+             origem = 'manual',
+             atualizado_em = NOW()
+         WHERE id = $1 AND campaign_id = $2`,
+        [campanhaId, campaignMetaId]
       ).catch(() => null);
     }
 
@@ -39294,6 +39376,21 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     }
 
     campaignMetaId = campanhaMeta.id;
+
+    // Reserva o ID remoto no próprio rascunho imediatamente. Sem isso existe
+    // uma janela entre a criação da campanha e a criação do anúncio em que o
+    // sincronizador pode enxergar o objeto novo na Meta e inserir uma segunda
+    // linha local para o mesmo campaign_id.
+    await client.query(
+      `UPDATE campanhas
+       SET campaign_id = $1,
+           conta_anuncios_id = $2,
+           status = 'PAUSED',
+           atualizado_em = NOW()
+       WHERE id = $3 AND usuario_id = $4`,
+      [campaignMetaId, adAccountId, campanhaId, user.id]
+    );
+    campaignIdReservadoNoBanco = true;
 
     await registrarIdCampanhaNativa(
       user.id,
