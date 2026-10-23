@@ -29,6 +29,7 @@ import {
   type VeiculacaoCampanha,
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
+import { consultarInsightsMetaPaginados } from "./meta-insights-paginados";
 
 import {
   CATEGORIA_ACAO_GOOGLE,
@@ -35870,16 +35871,14 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         })
       );
 
-    const insights = await fetch(
-      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=campaign_id,spend,actions,impressions,clicks,reach&level=campaign&time_increment=1&time_range=${timeRange}&access_token=${token}`
-    ).then(r => r.json());
-
-    if (insights.error) {
-      return c.json({
-        error: "Erro ao buscar performance na Meta",
-        detalhe: insights.error
-      }, 400);
-    }
+    const insights = await consultarInsightsMetaPaginados<any>(
+      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=campaign_id,spend,actions,impressions,clicks,reach&level=campaign&time_increment=1&limit=500&time_range=${timeRange}&access_token=${token}`,
+      async (url) => {
+        const resposta = await fetch(url);
+        if (!resposta.ok) throw new Error("Meta Insights HTTP " + resposta.status);
+        return resposta.json();
+      }
+    );
 
     const leadsBanco = await client.query(
       `
@@ -36972,13 +36971,14 @@ app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: an
       );
     const timeRange = encodeURIComponent(JSON.stringify({ since: data, until: data }));
 
-    const insights = await fetch(
-      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=campaign_name,campaign_id,spend,actions,clicks,impressions&level=campaign&time_range=${timeRange}&access_token=${token}`
-    ).then(r => r.json());
-
-    if (insights.error) {
-      return c.json({ error: "Erro ao buscar dados da Meta", detalhe: insights.error }, 400);
-    }
+    const insights = await consultarInsightsMetaPaginados<any>(
+      `https://graph.facebook.com/v19.0/${adAccountId}/insights?fields=campaign_name,campaign_id,spend,actions,clicks,impressions&level=campaign&limit=500&time_range=${timeRange}&access_token=${token}`,
+      async (url) => {
+        const resposta = await fetch(url);
+        if (!resposta.ok) throw new Error("Meta Insights HTTP " + resposta.status);
+        return resposta.json();
+      }
+    );
 
     const campanhas = (insights.data || [])
       .filter((item: any) =>
