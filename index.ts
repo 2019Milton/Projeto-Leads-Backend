@@ -23389,6 +23389,121 @@ app.post("/site-formulario/nova-chave", authMiddleware, async (c) => {
 
 // Diagnostico das ultimas falhas de envio do bot (nao altera conversas/roteiros).
 // Apenas o dono autenticado consulta suas falhas; não retorna token, conteúdo ou telefone.
+// Diagnóstico somente leitura do bot para o próprio usuário autenticado.
+// Não libera o painel-cliente, não retorna telefones, texto das mensagens,
+// tokens nem o referral bruto. Serve para diferenciar falta de webhook,
+// falta de roteiro compatível, triagem e passagem ao atendimento humano.
+app.get("/whatsapp/bot/diagnostico-fluxo", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const [usuarioRes, roteirosRes, conversasRes] = await Promise.all([
+      client.query(
+        `SELECT COALESCE(whatsapp_multiplos_numeros_habilitado, FALSE) AS multiplos
+         FROM usuarios WHERE id = $1`,
+        [user.id]
+      ),
+      client.query(
+        `SELECT id, nome, nicho_id, ativo,
+                jsonb_array_length(passos) AS total_passos,
+                (nicho_id IS NULL AND criado_em < $2) AS legado_geral
+         FROM whatsapp_bot_config
+         WHERE usuario_id = $1 ORDER BY ativo DESC, id DESC`,
+        [user.id, CORTE_LEGADO_ROTEIRO_BOT_SEM_NICHO]
+      ),
+      client.query(
+        `SELECT wc.id, wc.status, wc.passo_atual, wc.roteiro_id,
+                wc.phone_number_id, wc.atualizado_em, wc.ultima_mensagem_em,
+                (wc.referral->>'source_id') IS NOT NULL AS anuncio_identificado_no_webhook,
+                COALESCE(jsonb_typeof(wc.variaveis->'triagem_nichos') = 'array', FALSE) AS triagem_iniciada,
+                l.origem AS origem_lead, l.nicho_id AS nicho_lead_id, l.campanha_id AS campanha_lead_id,
+                COALESCE(m.entradas, 0) AS entradas,
+                COALESCE(m.saidas, 0) AS saidas,
+                m.ultima_entrada, m.ultima_saida,
+                m.ultima_direcao
+         FROM whatsapp_conversas wc
+         LEFT JOIN leads l ON l.id = wc.lead_id AND l.usuario_id = wc.usuario_id
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) FILTER (WHERE direcao = 'entrada')::int AS entradas,
+                  COUNT(*) FILTER (WHERE direcao = 'saida')::int AS saidas,
+                  MAX(criado_em) FILTER (WHERE direcao = 'entrada') AS ultima_entrada,
+                  MAX(criado_em) FILTER (WHERE direcao = 'saida') AS ultima_saida,
+                  (ARRAY_AGG(direcao ORDER BY criado_em DESC, id DESC))[1] AS ultima_direcao
+           FROM whatsapp_mensagens_log
+           WHERE conversa_id = wc.id
+         ) m ON TRUE
+         WHERE wc.usuario_id = $1
+         ORDER BY COALESCE(wc.ultima_mensagem_em, wc.atualizado_em) DESC NULLS LAST
+         LIMIT 10`,
+        [user.id]
+      )
+    ]);
+    const multiplos = usuarioRes.rows[0]?.multiplos === true;
+    const numeroIds = (conversasRes.rows as any[]).map((row: any) => String(row.phone_number_id || "")).filter(Boolean);
+    const numerosRes = multiplos && numeroIds.length
+      ? await client.query(
+          `SELECT phone_number_id, bot_ativo, roteiro_id, nicho_id, campanha_id
+           FROM whatsapp_numeros
+           WHERE usuario_id = $1 AND phone_number_id = ANY($2::text[])`,
+          [user.id, numeroIds]
+        )
+      : { rows: [] as any[] };
+    const porNumero = new Map((numerosRes.rows as any[]).map((n: any) => [String(n.phone_number_id), n]));
+    const roteiros = (roteirosRes.rows as any[]).map((r: any) => ({
+      id: r.id, nome: r.nome, nicho_id: r.nicho_id, ativo: r.ativo === true,
+      total_passos: Number(r.total_passos || 0), legado_geral: r.legado_geral === true
+    }));
+    const conversas = (conversasRes.rows as any[]).map((row: any) => {
+      const numero: any = multiplos ? porNumero.get(String(row.phone_number_id)) : null;
+      const botAtivo = !multiplos || numero?.bot_ativo === true;
+      const nichoId = numero?.nicho_id ?? row.nicho_lead_id ?? null;
+      const atribuido = numero?.roteiro_id
+        ? roteiros.find((r: any) => Number(r.id) === Number(numero.roteiro_id))
+        : null;
+      const candidato = atribuido || roteiros.find((r: any) =>
+        r.ativo && r.total_passos > 0 &&
+        (r.nicho_id != null && nichoId != null && Number(r.nicho_id) === Number(nichoId) ||
+         r.legado_geral)
+      ) || null;
+      const semNichoSemRoteiro = !candidato && nichoId == null;
+      let situacao = "aguardando_novo_evento";
+      if (!botAtivo) situacao = "bot_desligado_no_numero";
+      else if (row.status === "humano") situacao = "atendimento_humano";
+      else if (row.status === "encerrada") situacao = "conversa_encerrada";
+      else if (row.triagem_iniciada && !row.nicho_lead_id) situacao = "triagem_sem_nicho_definido";
+      else if (!candidato && semNichoSemRoteiro) situacao = "sem_nicho_para_selecionar_roteiro";
+      else if (!candidato) situacao = "sem_roteiro_compativel_pelo_nicho";
+      else if (row.status === "aguardando_resposta") situacao = "aguardando_resposta_cliente";
+      else if (Number(row.saidas) === 0) situacao = "nenhuma_resposta_do_bot_registrada";
+      return {
+        conversa_id: row.id, status: row.status, situacao,
+        passo_atual: row.passo_atual, roteiro_em_uso_id: row.roteiro_id,
+        roteiro_elegivel_pelo_nicho_id: candidato?.id ?? null,
+        bot_ativo: botAtivo, nicho_lead_id: row.nicho_lead_id,
+        tem_campanha_atribuida: row.campanha_lead_id != null,
+        origem_lead: row.origem_lead,
+        anuncio_identificado_no_webhook: row.anuncio_identificado_no_webhook === true,
+        triagem_iniciada: row.triagem_iniciada === true,
+        mensagens_recebidas: Number(row.entradas || 0),
+        mensagens_enviadas_registradas: Number(row.saidas || 0),
+        ultima_entrada_em: row.ultima_entrada,
+        ultima_saida_em: row.ultima_saida,
+        ultima_direcao: row.ultima_direcao,
+        atualizado_em: row.atualizado_em
+      };
+    });
+    return c.json({
+      multiplos_numeros_habilitado: multiplos,
+      total_conversas_recentes: conversas.length,
+      roteiros,
+      conversas,
+      nota: "Roteiro elegivel e uma estimativa pelo nicho salvo; referral de anuncio pode selecionar outro nicho. Saida registrada confirma aceite da API, nao entrega ao cliente."
+    });
+  } catch (error) {
+    console.error("[whatsapp-bot] Erro ao diagnosticar fluxo:", error);
+    return c.json({ error: "Falha ao consultar fluxo do bot" }, 500);
+  }
+});
+
 app.get("/whatsapp/bot/falhas", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
