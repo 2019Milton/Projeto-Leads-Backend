@@ -39185,14 +39185,38 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
     }
 
     if (campaignMetaId && token) {
-      await fetch(
-        `https://graph.facebook.com/v19.0/${campaignMetaId}`,
-        {
-          method: "DELETE",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ access_token: token })
+      try {
+        const rollbackMeta = await fetch(
+          `https://graph.facebook.com/v19.0/${campaignMetaId}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              status: "DELETED",
+              access_token: token
+            })
+          }
+        ).then(r => r.json());
+
+        if (rollbackMeta?.error) {
+          console.error(
+            "PUBLICAR_RECEBIDA: falha ao remover campanha órfã após erro:",
+            campaignMetaId,
+            rollbackMeta.error
+          );
+        } else {
+          console.log(
+            "PUBLICAR_RECEBIDA: campanha remota removida após falha:",
+            campaignMetaId
+          );
         }
-      ).catch(() => null);
+      } catch (rollbackErr) {
+        console.error(
+          "PUBLICAR_RECEBIDA: erro no rollback da campanha remota:",
+          campaignMetaId,
+          rollbackErr
+        );
+      }
     }
 
     // A publicação reserva o campaign_id no rascunho assim que a Meta cria a
