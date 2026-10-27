@@ -1,18 +1,19 @@
-# LinkedIn Lead Sync — isolated preparation (NOT PRODUCTION)
+# LinkedIn Lead Sync — normalização fictícia, apenas estudo
 
-This directory contains a simulated-response normalizer, an optional PostgreSQL inbox adapter and an unapplied draft migration. No live API call, scheduling, webhook, campaign update or CRM integration is performed.
+**NÃO APLICAR EM PRODUÇÃO.** A auditoria do backend existente revelou que o sistema já tem `processarLeadGenFormResponseLinkedIn`, `sincronizarLinkedInAdsUsuario`, tabela `leads` associada a `usuario_id` e rotas de webhook. A proposta anterior de uma tabela `linkedin_lead_sync_inbox` foi descartada nesta branch por ser duplicação do modelo real.
 
-## Run tests
-`node --test linkedin-lead-sync-prep/*.test.mjs`
+Este diretório conserva apenas exemplos de normalização simulada, sem dependência da API externa. Eles **não** representam o contrato HTTP oficial do LinkedIn.
 
-## Required review gates before integration
-1. Read the existing backend routes, authentication, tenant model and CRM lead schema; do not trust tenant IDs supplied by API callers.
-2. Choose typed tenant IDs and add foreign keys to the actual tenant and account models. Review permissions, RLS policies and database role ownership. The draft enables RLS without policies and therefore denies access by default.
-3. Define retention, privacy, deletion and consent handling for the personally identifiable fields in `payload`. Never log personal answers or OAuth tokens.
-4. Verify LinkedIn Lead Sync API product approval, OAuth scopes, credential rotation, form ownership and access. Do not assume Advertising API approval enables lead form responses.
-5. Map the actual versioned LinkedIn response JSON to the internal simulated fixture shape and add API-contract fixtures/tests before network calls.
-6. Implement cursor/backfill, retry/backoff, 429 handling, webhook signature verification if applicable, and end-to-end idempotent CRM writes with an audit trail.
-7. Test in isolated environment using fake data and least-privileged DB role before any production migration.
-8. Do not automatically unpause, modify or publish LinkedIn campaigns.
+A correção do webhook existente está na PR de segurança:
+https://github.com/2019Milton/Projeto-Leads-Backend/pull/32
 
-Current tests are mock/unit tests only. The inbox adapter should not be attached to an HTTP route until tenancy security and database policy are validated.
+## Testes de normalização (dados fictícios)
+`node --test linkedin-lead-sync-prep/normalize.test.mjs`
+
+## Antes de liberar integração real
+- Aguardar aprovação de Lead Sync API e permissão `r_marketing_leadgen_automation`.
+- Preservar a sincronização de campanhas atual e não alterar campanhas pausadas.
+- Revisar índice único e transações contra duplicidade de respostas, por `usuario_id`, conta e resposta.
+- Testar contrato da API versão vigente, erros 401/403/429, limites e paginação.
+- Validar permissões dos membros e políticas de privacidade para dados pessoais.
+- Não habilitar `LINKEDIN_LEAD_SYNC_ENABLED` antes dos testes de homologação.
