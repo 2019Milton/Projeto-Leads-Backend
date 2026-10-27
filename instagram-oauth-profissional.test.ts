@@ -1,6 +1,7 @@
 import {test,expect} from "bun:test";
 import {
-  AVISO_INSTAGRAM_ACESSO, trocarTokenLongoInstagram, buscarPerfilInstagram
+  AVISO_INSTAGRAM_ACESSO, trocarTokenLongoInstagram, buscarPerfilInstagram,
+  criarDiagnosticoInstagram, ErroOAuthInstagram, type DiagnosticoInstagram
 } from "./instagram-oauth-profissional";
 
 const responder = (body: any, status=200) =>
@@ -77,4 +78,86 @@ test("nunca aceita somente login sem perfil validado",async()=>{
   await expect(buscarPerfilInstagram("token","29164160523276212",async()=>responder(
     {user_id:"29164160523276212"}
   ))).rejects.toThrow("Resposta inválida");
+});
+
+test("diagnóstico distingue GET e POST e preserva código 100 sem analisar mensagem traduzida",async()=>{
+  const eventos: DiagnosticoInstagram[]=[];
+  let chamadas=0;
+  const req=async()=>responder({error:{
+    code:100, error_subcode:33, type:"IGApiException", fbtrace_id:"Trace_123-abc",
+    message:++chamadas===1 ? "Unsupported request - method type: get" : "Unsupported request - method type: post"
+  }},400);
+  let falha:unknown;
+  try { await trocarTokenLongoInstagram("token_privado","segredo_privado",req,e=>eventos.push(e)); }
+  catch(erro) { falha=erro; }
+  expect(falha).toBeInstanceOf(ErroOAuthInstagram);
+  expect((falha as ErroOAuthInstagram).message).toBe(AVISO_INSTAGRAM_ACESSO);
+  expect((falha as ErroOAuthInstagram).diagnostico).toMatchObject({etapa:"long_token_post",codigo:100});
+  expect(eventos.map(e=>[e.etapa,e.status_http,e.codigo,e.motivo])).toEqual([
+    ["long_token_get",400,100,"metodo_get_nao_suportado"],
+    ["long_token_post",400,100,"metodo_post_nao_suportado"]
+  ]);
+});
+
+test("token longo bem-sucedido é separado das duas falhas posteriores de perfil",async()=>{
+  const eventos: DiagnosticoInstagram[]=[];
+  const registrar=(e:DiagnosticoInstagram)=>eventos.push(e);
+  const longo=await trocarTokenLongoInstagram("curto","segredo",async()=>responder({access_token:"longo"}),registrar);
+  let falha:unknown;
+  try {
+    await buscarPerfilInstagram(longo,"123456",async()=>responder({error:{code:100,
+      type:"IGApiException",message:"Unsupported request - method type: get"}},400),registrar);
+  } catch(erro) { falha=erro; }
+  expect((falha as ErroOAuthInstagram).diagnostico.etapa).toBe("profile_id");
+  expect(eventos.map(e=>[e.etapa,e.resultado])).toEqual([
+    ["long_token_get","sucesso"],["profile_me","erro_api"],["profile_id","erro_api"]
+  ]);
+});
+
+test("erro 100 que não recusa o método GET continua sem tentar POST",async()=>{
+  const eventos:DiagnosticoInstagram[]=[];
+  let chamadas=0;
+  await expect(trocarTokenLongoInstagram("curto","segredo",async()=>{
+    chamadas++;
+    return responder({error:{code:100,message:"Permission denied"}},400);
+  },e=>eventos.push(e))).rejects.toThrow(AVISO_INSTAGRAM_ACESSO);
+  expect(chamadas).toBe(1);
+  expect(eventos[0]).toMatchObject({etapa:"long_token_get",motivo:"acesso_recusado"});
+});
+
+test("falha de rede não registra URL nem mensagem da exceção com credenciais",async()=>{
+  const eventos:DiagnosticoInstagram[]=[];
+  const req=async(url:string)=>{throw new Error("Fetch failed: "+url);};
+  let falha:unknown;
+  try {await trocarTokenLongoInstagram("token_privado","segredo_privado",req,e=>eventos.push(e));}
+  catch(erro) {falha=erro;}
+  expect((falha as ErroOAuthInstagram).diagnostico).toMatchObject({etapa:"long_token_get",resultado:"erro_rede",status_http:null});
+  const visivel=JSON.stringify(eventos)+(falha as Error).message;
+  for(const privado of ["token_privado","segredo_privado","access_token","client_secret","https://"]) {
+    expect(visivel).not.toContain(privado);
+  }
+});
+
+test("diagnóstico permite apenas campos técnicos e não copia mensagens ou payloads privados",()=>{
+  const evento=criarDiagnosticoInstagram("profile_me",400,{
+    access_token:"token_privado",client_secret:"segredo_privado",user_id:"987654321",
+    error:{code:100,error_subcode:33,type:"IGApiException",fbtrace_id:"Trace_123-abc",
+      message:"Unsupported request - method type: get https://graph.instagram.com/me?access_token=token_privado&client_secret=segredo_privado",
+      error_data:{token:"token_privado"}}
+  },"erro_api");
+  expect(evento).toEqual({etapa:"profile_me",resultado:"erro_api",status_http:400,codigo:100,
+    subcodigo:33,tipo:"IGApiException",motivo:"metodo_get_nao_suportado",fbtrace_id:"Trace_123-abc"});
+  const desconhecido=criarDiagnosticoInstagram("profile_me",400,{
+    error:{code:"token_privado",type:"segredo_privado",fbtrace_id:"https://privado",message:"segredo_privado"}
+  },"erro_api");
+  expect(desconhecido).toMatchObject({codigo:null,tipo:null,fbtrace_id:null,motivo:"outro_erro_meta"});
+});
+
+test("perfil divergente é identificado sem registrar dados da outra conta",async()=>{
+  const eventos:DiagnosticoInstagram[]=[];
+  await expect(buscarPerfilInstagram("token_privado","1234",async()=>responder({
+    user_id:"5678",username:"perfil_privado",profile_picture_url:"https://privado"
+  }),e=>eventos.push(e))).rejects.toThrow("difere");
+  expect(eventos[0]).toMatchObject({etapa:"profile_me",resultado:"perfil_divergente",status_http:200});
+  expect(JSON.stringify(eventos)).not.toMatch(/5678|perfil_privado|https:\/\/privado|token_privado/);
 });

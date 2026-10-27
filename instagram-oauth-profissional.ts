@@ -10,6 +10,69 @@ export const AVISO_INSTAGRAM_ACESSO =
 type InstagramRequest = (url: string, init?: RequestInit) => Promise<Response>;
 type InstagramPayload = Record<string, any>;
 
+type EtapaInstagram = "short_token" | "long_token_get" | "long_token_post" | "profile_me" | "profile_id";
+export type DiagnosticoInstagram = {
+  etapa: EtapaInstagram;
+  resultado: "sucesso" | "erro_api" | "resposta_invalida" | "erro_rede" | "perfil_divergente";
+  status_http: number | null;
+  codigo: number | null;
+  subcodigo: number | null;
+  tipo: string | null;
+  motivo: string | null;
+  fbtrace_id: string | null;
+};
+type RegistrarDiagnostico = (evento: DiagnosticoInstagram) => void;
+
+// A mensagem original pode conter dados privados. Registramos somente categorias
+// conhecidas e campos estritamente permitidos, nunca payloads, URLs ou credenciais.
+function motivoSeguro(mensagem: unknown): string | null {
+  if (typeof mensagem !== "string") return null;
+  if (/unsupported request\s*-\s*method type:\s*get\b/i.test(mensagem)) return "metodo_get_nao_suportado";
+  if (/unsupported request\s*-\s*method type:\s*post\b/i.test(mensagem)) return "metodo_post_nao_suportado";
+  if (/unsupported get request/i.test(mensagem)) return "consulta_get_nao_suportada";
+  if (/expired|expirad/i.test(mensagem)) return "token_expirado";
+  if (/access token|oauth token/i.test(mensagem)) return "token_recusado";
+  if (/permission|not authorized|access denied/i.test(mensagem)) return "acesso_recusado";
+  return "outro_erro_meta";
+}
+
+export function criarDiagnosticoInstagram(
+  etapa: EtapaInstagram, status: number | null, dados: InstagramPayload,
+  resultado: DiagnosticoInstagram["resultado"]
+): DiagnosticoInstagram {
+  const erro = dados?.error;
+  const numero = (valor: unknown) => typeof valor === "number" && Number.isSafeInteger(valor) ? valor : null;
+  const texto = (valor: unknown, formato: RegExp) => typeof valor === "string" && formato.test(valor) ? valor : null;
+  return {
+    etapa, resultado, status_http: status,
+    codigo: numero(erro?.code), subcodigo: numero(erro?.error_subcode),
+    tipo: texto(erro?.type, /^(?:IGApiException|OAuthException|GraphMethodException|FacebookApiException)$/),
+    motivo: erro ? motivoSeguro(erro.message) : null,
+    fbtrace_id: texto(erro?.fbtrace_id, /^[A-Za-z0-9_-]{1,64}$/)
+  };
+}
+
+export class ErroOAuthInstagram extends Error {
+  constructor(mensagem: string, readonly diagnostico: DiagnosticoInstagram) {
+    super(mensagem);
+    this.name = "ErroOAuthInstagram";
+  }
+}
+
+async function consultarInstagram(
+  etapa: EtapaInstagram, url: string, init: RequestInit | undefined,
+  solicitar: InstagramRequest, registrar?: RegistrarDiagnostico
+): Promise<{ resposta: Response; dados: InstagramPayload }> {
+  try {
+    const resposta = await solicitar(url, init);
+    return { resposta, dados: await lerJson(resposta) };
+  } catch {
+    const diagnostico = criarDiagnosticoInstagram(etapa, null, {}, "erro_rede");
+    registrar?.(diagnostico);
+    throw new ErroOAuthInstagram("Não foi possível consultar a API do Instagram. Tente novamente.", diagnostico);
+  }
+}
+
 function erroInstagram(retorno: InstagramPayload): string {
   const codigo = Number(retorno?.error?.code || 0);
   if (codigo === 100) return AVISO_INSTAGRAM_ACESSO;
@@ -27,7 +90,8 @@ async function lerJson(res: Response): Promise<InstagramPayload> {
 }
 
 export async function trocarTokenLongoInstagram(
-  tokenCurto: string, segredo: string, solicitar: InstagramRequest = fetch
+  tokenCurto: string, segredo: string, solicitar: InstagramRequest = fetch,
+  registrar?: RegistrarDiagnostico
 ): Promise<string> {
   if (!tokenCurto || !segredo) throw new Error("Configuração da conexão Instagram incompleta.");
   const parametros = new URLSearchParams({
@@ -35,27 +99,38 @@ export async function trocarTokenLongoInstagram(
     client_secret: segredo,
     access_token: tokenCurto
   });
-  const respostaGet = await solicitar("https://graph.instagram.com/access_token?" + parametros.toString());
-  let dados = await lerJson(respostaGet);
+  const consultaGet = await consultarInstagram("long_token_get",
+    "https://graph.instagram.com/access_token?" + parametros.toString(), undefined, solicitar, registrar);
+  const respostaGet = consultaGet.resposta;
+  let dados = consultaGet.dados;
+  let diagnostico = criarDiagnosticoInstagram("long_token_get", respostaGet.status, dados,
+    dados.error || !respostaGet.ok ? "erro_api" : "resposta_invalida");
   if (respostaGet.ok && typeof dados.access_token === "string" && dados.access_token) {
+    registrar?.({ ...diagnostico, resultado: "sucesso" });
     return dados.access_token;
   }
+  registrar?.(diagnostico);
 
   // Algumas contas recebem IGApiException 100 "method type: get" neste endpoint.
   // POST é uma alternativa apenas para troca de token (nunca para leitura do perfil).
   if (Number(dados?.error?.code) === 100 &&
       /method type:\s*get/i.test(String(dados?.error?.message || ""))) {
-    const respostaPost = await solicitar("https://graph.instagram.com/access_token", {
+    const consultaPost = await consultarInstagram("long_token_post", "https://graph.instagram.com/access_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: parametros.toString()
-    });
-    dados = await lerJson(respostaPost);
+    }, solicitar, registrar);
+    const respostaPost = consultaPost.resposta;
+    dados = consultaPost.dados;
+    diagnostico = criarDiagnosticoInstagram("long_token_post", respostaPost.status, dados,
+      dados.error || !respostaPost.ok ? "erro_api" : "resposta_invalida");
     if (respostaPost.ok && typeof dados.access_token === "string" && dados.access_token) {
+      registrar?.({ ...diagnostico, resultado: "sucesso" });
       return dados.access_token;
     }
+    registrar?.(diagnostico);
   }
-  throw new Error(erroInstagram(dados));
+  throw new ErroOAuthInstagram(erroInstagram(dados), diagnostico);
 }
 
 export type PerfilInstagramValidado = {
@@ -64,7 +139,8 @@ export type PerfilInstagramValidado = {
   profile_picture_url: string | null;
 };
 export async function buscarPerfilInstagram(
-  token: string, usuarioId: string, solicitar: InstagramRequest = fetch
+  token: string, usuarioId: string, solicitar: InstagramRequest = fetch,
+  registrar?: RegistrarDiagnostico
 ): Promise<PerfilInstagramValidado> {
   if (!token || !/^\d+$/.test(usuarioId)) throw new Error("Identificação do Instagram inválida.");
   const campos = "user_id,username,account_type,profile_picture_url";
@@ -74,17 +150,25 @@ export async function buscarPerfilInstagram(
       "?fields=" + campos + "&access_token=" + encodeURIComponent(token)
   ];
   let ultimoErro: InstagramPayload = {};
-  for (const url of urls) {
-    const resposta = await solicitar(url);
-    const perfil = await lerJson(resposta);
+  let diagnostico = criarDiagnosticoInstagram("profile_me", null, {}, "resposta_invalida");
+  for (const [indice, url] of urls.entries()) {
+    const etapa = indice === 0 ? "profile_me" : "profile_id";
+    const consulta = await consultarInstagram(etapa, url, undefined, solicitar, registrar);
+    const resposta = consulta.resposta;
+    const perfil = consulta.dados;
+    diagnostico = criarDiagnosticoInstagram(etapa, resposta.status, perfil,
+      perfil.error || !resposta.ok ? "erro_api" : "resposta_invalida");
     if (resposta.ok && !perfil.error &&
         (perfil.user_id || perfil.id) &&
         typeof perfil.username === "string" && perfil.username.trim()) {
       const recebidoId = String(perfil.user_id || perfil.id);
       // Uma conta diferente nunca pode substituir o usuário autenticado.
       if (recebidoId !== usuarioId) {
-        throw new Error("A conta do Instagram retornada difere da conta autorizada. Tente novamente.");
+        diagnostico = { ...diagnostico, resultado: "perfil_divergente" };
+        registrar?.(diagnostico);
+        throw new ErroOAuthInstagram("A conta do Instagram retornada difere da conta autorizada. Tente novamente.", diagnostico);
       }
+      registrar?.({ ...diagnostico, resultado: "sucesso" });
       return {
         user_id: recebidoId,
         username: perfil.username.trim(),
@@ -92,9 +176,10 @@ export async function buscarPerfilInstagram(
           ? perfil.profile_picture_url : null
       };
     }
+    registrar?.(diagnostico);
     ultimoErro = perfil;
     // O segundo caminho somente é necessário para erros de endpoint GET (100).
     if (Number(perfil?.error?.code) !== 100) break;
   }
-  throw new Error(erroInstagram(ultimoErro));
+  throw new ErroOAuthInstagram(erroInstagram(ultimoErro), diagnostico);
 }
