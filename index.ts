@@ -6,6 +6,7 @@ import bcrypt from "bcryptjs";
 import sharp from "sharp";
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { criarDesafioLinkedIn, verificarAssinaturaLinkedIn, lerNotificacaoLinkedIn } from "./linkedin-webhook-security.mjs";
 import { validarDadosAssistente, sanitizarAcompanhamentoAssistente, criarContaGoogleAssistente } from "./assistente-contas";
 import {
   MINIMO_CONTAS_REDE,
@@ -17696,7 +17697,7 @@ async function obterCamposLeadFormLinkedIn(
   adAccountId: string,
   formId: string
 ): Promise<Record<string, CampoLeadFormLinkedIn>> {
-  const chave = `${adAccountId}:${formId}`;
+  const chave = `${usuarioId}:${adAccountId}:${formId}`;
   const agora = Date.now();
   const cache = linkedinLeadFormSchemaCache.get(chave);
   if (cache && cache.expiraEm > agora) return cache.campos;
@@ -25551,78 +25552,50 @@ app.post("/webhook/tiktok", async (c) => {
    sendo o caminho garantido enquanto isso.
 ========================= */
 
-// Resumo seguro do webhook do LinkedIn pra log: mantém só o que é técnico (conta, form,
-// id do lead, quantas respostas vieram) e deixa de fora formResponse.answers — é ali que
-// mora o nome/e-mail/telefone/qualificação do lead (ver processarLeadGenFormResponseLinkedIn,
-// que já extrai esses campos pra gravar em `leads`; não precisa duplicar em texto no log).
-function resumoWebhookLinkedInParaLog(body: any) {
-  const elementos = Array.isArray(body?.elements) ? body.elements : Array.isArray(body) ? body : [body];
-  return {
-    total_elementos: elementos.length,
-    elementos: elementos.map((el: any) => ({
-      owner: el?.owner?.sponsoredAccount || el?.owner || null,
-      lead_gen_form: el?.versionedLeadGenFormUrn || el?.leadGenFormUrn || el?.leadGenForm || null,
-      lead_id: el?.id ?? null,
-      submitted_at: el?.submittedAt ?? null,
-      total_respostas: Array.isArray(el?.formResponse?.answers) ? el.formResponse.answers.length : 0
-    }))
-  };
-}
-
+// LinkedIn uses challengeCode/HMAC and X-LI-Signature, NOT a Bearer token.
+// Signed LEAD_ACTION notifications only tell us that a response exists.
+// We must fetch complete responses using the approved API; never INSERT a
+// notification body as if it contained personal form answers.
 app.get("/webhook/linkedin", async (c) => {
-  const challenge = c.req.query("challenge");
-  if (challenge) return c.text(challenge);
-  return c.text("LinkedIn webhook ativo");
+  if (!LINKEDIN_LEAD_SYNC_HABILITADO) {
+    return c.json({ error: "Lead Sync API aguardando aprovação" }, 503);
+  }
+  const challengeCode = c.req.query("challengeCode");
+  const clientSecret = Bun.env.LINKEDIN_ADS_CLIENT_SECRET;
+  if (!clientSecret) return c.json({ error: "LinkedIn não configurado" }, 503);
+  if (!challengeCode) return c.json({ error: "challengeCode obrigatório" }, 400);
+  return c.json(criarDesafioLinkedIn(challengeCode, clientSecret));
 });
 
 app.post("/webhook/linkedin", async (c) => {
-  const linkedinSecret = Bun.env.LINKEDIN_WEBHOOK_SECRET;
-  if (linkedinSecret) {
-    const auth = c.req.header("authorization") || "";
-    const provided = auth.replace(/^Bearer\s+/i, "").trim();
-    if (
-      !provided ||
-      provided.length !== linkedinSecret.length ||
-      !timingSafeEqual(Buffer.from(provided), Buffer.from(linkedinSecret))
-    ) {
-      return c.json({ error: "Unauthorized" }, 401);
-    }
+  // Fail closed even if someone sends a forged request while the API is pending.
+  if (!LINKEDIN_LEAD_SYNC_HABILITADO) {
+    return c.json({ error: "Lead Sync API aguardando aprovação" }, 503);
   }
-
+  const clientSecret = Bun.env.LINKEDIN_ADS_CLIENT_SECRET;
+  if (!clientSecret) return c.json({ error: "LinkedIn não configurado" }, 503);
+  const rawBody = await c.req.text();
+  if (Buffer.byteLength(rawBody, "utf8") > 262_144) {
+    return c.json({ error: "Payload muito grande" }, 413);
+  }
+  if (!verificarAssinaturaLinkedIn(
+    rawBody,
+    c.req.header("x-li-signature") || "",
+    clientSecret
+  )) return c.json({ error: "Assinatura inválida" }, 401);
   try {
-    const body = await c.req.json() as any;
-    console.log("WEBHOOK LINKEDIN RECEBIDO:", JSON.stringify(resumoWebhookLinkedInParaLog(body)));
-
-    const eventos = Array.isArray(body?.elements) ? body.elements : Array.isArray(body) ? body : [body];
-
-    for (const lead of eventos) {
-      const ownerUrn = String(lead?.owner?.sponsoredAccount || lead?.owner || "");
-      const adAccountId = ownerUrn.split(":").pop() || "";
-      if (!adAccountId) {
-        console.log("LINKEDIN WEBHOOK: evento sem conta de anuncios identificavel");
-        continue;
-      }
-
-      const conn = await client.query(
-        `SELECT usuario_id FROM plataforma_conexoes
-         WHERE plataforma = 'linkedin' AND dados_conta->>'ad_account_id' = $1
-         LIMIT 1`,
-        [adAccountId]
-      );
-      if (!conn.rows.length) {
-        console.log("LinkedIn webhook: conta de anuncios nao identificada:", adAccountId);
-        continue;
-      }
-
-      const usuarioId = Number(conn.rows[0].usuario_id);
-      const inserido = await processarLeadGenFormResponseLinkedIn(usuarioId, adAccountId, lead);
-      if (inserido) console.log("✅ LINKEDIN LEAD SALVO (webhook), usuario:", usuarioId);
-    }
-
-    return c.json({ sucesso: true });
-  } catch (err) {
-    console.error("ERRO WEBHOOK LINKEDIN:", err);
-    return c.json({ error: "Erro webhook LinkedIn" }, 500);
+    const notification = lerNotificacaoLinkedIn(JSON.parse(rawBody));
+    if (!notification) return c.json({ error: "Notificação LinkedIn inválida" }, 400);
+    // Polling existing /leadFormResponses is responsible for retrieving form
+    // answers and for CRM writes. Never synthesize a lead from this envelope.
+    console.log("LINKEDIN NOTIFICAÇÃO VERIFICADA:", JSON.stringify({
+      conta: notification.accountId,
+      acao: notification.action,
+      ocorrido_em: notification.occurredAt
+    }));
+    return c.json({ sucesso: true, sincronizacao: "polling" });
+  } catch {
+    return c.json({ error: "JSON LinkedIn inválido" }, 400);
   }
 });
 
