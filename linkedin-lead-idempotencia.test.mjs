@@ -47,3 +47,17 @@ test("sem ID válido não escreve no banco",async()=>{
  await assert.rejects(inserirRespostaLinkedInUmaVez(db,{...fixture,usuarioId:0}),/usuarioId/);
  assert.equal(db.calls.length,0);assert.equal(db.released,0);
 });
+
+test("processador real do LinkedIn usa a reserva atômica e não inventa ID", async()=>{
+ const {readFileSync}=await import("node:fs");
+ const source=readFileSync(new URL("./index.ts",import.meta.url),"utf8");
+ const start=source.indexOf("async function processarLeadGenFormResponseLinkedIn(");
+ const end=source.indexOf("async function sincronizarLinkedInAdsUsuario(",start);
+ assert.ok(start>0&&end>start);
+ const block=source.slice(start,end);
+ assert.match(block,/inserirRespostaLinkedInUmaVez\(client,/);
+ assert.match(block,/if \(!leadId\)/);
+ assert.doesNotMatch(block,/const jaExiste = await client\.query/);
+ assert.doesNotMatch(block,/const leadInseridoLinkedIn = await client\.query/);
+ assert.match(block,/if \(novoLeadId === null\) return false/);
+});
