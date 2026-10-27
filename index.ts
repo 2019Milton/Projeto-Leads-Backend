@@ -48,6 +48,7 @@ import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarC
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
 import { anexarResumoCrmPorConjunto } from "./meta-conjuntos-crm-resumo";
 import { consultarResumoConjuntosNoCrm } from "./meta-conjuntos-crm-consulta";
+import { buscarPerfilInstagram, trocarTokenLongoInstagram } from "./instagram-oauth-profissional";
 import {
   intervaloDistribuicao,mapearConjuntosMeta,agregarDistribuicao,dataHojeBrasil
 } from "./meta-distribuicao-leads";
@@ -18200,49 +18201,40 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       shortTokenData.user_id
     );
 
-    // 🔥 troca por token de longa duracao
-    const longParams =
-      new URLSearchParams({
-        grant_type: "ig_exchange_token",
-        client_secret: clientSecret,
-        access_token: shortTokenData.access_token
+    // Troca curta -> longa. Falhas da API sao tratadas sem registrar tokens.
+    // Quando a Meta responder 100 ("Unsupported request - method type: get"),
+    // a troca tenta POST form-urlencoded; nenhuma conexao e salva em caso de falha.
+    let access_token: string;
+    let perfil: {user_id: string;username: string;profile_picture_url: string | null};
+    try {
+      access_token = await trocarTokenLongoInstagram(
+        String(shortTokenData.access_token), String(clientSecret)
+      );
+      perfil = await buscarPerfilInstagram(
+        access_token, String(shortTokenData.user_id || "")
+      );
+    } catch (erroPerfil) {
+      const mensagem = erroPerfil instanceof Error
+        ? erroPerfil.message
+        : "O Instagram autorizou o acesso, mas nao concluiu a verificacao do perfil.";
+      console.warn("INSTAGRAM CALLBACK: troca de token ou perfil nao validado", {
+        codigo: /codigo 100/i.test(mensagem) ? 100 : "indisponivel",
+        etapa: "api_instagram",
       });
-
-    const longTokenData = await fetch(
-      `https://graph.instagram.com/access_token?${longParams.toString()}`
-    ).then(r => r.json());
-
-    console.log(
-      "INSTAGRAM LONG TOKEN:",
-      JSON.stringify({
-        ok: Boolean(longTokenData.access_token),
-        error: longTokenData.error
-      })
-    );
-
-    const access_token =
-      longTokenData.access_token || shortTokenData.access_token;
-
-    // 🔥 BUSCA PERFIL DA CONTA DO INSTAGRAM
-    const perfil = await fetch(
-      `https://graph.instagram.com/v21.0/me?fields=user_id,username,account_type,profile_picture_url&access_token=${encodeURIComponent(access_token)}`
-    ).then(r => r.json());
-
-    console.log("INSTAGRAM LOGIN PERFIL:", JSON.stringify(perfil));
-
-    if (!perfil.user_id) {
-      console.error("INSTAGRAM LOGIN: perfil invalido", perfil);
-      return c.html(`
+      // postMessage para a interface sem exibir nem divulgar o token.
+      const mensagemSegura = JSON.stringify(mensagem).replace(/</g, "\\u003c");
+      return c.html(`<!doctype html><html lang="pt-BR"><meta charset="UTF-8">
+        <body><p>Não foi possível concluir a conexão do Instagram.</p>
         <script>
-          if (window.opener) {
-            window.opener.postMessage({ type: "instagram_erro", erro: "Não foi possível obter os dados da conta do Instagram." }, "${obterFrontendUrl()}");
-          }
+          if (window.opener) window.opener.postMessage(
+            {type:"instagram_erro",erro:${mensagemSegura}},
+            ${JSON.stringify(obterFrontendUrl())}
+          );
           window.close();
-        </script>
-      `);
+        </script></body></html>`);
     }
 
-    console.log("INSTAGRAM conectado com sucesso:", perfil.username);
+    console.log("INSTAGRAM perfil autorizado e validado:", perfil.username);
 
     // 💾 salva no banco
     await client.query(
