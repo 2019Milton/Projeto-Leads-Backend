@@ -11,6 +11,7 @@ export async function consultarIdentidadeInstagramAds(input: {
   contaAnunciosId: string | null;
   instagramId: string | null;
   token: string;
+  conexaoSeparada?: boolean;
   fetchFn?: MetaHttp;
 }): Promise<ResultadoConsultaInstagramAds> {
   const idValido = (v: string | null) => typeof v === "string" && /^[0-9]+$/.test(v);
@@ -56,7 +57,7 @@ export async function consultarIdentidadeInstagramAds(input: {
     }
     // Dois inventários completos e sem o perfil selecionado: a identidade não
     // está disponibilizada para esta conta de anúncios (não é reprovação de anúncio).
-    return { estado: "pendente", motivo: "SEM_EVIDENCIA_SUFFICIENTE" };
+    return { estado: input.conexaoSeparada ? "indeterminado" : "pendente", motivo: "SEM_EVIDENCIA_SUFFICIENTE" };
   } catch {
     return { estado: "indeterminado", motivo: "FALHA_META" };
   }
