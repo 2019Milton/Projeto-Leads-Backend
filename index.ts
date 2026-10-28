@@ -48,7 +48,7 @@ import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarC
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
 import { anexarResumoCrmPorConjunto } from "./meta-conjuntos-crm-resumo";
 import { consultarResumoConjuntosNoCrm } from "./meta-conjuntos-crm-consulta";
-import { buscarPerfilInstagram, trocarTokenLongoInstagram } from "./instagram-oauth-profissional";
+import { buscarPerfilInstagram, trocarTokenLongoInstagram, criarDiagnosticoInstagram, ErroOAuthInstagram, type DiagnosticoInstagram } from "./instagram-oauth-profissional";
 import {
   intervaloDistribuicao,mapearConjuntosMeta,agregarDistribuicao,dataHojeBrasil
 } from "./meta-distribuicao-leads";
@@ -18172,6 +18172,11 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       `);
     }
 
+    const tentativaInstagram = crypto.randomUUID();
+    const registrarInstagram = (evento: DiagnosticoInstagram) => {
+      console.info("INSTAGRAM OAUTH:", JSON.stringify({ tentativa: tentativaInstagram, ...evento }));
+    };
+
     // 🔥 troca code por token de curta duracao
     const shortTokenForm = new URLSearchParams({
       client_id: clientId,
@@ -18192,14 +18197,12 @@ app.get("/auth/meta/instagram/callback", async (c) => {
     const shortTokenData = await shortTokenRes.json();
 
     if (!shortTokenRes.ok || !shortTokenData.access_token) {
-      console.error("ERRO TOKEN INSTAGRAM:", shortTokenData);
+      registrarInstagram(criarDiagnosticoInstagram("short_token", shortTokenRes.status, shortTokenData,
+        shortTokenData.error || !shortTokenRes.ok ? "erro_api" : "resposta_invalida"));
       return c.text("Erro ao obter token Instagram", 502);
     }
 
-    console.log(
-      "INSTAGRAM SHORT TOKEN OK. user_id:",
-      shortTokenData.user_id
-    );
+    registrarInstagram(criarDiagnosticoInstagram("short_token", shortTokenRes.status, {}, "sucesso"));
 
     // Troca curta -> longa. Falhas da API sao tratadas sem registrar tokens.
     // Quando a Meta responder 100 ("Unsupported request - method type: get"),
@@ -18208,18 +18211,19 @@ app.get("/auth/meta/instagram/callback", async (c) => {
     let perfil: {user_id: string;username: string;profile_picture_url: string | null};
     try {
       access_token = await trocarTokenLongoInstagram(
-        String(shortTokenData.access_token), String(clientSecret)
+        String(shortTokenData.access_token), String(clientSecret), fetch, registrarInstagram
       );
       perfil = await buscarPerfilInstagram(
-        access_token, String(shortTokenData.user_id || "")
+        access_token, String(shortTokenData.user_id || ""), fetch, registrarInstagram
       );
     } catch (erroPerfil) {
       const mensagem = erroPerfil instanceof Error
         ? erroPerfil.message
         : "O Instagram autorizou o acesso, mas nao concluiu a verificacao do perfil.";
       console.warn("INSTAGRAM CALLBACK: troca de token ou perfil nao validado", {
-        codigo: /codigo 100/i.test(mensagem) ? 100 : "indisponivel",
-        etapa: "api_instagram",
+        tentativa: tentativaInstagram,
+        codigo: erroPerfil instanceof ErroOAuthInstagram ? erroPerfil.diagnostico.codigo : null,
+        etapa: erroPerfil instanceof ErroOAuthInstagram ? erroPerfil.diagnostico.etapa : "validacao_local",
       });
       // postMessage para a interface sem exibir nem divulgar o token.
       const mensagemSegura = JSON.stringify(mensagem).replace(/</g, "\\u003c");
