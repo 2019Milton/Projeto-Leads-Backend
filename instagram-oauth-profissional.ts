@@ -21,6 +21,7 @@ export type DiagnosticoInstagram = {
   motivo: string | null;
   fbtrace_id: string | null;
   identidade?: "id" | "user_id" | "ambos" | "nenhum" | "campos_ausentes";
+  campos_identidade?: "ambos" | "somente_id" | "somente_user_id" | "nenhum";
 };
 type RegistrarDiagnostico = (evento: DiagnosticoInstagram) => void;
 
@@ -173,9 +174,13 @@ export async function buscarPerfilInstagram(
       const recebidoId = idsRecebidos.includes(usuarioId) ? usuarioId : "";
       const idCorresponde = String(perfil.id ?? "") === usuarioId;
       const userIdCorresponde = String(perfil.user_id ?? "") === usuarioId;
+      const temId = typeof perfil.id === "string" && /^\d+$/.test(perfil.id);
+      const temUserId = typeof perfil.user_id === "string" && /^\d+$/.test(perfil.user_id);
       diagnostico = { ...diagnostico, identidade:
         idCorresponde && userIdCorresponde ? "ambos" :
-        idCorresponde ? "id" : userIdCorresponde ? "user_id" : "nenhum" };
+        idCorresponde ? "id" : userIdCorresponde ? "user_id" : "nenhum",
+        campos_identidade: temId && temUserId ? "ambos" :
+          temId ? "somente_id" : temUserId ? "somente_user_id" : "nenhum" };
       // Uma conta diferente nunca pode substituir o usuário autenticado.
       if (!recebidoId) {
         diagnostico = { ...diagnostico, resultado: "perfil_divergente" };

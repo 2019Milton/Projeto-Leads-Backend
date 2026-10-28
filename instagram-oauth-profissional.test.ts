@@ -195,3 +195,10 @@ test("diagnostico informa somente qual identificador corresponde, sem revelar ID
   expect(eventos[0].identidade).toBe("id");
   expect(JSON.stringify(eventos)).not.toMatch(/123456|987654|teste_privado|token_privado/);
 });
+
+test("diagnostico de campos sem expor valores",async()=>{
+  const eventos: DiagnosticoInstagram[]=[];
+  await expect(buscarPerfilInstagram("segredo","123",async()=>responder({id:"999",username:"privado"}),e=>eventos.push(e))).rejects.toThrow("difere");
+  expect(eventos[0].campos_identidade).toBe("somente_id");
+  expect(JSON.stringify(eventos)).not.toContain("999");
+});
