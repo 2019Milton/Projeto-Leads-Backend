@@ -5,9 +5,9 @@ test("identidade presente na conta ativa", async () => {
  const result = await consultarIdentidadeInstagramAds({contaAnunciosId:"456", instagramId:"123", token:"test", fetchFn:async () => response(200,{data:[{id:"123"}]})});
  expect(result.estado).toBe("autorizado");
 });
-test("lista vazia nao comprova pendencia", async () => {
+test("dois inventarios completos sem identidade indicam pendencia", async () => {
  const result = await consultarIdentidadeInstagramAds({contaAnunciosId:"456", instagramId:"123", token:"test", fetchFn:async () => response(200,{data:[]})});
- expect(result.estado).toBe("indeterminado");
+ expect(result.estado).toBe("pendente");
 });
 test("falha Meta nao comprova pendencia", async () => {
  const result = await consultarIdentidadeInstagramAds({contaAnunciosId:"456", instagramId:"123", token:"test", fetchFn:async () => response(403,{error:{code:200}})});
