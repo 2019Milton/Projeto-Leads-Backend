@@ -18312,7 +18312,8 @@ app.get("/meta/instagram/autorizacao-anuncios", authMiddleware, async (c) => {
     const resultado = await consultarIdentidadeInstagramAds({
       contaAnunciosId: conta,
       instagramId,
-      token: atual.access_token
+      token: atual.access_token,
+      conexaoSeparada: Boolean(atual.instagram_id)
     });
     return c.json(resultado);
   } catch {
