@@ -144,7 +144,7 @@ export async function buscarPerfilInstagram(
   registrar?: RegistrarDiagnostico
 ): Promise<PerfilInstagramValidado> {
   if (!token || !/^\d+$/.test(usuarioId)) throw new Error("Identificação do Instagram inválida.");
-  const campos = "user_id,username,account_type,profile_picture_url";
+  const campos = "id,user_id,username,account_type,profile_picture_url";
   const urls = [
     "https://graph.instagram.com/v25.0/me?fields=" + campos + "&access_token=" + encodeURIComponent(token),
     "https://graph.instagram.com/v25.0/" + encodeURIComponent(usuarioId) +
