@@ -40,3 +40,8 @@ test("OAuth Instagram separado sem identidade no inventario nao implica pendenci
  const result = await consultarIdentidadeInstagramAds({contaAnunciosId:"456", instagramId:"123", token:"test", conexaoSeparada:true, fetchFn:async () => response(200,{data:[]})});
  expect(result.estado).toBe("indeterminado");
 });
+
+test("conexao separada sem inventario retorna motivo especifico", async () => {
+ const result = await consultarIdentidadeInstagramAds({contaAnunciosId:"456", instagramId:"123", token:"test", conexaoSeparada:true, fetchFn:async () => response(200,{data:[]})});
+ expect(result.motivo).toBe("CONEXAO_SEPARADA_SEM_VINCULO_CONFIRMADO");
+});

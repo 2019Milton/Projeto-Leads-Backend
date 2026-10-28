@@ -3,7 +3,7 @@ import type { EstadoAutorizacao } from "./meta-instagram-autorizacao-anuncios";
 type MetaHttp = (url: string, init?: RequestInit) => Promise<Response>;
 export type ResultadoConsultaInstagramAds = {
   estado: EstadoAutorizacao;
-  motivo: "CONTA_NAO_SELECIONADA" | "PERFIL_NAO_IDENTIFICADO" | "FALHA_META" | "IDENTIDADE_NA_CONTA" | "SEM_EVIDENCIA_SUFFICIENTE";
+  motivo: "CONTA_NAO_SELECIONADA" | "PERFIL_NAO_IDENTIFICADO" | "FALHA_META" | "IDENTIDADE_NA_CONTA" | "SEM_EVIDENCIA_SUFFICIENTE" | "CONEXAO_SEPARADA_SEM_VINCULO_CONFIRMADO";
 };
 
 /** Apenas leitura. O resultado confirma identidade na conta, não garante aprovação de anúncios. */
@@ -57,7 +57,9 @@ export async function consultarIdentidadeInstagramAds(input: {
     }
     // Dois inventários completos e sem o perfil selecionado: a identidade não
     // está disponibilizada para esta conta de anúncios (não é reprovação de anúncio).
-    return { estado: input.conexaoSeparada ? "indeterminado" : "pendente", motivo: "SEM_EVIDENCIA_SUFFICIENTE" };
+    return input.conexaoSeparada
+      ? { estado: "indeterminado", motivo: "CONEXAO_SEPARADA_SEM_VINCULO_CONFIRMADO" }
+      : { estado: "pendente", motivo: "SEM_EVIDENCIA_SUFFICIENTE" };
   } catch {
     return { estado: "indeterminado", motivo: "FALHA_META" };
   }
