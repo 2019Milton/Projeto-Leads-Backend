@@ -1,4 +1,5 @@
 import { desvincularInstagramAvulso } from "./meta-instagram-desconexao";
+import { escolherInstagramDaContaAnuncios } from "./meta-instagram-deteccao";
 ﻿import { Hono } from "hono@4";
 import { cors } from "hono/cors";
 import { capturaNome, normalizarNome, renderizarTextoBot, salvarNomeBot } from "./whatsapp-bot-variaveis";
@@ -20117,12 +20118,9 @@ app.get(
     // Quando há um único Instagram autorizado para esta conta de anuncios,
     // ele é inequivocamente a identidade de anuncio. Nunca escolher o primeiro
     // elemento de uma lista com multiplas contas.
-    const instagramDaConta = contasInstagramAnuncio.length === 1
-      ? contasInstagramAnuncio[0]
-      : instagramDetectadoMeta?.id
-        ? contasInstagramAnuncio.find((item: any) =>
-            String(item.id) === String(instagramDetectadoMeta.id)) || null
-        : null;
+    const instagramDaConta = escolherInstagramDaContaAnuncios(
+      contasInstagramAnuncio, instagramDetectadoMeta
+    );
     const instagram = instagramDaConta || instagramDetectadoMeta || instagramSeparado;
 
     // Não atribuir artificialmente a todas as Paginas um Instagram encontrado
