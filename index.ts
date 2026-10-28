@@ -1,3 +1,4 @@
+import { consultarIdentidadeInstagramAds } from "./meta-instagram-consulta-anuncios";
 import { desvincularInstagramAvulso } from "./meta-instagram-desconexao";
 import { salvarTokenMetaSemPerderVinculos } from "./meta-reautorizacao-segura";
 import { escolherInstagramDaContaAnuncios, extrairInstagramVinculadoPagina, resumirConsultaInstagramPagina } from "./meta-instagram-deteccao";
@@ -18290,6 +18291,35 @@ app.get("/auth/meta/instagram/callback", async (c) => {
 /* =========================
    🧪 TESTE META
 ========================= */
+
+app.get("/meta/instagram/autorizacao-anuncios", authMiddleware, async (c) => {
+  const user: any = c.get("user");
+  try {
+    const conexao = await client.query(
+      "SELECT access_token, conta_anuncios_id, instagram_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [user.id]
+    );
+    if (!conexao.rows.length) {
+      return c.json({ estado: "indeterminado", motivo: "META_NAO_CONECTADA" });
+    }
+    const atual = conexao.rows[0];
+    // Se o login Instagram foi separado, usar seu identificador. Caso
+    // contrário, procurar a identidade já detectada pela Página.
+    const paginas = await listarPaginasComInstagram(atual.access_token);
+    const perfilPagina = await detectarInstagramMeta(atual.access_token, paginas);
+    const instagramId = atual.instagram_id ? String(atual.instagram_id) : perfilPagina?.id ? String(perfilPagina.id) : null;
+    const conta = atual.conta_anuncios_id ? String(atual.conta_anuncios_id).replace(/^act_/, "") : null;
+    const resultado = await consultarIdentidadeInstagramAds({
+      contaAnunciosId: conta,
+      instagramId,
+      token: atual.access_token,
+      conexaoSeparada: Boolean(atual.instagram_id)
+    });
+    return c.json(resultado);
+  } catch {
+    return c.json({ estado: "indeterminado", motivo: "FALHA_CONSULTA" });
+  }
+});
 
 app.get("/meta/teste", authMiddleware, async (c) => {
   try {
