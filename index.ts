@@ -1,4 +1,5 @@
 import { desvincularInstagramAvulso } from "./meta-instagram-desconexao";
+import { salvarTokenMetaSemPerderVinculos } from "./meta-reautorizacao-segura";
 import { escolherInstagramDaContaAnuncios } from "./meta-instagram-deteccao";
 ﻿import { Hono } from "hono@4";
 import { cors } from "hono/cors";
@@ -7453,6 +7454,9 @@ app.get("/auth/meta/login", async (c) => {
     "pages_show_list",
     "pages_read_engagement",
     "pages_manage_ads",
+    // instagram_basic exige permissao habilitada no aplicativo Meta.
+    // Nao habilitar globalmente antes de confirmar acesso/aprovacao.
+    ...(Bun.env.META_INSTAGRAM_BASIC_SCOPE_ENABLED === "true" ? ["instagram_basic"] : []),
     // Sem estes dois, a Meta aceita destination_type=WHATSAPP no Ad Set mas
     // ignora silenciosamente promoted_object.whatsapp_phone_number (nao da
     // erro nenhum) - confirmado via /me/permissions retornando "declined"
@@ -7575,14 +7579,11 @@ app.get("/auth/meta/callback", async (c) => {
       return c.text("Usuário inválido", 401);
     }
 
-    // 💾 substitui conexão existente (evita duplicata)
-    await client.query(
-      "DELETE FROM meta_conexoes WHERE usuario_id = $1",
-      [usuarioId]
-    );
-    await client.query(
-      "INSERT INTO meta_conexoes (usuario_id, access_token) VALUES ($1, $2)",
-      [usuarioId, access_token]
+    // Reautorizar Meta sem apagar conta de anuncios selecionada,
+    // Instagram separado e outros campos da conexao existente.
+    await salvarTokenMetaSemPerderVinculos(
+      (sql, params) => client.query(sql, params),
+      usuarioId, access_token
     );
 
     // Espelha no hub genérico de conexões
