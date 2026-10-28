@@ -174,8 +174,8 @@ export async function buscarPerfilInstagram(
       const recebidoId = idsRecebidos.includes(usuarioId) ? usuarioId : "";
       const idCorresponde = String(perfil.id ?? "") === usuarioId;
       const userIdCorresponde = String(perfil.user_id ?? "") === usuarioId;
-      const temId = typeof perfil.id === "string" && /^\\d+$/.test(perfil.id);
-      const temUserId = typeof perfil.user_id === "string" && /^\\d+$/.test(perfil.user_id);
+      const temId = typeof perfil.id === "string" && /^\d+$/.test(perfil.id);
+      const temUserId = typeof perfil.user_id === "string" && /^\d+$/.test(perfil.user_id);
       diagnostico = { ...diagnostico, identidade:
         idCorresponde && userIdCorresponde ? "ambos" :
         idCorresponde ? "id" : userIdCorresponde ? "user_id" : "nenhum",
