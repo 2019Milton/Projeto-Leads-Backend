@@ -10,6 +10,7 @@ export type ResultadoConsultaInstagramAds = {
 export async function consultarIdentidadeInstagramAds(input: {
   contaAnunciosId: string | null;
   instagramId: string | null;
+  instagramUsername?: string | null;
   token: string;
   conexaoSeparada?: boolean;
   fetchFn?: MetaHttp;
@@ -20,11 +21,13 @@ export async function consultarIdentidadeInstagramAds(input: {
   const fetchFn = input.fetchFn || fetch;
   try {
     const encontrados = new Set<string>();
+    const usernames = new Map<string, Set<string>>();
+    const normalizarUsername = (v: unknown) => typeof v === "string" ? v.replace(/^@/, "").trim().toLowerCase() : "";
     // Ambos os edges precisam completar com sucesso para interpretar a ausência.
     // Qualquer erro deixa o estado indeterminado.
     for (const edge of ["connected_instagram_accounts", "instagram_accounts"]) {
       const url = new URL("https://graph.facebook.com/v19.0/act_" + input.contaAnunciosId + "/" + edge);
-      url.searchParams.set("fields", "id");
+      url.searchParams.set("fields", "id,username");
       url.searchParams.set("limit", "100");
       let proximo: string | null = url.toString();
       const vistos = new Set<string>();
@@ -32,11 +35,19 @@ export async function consultarIdentidadeInstagramAds(input: {
         if (vistos.has(proximo)) return { estado: "indeterminado", motivo: "FALHA_META" };
         vistos.add(proximo);
         const resposta = await fetchFn(proximo, { headers: { Authorization: "Bearer " + input.token } });
-        const dados = await resposta.json() as { data?: Array<{ id?: string | number }>; paging?: { next?: string }; error?: unknown };
+        const dados = await resposta.json() as { data?: Array<{ id?: string | number; username?: string }>; paging?: { next?: string }; error?: unknown };
         if (!resposta.ok || dados.error || !Array.isArray(dados.data)) {
           return { estado: "indeterminado", motivo: "FALHA_META" };
         }
-        for (const item of dados.data) if (/^[0-9]+$/.test(String(item?.id ?? ""))) encontrados.add(String(item.id));
+        for (const item of dados.data) {
+          if (!/^[0-9]+$/.test(String(item?.id ?? ""))) continue;
+          encontrados.add(String(item.id));
+          const nome = normalizarUsername(item.username);
+          if (nome) {
+            if (!usernames.has(nome)) usernames.set(nome, new Set());
+            usernames.get(nome)!.add(String(item.id));
+          }
+        }
         const pagina = dados.paging?.next;
         if (pagina) {
           let segura = false;
@@ -51,6 +62,8 @@ export async function consultarIdentidadeInstagramAds(input: {
       if (proximo) return { estado: "indeterminado", motivo: "FALHA_META" };
       // Evidência positiva dispensa consultar o edge legado, que pode não estar disponível.
       if (encontrados.has(input.instagramId!)) return { estado: "autorizado", motivo: "IDENTIDADE_NA_CONTA" };
+      const correspondentes = usernames.get(normalizarUsername(input.instagramUsername));
+      if (correspondentes?.size === 1 && normalizarUsername(input.instagramUsername)) return { estado: "autorizado", motivo: "IDENTIDADE_NA_CONTA" };
     }
     if (encontrados.has(input.instagramId!)) {
       return { estado: "autorizado", motivo: "IDENTIDADE_NA_CONTA" };
