@@ -1,6 +1,6 @@
 import { desvincularInstagramAvulso } from "./meta-instagram-desconexao";
 import { salvarTokenMetaSemPerderVinculos } from "./meta-reautorizacao-segura";
-import { escolherInstagramDaContaAnuncios, extrairInstagramVinculadoPagina } from "./meta-instagram-deteccao";
+import { escolherInstagramDaContaAnuncios, extrairInstagramVinculadoPagina, resumirConsultaInstagramPagina } from "./meta-instagram-deteccao";
 ﻿import { Hono } from "hono@4";
 import { cors } from "hono/cors";
 import { capturaNome, normalizarNome, renderizarTextoBot, salvarNomeBot } from "./whatsapp-bot-variaveis";
@@ -1172,9 +1172,13 @@ async function detectarInstagramMeta(
 
   if (!instagram && primeiraPagina?.id) {
 
-    const instaRes = await fetch(
+    const respostaPagina = await fetch(
       `https://graph.facebook.com/v19.0/${primeiraPagina.id}?fields=instagram_business_account,connected_instagram_account&access_token=${token}`
-    ).then(r => r.json());
+    );
+    const instaRes = await respostaPagina.json();
+    console.info("META INSTAGRAM VINCULO PAGINA:", JSON.stringify(
+      resumirConsultaInstagramPagina(instaRes, respostaPagina.status)
+    ));
 
     const igPagina = extrairInstagramVinculadoPagina(instaRes);
     if (igPagina) {

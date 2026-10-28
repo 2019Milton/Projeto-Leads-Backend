@@ -28,3 +28,21 @@ export function extrairInstagramVinculadoPagina(
   }
   return null;
 }
+
+/**
+ * Diagnóstico de presença de vínculo no Page Graph API, sem expor IDs, nomes,
+ * URL de perfil, payloads de erro, nem tokens.
+ */
+export function resumirConsultaInstagramPagina(dados: Record<string, any>, statusHttp: number) {
+  const validId = (v: any) => v && /^\d+$/.test(String(v.id ?? ""));
+  const code = dados?.error?.code;
+  return {
+    http: Number.isInteger(statusHttp) ? statusHttp : null,
+    vinculo: validId(dados?.instagram_business_account) && validId(dados?.connected_instagram_account)
+      ? "ambos"
+      : validId(dados?.instagram_business_account) ? "business"
+      : validId(dados?.connected_instagram_account) ? "connected"
+      : "nenhum",
+    erro_codigo: typeof code === "number" && Number.isInteger(code) ? code : null
+  };
+}
