@@ -220,3 +220,17 @@ test("perfil ausente em qualquer token bloqueia o vínculo",async()=>{
  let i=0;
  await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>responder(++i===1?{id:"123",username:"ok"}:{username:"ok"}))).rejects.toThrow();
 });
+
+test("mesmo ID com usernames diferentes bloqueia o vínculo",async()=>{
+ let n=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>
+   responder({id:"123",username:++n===1?"perfil_a":"perfil_b"}))).rejects.toThrow("mudou");
+});
+test("falha do endpoint com token curto bloqueia antes da consulta com token longo",async()=>{
+ let n=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>{
+   n++;
+   return responder({error:{code:190,type:"OAuthException",message:"Invalid OAuth access token."}},400);
+ })).rejects.toThrow();
+ expect(n).toBe(1);
+});
