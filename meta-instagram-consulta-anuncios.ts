@@ -18,31 +18,43 @@ export async function consultarIdentidadeInstagramAds(input: {
   if (!idValido(input.instagramId)) return { estado: "indeterminado", motivo: "PERFIL_NAO_IDENTIFICADO" };
   const fetchFn = input.fetchFn || fetch;
   try {
-    const url = new URL("https://graph.facebook.com/v19.0/act_" + input.contaAnunciosId + "/connected_instagram_accounts");
-    url.searchParams.set("fields", "id");
-    url.searchParams.set("limit", "100");
     const encontrados = new Set<string>();
-    let proximo: string | null = url.toString();
-    for (let i = 0; proximo && i < 10; i++) {
-      const resposta = await fetchFn(proximo, { headers: { Authorization: "Bearer " + input.token } });
-      const dados = await resposta.json() as { data?: Array<{ id?: string }>; paging?: { next?: string }; error?: unknown };
-      if (!resposta.ok || dados.error || !Array.isArray(dados.data)) {
-        return { estado: "indeterminado", motivo: "FALHA_META" };
+    // Ambos os edges precisam completar com sucesso para interpretar a ausência.
+    // Qualquer erro deixa o estado indeterminado.
+    for (const edge of ["instagram_accounts", "connected_instagram_accounts"]) {
+      const url = new URL("https://graph.facebook.com/v19.0/act_" + input.contaAnunciosId + "/" + edge);
+      url.searchParams.set("fields", "id");
+      url.searchParams.set("limit", "100");
+      let proximo: string | null = url.toString();
+      const vistos = new Set<string>();
+      for (let i = 0; proximo && i < 10; i++) {
+        if (vistos.has(proximo)) return { estado: "indeterminado", motivo: "FALHA_META" };
+        vistos.add(proximo);
+        const resposta = await fetchFn(proximo, { headers: { Authorization: "Bearer " + input.token } });
+        const dados = await resposta.json() as { data?: Array<{ id?: string | number }>; paging?: { next?: string }; error?: unknown };
+        if (!resposta.ok || dados.error || !Array.isArray(dados.data)) {
+          return { estado: "indeterminado", motivo: "FALHA_META" };
+        }
+        for (const item of dados.data) if (/^[0-9]+$/.test(String(item?.id ?? ""))) encontrados.add(String(item.id));
+        const pagina = dados.paging?.next;
+        if (pagina) {
+          let segura = false;
+          try {
+            const proximaUrl = new URL(pagina);
+            segura = proximaUrl.protocol === "https:" && proximaUrl.hostname === "graph.facebook.com" && proximaUrl.port === "";
+          } catch {}
+          if (!segura || pagina.length > 4096) return { estado: "indeterminado", motivo: "FALHA_META" };
+        }
+        proximo = pagina || null;
       }
-      for (const item of dados.data) if (typeof item.id === "string") encontrados.add(item.id);
-      const pagina = dados.paging?.next;
-      if (pagina && (!pagina.startsWith("https://graph.facebook.com/") || pagina.length > 4096)) {
-        return { estado: "indeterminado", motivo: "FALHA_META" };
-      }
-      proximo = pagina || null;
+      if (proximo) return { estado: "indeterminado", motivo: "FALHA_META" };
     }
-    if (proximo) return { estado: "indeterminado", motivo: "FALHA_META" };
-    const estado = classificarAutorizacao({
-      instagramId: input.instagramId, contaAnunciosId: input.contaAnunciosId,
-      consultaOk: true, identidadesDisponiveis: [...encontrados],
-      autorizacaoConfirmada: encontrados.has(input.instagramId!),
-    });
-    return { estado, motivo: estado === "autorizado" ? "IDENTIDADE_NA_CONTA" : "SEM_EVIDENCIA_SUFFICIENTE" };
+    if (encontrados.has(input.instagramId!)) {
+      return { estado: "autorizado", motivo: "IDENTIDADE_NA_CONTA" };
+    }
+    // Dois inventários completos e sem o perfil selecionado: a identidade não
+    // está disponibilizada para esta conta de anúncios (não é reprovação de anúncio).
+    return { estado: "pendente", motivo: "SEM_EVIDENCIA_SUFFICIENTE" };
   } catch {
     return { estado: "indeterminado", motivo: "FALHA_META" };
   }
