@@ -35,3 +35,8 @@ test("sem identidade e erro no segundo edge nao cria pendencia falsa", async () 
  }});
  expect(result.estado).toBe("indeterminado");
 });
+
+test("OAuth Instagram separado sem identidade no inventario nao implica pendencia", async () => {
+ const result = await consultarIdentidadeInstagramAds({contaAnunciosId:"456", instagramId:"123", token:"test", conexaoSeparada:true, fetchFn:async () => response(200,{data:[]})});
+ expect(result.estado).toBe("indeterminado");
+});
