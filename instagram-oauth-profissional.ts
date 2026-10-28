@@ -202,3 +202,40 @@ export async function buscarPerfilInstagram(
   }
   throw new ErroOAuthInstagram(erroInstagram(ultimoErro), diagnostico);
 }
+
+
+/**
+ * Consulta o mesmo endpoint /me para cada token e confirma que ambos
+ * representam exatamente a mesma identidade. Não compara IDs de escopos
+ * diferentes (code exchange versus Graph /me).
+ */
+export async function validarPerfilPorTokensInstagram(
+  tokenCurto: string, tokenLongo: string, solicitar: InstagramRequest = fetch,
+  registrar?: RegistrarDiagnostico
+): Promise<PerfilInstagramValidado> {
+  const consultar = async (token: string): Promise<{id:string;username:string;profile_picture_url:string|null}> => {
+    if (!token) throw new Error("Token do Instagram ausente.");
+    const url = "https://graph.instagram.com/v25.0/me?fields=id,username,profile_picture_url&access_token=" +
+      encodeURIComponent(token);
+    const consulta = await consultarInstagram("profile_me",url,undefined,solicitar,registrar);
+    const dados = consulta.dados;
+    const id = typeof dados.id === "string" && /^\d+$/.test(dados.id) ? dados.id : "";
+    const username = typeof dados.username === "string" ? dados.username.trim() : "";
+    if (!consulta.resposta.ok || dados.error || !id || !username) {
+      const diagnostico = criarDiagnosticoInstagram("profile_me",consulta.resposta.status,dados,
+        dados.error || !consulta.resposta.ok ? "erro_api" : "resposta_invalida");
+      registrar?.(diagnostico);
+      throw new ErroOAuthInstagram(erroInstagram(dados),diagnostico);
+    }
+    return {id,username,profile_picture_url:typeof dados.profile_picture_url==="string"?dados.profile_picture_url:null};
+  };
+  const curto = await consultar(tokenCurto);
+  const longo = await consultar(tokenLongo);
+  if (curto.id !== longo.id || curto.username !== longo.username) {
+    const diagnostico = criarDiagnosticoInstagram("profile_me",200,{},"perfil_divergente");
+    registrar?.(diagnostico);
+    throw new ErroOAuthInstagram("A identidade do Instagram mudou durante a autorização.",diagnostico);
+  }
+  registrar?.(criarDiagnosticoInstagram("profile_me",200,{},"sucesso"));
+  return {user_id:longo.id,username:longo.username,profile_picture_url:longo.profile_picture_url};
+}
