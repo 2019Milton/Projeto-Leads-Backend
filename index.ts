@@ -18214,32 +18214,12 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       access_token = await trocarTokenLongoInstagram(
         String(shortTokenData.access_token), String(clientSecret), fetch, registrarInstagram
       );
-      try {
-        perfil = await buscarPerfilInstagram(
-          access_token, String(shortTokenData.user_id || ""), fetch, registrarInstagram
-        );
-      } catch (erroIdentidade) {
-        // Diagnostico sem escrita: confirmar se os dois tokens consultam a mesma conta.
-        // Mesmo em caso de sucesso diagnostico, preservar a rejeicao atual.
-        if (erroIdentidade instanceof ErroOAuthInstagram &&
-            erroIdentidade.diagnostico.resultado === "perfil_divergente") {
-          try {
-            await validarPerfilPorTokensInstagram(
-              String(shortTokenData.access_token), access_token, fetch, registrarInstagram
-            );
-            console.info("INSTAGRAM OAUTH COMPARACAO:", JSON.stringify({
-              tentativa: tentativaInstagram, resultado: "tokens_mesmo_perfil"
-            }));
-          } catch (erroDiagnostico) {
-            console.info("INSTAGRAM OAUTH COMPARACAO:", JSON.stringify({
-              tentativa: tentativaInstagram, resultado: "comparacao_nao_confirmada",
-              etapa: erroDiagnostico instanceof ErroOAuthInstagram
-                ? erroDiagnostico.diagnostico.etapa : "validacao_local"
-            }));
-          }
-        }
-        throw erroIdentidade;
-      }
+      // Ambos os tokens devem autenticar o mesmo perfil na mesma API /me.
+      // O user_id retornado pela troca inicial pode ter outro escopo.
+      // Em qualquer divergencia ou falha na API, nao salva a conexao.
+      perfil = await validarPerfilPorTokensInstagram(
+        String(shortTokenData.access_token), access_token, fetch, registrarInstagram
+      );
     } catch (erroPerfil) {
       const mensagem = erroPerfil instanceof Error
         ? erroPerfil.message
