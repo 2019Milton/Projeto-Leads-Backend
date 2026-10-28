@@ -49,7 +49,7 @@ import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarC
 import { distribuirOrcamentosMeta } from "./meta-orcamentos-conjuntos";
 import { anexarResumoCrmPorConjunto } from "./meta-conjuntos-crm-resumo";
 import { consultarResumoConjuntosNoCrm } from "./meta-conjuntos-crm-consulta";
-import { buscarPerfilInstagram, trocarTokenLongoInstagram, criarDiagnosticoInstagram, ErroOAuthInstagram, type DiagnosticoInstagram } from "./instagram-oauth-profissional";
+import { buscarPerfilInstagram, trocarTokenLongoInstagram, validarPerfilPorTokensInstagram, criarDiagnosticoInstagram, ErroOAuthInstagram, type DiagnosticoInstagram } from "./instagram-oauth-profissional";
 import {
   intervaloDistribuicao,mapearConjuntosMeta,agregarDistribuicao,dataHojeBrasil
 } from "./meta-distribuicao-leads";
@@ -18214,9 +18214,32 @@ app.get("/auth/meta/instagram/callback", async (c) => {
       access_token = await trocarTokenLongoInstagram(
         String(shortTokenData.access_token), String(clientSecret), fetch, registrarInstagram
       );
-      perfil = await buscarPerfilInstagram(
-        access_token, String(shortTokenData.user_id || ""), fetch, registrarInstagram
-      );
+      try {
+        perfil = await buscarPerfilInstagram(
+          access_token, String(shortTokenData.user_id || ""), fetch, registrarInstagram
+        );
+      } catch (erroIdentidade) {
+        // Diagnostico sem escrita: confirmar se os dois tokens consultam a mesma conta.
+        // Mesmo em caso de sucesso diagnostico, preservar a rejeicao atual.
+        if (erroIdentidade instanceof ErroOAuthInstagram &&
+            erroIdentidade.diagnostico.resultado === "perfil_divergente") {
+          try {
+            await validarPerfilPorTokensInstagram(
+              String(shortTokenData.access_token), access_token, fetch, registrarInstagram
+            );
+            console.info("INSTAGRAM OAUTH COMPARACAO:", JSON.stringify({
+              tentativa: tentativaInstagram, resultado: "tokens_mesmo_perfil"
+            }));
+          } catch (erroDiagnostico) {
+            console.info("INSTAGRAM OAUTH COMPARACAO:", JSON.stringify({
+              tentativa: tentativaInstagram, resultado: "comparacao_nao_confirmada",
+              etapa: erroDiagnostico instanceof ErroOAuthInstagram
+                ? erroDiagnostico.diagnostico.etapa : "validacao_local"
+            }));
+          }
+        }
+        throw erroIdentidade;
+      }
     } catch (erroPerfil) {
       const mensagem = erroPerfil instanceof Error
         ? erroPerfil.message
