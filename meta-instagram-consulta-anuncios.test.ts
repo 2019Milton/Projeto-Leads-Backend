@@ -17,3 +17,21 @@ test("sem conta ativa nao faz request", async () => {
  const result = await consultarIdentidadeInstagramAds({contaAnunciosId:null, instagramId:"123", token:"test", fetchFn:async () => { throw new Error("request inesperado"); }});
  expect(result.motivo).toBe("CONTA_NAO_SELECIONADA");
 });
+
+test("identidade encontrada no edge atual dispensa edge legado", async () => {
+ let chamadas = 0;
+ const result = await consultarIdentidadeInstagramAds({ contaAnunciosId:"456", instagramId:"123", token:"teste", fetchFn:async () => {
+  chamadas++;
+  return response(200,{data:[{id:"123"}]});
+ }});
+ expect(result.estado).toBe("autorizado");
+ expect(chamadas).toBe(1);
+});
+test("sem identidade e erro no segundo edge nao cria pendencia falsa", async () => {
+ let chamadas = 0;
+ const result = await consultarIdentidadeInstagramAds({ contaAnunciosId:"456", instagramId:"123", token:"teste", fetchFn:async () => {
+  chamadas++;
+  return chamadas === 1 ? response(200,{data:[]}) : response(403,{error:{code:200}});
+ }});
+ expect(result.estado).toBe("indeterminado");
+});
