@@ -1,4 +1,4 @@
-import { classificarAutorizacao, type EstadoAutorizacao } from "./meta-instagram-autorizacao-anuncios";
+import type { EstadoAutorizacao } from "./meta-instagram-autorizacao-anuncios";
 
 type MetaHttp = (url: string, init?: RequestInit) => Promise<Response>;
 export type ResultadoConsultaInstagramAds = {
