@@ -185,3 +185,12 @@ test("IDs divergentes continuam bloqueados mesmo se username parecer correto",as
     id:"888888",user_id:"999999",username:"conta_correta"
   }))).rejects.toThrow("difere");
 });
+
+test("diagnostico informa somente qual identificador corresponde, sem revelar IDs",async()=>{
+  const eventos: DiagnosticoInstagram[]=[];
+  await buscarPerfilInstagram("token_privado","123456",async()=>responder({
+    id:"123456",user_id:"987654",username:"teste_privado"
+  }),e=>eventos.push(e));
+  expect(eventos[0].identidade).toBe("id");
+  expect(JSON.stringify(eventos)).not.toMatch(/123456|987654|teste_privado|token_privado/);
+});
