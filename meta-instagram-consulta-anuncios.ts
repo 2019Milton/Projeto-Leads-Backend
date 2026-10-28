@@ -27,7 +27,7 @@ export async function consultarIdentidadeInstagramAds(input: {
     // Qualquer erro deixa o estado indeterminado.
     for (const edge of ["connected_instagram_accounts", "instagram_accounts"]) {
       const url = new URL("https://graph.facebook.com/v19.0/act_" + input.contaAnunciosId + "/" + edge);
-      url.searchParams.set("fields", "id,username");
+      url.searchParams.set("fields", edge === "instagram_accounts" ? "id,username" : "id");
       url.searchParams.set("limit", "100");
       let proximo: string | null = url.toString();
       const vistos = new Set<string>();
