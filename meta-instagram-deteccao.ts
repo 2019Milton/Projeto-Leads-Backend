@@ -11,3 +11,20 @@ export function escolherInstagramDaContaAnuncios(
   }
   return null;
 }
+
+/** Page API: business link preferido, connected link como fallback. */
+export function extrairInstagramVinculadoPagina(
+  dados: Record<string, any>
+): InstagramIdentidade | null {
+  const perfis = [dados?.instagram_business_account, dados?.connected_instagram_account];
+  for (const perfil of perfis) {
+    if (perfil && /^\d+$/.test(String(perfil.id ?? ""))) {
+      return {
+        id: String(perfil.id),
+        username: typeof perfil.username === "string" ? perfil.username : null,
+        profile_picture_url: typeof perfil.profile_picture_url === "string" ? perfil.profile_picture_url : null
+      };
+    }
+  }
+  return null;
+}
