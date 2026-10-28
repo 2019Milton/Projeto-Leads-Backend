@@ -45,6 +45,7 @@ test("falhas GET e POST não marcam conexão como autorizada",async()=>{
 test("perfil atual usa API v25, id e username conferidos",async()=>{
   const req=async(url:string)=>{
     expect(url).toContain("/v25.0/me?");
+    expect(url).toContain("fields=id,user_id,username");
     return responder({user_id:"29164160523276212",username:"lifecorp_supplement"});
   };
   expect(await buscarPerfilInstagram("token","29164160523276212",req)).toEqual({
