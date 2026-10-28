@@ -161,9 +161,17 @@ export async function buscarPerfilInstagram(
     if (resposta.ok && !perfil.error &&
         (perfil.user_id || perfil.id) &&
         typeof perfil.username === "string" && perfil.username.trim()) {
-      const recebidoId = String(perfil.user_id || perfil.id);
+      // A API pode devolver id escopado ao app e user_id da conta.
+      // Aceitar apenas correspondencia exata com um ID devolvido pelo perfil
+      // autenticado, nunca somente pelo nome de usuario.
+      const idsRecebidos = [perfil.id, perfil.user_id]
+        .filter((valor): valor is string | number =>
+          (typeof valor === "string" && /^\d+$/.test(valor)) ||
+          (typeof valor === "number" && Number.isSafeInteger(valor) && valor >= 0))
+        .map(String);
+      const recebidoId = idsRecebidos.includes(usuarioId) ? usuarioId : "";
       // Uma conta diferente nunca pode substituir o usuário autenticado.
-      if (recebidoId !== usuarioId) {
+      if (!recebidoId) {
         diagnostico = { ...diagnostico, resultado: "perfil_divergente" };
         registrar?.(diagnostico);
         throw new ErroOAuthInstagram("A conta do Instagram retornada difere da conta autorizada. Tente novamente.", diagnostico);
