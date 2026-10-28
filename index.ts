@@ -35567,7 +35567,16 @@ async function executarRankingMercado(opcoes: { nichoSlug?: string; forcar?: boo
         await registrarExecucaoRankingMercado(nicho.slug, "ok", r.modelo, r.usage, null);
         resultados.push({ nicho: nicho.slug, status: "ok", detalhe: `${r.atualizadas} notas, ${r.fontes} fontes` });
       } catch (err: any) {
-        const mensagem = err?.message || String(err);
+        const textoErro = String(err?.message || err || "");
+        // Nunca persistir nem registrar respostas brutas do provedor:
+        // mensagens de credencial invalida podem conter trechos da chave.
+        const mensagem = /incorrect api key|invalid api key|invalid_api_key|authentication_error|401/i.test(textoErro)
+          ? "Falha de autenticacao OpenAI: confira OPENAI_API_KEY na Railway."
+          : /429|rate_limit/i.test(textoErro)
+          ? "Limite de requisicoes OpenAI."
+          : /timeout|abort/i.test(textoErro)
+          ? "Tempo limite da API OpenAI."
+          : "Falha ao consultar ranking de mercado na API OpenAI.";
         rankingMercadoProximaTentativa.set(nicho.slug, Date.now() + RANKING_MERCADO_REPETIR_APOS_ERRO_MS);
         await registrarExecucaoRankingMercado(nicho.slug, "erro", modeloResponsesCriativo(), err?.usage || null, mensagem);
         console.error(`ERRO ranking de mercado (${nicho.slug}):`, mensagem);
