@@ -21,7 +21,7 @@ export async function consultarIdentidadeInstagramAds(input: {
     const encontrados = new Set<string>();
     // Ambos os edges precisam completar com sucesso para interpretar a ausência.
     // Qualquer erro deixa o estado indeterminado.
-    for (const edge of ["instagram_accounts", "connected_instagram_accounts"]) {
+    for (const edge of ["connected_instagram_accounts", "instagram_accounts"]) {
       const url = new URL("https://graph.facebook.com/v19.0/act_" + input.contaAnunciosId + "/" + edge);
       url.searchParams.set("fields", "id");
       url.searchParams.set("limit", "100");
@@ -48,6 +48,8 @@ export async function consultarIdentidadeInstagramAds(input: {
         proximo = pagina || null;
       }
       if (proximo) return { estado: "indeterminado", motivo: "FALHA_META" };
+      // Evidência positiva dispensa consultar o edge legado, que pode não estar disponível.
+      if (encontrados.has(input.instagramId!)) return { estado: "autorizado", motivo: "IDENTIDADE_NA_CONTA" };
     }
     if (encontrados.has(input.instagramId!)) {
       return { estado: "autorizado", motivo: "IDENTIDADE_NA_CONTA" };
