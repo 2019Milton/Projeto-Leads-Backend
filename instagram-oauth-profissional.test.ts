@@ -234,3 +234,9 @@ test("falha do endpoint com token curto bloqueia antes da consulta com token lon
  })).rejects.toThrow();
  expect(n).toBe(1);
 });
+
+test("user_id diferente entre tokens bloqueia mesmo com id igual",async()=>{
+ let i=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>
+   responder({id:"123",user_id:++i===1?"456":"789",username:"igual"}))).rejects.toThrow("mudou");
+});
