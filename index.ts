@@ -20101,28 +20101,32 @@ app.get(
       console.error("ERRO PERMISSOES META:", e);
     }
 
-    // 🔥 INSTAGRAM
-    const instagram =
-      (await detectarInstagramMeta(token, paginas)) ||
-      (conn.rows[0].instagram_id ? {
-        id: conn.rows[0].instagram_id,
-        username: conn.rows[0].instagram_username,
-        profile_picture_url: conn.rows[0].instagram_profile_picture_url
-      } : null);
-
-    // Reflete o vinculo encontrado (qualquer origem) nas Paginas, para o front-end
-    if (instagram) {
-      for (const pagina of paginas) {
-        if (!pagina.instagram) {
-          pagina.instagram = instagram;
-        }
-      }
-    }
-
-    // 🔥 INSTAGRAM VINCULADO AO GERENCIADOR DE NEGOCIOS DA CONTA DE ANUNCIOS
-    // (permite anunciar no Instagram mesmo sem vinculo direto com a Pagina)
+    // Consultar primeiro os ativos da conta de anuncios selecionada.
+    // A conta profissional pode estar autorizada para publicidade sem estar
+    // exposta no /me/accounts nem no portfolio Business do usuario.
     const contasInstagramAnuncio =
       await listarContasInstagramAnuncio(token, adAccountId);
+    const instagramDetectadoMeta = await detectarInstagramMeta(token, paginas);
+    const instagramSeparado = conn.rows[0].instagram_conexao_separada && conn.rows[0].instagram_id
+      ? {
+          id: conn.rows[0].instagram_id,
+          username: conn.rows[0].instagram_username,
+          profile_picture_url: conn.rows[0].instagram_profile_picture_url
+        }
+      : null;
+    // Quando há um único Instagram autorizado para esta conta de anuncios,
+    // ele é inequivocamente a identidade de anuncio. Nunca escolher o primeiro
+    // elemento de uma lista com multiplas contas.
+    const instagramDaConta = contasInstagramAnuncio.length === 1
+      ? contasInstagramAnuncio[0]
+      : instagramDetectadoMeta?.id
+        ? contasInstagramAnuncio.find((item: any) =>
+            String(item.id) === String(instagramDetectadoMeta.id)) || null
+        : null;
+    const instagram = instagramDaConta || instagramDetectadoMeta || instagramSeparado;
+
+    // Não atribuir artificialmente a todas as Paginas um Instagram encontrado
+    // somente por meio da conta de anuncios. Vinculos de Pagina sao distintos.
 
     // O Instagram "conectado" (via Página ou login avulso) só funciona de fato
     // no anúncio se aparecer entre os ativos liberados para ESTA conta de
