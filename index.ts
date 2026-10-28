@@ -18296,7 +18296,7 @@ app.get("/meta/instagram/autorizacao-anuncios", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const conexao = await client.query(
-      "SELECT access_token, conta_anuncios_id, instagram_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      "SELECT access_token, conta_anuncios_id, instagram_id, instagram_username FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
       [user.id]
     );
     if (!conexao.rows.length) {
@@ -18312,6 +18312,7 @@ app.get("/meta/instagram/autorizacao-anuncios", authMiddleware, async (c) => {
     const resultado = await consultarIdentidadeInstagramAds({
       contaAnunciosId: conta,
       instagramId,
+      instagramUsername: atual.instagram_id ? atual.instagram_username : perfilPagina?.username,
       token: atual.access_token,
       conexaoSeparada: Boolean(atual.instagram_id)
     });
