@@ -20,6 +20,7 @@ export type DiagnosticoInstagram = {
   tipo: string | null;
   motivo: string | null;
   fbtrace_id: string | null;
+  identidade?: "id" | "user_id" | "ambos" | "nenhum" | "campos_ausentes";
 };
 type RegistrarDiagnostico = (evento: DiagnosticoInstagram) => void;
 
@@ -143,7 +144,7 @@ export async function buscarPerfilInstagram(
   registrar?: RegistrarDiagnostico
 ): Promise<PerfilInstagramValidado> {
   if (!token || !/^\d+$/.test(usuarioId)) throw new Error("Identificação do Instagram inválida.");
-  const campos = "user_id,username,account_type,profile_picture_url";
+  const campos = "id,user_id,username,account_type,profile_picture_url";
   const urls = [
     "https://graph.instagram.com/v25.0/me?fields=" + campos + "&access_token=" + encodeURIComponent(token),
     "https://graph.instagram.com/v25.0/" + encodeURIComponent(usuarioId) +
@@ -161,9 +162,22 @@ export async function buscarPerfilInstagram(
     if (resposta.ok && !perfil.error &&
         (perfil.user_id || perfil.id) &&
         typeof perfil.username === "string" && perfil.username.trim()) {
-      const recebidoId = String(perfil.user_id || perfil.id);
+      // A API pode devolver id escopado ao app e user_id da conta.
+      // Aceitar apenas correspondencia exata com um ID devolvido pelo perfil
+      // autenticado, nunca somente pelo nome de usuario.
+      const idsRecebidos = [perfil.id, perfil.user_id]
+        .filter((valor): valor is string | number =>
+          (typeof valor === "string" && /^\d+$/.test(valor)) ||
+          (typeof valor === "number" && Number.isSafeInteger(valor) && valor >= 0))
+        .map(String);
+      const recebidoId = idsRecebidos.includes(usuarioId) ? usuarioId : "";
+      const idCorresponde = String(perfil.id ?? "") === usuarioId;
+      const userIdCorresponde = String(perfil.user_id ?? "") === usuarioId;
+      diagnostico = { ...diagnostico, identidade:
+        idCorresponde && userIdCorresponde ? "ambos" :
+        idCorresponde ? "id" : userIdCorresponde ? "user_id" : "nenhum" };
       // Uma conta diferente nunca pode substituir o usuário autenticado.
-      if (recebidoId !== usuarioId) {
+      if (!recebidoId) {
         diagnostico = { ...diagnostico, resultado: "perfil_divergente" };
         registrar?.(diagnostico);
         throw new ErroOAuthInstagram("A conta do Instagram retornada difere da conta autorizada. Tente novamente.", diagnostico);
