@@ -161,3 +161,27 @@ test("perfil divergente é identificado sem registrar dados da outra conta",asyn
   expect(eventos[0]).toMatchObject({etapa:"profile_me",resultado:"perfil_divergente",status_http:200});
   expect(JSON.stringify(eventos)).not.toMatch(/5678|perfil_privado|https:\/\/privado|token_privado/);
 });
+
+
+test("id do app corresponde ao OAuth mesmo com user_id diferente",async()=>{
+  const eventos: DiagnosticoInstagram[]=[];
+  const perfil=await buscarPerfilInstagram("token_privado","123456",async()=>responder({
+    id:"123456",user_id:"987654",username:"conta_correta"
+  }),e=>eventos.push(e));
+  expect(perfil).toEqual({user_id:"123456",username:"conta_correta",profile_picture_url:null});
+  expect(eventos).toHaveLength(1);
+  expect(eventos[0].resultado).toBe("sucesso");
+});
+
+test("user_id corresponde ao OAuth mesmo com id do app diferente",async()=>{
+  const perfil=await buscarPerfilInstagram("token","123456",async()=>responder({
+    id:"987654",user_id:"123456",username:"conta_correta"
+  }));
+  expect(perfil.user_id).toBe("123456");
+});
+
+test("IDs divergentes continuam bloqueados mesmo se username parecer correto",async()=>{
+  await expect(buscarPerfilInstagram("token","123456",async()=>responder({
+    id:"888888",user_id:"999999",username:"conta_correta"
+  }))).rejects.toThrow("difere");
+});
