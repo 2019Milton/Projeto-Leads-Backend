@@ -1,7 +1,7 @@
 import {test,expect} from "bun:test";
 import {
   AVISO_INSTAGRAM_ACESSO, trocarTokenLongoInstagram, buscarPerfilInstagram,
-  criarDiagnosticoInstagram, ErroOAuthInstagram, type DiagnosticoInstagram
+  criarDiagnosticoInstagram, ErroOAuthInstagram, validarPerfilPorTokensInstagram, type DiagnosticoInstagram
 } from "./instagram-oauth-profissional";
 
 const responder = (body: any, status=200) =>
@@ -201,4 +201,55 @@ test("diagnostico de campos sem expor valores",async()=>{
   await expect(buscarPerfilInstagram("segredo","123",async()=>responder({id:"999",username:"privado"}),e=>eventos.push(e))).rejects.toThrow("difere");
   expect(eventos[0].campos_identidade).toBe("somente_id");
   expect(JSON.stringify(eventos)).not.toContain("999");
+});
+
+test("mesmo perfil em tokens curto e longo é aceito",async()=>{
+ const calls:string[]=[];
+ const fetchMock=async(url:string)=>{calls.push(url);return responder({id:"123",username:"perfil_profissional"});};
+ const perfil=await validarPerfilPorTokensInstagram("curto","longo",fetchMock);
+ expect(perfil.user_id).toBe("123");
+ expect(calls).toHaveLength(2);
+ expect(calls[0]).toContain("access_token=curto");
+ expect(calls[1]).toContain("access_token=longo");
+});
+test("IDs diferentes entre tokens bloqueiam o vínculo",async()=>{
+ let i=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>responder({id:++i===1?"123":"999",username:"igual"}))).rejects.toThrow("mudou");
+});
+test("perfil ausente em qualquer token bloqueia o vínculo",async()=>{
+ let i=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>responder(++i===1?{id:"123",username:"ok"}:{username:"ok"}))).rejects.toThrow();
+});
+
+test("mesmo ID com usernames diferentes bloqueia o vínculo",async()=>{
+ let n=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>
+   responder({id:"123",username:++n===1?"perfil_a":"perfil_b"}))).rejects.toThrow("mudou");
+});
+test("falha do endpoint com token curto bloqueia antes da consulta com token longo",async()=>{
+ let n=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>{
+   n++;
+   return responder({error:{code:190,type:"OAuthException",message:"Invalid OAuth access token."}},400);
+ })).rejects.toThrow();
+ expect(n).toBe(1);
+});
+
+test("user_id diferente entre tokens bloqueia mesmo com id igual",async()=>{
+ let i=0;
+ await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>
+   responder({id:"123",user_id:++i===1?"456":"789",username:"igual"}))).rejects.toThrow("mudou");
+});
+
+test("diagnostico distingue tokens sem registrar IDs ou tokens",async()=>{
+ const eventos:DiagnosticoInstagram[]=[];
+ const perfil=await validarPerfilPorTokensInstagram("curto_privado","longo_privado",
+  async()=>responder({id:"12345",user_id:"99999",username:"perfil_privado"}),
+  evento=>eventos.push(evento));
+ expect(perfil.username).toBe("perfil_privado");
+ expect(eventos.at(-1)?.resultado).toBe("sucesso");
+ expect(JSON.stringify(eventos)).not.toContain("curto_privado");
+ expect(JSON.stringify(eventos)).not.toContain("longo_privado");
+ expect(JSON.stringify(eventos)).not.toContain("12345");
+ expect(JSON.stringify(eventos)).not.toContain("99999");
 });

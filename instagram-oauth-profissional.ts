@@ -10,7 +10,7 @@ export const AVISO_INSTAGRAM_ACESSO =
 type InstagramRequest = (url: string, init?: RequestInit) => Promise<Response>;
 type InstagramPayload = Record<string, any>;
 
-type EtapaInstagram = "short_token" | "long_token_get" | "long_token_post" | "profile_me" | "profile_id";
+type EtapaInstagram = "short_token" | "long_token_get" | "long_token_post" | "profile_me" | "profile_id" | "profile_short" | "profile_long";
 export type DiagnosticoInstagram = {
   etapa: EtapaInstagram;
   resultado: "sucesso" | "erro_api" | "resposta_invalida" | "erro_rede" | "perfil_divergente";
@@ -201,4 +201,42 @@ export async function buscarPerfilInstagram(
     if (Number(perfil?.error?.code) !== 100) break;
   }
   throw new ErroOAuthInstagram(erroInstagram(ultimoErro), diagnostico);
+}
+
+
+/**
+ * Consulta o mesmo endpoint /me para cada token e confirma que ambos
+ * representam exatamente a mesma identidade. Não compara IDs de escopos
+ * diferentes (code exchange versus Graph /me).
+ */
+export async function validarPerfilPorTokensInstagram(
+  tokenCurto: string, tokenLongo: string, solicitar: InstagramRequest = fetch,
+  registrar?: RegistrarDiagnostico
+): Promise<PerfilInstagramValidado> {
+  const consultar = async (token: string, etapa: "profile_short" | "profile_long"): Promise<{id:string;user_id:string;username:string;profile_picture_url:string|null}> => {
+    if (!token) throw new Error("Token do Instagram ausente.");
+    const url = "https://graph.instagram.com/v25.0/me?fields=id,user_id,username,profile_picture_url&access_token=" +
+      encodeURIComponent(token);
+    const consulta = await consultarInstagram(etapa,url,undefined,solicitar,registrar);
+    const dados = consulta.dados;
+    const id = typeof dados.id === "string" && /^\d+$/.test(dados.id) ? dados.id : "";
+    const user_id = typeof dados.user_id === "string" && /^\d+$/.test(dados.user_id) ? dados.user_id : "";
+    const username = typeof dados.username === "string" ? dados.username.trim() : "";
+    if (!consulta.resposta.ok || dados.error || !id || !username) {
+      const diagnostico = criarDiagnosticoInstagram(etapa,consulta.resposta.status,dados,
+        dados.error || !consulta.resposta.ok ? "erro_api" : "resposta_invalida");
+      registrar?.(diagnostico);
+      throw new ErroOAuthInstagram(erroInstagram(dados),diagnostico);
+    }
+    return {id,user_id,username,profile_picture_url:typeof dados.profile_picture_url==="string"?dados.profile_picture_url:null};
+  };
+  const curto = await consultar(tokenCurto,"profile_short");
+  const longo = await consultar(tokenLongo,"profile_long");
+  if (curto.id !== longo.id || (curto.user_id && longo.user_id && curto.user_id !== longo.user_id) || curto.username !== longo.username) {
+    const diagnostico = criarDiagnosticoInstagram("profile_me",200,{},"perfil_divergente");
+    registrar?.(diagnostico);
+    throw new ErroOAuthInstagram("A identidade do Instagram mudou durante a autorização.",diagnostico);
+  }
+  registrar?.(criarDiagnosticoInstagram("profile_me",200,{},"sucesso"));
+  return {user_id:longo.id,username:longo.username,profile_picture_url:longo.profile_picture_url};
 }
