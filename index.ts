@@ -1,3 +1,4 @@
+import { desvincularInstagramAvulso } from "./meta-instagram-desconexao";
 ﻿import { Hono } from "hono@4";
 import { cors } from "hono/cors";
 import { capturaNome, normalizarNome, renderizarTextoBot, salvarNomeBot } from "./whatsapp-bot-variaveis";
@@ -19925,7 +19926,8 @@ app.get(
     const conn = await client.query(
       `
       SELECT access_token, ultimo_sync, conta_anuncios_id,
-        instagram_id, instagram_username, instagram_profile_picture_url
+        instagram_id, instagram_username, instagram_profile_picture_url,
+        (instagram_token IS NOT NULL OR instagram_id IS NOT NULL) AS instagram_conexao_separada
       FROM meta_conexoes
       WHERE usuario_id = $1
       ORDER BY id DESC
@@ -20045,6 +20047,7 @@ app.get(
         paginas: paginasSemConta,
         tos_aceitas: tosAceitas,
         instagram: instagramSemConta,
+        instagram_conexao_separada: Boolean(conn.rows[0].instagram_conexao_separada),
         instagram_utilizavel_na_conta: null,
         metricas: {
           campanhas: 0,
@@ -20543,6 +20546,7 @@ app.get(
       tos_aceitas: tosAceitas,
 
       instagram,
+      instagram_conexao_separada: Boolean(conn.rows[0].instagram_conexao_separada),
 
       instagram_utilizavel_na_conta: instagramUtilizavelNaConta,
 
@@ -20981,6 +20985,30 @@ app.post("/meta/direcionamento/localizacao", authMiddleware, async (c) => {
     return c.json({
       error: "Erro ao buscar localização Meta"
     }, 500);
+  }
+});
+
+// Desconexao local, restrita ao OAuth avulso Instagram deste usuario.
+// Nao revoga o token Facebook nem altera business assets, anuncios ou Paginas.
+// Revogacao do acesso externo do app deve ser feita no proprio Instagram.
+app.post("/meta/instagram/desconectar", authMiddleware, async (c) => {
+  const usuario: any = c.get("user");
+  const usuarioId = Number(usuario?.id);
+  if (!Number.isSafeInteger(usuarioId) || usuarioId <= 0)
+    return c.json({ error: "Usuario nao autenticado." }, 401);
+  try {
+    const desconectou = await desvincularInstagramAvulso(client, usuarioId);
+    if (!desconectou)
+      return c.json({ error: "Nenhuma conexao separada de Instagram registrada nesta conta." }, 404);
+    return c.json({
+      sucesso: true,
+      instagram_desconectado: true,
+      meta_preservada: true,
+      aviso: "O Instagram foi desconectado desta plataforma. A Pagina do Facebook e os ativos da Meta nao foram alterados."
+    });
+  } catch (erro) {
+    console.error("ERRO DESCONECTAR SOMENTE INSTAGRAM:", erro);
+    return c.json({ error: "Nao foi possivel desconectar somente o Instagram." }, 500);
   }
 });
 
