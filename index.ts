@@ -18307,16 +18307,30 @@ app.get("/meta/instagram/autorizacao-anuncios", authMiddleware, async (c) => {
     // contrário, procurar a identidade já detectada pela Página.
     const paginas = await listarPaginasComInstagram(atual.access_token);
     const perfilPagina = await detectarInstagramMeta(atual.access_token, paginas);
-    const instagramId = atual.instagram_id ? String(atual.instagram_id) : perfilPagina?.id ? String(perfilPagina.id) : null;
     const conta = atual.conta_anuncios_id ? String(atual.conta_anuncios_id).replace(/^act_/, "") : null;
+    const inventario = conta ? await listarContasInstagramAnuncio(atual.access_token, "act_" + conta) : [];
+    const identidadeAds = escolherInstagramDaContaAnuncios(inventario, perfilPagina);
+    const perfilAvulso = atual.instagram_id ? {
+      id: String(atual.instagram_id),
+      username: atual.instagram_username || null
+    } : null;
+    // O login avulso não substitui a identidade disponível para publicidade.
+    const perfilParaVerificar = identidadeAds || perfilPagina;
     const resultado = await consultarIdentidadeInstagramAds({
       contaAnunciosId: conta,
-      instagramId,
-      instagramUsername: atual.instagram_id ? atual.instagram_username : perfilPagina?.username,
+      instagramId: perfilParaVerificar?.id ? String(perfilParaVerificar.id) : null,
+      instagramUsername: perfilParaVerificar?.username || null,
       token: atual.access_token,
-      conexaoSeparada: Boolean(atual.instagram_id)
+      conexaoSeparada: false
     });
-    return c.json(resultado);
+    return c.json({
+      ...resultado,
+      identidade_anuncios: identidadeAds ? {
+        id: String(identidadeAds.id), username: identidadeAds.username || null
+      } : null,
+      instagram_conectado_separadamente: perfilAvulso,
+      conta_anuncios_id: conta
+    });
   } catch {
     return c.json({ estado: "indeterminado", motivo: "FALHA_CONSULTA" });
   }
