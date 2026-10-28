@@ -45,3 +45,28 @@ test("conexao separada sem inventario retorna motivo especifico", async () => {
  const result = await consultarIdentidadeInstagramAds({contaAnunciosId:"456", instagramId:"123", token:"test", conexaoSeparada:true, fetchFn:async () => response(200,{data:[]})});
  expect(result.motivo).toBe("CONEXAO_SEPARADA_SEM_VINCULO_CONFIRMADO");
 });
+
+test("login separado pode corresponder pelo mesmo username na conta de anuncios", async () => {
+ const result = await consultarIdentidadeInstagramAds({
+  contaAnunciosId:"456", instagramId:"123", instagramUsername:"@MMicaSantos10",
+  token:"test", conexaoSeparada:true,
+  fetchFn:async () => response(200,{data:[{id:"789",username:"mmicasantos10"}]})
+ });
+ expect(result.estado).toBe("autorizado");
+});
+test("username diferente nao permite confirmar identidade", async () => {
+ const result = await consultarIdentidadeInstagramAds({
+  contaAnunciosId:"456", instagramId:"123", instagramUsername:"mmicasantos10",
+  token:"test", conexaoSeparada:true,
+  fetchFn:async () => response(200,{data:[{id:"789",username:"outra_conta"}]})
+ });
+ expect(result.estado).toBe("indeterminado");
+});
+test("username ausente nao autoriza identidade diferente", async () => {
+ const result = await consultarIdentidadeInstagramAds({
+  contaAnunciosId:"456", instagramId:"123", instagramUsername:null,
+  token:"test", conexaoSeparada:true,
+  fetchFn:async () => response(200,{data:[{id:"789",username:"mmicasantos10"}]})
+ });
+ expect(result.estado).toBe("indeterminado");
+});
