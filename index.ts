@@ -8103,7 +8103,7 @@ app.get("/google/contas", authMiddleware, async (c) => {
       [user.id]
     );
     if (!conn.rows.length || !conn.rows[0].refresh_token) {
-      return c.json({ error: "Google Ads nao conectado" }, 400);
+      return c.json({ contas: [], avisos: [], conectado: false });
     }
 
     const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
@@ -35943,6 +35943,12 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
     }
 
     const token = conn.rows[0].access_token;
+
+    // O usuario pode ter multiplas contas disponíveis e ainda nao ter
+    // escolhido qual usar. Não selecionar automaticamente nem lançar 500.
+    if (!conn.rows[0].conta_anuncios_id) {
+      return c.body(null, 204);
+    }
 
     const contaAds =
       await obterContaAnuncios(
