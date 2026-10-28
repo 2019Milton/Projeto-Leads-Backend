@@ -240,3 +240,16 @@ test("user_id diferente entre tokens bloqueia mesmo com id igual",async()=>{
  await expect(validarPerfilPorTokensInstagram("curto","longo",async()=>
    responder({id:"123",user_id:++i===1?"456":"789",username:"igual"}))).rejects.toThrow("mudou");
 });
+
+test("diagnostico distingue tokens sem registrar IDs ou tokens",async()=>{
+ const eventos:DiagnosticoInstagram[]=[];
+ const perfil=await validarPerfilPorTokensInstagram("curto_privado","longo_privado",
+  async()=>responder({id:"12345",user_id:"99999",username:"perfil_privado"}),
+  evento=>eventos.push(evento));
+ expect(perfil.username).toBe("perfil_privado");
+ expect(eventos.at(-1)?.resultado).toBe("sucesso");
+ expect(JSON.stringify(eventos)).not.toContain("curto_privado");
+ expect(JSON.stringify(eventos)).not.toContain("longo_privado");
+ expect(JSON.stringify(eventos)).not.toContain("12345");
+ expect(JSON.stringify(eventos)).not.toContain("99999");
+});
