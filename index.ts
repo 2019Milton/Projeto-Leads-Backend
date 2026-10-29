@@ -20000,6 +20000,14 @@ app.get(
     }
 
     const token = conn.rows[0].access_token;
+    // Perfil salvo pelo Instagram Login; independente da identidade de anúncios.
+    const instagramSeparado = conn.rows[0].instagram_conexao_separada && conn.rows[0].instagram_id
+      ? {
+          id: conn.rows[0].instagram_id,
+          username: conn.rows[0].instagram_username,
+          profile_picture_url: conn.rows[0].instagram_profile_picture_url
+        }
+      : null;
 
     // 🔥 PÁGINAS COM TERMOS DE LEAD ADS JÁ ACEITOS
     const tosAceitos = await client.query(
@@ -20102,6 +20110,7 @@ app.get(
         paginas: paginasSemConta,
         tos_aceitas: tosAceitas,
         instagram: instagramSemConta,
+        instagram_perfil_separado: instagramSeparado,
         instagram_conexao_separada: Boolean(conn.rows[0].instagram_conexao_separada),
         instagram_utilizavel_na_conta: null,
         metricas: {
@@ -20159,13 +20168,6 @@ app.get(
     const contasInstagramAnuncio =
       await listarContasInstagramAnuncio(token, adAccountId);
     const instagramDetectadoMeta = await detectarInstagramMeta(token, paginas);
-    const instagramSeparado = conn.rows[0].instagram_conexao_separada && conn.rows[0].instagram_id
-      ? {
-          id: conn.rows[0].instagram_id,
-          username: conn.rows[0].instagram_username,
-          profile_picture_url: conn.rows[0].instagram_profile_picture_url
-        }
-      : null;
     // Quando há um único Instagram autorizado para esta conta de anuncios,
     // ele é inequivocamente a identidade de anuncio. Nunca escolher o primeiro
     // elemento de uma lista com multiplas contas.
@@ -20603,6 +20605,7 @@ app.get(
 
       instagram,
       instagram_conexao_separada: Boolean(conn.rows[0].instagram_conexao_separada),
+      instagram_perfil_separado: instagramSeparado,
 
       instagram_utilizavel_na_conta: instagramUtilizavelNaConta,
 
