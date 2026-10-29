@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { consultarRedesMeta, contarCampanhasPorRedeMeta, montarEvidenciasRedesMeta, redesCampanhaPainelMeta } from "./redes-meta";
+import { consultarRedesMeta, contarCampanhasPorRedeMeta, detectarRedeOrigemReferral, montarEvidenciasRedesMeta, redesCampanhaPainelMeta } from "./redes-meta";
 
 const campanha = (cfg: any, status = "ACTIVE", campaign_id = "421") => ({
   campaign_id, status, configuracoes_avancadas: cfg
@@ -100,5 +100,27 @@ describe("consulta à Meta", () => {
   test("não envia token a host de paginação inesperado", async () => {
     const mock = (async () => Response.json({ data: [], paging: { next: "https://example.com" } })) as typeof fetch;
     await expect(consultarRedesMeta("segredo", "act_1", ["421"], mock)).rejects.toThrow("Paginação");
+  });
+});
+
+describe("identificação segura da rede de origem CTWA", () => {
+  test("reconhece Instagram e Facebook pelo host e ignora palavras na URL", () => {
+    expect(detectarRedeOrigemReferral({ source_url: "https://www.instagram.com/p/123" })).toBe("instagram");
+    expect(detectarRedeOrigemReferral({ source_url: "https://fb.me/anuncio" })).toBe("facebook");
+    expect(detectarRedeOrigemReferral({ source_url: "https://www.facebook.com/?redirect=instagram.com" })).toBe("facebook");
+  });
+  test("imagem do CDN Instagram reforça origem quando a URL não ajuda", () => {
+    expect(detectarRedeOrigemReferral({ image_url: "https://scontent.cdninstagram.com/arquivo.jpg" })).toBe("instagram");
+    expect(detectarRedeOrigemReferral({ image_url: "https://instagram.fna-1.fna.fbcdn.net/arquivo.jpg" })).toBe("instagram");
+  });
+  test("nunca deduz Facebook para URLs desconhecidas ou domínio falso", () => {
+    for (const referral of [
+      {}, { source_url: "https://example.org/anuncio" },
+      { source_url: "https://instagram.com.exemplo.com/post" },
+      { source_url: "https://example.org/?rede=instagram" },
+      { image_url: "https://scontent.xx.fbcdn.net/arquivo.jpg" }
+    ]) {
+      expect(detectarRedeOrigemReferral(referral)).toBeNull();
+    }
   });
 });

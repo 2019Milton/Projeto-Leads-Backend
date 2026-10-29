@@ -44,7 +44,7 @@ import {
   planejarMetasCampanhaGoogle
 } from "./metas-google";
 
-import { contarCampanhasPorRedeMeta, consultarRedesMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
+import { contarCampanhasPorRedeMeta, consultarRedesMeta, detectarRedeOrigemReferral, redesCampanhaPainelMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
 
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
@@ -26526,18 +26526,8 @@ async function vincularConversaAoLead(conversa: any, usuarioId: number): Promise
   return leadEncontrado.id;
 }
 
-// A API de Lead Ads e a de Conversion Leads não expõem se um lead veio do
-// Facebook ou do Instagram (um mesmo anúncio pode rodar nos dois ao mesmo
-// tempo) — mas o referral de Click-to-WhatsApp sim: source_url aponta pra
-// um link do instagram.com quando a pessoa clicou vindo do Instagram, ou
-// fb.me/facebook.com quando veio do Facebook. image_url serve de reforço
-// (hosts *cdninstagram.com / instagram.*.fna.fbcdn.net só existem pro IG).
-function detectarRedeOrigemReferral(referral: any): string | null {
-  const pistas = `${referral?.source_url || ""} ${referral?.image_url || ""}`.toLowerCase();
-  if (!pistas.trim()) return null;
-  if (pistas.includes("instagram")) return "instagram";
-  return "facebook";
-}
+// Atribuição por rede do CTWA usa apenas domínios confiáveis no referral.
+// Origem desconhecida permanece NULL, sem presumir Facebook por exclusão.
 
 // Cria um lead novo a partir de uma conversa de WhatsApp sem lead correspondente
 // — só quando a conversa carrega um referral genuíno de anúncio Click-to-WhatsApp
@@ -29483,20 +29473,24 @@ await client.query(`
   ALTER TABLE leads ADD COLUMN IF NOT EXISTS rede_origem TEXT;
 `);
 
-// Backfill único (idempotente — só toca linhas ainda NULL): leads de CTWA
-// criados antes dessa coluna existir já têm o referral salvo em
-// whatsapp_conversas, então dá pra preencher rede_origem retroativamente
-// sem esperar uma nova mensagem chegar.
+// Backfill conservador: só classifica registros ainda NULL com domínio
+// reconhecido no referral, sem modificar atribuições históricas existentes.
 await client.query(`
   UPDATE leads l
   SET rede_origem = CASE
-    WHEN (wc.referral->>'source_url' ILIKE '%instagram%' OR wc.referral->>'image_url' ILIKE '%instagram%') THEN 'instagram'
-    ELSE 'facebook'
+    WHEN wc.referral->>'source_url' ~* '^https?://([a-z0-9-]+[.])*instagram[.]com([:/?#]|$)' THEN 'instagram'
+    WHEN wc.referral->>'source_url' ~* '^https?://([a-z0-9-]+[.])*(facebook[.]com|fb[.]me)([:/?#]|$)' THEN 'facebook'
+    WHEN wc.referral->>'image_url' ~* '^https?://([a-z0-9-]+[.])*cdninstagram[.]com([:/?#]|$)' THEN 'instagram'
+    ELSE NULL
   END
   FROM whatsapp_conversas wc
   WHERE wc.lead_id = l.id
     AND wc.referral IS NOT NULL
     AND l.rede_origem IS NULL
+    AND (
+      wc.referral->>'source_url' ~* '^https?://([a-z0-9-]+[.])*(instagram[.]com|facebook[.]com|fb[.]me)([:/?#]|$)'
+      OR wc.referral->>'image_url' ~* '^https?://([a-z0-9-]+[.])*cdninstagram[.]com([:/?#]|$)'
+    )
 `).catch(err => console.error("AVISO backfill leads.rede_origem:", err.message));
 
 await client.query(`
@@ -40719,6 +40713,26 @@ app.get("/leads", authMiddleware, async (c) => {
 
     marcarLeadsRecorrentes(result.rows);
 
+    // Redes configuradas/identificadas em campanhas Meta já publicadas,
+    // mesmo que ainda não haja leads da rede na conta selecionada.
+    const campanhasMetaRes = await client.query(
+      `SELECT plataforma, campaign_id, configuracoes_avancadas
+         FROM campanhas
+        WHERE usuario_id = $1 AND conta_anuncios_id = $2
+          AND campaign_id IS NOT NULL
+          AND LOWER(COALESCE(plataforma, 'meta')) IN ('meta','facebook','instagram')
+          AND UPPER(COALESCE(status, '')) NOT IN ('REMOVED','DELETED')`,
+      [user.id, contaAnunciosId]
+    );
+    const redesOrigemCampanhas = [
+      ...new Set(campanhasMetaRes.rows.flatMap((campanha: any) => {
+        const identificadas = redesCampanhaPainelMeta(campanha);
+        if (identificadas.length) return identificadas;
+        const plataforma = String(campanha.plataforma || "").toLowerCase();
+        return plataforma === "facebook" || plataforma === "instagram" ? [plataforma] : [];
+      }))
+    ].filter(rede => rede === "facebook" || rede === "instagram");
+
     // Opcoes vindas dos numeros conectados deste usuario, incluindo os que
     // ainda nao receberam leads. Nenhum WhatsApp de outra conta é exposto.
     const numerosDisponiveisRes=await client.query(
@@ -40809,7 +40823,7 @@ app.get("/leads", authMiddleware, async (c) => {
         }
     }
 
-    return c.json({...leads,whatsapp_numeros_disponiveis:numerosDisponiveis});
+    return c.json({...leads,whatsapp_numeros_disponiveis:numerosDisponiveis,redes_origem_campanhas:redesOrigemCampanhas});
 
   } catch (err) {
 
