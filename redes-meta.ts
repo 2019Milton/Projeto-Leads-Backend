@@ -112,6 +112,31 @@ export async function consultarRedesMeta(
   return montarEvidenciasRedesMeta(campanhas, conjuntos, [...historico, ...hoje]);
 }
 
+// Retorna NULL se o referral não trouxer evidência confiável da rede.
+
+export function detectarRedeOrigemReferral(referral: any): "facebook" | "instagram" | null {
+  const host = (valor: unknown) => {
+    if (typeof valor !== "string") return "";
+    try {
+      const url = new URL(valor);
+      return ["http:", "https:"].includes(url.protocol) ? url.hostname.toLowerCase() : "";
+    } catch { return ""; }
+  };
+  const dominio = (atual: string, raiz: string) =>
+    atual === raiz || atual.endsWith("." + raiz);
+
+  const fonte = host(referral?.source_url);
+  if (dominio(fonte, "instagram.com")) return "instagram";
+  if (dominio(fonte, "facebook.com") || dominio(fonte, "fb.me")) return "facebook";
+
+  const imagem = host(referral?.image_url);
+  if (dominio(imagem, "cdninstagram.com") ||
+      (imagem.startsWith("instagram.") && imagem.endsWith(".fna.fbcdn.net"))) {
+    return "instagram";
+  }
+  return null;
+}
+
 // Merge atômico apenas dos metadados; preserva nicho, criativos e posicionamentos.
 export const SQL_SALVAR_REDES_META = `
   UPDATE campanhas
