@@ -43885,7 +43885,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         const data: any = await resp.json();
 
         if (!resp.ok) {
-          console.error("CRIADOR CAMPANHA OPENAI ERROR:", data?.error?.message, "| model:", modelo);
+          // Evita registrar o corpo bruto do provedor (pode conter trecho da chave de API).
+          console.error("CRIADOR CAMPANHA OPENAI ERROR: HTTP", resp.status, "| model:", modelo);
           return null;
         }
 
@@ -43931,7 +43932,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
         const dataAnthropic: any = await respAnthropic.json();
 
         if (!respAnthropic.ok) {
-          console.error("CRIADOR CAMPANHA ANTHROPIC ERROR:", dataAnthropic?.error?.message);
+          // Não expor mensagens potencialmente sensíveis retornadas pelo provedor.
+          console.error("CRIADOR CAMPANHA ANTHROPIC ERROR: HTTP", respAnthropic.status);
           return null;
         }
 
@@ -43970,8 +43972,8 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     }
     return c.json({
       sugestoes: fallbackVariacoes(topico),
-      _origem: "sem_chave",
-      aviso: `${mensagemIAIndisponivel()} As opções abaixo são modelos prontos, não foram geradas por IA.`
+      _origem: "modelo_pronto",
+      aviso: "Não foi possível gerar novas opções com IA nesta tentativa. As opções abaixo são modelos prontos para adaptação, não foram geradas por IA. A conexão dos provedores precisa ser verificada."
     });
 
   } catch (err) {
@@ -43979,7 +43981,11 @@ app.post("/ia/campanhas/criador", authMiddleware, async (c) => {
     if (modoCompletar) {
       return c.json({ error: "Não foi possível gerar os complementos sem alterar a campanha existente." }, 500);
     }
-    return c.json({ sugestoes: fallbackVariacoes(topico) });
+    return c.json({
+      sugestoes: fallbackVariacoes(topico),
+      _origem: "modelo_pronto",
+      aviso: "Houve uma falha ao gerar opções com IA. Os exemplos abaixo são modelos prontos para adaptar, não foram criados pela IA."
+    });
   }
 });
 
