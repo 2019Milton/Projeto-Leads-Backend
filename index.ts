@@ -11,6 +11,7 @@ import sharp from "sharp";
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { criarDesafioLinkedIn, verificarAssinaturaLinkedIn, lerNotificacaoLinkedIn } from "./linkedin-webhook-security.mjs";
+import { inserirRespostaLinkedInUmaVez } from "./linkedin-lead-idempotencia.mjs";
 import { validarDadosAssistente, sanitizarAcompanhamentoAssistente, criarContaGoogleAssistente } from "./assistente-contas";
 import {
   MINIMO_CONTAS_REDE,
@@ -17746,13 +17747,13 @@ async function processarLeadGenFormResponseLinkedIn(
   const formIdResposta = formUrnResposta.match(/urn:li:leadGenForm:(\d+)/)?.[1] || "";
   const formUrnBase = formIdResposta ? `urn:li:leadGenForm:${formIdResposta}` : "";
 
-  const leadId = String(lead.id ?? `${formIdResposta || "linkedin"}-${lead.submittedAt}`);
-
-  const jaExiste = await client.query(
-    `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
-    [leadId, usuarioId]
-  );
-  if (jaExiste.rows.length > 0) return false;
+  // IDs sintetizados a partir do timestamp podem unir respostas distintas.
+  // A API sempre deve fornecer um identificador real para idempotência.
+  const leadId = String(lead.id ?? "").trim();
+  if (!leadId) {
+    console.warn("LINKEDIN: resposta de formulário sem identificador; ignorada");
+    return false;
+  }
 
   const campanhaEncontrada = formIdResposta
     ? (await client.query(
@@ -17792,24 +17793,27 @@ async function processarLeadGenFormResponseLinkedIn(
     });
   }
 
-  const leadInseridoLinkedIn = await client.query(
-    `INSERT INTO leads
-       (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
-        origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'linkedin','linkedin','novo',$8,$9,COALESCE(to_timestamp($10::bigint / 1000), NOW()))
-     RETURNING id`,
-    [
-      usuarioId, leadId, nome || "Lead LinkedIn", email, telefone,
-      nomeCampanha, adAccountId,
-      JSON.stringify(respostasQualificacao), nichoId, lead.submittedAt ?? null
-    ]
-  );
+  // Deduplicação atômica entre cron, sync manual e múltiplas instâncias.
+  // Usa a tabela leads existente, sem migração ou tabelas paralelas.
+  const novoLeadId = await inserirRespostaLinkedInUmaVez(client, {
+    usuarioId,
+    contaAnunciosId: String(adAccountId),
+    responseId: leadId,
+    nome: nome || "Lead LinkedIn",
+    email,
+    telefone,
+    campanha: nomeCampanha,
+    respostasQualificacao,
+    nichoId,
+    submittedAt: lead.submittedAt ?? null,
+  });
+  if (novoLeadId === null) return false;
 
   await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
 
   avaliarEEnviarQualificacaoLead(
     {
-      id: leadInseridoLinkedIn.rows[0]?.id,
+      id: novoLeadId,
       lead_id: leadId,
       plataforma: "linkedin",
       status: "novo",
@@ -17820,7 +17824,7 @@ async function processarLeadGenFormResponseLinkedIn(
     usuarioId
   ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (linkedin):", err));
 
-  iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInseridoLinkedIn.rows[0]?.id)
+  iniciarContatoWhatsAppLeadFormulario(usuarioId, novoLeadId)
     .catch(err => console.error("ERRO contato WhatsApp formulário (linkedin):", err));
 
   return true;
