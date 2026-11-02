@@ -841,6 +841,14 @@ function normalizarEmailLogin(value: unknown) {
   return String(value ?? "").trim().toLowerCase();
 }
 
+// E-mail gravado num cadastro (já normalizado). O teste antigo (/^\S+@\S+\.\S+$/) aceitava
+// aspas, < > e = — um gestor podia criar o cliente com o e-mail "a'/onmouseover='...'@x.co"
+// e o script rodava na lista de usuários do Super Admin. Aqui só o que um e-mail real usa.
+function emailCadastroValido(email: string) {
+  return email.length <= 254 &&
+    /^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(email);
+}
+
 // O CDN da Meta (fbcdn/cdninstagram) devolve o MESMO arquivo com host regional
 // e assinatura (oh/oe/_nc_*) diferentes a cada consulta. Dedupe pela URL
 // inteira deixava a lista de imagens crescer a cada abertura do editor (visto:
@@ -7123,6 +7131,10 @@ app.post("/usuarios", authMiddleware, masterMiddleware, async (c) => {
   const { senha } = body;
   const email = normalizarEmailLogin(body.email);
 
+  if (!emailCadastroValido(email) || !senha) {
+    return c.json({ error: "Informe um email válido e a senha" }, 400);
+  }
+
   try {
     const senhaHash = await gerarHashSenha(senha);
 
@@ -7172,8 +7184,28 @@ app.get("/usuarios", authMiddleware, masterMiddleware, async (c) => {
   return c.json(result.rows);
 });
 
+// Rotas legadas (o front não usa mais). O "master" passa pelo masterMiddleware, mas não pode
+// mexer em conta administrativa: antes ele apagava o Super Admin, ou trocava o e-mail dele
+// e pedia o reset de senha para o endereço novo.
+async function alvoLegadoProtegido(user: any, alvoId: number) {
+  const alvo = await client.query("SELECT tipo FROM usuarios WHERE id = $1", [alvoId]);
+  if (!alvo.rows.length) return "nao_encontrado";
+  const tipoAlvo = String(alvo.rows[0].tipo || "");
+  if (tipoAlvo === "super_admin" && Number(user.id) !== alvoId) return "protegido";
+  if (tipoAlvo === "master" && user.tipo !== "super_admin" && Number(user.id) !== alvoId) return "protegido";
+  return null;
+}
+
 app.delete("/usuarios/:id", authMiddleware, masterMiddleware, async (c) => {
-  const id = c.req.param("id");
+  const user: any = c.get("user");
+  const id = Number(c.req.param("id"));
+
+  if (!Number.isInteger(id) || id <= 0) return c.json({ error: "Usuário inválido" }, 400);
+  if (id === Number(user.id)) return c.json({ error: "Você não pode excluir seu próprio usuário." }, 400);
+
+  const bloqueio = await alvoLegadoProtegido(user, id);
+  if (bloqueio === "nao_encontrado") return c.json({ error: "Usuário não encontrado" }, 404);
+  if (bloqueio) return c.json({ error: "Acesso negado" }, 403);
 
   await client.query("DELETE FROM usuarios WHERE id=$1", [id]);
 
@@ -7379,12 +7411,21 @@ app.put("/admin/usuarios/:id/vinculo-parceiro", authMiddleware, async (c) => {
 
 
 app.put("/usuarios/:id", authMiddleware, masterMiddleware, async (c) => {
-  const id = c.req.param("id");
+  const user: any = c.get("user");
+  const id = Number(c.req.param("id"));
   const body = await c.req.json();
+  const email = normalizarEmailLogin(body.email);
+
+  if (!Number.isInteger(id) || id <= 0) return c.json({ error: "Usuário inválido" }, 400);
+  if (!emailCadastroValido(email)) return c.json({ error: "Informe um email válido" }, 400);
+
+  const bloqueio = await alvoLegadoProtegido(user, id);
+  if (bloqueio === "nao_encontrado") return c.json({ error: "Usuário não encontrado" }, 404);
+  if (bloqueio) return c.json({ error: "Acesso negado" }, 403);
 
   await client.query(
     "UPDATE usuarios SET email=$1 WHERE id=$2",
-    [normalizarEmailLogin(body.email), id]
+    [email, id]
   );
 
   return c.json({ message: "Usuário atualizado" });
@@ -30301,7 +30342,7 @@ app.post("/gestor/clientes", authMiddleware, async (c) => {
     return c.json({ error: "Nome, email e senha são obrigatórios" }, 400);
   }
 
-  if (!/^\S+@\S+\.\S+$/.test(email)) {
+  if (!emailCadastroValido(email)) {
     return c.json({ error: "Informe um email válido" }, 400);
   }
 
@@ -30503,7 +30544,7 @@ app.patch("/gestor/clientes/:id", authMiddleware, async (c) => {
 
   if (Object.prototype.hasOwnProperty.call(body, "email")) {
     const email = textoOpcional(body.email).toLowerCase();
-    if (!/^\S+@\S+\.\S+$/.test(email)) {
+    if (!emailCadastroValido(email)) {
       return c.json({ error: "Informe um email válido" }, 400);
     }
     adicionar("email", email);
@@ -41295,41 +41336,27 @@ app.patch("/leads/:id/data-contato", authMiddleware, async (c) => {
     const dataContato = body.data_contato ?? null;
     const observacaoAgendamento = body.observacao_agendamento ?? null;
 
-    // busca o lead e o dono para checar permissão em JS
-    const leadRow = await client.query(`SELECT id, usuario_id FROM leads WHERE id = $1`, [leadId]);
-    if (!leadRow.rows[0]) return c.json({ error: "Lead não encontrado" }, 404);
+    if (!Number.isInteger(leadId) || leadId <= 0) return c.json({ error: "Lead inválido" }, 400);
 
-    const leadOwnerId: number = leadRow.rows[0].usuario_id;
-    const ownerRow = await client.query(`SELECT id, admin_id FROM usuarios WHERE id = $1`, [leadOwnerId]);
-    const leadOwnerAdminId: number | null = ownerRow.rows[0]?.admin_id ?? null;
-
-    const uid = Number(user.id);
-    const temPermissao =
-      Number(leadOwnerId) === uid ||           // lead é do próprio usuário
-      Number(user.admin_id) === Number(leadOwnerId) ||  // corretor acessando lead do seu admin
-      Number(leadOwnerAdminId) === uid;        // admin acessando lead de um corretor dele
-
-    if (!temPermissao) {
-      console.error("PERMISSAO NEGADA data-contato:", { leadOwnerId, userId: user.id, userAdminId: user.admin_id, leadOwnerAdminId });
-      return c.json({ error: "Sem permissão para editar este lead" }, 403);
-    }
-
+    // Só o dono do lead, como no resto do CRM (GET /leads só lista os próprios). Antes o
+    // corretor vinculado mexia no agendamento dos leads do admin dele, e o admin nos do corretor.
+    // No acesso do gestor, user.id já é o cliente.
     const res = await client.query(
       `UPDATE leads
        SET data_contato = $1,
            observacao_agendamento = $2,
            lembrete_1dia_enviado = FALSE,
            lembrete_dia_enviado  = FALSE
-       WHERE id = $3
+       WHERE id = $3 AND usuario_id = $4
        RETURNING id, data_contato, observacao_agendamento`,
-      [dataContato, observacaoAgendamento, leadId]
+      [dataContato, observacaoAgendamento, leadId, Number(user.id)]
     );
 
-    if (!res.rows[0]) return c.json({ error: "Falha ao atualizar" }, 500);
+    if (!res.rows[0]) return c.json({ error: "Lead não encontrado" }, 404);
     return c.json(res.rows[0]);
   } catch (err: any) {
     console.error("ERRO DATA CONTATO:", err);
-    return c.json({ error: "Erro ao salvar data de contato", detail: String(err?.message || err) }, 500);
+    return c.json({ error: "Erro ao salvar data de contato" }, 500);
   }
 });
 
@@ -45009,6 +45036,18 @@ app.put("/admin/usuarios/:id/plano", authMiddleware, async (c) => {
   }
 });
 
+// Tipos que o painel pode atribuir (criar usuário e "Alterar tipo"). super_admin e master
+// ficam de fora: antes o POST /admin/usuarios gravava qualquer tipo recebido, e um "master"
+// criava para si uma conta super_admin.
+const TIPOS_USUARIO_ATRIBUIVEIS = [
+  "admin_corretor",
+  "corretor",
+  "corretor_receptor",
+  "suporte",
+  "criador_campanha",
+  "trafego_pago"
+];
+
 app.post("/admin/usuarios", authMiddleware, async (c) => {
 
   try {
@@ -45046,6 +45085,16 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
       return c.json({
         error: "Nome, sobrenome, email e senha são obrigatórios"
       }, 400);
+    }
+
+    if (!emailCadastroValido(email)) {
+      return c.json({ error: "Informe um email válido" }, 400);
+    }
+
+    const tipoFinal = String(tipo || "corretor");
+
+    if (!TIPOS_USUARIO_ATRIBUIVEIS.includes(tipoFinal)) {
+      return c.json({ error: "Tipo inválido" }, 400);
     }
 
     const senhaForte =
@@ -45105,7 +45154,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         sobrenome,
         email,
         senhaHash,
-        tipo || "corretor",
+        tipoFinal,
         admin_id || null,
         planoFinal,
         whatsapp ? String(whatsapp).replace(/\D/g, "").slice(0, 20) : null
@@ -45143,7 +45192,7 @@ app.post("/admin/usuarios", authMiddleware, async (c) => {
         nome: String(nome),
         sobrenome: String(sobrenome),
         email: String(email),
-        tipo: String(tipo || "corretor"),
+        tipo: tipoFinal,
         plano: planoFinal,
         origem: "Painel Super Admin"
       });
@@ -45230,16 +45279,7 @@ app.put("/admin/usuarios/:id/tipo", authMiddleware, async (c) => {
 
   const { tipo } = await c.req.json();
 
-  const tiposPermitidos = [
-    "admin_corretor",
-    "corretor",
-    "corretor_receptor",
-    "suporte",
-    "criador_campanha",
-    "trafego_pago"
-  ];
-
-  if (!tiposPermitidos.includes(tipo)) {
+  if (!TIPOS_USUARIO_ATRIBUIVEIS.includes(tipo)) {
     return c.json({ error: "Tipo inválido" }, 400);
   }
 
@@ -45355,13 +45395,16 @@ app.post("/admin/trocar-senha", authMiddleware, async (c) => {
 
     const usuarioAlvo = alvo.rows[0];
 
-    // 🔐 permissões
+    // 🔐 permissões. A própria senha (fora o Super Admin, que usa esta tela na lista de
+    // usuários) troca em PUT /usuarios/me/senha, que pede a senha atual — aqui bastava o
+    // token. E o Admin Corretor nunca mexe em conta administrativa, mesmo vinculada a ele.
     const permitido =
       user.tipo === "super_admin" ||
-      Number(user.id) === Number(usuario_id) ||
       (
         user.tipo === "admin_corretor" &&
-        Number(usuarioAlvo.admin_id) === Number(user.id)
+        Number(usuarioAlvo.admin_id) === Number(user.id) &&
+        Number(usuarioAlvo.id) !== Number(user.id) &&
+        !["super_admin", "master"].includes(String(usuarioAlvo.tipo || ""))
       );
 
     if (!permitido) {
@@ -48447,6 +48490,19 @@ app.patch("/campanhas/rascunho/:id", authMiddleware, async (c) => {
     }
 
     const { nome, corretor_id, configuracoes } = await c.req.json();
+
+    // Mesma regra da criação: o rascunho só vai para corretor ativo (antes o PATCH aceitava
+    // qualquer id, inclusive o de um Super Admin).
+    if (corretor_id) {
+      const corretorRes = await client.query(
+        `SELECT id FROM usuarios WHERE id = $1 AND tipo IN ('corretor', 'admin_corretor') AND COALESCE(ativo, true) = true`,
+        [Number(corretor_id)]
+      );
+
+      if (corretorRes.rows.length === 0) {
+        return c.json({ error: "Corretor não encontrado ou inativo" }, 404);
+      }
+    }
 
     const campos: string[] = [];
     const valores: any[] = [];
