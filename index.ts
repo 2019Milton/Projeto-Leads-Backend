@@ -849,6 +849,27 @@ function emailCadastroValido(email: string) {
     /^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(email);
 }
 
+// Mensagem de um erro capturado que pode ir para a tela. As das APIs de anúncio (Google,
+// TikTok, LinkedIn, Meta) e as nossas validações seguem como estão — o usuário precisa delas.
+// Erro do Postgres (nome de tabela/coluna/constraint), de rede e de runtime (TypeError,
+// JSON quebrado) vira "" e a rota usa o texto padrão dela; o detalhe fica no console.error.
+function mensagemErroPublica(err: any) {
+  const msg = typeof err === "string" ? err : typeof err?.message === "string" ? err.message : "";
+  if (!msg.trim()) return "";
+  const doBanco = typeof err?.severity === "string" && /^[0-9A-Z]{5}$/.test(String(err?.code || ""));
+  const interno = err instanceof TypeError || err instanceof ReferenceError ||
+    err instanceof SyntaxError || typeof err?.syscall === "string";
+  const textoDoBanco = /relation "|column "|violates [\w -]*constraint|duplicate key value|syntax error at or near|invalid input syntax for|current transaction is aborted|null value in column|Connection terminated/i;
+  if (doBanco || interno || textoDoBanco.test(msg)) return "";
+  return msg.replace(/(access_token|client_secret|refresh_token)=[^&\s"']+/gi, "$1=***");
+}
+
+// Para os campos `detalhe`: mesma regra; um objeto que não é Error (resposta da API
+// lançada como está) continua indo inteiro, como antes.
+function detalheErroPublico(err: any) {
+  return mensagemErroPublica(err) || (err instanceof Error || typeof err === "string" ? undefined : err);
+}
+
 // O CDN da Meta (fbcdn/cdninstagram) devolve o MESMO arquivo com host regional
 // e assinatura (oh/oe/_nc_*) diferentes a cada consulta. Dedupe pela URL
 // inteira deixava a lista de imagens crescer a cada abertura do editor (visto:
@@ -8162,7 +8183,7 @@ app.get("/google/contas", authMiddleware, async (c) => {
     return c.json({ contas, avisos });
   } catch (err: any) {
     console.error("ERRO /google/contas:", err);
-    return c.json({ error: err.message || "Erro interno" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro interno" }, 500);
   }
 });
 
@@ -8860,7 +8881,7 @@ app.post("/google/sincronizar-campanhas", authMiddleware, async (c) => {
     return c.json(await sincronizarGoogleAdsUsuario(user.id));
   } catch (err: any) {
     console.error("ERRO GOOGLE SINCRONIZAR:", err);
-    return c.json({ error: err.message || "Erro ao sincronizar Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao sincronizar Google Ads" }, 500);
   } finally {
     googleSyncEmAndamento.delete(user.id);
   }
@@ -9629,7 +9650,7 @@ app.get("/google/whatsapp-elegibilidade", authMiddleware, async (c) => {
     console.error("ERRO /google/whatsapp-elegibilidade:", err);
     return c.json({
       elegivel: false,
-      error: err?.message || "Não foi possível validar o WhatsApp no Google Ads",
+      error: mensagemErroPublica(err) || "Não foi possível validar o WhatsApp no Google Ads",
     }, 500);
   }
 });
@@ -10000,7 +10021,7 @@ app.post("/google/campanha", authMiddleware, async (c) => {
     return c.json({ id: campaignId, campaign_id: campaignId, campanha_local_id: rascunhoLocal?.id || null });
   } catch (err: any) {
     console.error("ERRO /google/campanha:", err);
-    return c.json({ error: err.message || "Erro ao criar campanha Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao criar campanha Google Ads" }, 500);
   }
 });
 
@@ -10054,7 +10075,7 @@ app.post("/google/adgroup", authMiddleware, async (c) => {
     return c.json({ id: adGroupResourceName.split("/").pop(), adgroup_id: adGroupResourceName.split("/").pop() });
   } catch (err: any) {
     console.error("ERRO /google/adgroup:", err);
-    return c.json({ error: err.message || "Erro ao criar grupo de anúncios Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao criar grupo de anúncios Google Ads" }, 500);
   }
 });
 
@@ -10243,7 +10264,7 @@ app.get("/google/lead-form-elegibilidade", authMiddleware, async (c) => {
       termos: "indeterminado",
       elegibilidade: "indeterminada",
       pode_criar: false,
-      mensagem: err?.message || "Não foi possível verificar o formulário de leads no Google Ads.",
+      mensagem: mensagemErroPublica(err) || "Não foi possível verificar o formulário de leads no Google Ads.",
     }, 500);
   }
 });
@@ -10353,7 +10374,7 @@ app.post("/google/formulario", authMiddleware, async (c) => {
     return c.json({ resource_name: resourceName });
   } catch (err: any) {
     console.error("ERRO /google/formulario:", err);
-    return c.json({ error: err.message || "Erro ao criar formulário no Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao criar formulário no Google Ads" }, 500);
   }
 });
 
@@ -10476,7 +10497,7 @@ app.post("/google/upload-imagem", authMiddleware, async (c) => {
     return c.json({ resource_name: resourceName });
   } catch (err: any) {
     console.error("ERRO /google/upload-imagem:", err);
-    return c.json({ error: err.message || "Erro ao enviar imagem para o Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao enviar imagem para o Google Ads" }, 500);
   }
 });
 
@@ -10582,7 +10603,7 @@ app.post("/google/upload-video", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO /google/upload-video:", err);
-    return c.json({ error: err?.message || "Erro ao enviar vídeo para o Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao enviar vídeo para o Google Ads" }, 500);
   }
 });
 
@@ -10674,7 +10695,7 @@ app.post("/google/video-status", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO /google/video-status:", err);
-    return c.json({ error: err?.message || "Erro ao verificar vídeo no Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao verificar vídeo no Google Ads" }, 500);
   }
 });
 
@@ -11332,7 +11353,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO /google/anuncio:", err);
-    return c.json({ error: err.message || "Erro ao criar anúncio Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao criar anúncio Google Ads" }, 500);
   }
 });
 
@@ -11540,7 +11561,7 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
       }
     } catch (err: any) {
       console.error("ERRO /google/editar-campanha (nome/orcamento):", err);
-      return c.json({ error: err.message || "Erro ao salvar as alterações no Google Ads" }, 400);
+      return c.json({ error: mensagemErroPublica(err) || "Erro ao salvar as alterações no Google Ads" }, 400);
     }
 
     // Texto do anuncio: melhor esforco. A Google nao permite editar headlines/
@@ -11677,7 +11698,7 @@ app.post("/google/editar-campanha", authMiddleware, async (c) => {
     return c.json({ sucesso: true, aviso: anuncioAtualizadoComErro });
   } catch (err: any) {
     console.error("ERRO /google/editar-campanha:", err);
-    return c.json({ error: err.message || "Erro ao editar campanha Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao editar campanha Google Ads" }, 500);
   }
 });
 
@@ -11728,7 +11749,7 @@ app.post("/google/excluir-campanha", authMiddleware, async (c) => {
         googleAdsErroConfirmaRecursoAusente(err);
 
       if (!naoPertenceMaisGoogle) {
-        return c.json({ error: err.message || "Erro ao excluir no Google Ads" }, 400);
+        return c.json({ error: mensagemErroPublica(err) || "Erro ao excluir no Google Ads" }, 400);
       }
       console.log("EXCLUIR GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campaign_id);
     }
@@ -12325,7 +12346,7 @@ app.get("/google/campanha-status/:campaign_id", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO /google/campanha-status:", err);
-    return c.json({ error: err.message || "Erro ao consultar status da campanha no Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao consultar status da campanha no Google Ads" }, 500);
   }
 });
 
@@ -12362,7 +12383,7 @@ app.post("/google/excluir-adgroup", authMiddleware, async (c) => {
     } catch (err: any) {
       const msg = String(err?.message || "").toLowerCase();
       if (!msg.includes("not found") && !msg.includes("does not exist") && !msg.includes("invalid resource")) {
-        return c.json({ error: err.message || "Erro ao remover grupo de anúncios" }, 400);
+        return c.json({ error: mensagemErroPublica(err) || "Erro ao remover grupo de anúncios" }, 400);
       }
     }
 
@@ -12439,7 +12460,7 @@ app.post("/google/toggle-campanha", authMiddleware, async (c) => {
     return c.json({ sucesso: true });
   } catch (err: any) {
     console.error("ERRO /google/toggle-campanha:", err);
-    return c.json({ error: err.message || "Erro ao alterar campanha Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao alterar campanha Google Ads" }, 500);
   }
 });
 
@@ -13445,7 +13466,7 @@ app.get("/tiktok/campanhas/:id/configuracao-edicao", authMiddleware, async (c) =
     });
   } catch (err: any) {
     console.error("ERRO CONFIGURAÇÃO EDIÇÃO TIKTOK:", err);
-    return c.json({ error: err?.message || "Erro ao carregar configuração da campanha TikTok" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao carregar configuração da campanha TikTok" }, 500);
   }
 });
 
@@ -13806,7 +13827,7 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
     return c.json({ sucesso: true, aviso: avisos.length ? avisos.join(" ") : null });
   } catch (err: any) {
     console.error("ERRO /tiktok/editar-campanha:", err);
-    return c.json({ error: err?.message || "Erro ao editar campanha TikTok" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao editar campanha TikTok" }, 500);
   }
 });
 
@@ -14309,7 +14330,7 @@ app.post("/tiktok/sincronizar-campanhas", authMiddleware, async (c) => {
     return c.json(await sincronizarTikTokAdsUsuario(user.id));
   } catch (err: any) {
     console.error("ERRO TIKTOK SINCRONIZAR:", err);
-    return c.json({ error: err?.message || "Erro ao sincronizar TikTok" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao sincronizar TikTok" }, 500);
   } finally {
     tiktokSyncEmAndamento.delete(user.id);
   }
@@ -14567,7 +14588,7 @@ app.post("/tiktok/upload-imagem", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO /tiktok/upload-imagem:", err?.message || err);
-    return c.json({ error: err?.message || "Erro upload imagem TikTok" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro upload imagem TikTok" }, 500);
   }
 });
 
@@ -14642,7 +14663,7 @@ app.post("/tiktok/upload-video", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO /tiktok/upload-video:", err?.message || err);
-    return c.json({ error: err?.message || "Erro upload vídeo TikTok" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro upload vídeo TikTok" }, 500);
   }
 });
 
@@ -14976,7 +14997,7 @@ app.post("/tiktok/preflight-publicacao", authMiddleware, async (c) => {
     return c.json({ ...resultado, preflight: true });
   } catch (err: any) {
     console.error("ERRO /tiktok/preflight-publicacao:", err);
-    return c.json({ error: err?.message || "Erro ao validar a publicação TikTok", preflight: false }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao validar a publicação TikTok", preflight: false }, 500);
   }
 });
 
@@ -15490,7 +15511,7 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
     return c.json({ id: String(adId), ad_id: String(adId) });
   } catch (err: any) {
     console.error("ERRO /tiktok/anuncio:", err);
-    return c.json({ error: "Erro ao criar anúncio TikTok", detalhe: err?.message || err }, 500);
+    return c.json({ error: "Erro ao criar anúncio TikTok", detalhe: detalheErroPublico(err) }, 500);
   }
 });
 
@@ -15670,7 +15691,7 @@ app.post("/kwai/sincronizar-campanhas", authMiddleware, async (c) => {
     return c.json(await sincronizarKwaiAdsUsuario(user.id));
   } catch (err: any) {
     console.error("ERRO KWAI SINCRONIZAR:", err);
-    return c.json({ error: err?.message || "Erro ao sincronizar Kwai" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao sincronizar Kwai" }, 500);
   } finally {
     kwaiSyncEmAndamento.delete(user.id);
   }
@@ -15721,7 +15742,7 @@ app.post("/kwai/upload-imagem", authMiddleware, async (c) => {
     return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 503);
   } catch (err: any) {
     console.error("ERRO /kwai/upload-imagem:", err?.message || err);
-    return c.json({ error: err?.message || "Erro upload imagem Kwai" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro upload imagem Kwai" }, 500);
   }
 });
 
@@ -15754,7 +15775,7 @@ app.post("/kwai/upload-video", authMiddleware, async (c) => {
     return c.json({ error: KWAI_AVISO_INDISPONIVEL }, 503);
   } catch (err: any) {
     console.error("ERRO /kwai/upload-video:", err?.message || err);
-    return c.json({ error: err?.message || "Erro upload vídeo Kwai" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro upload vídeo Kwai" }, 500);
   }
 });
 
@@ -16023,7 +16044,7 @@ app.post("/kwai/anuncio", authMiddleware, async (c) => {
     return c.json({ error: `${KWAI_AVISO_INDISPONIVEL} Nenhum anúncio foi criado.` }, 503);
   } catch (err: any) {
     console.error("ERRO /kwai/anuncio:", err);
-    return c.json({ error: "Erro ao criar anúncio Kwai", detalhe: err?.message || err }, 500);
+    return c.json({ error: "Erro ao criar anúncio Kwai", detalhe: detalheErroPublico(err) }, 500);
   }
 });
 
@@ -16354,7 +16375,7 @@ app.get("/linkedin/contas", authMiddleware, async (c) => {
     return c.json({ contas: await listarContasLinkedInDisponiveis(token) });
   } catch (err: any) {
     console.error("ERRO /linkedin/contas:", err);
-    return c.json({ error: err?.message || "Erro ao listar contas do LinkedIn Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao listar contas do LinkedIn Ads" }, 500);
   }
 });
 
@@ -16418,7 +16439,7 @@ app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
     return c.json({ sucesso: true, conta });
   } catch (err: any) {
     console.error("ERRO /linkedin/selecionar-conta:", err);
-    return c.json({ error: err?.message || "Erro ao selecionar a conta do LinkedIn Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao selecionar a conta do LinkedIn Ads" }, 500);
   }
 });
 
@@ -16513,7 +16534,7 @@ app.get("/linkedin/status-completo", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO /linkedin/status-completo:", err);
-    return c.json({ error: err?.message || "Erro ao carregar o status do LinkedIn Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao carregar o status do LinkedIn Ads" }, 500);
   }
 });
 
@@ -16880,7 +16901,7 @@ app.post("/linkedin/upload-imagem", authMiddleware, async (c) => {
     return c.json({ image_urn: imagemUrn });
   } catch (err: any) {
     console.error("ERRO /linkedin/upload-imagem:", err);
-    return c.json({ error: err.message || "Erro ao enviar imagem para o LinkedIn" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao enviar imagem para o LinkedIn" }, 500);
   }
 });
 
@@ -16989,7 +17010,7 @@ app.post("/linkedin/upload-video", authMiddleware, async (c) => {
     return c.json({ video_urn: videoUrn, pronto });
   } catch (err: any) {
     console.error("ERRO /linkedin/upload-video:", err);
-    return c.json({ error: err.message || "Erro ao enviar vídeo para o LinkedIn" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao enviar vídeo para o LinkedIn" }, 500);
   }
 });
 
@@ -17142,7 +17163,7 @@ app.post("/linkedin/formulario", authMiddleware, async (c) => {
     return c.json({ resource_name: resposta.id, form_id: resposta.id });
   } catch (err: any) {
     console.error("ERRO /linkedin/formulario:", err);
-    return c.json({ error: err.message || "Erro ao criar formulário no LinkedIn" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao criar formulário no LinkedIn" }, 500);
   }
 });
 
@@ -17361,7 +17382,7 @@ app.post("/linkedin/anuncio", authMiddleware, async (c) => {
     return c.json({ id: String(creativeId), ad_id: String(creativeId) });
   } catch (err: any) {
     console.error("ERRO /linkedin/anuncio:", err);
-    return c.json({ error: "Erro ao criar anúncio LinkedIn", detalhe: err?.message || err }, 500);
+    return c.json({ error: "Erro ao criar anúncio LinkedIn", detalhe: detalheErroPublico(err) }, 500);
   }
 });
 
@@ -17988,7 +18009,7 @@ app.post("/linkedin/sincronizar-campanhas", authMiddleware, async (c) => {
     return c.json(await sincronizarLinkedInAdsUsuario(user.id));
   } catch (err: any) {
     console.error("ERRO LINKEDIN SINCRONIZAR:", err);
-    return c.json({ error: err?.message || "Erro ao sincronizar LinkedIn" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao sincronizar LinkedIn" }, 500);
   } finally {
     linkedinSyncEmAndamento.delete(user.id);
   }
@@ -18480,7 +18501,7 @@ app.post("/meta/conta-anuncios", authMiddleware, async (c) => {
 
     return c.json({
       error:
-        err?.message ||
+        mensagemErroPublica(err) ||
         "Erro ao selecionar conta de anuncios Meta"
     }, 500);
   }
@@ -18650,7 +18671,7 @@ app.post("/meta/campanha", authMiddleware, async (c) => {
       );
     
       return c.json({
-        error: String(err) || "Erro ao criar campanha"
+        error: mensagemErroPublica(err) || "Erro ao criar campanha"
       }, 500);
   }
 });
@@ -19362,7 +19383,7 @@ app.post("/meta/upload-imagem", authMiddleware, async (c) => {
     console.error("UPLOAD IMAGEM:", err?.message || err);
 
     return c.json({
-      error: err?.message || "Erro upload imagem"
+      error: mensagemErroPublica(err) || "Erro upload imagem"
     }, 500);
   }
 });
@@ -19492,7 +19513,7 @@ app.post("/meta/upload-video", authMiddleware, async (c) => {
     console.error("UPLOAD VIDEO:", err?.message || err);
 
     return c.json({
-      error: err?.message || "Erro upload vídeo"
+      error: mensagemErroPublica(err) || "Erro upload vídeo"
     }, 500);
   }
 });
@@ -20689,7 +20710,7 @@ app.get(
     
       return c.json({
         erro: "Erro ao validar Meta",
-        detalhe: err?.message || err
+        detalhe: detalheErroPublico(err)
       }, 500);
     }
 });
@@ -21469,7 +21490,7 @@ app.post("/assistente-contas-anuncios/google/criar", authMiddleware, async (c) =
 
   } catch (err: any) {
     console.error("ERRO /assistente-contas-anuncios/google/criar:", err);
-    return c.json({ error: err?.message || "Erro ao criar a conta do Google Ads" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao criar a conta do Google Ads" }, 500);
   } finally {
     assistenteGoogleCriacaoEmAndamento.delete(Number(user.id));
   }
@@ -22458,7 +22479,7 @@ app.get("/meta/distribuicao-leads",authMiddleware,async(c)=>{
       String(c.req.query("periodo")||"hoje"),
       c.req.query("inicio"),c.req.query("fim")
     );
-  }catch(e){return c.json({error:e instanceof Error?e.message:"Período inválido"},400);}
+  }catch(e){return c.json({error:mensagemErroPublica(e) || "Período inválido"},400);}
   try{
     const ctx=await contextoConjuntosMeta(usuario.id,localId);
     if("erro" in ctx)return c.json({error:ctx.erro},ctx.status);
@@ -22693,7 +22714,7 @@ async function processarNovoConjuntoMeta(c:any,somenteValidar:boolean) {
   } catch (e) {
     console.error(somenteValidar ? "[meta-conjuntos] validação:" : "[meta-conjuntos] criação:",
       e instanceof Error ? e.message : "indisponível");
-    return c.json({error: e instanceof Error ? e.message : "Meta não conseguiu validar a configuração",
+    return c.json({error: mensagemErroPublica(e) || "Meta não conseguiu validar a configuração",
       validacao_sem_criacao: somenteValidar},400);
   }
 }
@@ -23238,7 +23259,8 @@ app.put("/whatsapp/contato-formulario", authMiddleware, async (c) => {
     return c.json({ ok: true, config: novo });
   } catch (err: any) {
     console.error("ERRO PUT /whatsapp/contato-formulario:", err);
-    return c.json({ error: err?.message ? `Erro ao salvar: ${err.message}` : "Erro ao salvar o contato automático" }, 500);
+    const motivo = mensagemErroPublica(err);
+    return c.json({ error: motivo ? `Erro ao salvar: ${motivo}` : "Erro ao salvar o contato automático" }, 500);
   }
 });
 
@@ -31683,7 +31705,7 @@ app.post("/gestor/clientes/:id/voip/desativar", authMiddleware, async (c) => {
 
     return c.json({
       error: "Não foi possível confirmar a liberação no provedor. O número foi mantido na conta para evitar esconder uma cobrança que ainda possa existir.",
-      detalhe: String(err?.message || err)
+      detalhe: mensagemErroPublica(err) || undefined
     }, 502);
   }
 });
@@ -32328,7 +32350,7 @@ app.get("/painel-cliente/whatsapp/modelos", authMiddleware, async (c) => {
   } catch (err: any) {
     console.error("ERRO modelos WhatsApp no painel:", err);
     return c.json({
-      error: err?.message || "Não foi possível carregar os modelos aprovados"
+      error: mensagemErroPublica(err) || "Não foi possível carregar os modelos aprovados"
     }, 502);
   }
 });
@@ -32530,7 +32552,7 @@ app.post("/painel-cliente/whatsapp/conversas/:id/modelo", authMiddleware, async 
     });
   } catch (err: any) {
     console.error("ERRO modelo WhatsApp painel:", err);
-    return c.json({ error: err?.message || "Erro ao enviar o modelo" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao enviar o modelo" }, 500);
   }
 });
 
@@ -33212,7 +33234,7 @@ app.get("/painel-cliente/voip/token", authMiddleware, async (c) => {
   } catch (err: any) {
     console.error("VOIP TOKEN ERROR:", err);
     return c.json({
-      error: String(err?.message || "Não foi possível preparar o telefone no navegador")
+      error: mensagemErroPublica(err) || "Não foi possível preparar o telefone no navegador"
     }, 500);
   }
 });
@@ -35436,7 +35458,7 @@ app.get("/plataformas/ranking-base", authMiddleware, async (c) => {
     console.error("ERRO RANKING DE PLATAFORMAS:", err);
     return c.json({
       error: "Erro ao calcular ranking de plataformas",
-      detalhe: err?.message || String(err)
+      detalhe: mensagemErroPublica(err) || undefined
     }, 500);
   }
 });
@@ -36315,7 +36337,7 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
 
     return c.json({
       error: "Erro ao buscar performance diaria",
-      detalhe: err?.message || err
+      detalhe: detalheErroPublico(err)
     }, 500);
   }
 });
@@ -36817,7 +36839,7 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA GOOGLE:", err);
-    return c.json({ error: "Erro ao buscar performance diaria do Google Ads", detalhe: err?.message || err }, 500);
+    return c.json({ error: "Erro ao buscar performance diaria do Google Ads", detalhe: detalheErroPublico(err) }, 500);
   }
 });
 
@@ -36890,7 +36912,7 @@ app.get("/google/performance-diaria/:data/campanhas", authMiddleware, async (c: 
     return c.json({ data, campanhas, leads_sem_campanha: leadsSemCampanha });
   } catch (err: any) {
     console.error("ERRO CAMPANHAS DIA GOOGLE:", err);
-    return c.json({ error: "Erro ao buscar campanhas do dia", detalhe: err?.message }, 500);
+    return c.json({ error: "Erro ao buscar campanhas do dia", detalhe: mensagemErroPublica(err) || undefined }, 500);
   }
 });
 
@@ -37010,7 +37032,7 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA TIKTOK:", err);
-    return c.json({ error: "Erro ao buscar performance diaria do TikTok Ads", detalhe: err?.message || err }, 500);
+    return c.json({ error: "Erro ao buscar performance diaria do TikTok Ads", detalhe: detalheErroPublico(err) }, 500);
   }
 });
 
@@ -37155,7 +37177,7 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
     });
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA LINKEDIN:", err);
-    return c.json({ error: "Erro ao buscar performance diaria do LinkedIn Ads", detalhe: err?.message || err }, 500);
+    return c.json({ error: "Erro ao buscar performance diaria do LinkedIn Ads", detalhe: detalheErroPublico(err) }, 500);
   }
 });
 
@@ -37258,7 +37280,7 @@ app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: an
 
   } catch (err: any) {
     console.error("ERRO CAMPANHAS DIA:", err);
-    return c.json({ error: "Erro ao buscar campanhas do dia", detalhe: err?.message }, 500);
+    return c.json({ error: "Erro ao buscar campanhas do dia", detalhe: mensagemErroPublica(err) || undefined }, 500);
   }
 });
 
@@ -37333,7 +37355,7 @@ app.post("/meta/sincronizar-campanhas", authMiddleware, async (c) => {
     } catch (erroConta: any) {
 
       return c.json({
-        error: erroConta?.message ||
+        error: mensagemErroPublica(erroConta) ||
           "Selecione a conta de anúncios Meta que deseja usar."
       }, 400);
     }
@@ -38039,7 +38061,7 @@ app.delete("/campanhas/:id/definitiva", authMiddleware, async (c) => {
 
           if (!naoPertenceMaisGoogle) {
             return c.json({
-              error: err?.message || "O Google Ads não permitiu excluir a campanha"
+              error: mensagemErroPublica(err) || "O Google Ads não permitiu excluir a campanha"
             }, 400);
           }
           console.log("EXCLUIR DEFINITIVO GOOGLE: campanha não encontrada no Google Ads, removendo localmente:", campanhaLocal.campaign_id);
@@ -39131,7 +39153,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
         avancadas.attribution_spec, alterar_atribuicao_meta
       ));
     } catch(e) {
-      return c.json({error:e instanceof Error?e.message:"Atribuição inválida"},400);
+      return c.json({error:mensagemErroPublica(e) || "Atribuição inválida"},400);
     }
 
     let adsetRes = await enviarPayloadMetaComFallbackBid(
@@ -40381,7 +40403,7 @@ app.post("/teste/notif-whatsapp", authMiddleware, async (c) => {
       return c.json({ erro: "Z-API retornou erro", status: res.status, resposta }, 500);
     }
   } catch (err: any) {
-    return c.json({ erro: err?.message || "Erro desconhecido" }, 500);
+    return c.json({ erro: mensagemErroPublica(err) || "Erro desconhecido" }, 500);
   }
 });
 
@@ -46176,7 +46198,7 @@ app.post("/admin/corrigir-datas-leads", authMiddleware, masterMiddleware, async 
 
     return c.json({ total: leads.length, atualizados, erros, detalhes });
   } catch (err: any) {
-    return c.json({ error: err.message }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro interno" }, 500);
   }
 });
 
@@ -47390,7 +47412,7 @@ app.post("/campanhas/:id/rascunhos-plataformas", authMiddleware, async (c) => {
   } catch (err: any) {
     await db.query("ROLLBACK").catch(() => null);
     console.error("ERRO POST /campanhas/:id/rascunhos-plataformas:", err);
-    return c.json({ error: err?.message || "Erro ao salvar rascunhos das plataformas" }, 500);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao salvar rascunhos das plataformas" }, 500);
   } finally {
     db.release();
   }
