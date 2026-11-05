@@ -46,6 +46,21 @@ import {
 
 import { contarCampanhasPorRedeMeta, consultarRedesMeta, detectarRedeOrigemReferral, redesCampanhaPainelMeta, SQL_SALVAR_REDES_META } from "./redes-meta";
 
+import {
+  aplicarOtimizacaoLeadQualificado,
+  campanhaOtimizadaPorLeadQualificado,
+  escolherRegraLeadQualificado,
+  montarAssociacaoCampanhaConversao,
+  montarCorpoRegraLeadQualificado,
+  montarEventoConversaoLinkedIn,
+  OTIMIZACAO_LEAD_QUALIFICADO,
+  proximoStartBuscaRegras,
+  regraDaConexao,
+  urlBuscaRegrasConversao,
+  urnRegraConversao,
+  urnRespostaFormularioLinkedIn
+} from "./linkedin-conversoes";
+
 import { garantirLeadWhatsAppSemOrigem, prepararTriagemWhatsApp } from "./whatsapp-sem-origem";
 import { consultarDestinoWhatsappMeta } from "./meta-destinos-whatsapp";
 import { listarConjuntosCampanhaMeta, criarConjuntoWhatsappPausadoMeta, validarConjuntoWhatsappPausadoMeta } from "./meta-conjuntos-campanha";
@@ -1844,10 +1859,13 @@ async function avaliarEEnviarQualificacaoLinkedIn(
   try {
 
     // enviarEventoLinkedInConversionLeads casa o evento por e-mail hasheado
-    // (não existe um click id disponível nem pra lead nativo de Lead Gen
-    // Form nem pro lead criado via conversa de WhatsApp — ver
-    // criarLeadDeConversaLinkedIn) — sem e-mail não há como enviar.
-    if (!leadRow?.email) {
+    // e/ou pelo URN da resposta do Lead Gen Form (leads.lead_id vindo do
+    // Lead Sync). Não existe click id disponível nem pra lead nativo de Lead
+    // Gen Form nem pro lead criado via conversa de WhatsApp (ver
+    // criarLeadDeConversaLinkedIn) — sem nenhum dos dois não há como enviar.
+    const temUrnFormulario =
+      leadRow?.plataforma === "linkedin" && urnRespostaFormularioLinkedIn(leadRow?.lead_id) !== null;
+    if (!leadRow?.email && !temUrnFormulario) {
       return;
     }
 
@@ -7748,6 +7766,12 @@ const OAUTH_PROVEDORES: Record<string, {
       "w_organization_social",
       ...(Bun.env.LINKEDIN_LEAD_SYNC_ENABLED === "true"
         ? ["r_marketing_leadgen_automation"]
+        : []),
+      // rw_conversions (Conversions API) só entra depois de aprovado no
+      // portal do desenvolvedor — pedir escopo não aprovado derruba a
+      // autorização inteira. Ver LINKEDIN-CONVERSOES.md.
+      ...(Bun.env.LINKEDIN_CONVERSIONS_ENABLED === "true"
+        ? ["rw_conversions"]
         : []),
     ].join(" "),
     clientIdEnv: "LINKEDIN_ADS_CLIENT_ID",
@@ -16066,6 +16090,17 @@ app.post("/kwai/anuncio", authMiddleware, async (c) => {
 const linkedinSyncEmAndamento = new Set<number>();
 const LINKEDIN_LEAD_SYNC_HABILITADO = Bun.env.LINKEDIN_LEAD_SYNC_ENABLED === "true";
 
+// Leads qualificados de volta ao LinkedIn (Conversions API). As duas chaves
+// nascem DESLIGADAS: sem elas nenhuma chamada nova é feita e a criação de
+// campanha continua exatamente como antes. Detalhes em LINKEDIN-CONVERSOES.md.
+// - LINKEDIN_CONVERSIONS_ENABLED: pede o escopo rw_conversions no login, libera
+//   /linkedin/conversoes/configurar e o envio dos eventos de conversão.
+// - LINKEDIN_QUALIFIED_LEAD_OPTIMIZATION: campanhas novas de lead gen passam a
+//   usar MAX_QUALIFIED_LEAD (só se a regra de conversão já existir).
+const LINKEDIN_CONVERSOES_HABILITADO = Bun.env.LINKEDIN_CONVERSIONS_ENABLED === "true";
+const LINKEDIN_OTIMIZACAO_LEAD_QUALIFICADO_HABILITADA =
+  LINKEDIN_CONVERSOES_HABILITADO && Bun.env.LINKEDIN_QUALIFIED_LEAD_OPTIMIZATION === "true";
+
 const LINKEDIN_API_VERSION = "202608"; // YYYYMM — LinkedIn versiona por mês, revisar ~1x/ano
 const LINKEDIN_API = "https://api.linkedin.com/rest";
 
@@ -16237,6 +16272,17 @@ async function resolverConexaoLinkedIn(
     // for cobrada em outra moeda (bug confirmado nesta auditoria).
     moeda: dadosConta.moeda || "BRL",
   };
+}
+
+// URN da regra de conversão "lead qualificado" guardada na conexão — só vale
+// pra conta de anúncios atualmente selecionada (ver regraDaConexao).
+async function obterRegraLeadQualificadoDaConexao(usuarioId: number): Promise<string | null> {
+  const conn = await client.query(
+    `SELECT dados_conta FROM plataforma_conexoes
+     WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+    [usuarioId]
+  );
+  return regraDaConexao(conn.rows[0]?.dados_conta, "Qualified Lead");
 }
 
 type ContaLinkedInDisponivel = {
@@ -16421,11 +16467,19 @@ app.post("/linkedin/selecionar-conta", authMiddleware, async (c) => {
       organization_vanity_name: conta.organization_vanity_name,
       moeda: conta.moeda,
     };
-    if (conversion_rule_qualified_urn !== undefined) {
-      dadosSelecionados.conversion_rule_qualified_urn = textoOpcional(conversion_rule_qualified_urn);
-    }
-    if (conversion_rule_closed_urn !== undefined) {
-      dadosSelecionados.conversion_rule_closed_urn = textoOpcional(conversion_rule_closed_urn);
+    // A regra de conversão pertence a UMA conta de anúncios: guarda de qual
+    // conta é (regraDaConexao ignora a regra se a conta selecionada mudar).
+    for (const [campo, valor] of [
+      ["conversion_rule_qualified", conversion_rule_qualified_urn],
+      ["conversion_rule_closed", conversion_rule_closed_urn],
+    ] as const) {
+      if (valor === undefined) continue;
+      const texto = textoOpcional(valor);
+      if (texto && !urnRegraConversao(texto)) {
+        return c.json({ error: "URN da regra de conversão inválido (esperado urn:lla:llaPartnerConversion:<id> ou só o id)" }, 400);
+      }
+      dadosSelecionados[`${campo}_urn`] = texto ? urnRegraConversao(texto) : "";
+      dadosSelecionados[`${campo}_conta_id`] = texto ? conta.id : "";
     }
 
     const atualizado = await client.query(
@@ -16530,6 +16584,11 @@ app.get("/linkedin/status-completo", authMiddleware, async (c) => {
       lead_sync: {
         disponivel: LINKEDIN_LEAD_SYNC_HABILITADO,
         status: LINKEDIN_LEAD_SYNC_HABILITADO ? "Disponível" : "Aguardando aprovação do LinkedIn",
+      },
+      conversoes: {
+        habilitado: LINKEDIN_CONVERSOES_HABILITADO,
+        otimizacao_lead_qualificado: LINKEDIN_OTIMIZACAO_LEAD_QUALIFICADO_HABILITADA,
+        regra_lead_qualificado_configurada: Boolean(regraDaConexao(conexao.dados_conta, "Qualified Lead")),
       },
     });
   } catch (err: any) {
@@ -16803,7 +16862,30 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
       status: "DRAFT",
     };
 
-    const resposta = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns`, conexao.accessToken, {
+    // Otimização por lead qualificado (chave desligada por padrão): só pra
+    // lead gen e só com a regra de conversão já criada. Se o LinkedIn recusar
+    // o payload otimizado, cai no payload de sempre — a criação da campanha
+    // nunca falha por causa disso.
+    const regraQualificadoUrn = LINKEDIN_OTIMIZACAO_LEAD_QUALIFICADO_HABILITADA
+      ? await obterRegraLeadQualificadoDaConexao(usuarioId)
+      : null;
+    let respostaOtimizada: Awaited<ReturnType<typeof linkedinFetch>> | null = null;
+    if (regraQualificadoUrn) {
+      const payloadOtimizado = aplicarOtimizacaoLeadQualificado(payloadCampaign);
+      if (campanhaOtimizadaPorLeadQualificado(payloadOtimizado)) {
+        const tentativa = await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns`, conexao.accessToken, {
+          method: "POST",
+          body: payloadOtimizado
+        });
+        if (tentativa.ok && tentativa.id) {
+          respostaOtimizada = tentativa;
+        } else {
+          console.warn("AVISO LINKEDIN adgroup: otimização por lead qualificado recusada, usando o lance de sempre:", tentativa.data);
+        }
+      }
+    }
+
+    const resposta = respostaOtimizada ?? await linkedinFetch(`/adAccounts/${conexao.adAccountId}/adCampaigns`, conexao.accessToken, {
       method: "POST",
       body: payloadCampaign
     });
@@ -16824,10 +16906,168 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
       [String(resposta.id), orcamento, String(campaign_id), usuarioId, conexao.adAccountId]
     );
 
-    return c.json({ adgroup_id: resposta.id });
+    // Campanha otimizada por lead qualificado: registra no banco e associa à
+    // regra de conversão (a auto-associação do LinkedIn só vale na criação da
+    // regra). Falha aqui não derruba a criação — vira aviso e a rota
+    // /linkedin/conversoes/configurar refaz a associação.
+    let avisoConversao: string | null = null;
+    if (respostaOtimizada && regraQualificadoUrn) {
+      try {
+        await client.query(
+          `UPDATE campanhas
+           SET configuracoes_avancadas = COALESCE(configuracoes_avancadas, '{}'::jsonb)
+                 || jsonb_build_object('linkedin_otimizacao', $1::text)
+           WHERE campaign_id = $2 AND usuario_id = $3 AND plataforma = 'linkedin'
+             AND conta_anuncios_id = $4`,
+          [OTIMIZACAO_LEAD_QUALIFICADO, String(campaign_id), usuarioId, conexao.adAccountId]
+        );
+        const associacao = montarAssociacaoCampanhaConversao(String(resposta.id), regraQualificadoUrn);
+        const associou = await linkedinFetch(associacao.url, conexao.accessToken, {
+          method: "PUT",
+          body: associacao.body
+        });
+        if (!associou.ok) {
+          console.warn("AVISO LINKEDIN adgroup: campanha não associada à regra de conversão:", associou.data);
+          avisoConversao = "A campanha foi criada, mas não foi associada à regra de conversão de lead qualificado. Rode /linkedin/conversoes/configurar antes de ativar.";
+        }
+      } catch (err: any) {
+        console.warn("AVISO LINKEDIN adgroup: erro ao associar à regra de conversão:", err?.message);
+        avisoConversao = "A campanha foi criada, mas não foi associada à regra de conversão de lead qualificado. Rode /linkedin/conversoes/configurar antes de ativar.";
+      }
+    }
+
+    return c.json({
+      adgroup_id: resposta.id,
+      otimizacao: respostaOtimizada ? OTIMIZACAO_LEAD_QUALIFICADO : null,
+      ...(avisoConversao ? { aviso: avisoConversao } : {}),
+    });
   } catch (err: any) {
     console.error("ERRO /linkedin/adgroup:", err);
     return c.json({ error: "Erro ao criar grupo de segmentação LinkedIn" }, 500);
+  }
+});
+
+// Cria (ou reaproveita) a Conversion Rule "lead qualificado" da conta de
+// anúncios selecionada e associa a ela as campanhas já otimizadas por lead
+// qualificado. Idempotente: pode ser chamada de novo pra refazer associações.
+// Só funciona com LINKEDIN_CONVERSIONS_ENABLED e depois de reconectar o
+// LinkedIn com o escopo rw_conversions (ver LINKEDIN-CONVERSOES.md).
+// ASSUMPTION: formatos conferidos só contra a documentação oficial — não
+// testado contra uma conta real (rw_conversions ainda não aprovado).
+app.post("/linkedin/conversoes/configurar", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const corpo = await c.req.json().catch(() => ({}));
+    const usuarioId = resolverUsuarioIdOperacao(user, corpo?.usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+
+    if (!LINKEDIN_CONVERSOES_HABILITADO) {
+      return c.json({
+        error: "O envio de leads qualificados ao LinkedIn ainda não está habilitado (aguardando a permissão rw_conversions do LinkedIn).",
+        codigo: "conversoes_desabilitadas",
+      }, 409);
+    }
+
+    const conexao = await resolverConexaoLinkedIn(usuarioId);
+    if ("erro" in conexao) return c.json({ error: conexao.erro }, 400);
+
+    const semPermissao = (status: number) => status === 401 || status === 403;
+    const MSG_RECONECTAR = "O LinkedIn recusou o acesso às conversões. Reconecte o LinkedIn Ads para conceder a permissão rw_conversions e tente de novo.";
+
+    // 1) A regra já está guardada para esta conta?
+    let regraUrn = await obterRegraLeadQualificadoDaConexao(usuarioId);
+    let criada = false;
+
+    // 2) Senão, procura na conta (uma chamada anterior pode ter criado a regra
+    // e falhado depois). Só pagina se a própria resposta indicar mais páginas.
+    if (!regraUrn) {
+      const elementos: any[] = [];
+      let start: number | null = 0;
+      for (let pagina = 0; pagina < 10 && start !== null; pagina++) {
+        const busca = await linkedinFetch(
+          urlBuscaRegrasConversao(conexao.adAccountId, start || undefined),
+          conexao.accessToken
+        );
+        if (!busca.ok) {
+          console.error("ERRO LINKEDIN buscar regras de conversão:", busca.status, busca.data);
+          return semPermissao(busca.status)
+            ? c.json({ error: MSG_RECONECTAR }, 403)
+            : c.json({ error: busca.error || "Erro ao consultar as regras de conversão no LinkedIn" }, 400);
+        }
+        elementos.push(...(Array.isArray(busca.data?.elements) ? busca.data.elements : []));
+        start = proximoStartBuscaRegras(busca.data);
+      }
+      regraUrn = escolherRegraLeadQualificado(elementos);
+    }
+
+    // 3) Não existe: cria (type QUALIFIED_LEAD, conversionMethod CONVERSIONS_API).
+    if (!regraUrn) {
+      const criacao = await linkedinFetch(`/conversions`, conexao.accessToken, {
+        method: "POST",
+        body: montarCorpoRegraLeadQualificado(conexao.adAccountId),
+      });
+      regraUrn = criacao.ok ? urnRegraConversao(criacao.id) : null;
+      if (!regraUrn) {
+        console.error("ERRO LINKEDIN criar regra de conversão:", criacao.status, criacao.data);
+        return semPermissao(criacao.status)
+          ? c.json({ error: MSG_RECONECTAR }, 403)
+          : c.json({ error: criacao.error || "Erro ao criar a regra de conversão no LinkedIn" }, 400);
+      }
+      criada = true;
+    }
+
+    // 4) Guarda o URN junto com a conta a que ele pertence.
+    await client.query(
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || $1::jsonb,
+           atualizado_em = NOW()
+       WHERE usuario_id = $2 AND plataforma = 'linkedin'`,
+      [
+        JSON.stringify({
+          conversion_rule_qualified_urn: regraUrn,
+          conversion_rule_qualified_conta_id: conexao.adAccountId,
+        }),
+        usuarioId,
+      ]
+    );
+
+    // 5) Refaz a associação das campanhas já otimizadas por lead qualificado
+    // (campanha nova é associada na própria criação, em /linkedin/adgroup).
+    const campanhas = await client.query(
+      `SELECT adset_id FROM campanhas
+       WHERE usuario_id = $1 AND plataforma = 'linkedin' AND conta_anuncios_id = $2
+         AND adset_id IS NOT NULL
+         AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')
+         AND configuracoes_avancadas->>'linkedin_otimizacao' = $3
+       LIMIT 200`,
+      [usuarioId, conexao.adAccountId, OTIMIZACAO_LEAD_QUALIFICADO]
+    );
+    let associadas = 0;
+    const falhas: string[] = [];
+    for (const linha of campanhas.rows) {
+      try {
+        const associacao = montarAssociacaoCampanhaConversao(linha.adset_id, regraUrn);
+        const resposta = await linkedinFetch(associacao.url, conexao.accessToken, {
+          method: "PUT",
+          body: associacao.body,
+        });
+        if (resposta.ok) associadas++;
+        else falhas.push(String(linha.adset_id));
+      } catch {
+        falhas.push(String(linha.adset_id));
+      }
+    }
+
+    return c.json({
+      sucesso: true,
+      regra_urn: regraUrn,
+      criada,
+      campanhas_associadas: associadas,
+      campanhas_com_falha: falhas,
+    });
+  } catch (err: any) {
+    console.error("ERRO /linkedin/conversoes/configurar:", err);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao configurar as conversões do LinkedIn" }, 500);
   }
 });
 
@@ -18016,21 +18256,22 @@ app.post("/linkedin/sincronizar-campanhas", authMiddleware, async (c) => {
 });
 
 // Equivalente LinkedIn de enviarEventoMetaConversionLeads — LinkedIn
-// Conversions API, casando pelo lead_id nativo (urn do leadGenFormResponse).
-// ASSUMPTION: shape do evento conferido contra a documentação pública da
-// Conversions API, não testado contra uma conversion rule real ainda —
-// além disso, diferente de Meta/Google/TikTok, o LinkedIn exige que a
-// Conversion Rule já exista manualmente no Campaign Manager antes (não há
-// endpoint de criação automática confirmado) — se o envio falhar
-// consistentemente, esse é o primeiro ponto a verificar com o Milton.
+// Conversions API (POST /conversionEvents). O lead é casado com o perfil pelo
+// e-mail com hash e/ou pelo URN da resposta do Lead Gen Form (leads.lead_id
+// vindo do Lead Sync) — ver montarEventoConversaoLinkedIn.
+// Desligado por padrão (LINKEDIN_CONVERSIONS_ENABLED): sem a chave nenhuma
+// chamada é feita. A regra de conversão "lead qualificado" é criada por
+// /linkedin/conversoes/configurar (ou informada em /linkedin/selecionar-conta).
+// ASSUMPTION: shape do evento conferido contra a documentação oficial, não
+// testado contra uma regra real (rw_conversions ainda não aprovado).
 async function enviarEventoLinkedInConversionLeads(
   usuarioId: number,
   lead: any,
   eventName: "Qualified Lead" | "Closed Won"
 ): Promise<{ ok: boolean; erro?: string }> {
   try {
-    if (!lead?.email) {
-      return { ok: false, erro: "Lead sem e-mail — sem identificador pra casar com o clique no LinkedIn" };
+    if (!LINKEDIN_CONVERSOES_HABILITADO) {
+      return { ok: false, erro: "Envio de conversões do LinkedIn desativado (LINKEDIN_CONVERSIONS_ENABLED)" };
     }
 
     const conexao = await resolverConexaoLinkedIn(usuarioId);
@@ -18040,32 +18281,30 @@ async function enviarEventoLinkedInConversionLeads(
       `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
       [usuarioId]
     );
-    const conversionRuleUrn =
-      eventName === "Qualified Lead"
-        ? conn.rows[0]?.dados_conta?.conversion_rule_qualified_urn
-        : conn.rows[0]?.dados_conta?.conversion_rule_closed_urn;
+    const conversionRuleUrn = regraDaConexao(conn.rows[0]?.dados_conta, eventName);
 
     if (!conversionRuleUrn) {
       return { ok: false, erro: `Conversion Rule "${eventName}" não configurada para o LinkedIn` };
     }
 
+    const evento = montarEventoConversaoLinkedIn({
+      regraUrn: conversionRuleUrn,
+      lead,
+      etapa: eventName,
+      valor: valorVendaInformado(lead, eventName),
+      moeda: MOEDA_VALOR_NEGOCIO,
+    });
+    if (!evento) {
+      return { ok: false, erro: "Lead sem e-mail nem resposta de formulário — sem identificador pra casar com o perfil no LinkedIn" };
+    }
+
     const resposta = await linkedinFetch(`/conversionEvents`, conexao.accessToken, {
       method: "POST",
-      body: {
-        conversion: conversionRuleUrn,
-        conversionHappenedAt: Date.now(),
-        // Valor da venda informado pelo corretor ao fechar; sem ele, 0 como antes.
-        conversionValue: {
-          currencyCode: MOEDA_VALOR_NEGOCIO,
-          amount: valorVendaInformado(lead, eventName)?.toFixed(2) ?? "0"
-        },
-        user: { userIds: [{ idType: "SHA256_EMAIL", idValue: lead.email ? hashSha256(lead.email) : undefined }] },
-        eventId: `lead-${lead.id}-${eventName.replace(/\s+/g, "-").toLowerCase()}`,
-      }
+      body: evento
     });
 
     if (!resposta.ok) {
-      console.error(`ERRO ENVIO CONVERSAO LINKEDIN (${eventName}):`, resposta.data);
+      console.error(`ERRO ENVIO CONVERSAO LINKEDIN (${eventName}):`, resposta.status, resposta.data);
       return { ok: false, erro: resposta.error || "Erro ao enviar evento pro LinkedIn" };
     }
 
