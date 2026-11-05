@@ -112,6 +112,7 @@ import {
   normalizarAdgroupSmartPlus,
   normalizarAnuncioSmartPlus,
   obterCapaVideoTikTok,
+  traduzirErroPublicacaoTikTok,
   type FluxoCriacaoTikTok
 } from "./tiktok-smart-plus";
 
@@ -15519,7 +15520,7 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     if (!resposta.ok || !resposta.data?.data?.campaign_id) {
       console.error("ERRO CAMPANHA TIKTOK:", resposta.data);
       return c.json({
-        error: resposta.error || "Erro ao criar campanha na TikTok",
+        error: traduzirErroPublicacaoTikTok(resposta.error) || resposta.error || "Erro ao criar campanha na TikTok",
         detalhe: resposta.data
       }, 400);
     }

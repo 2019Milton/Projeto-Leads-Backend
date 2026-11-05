@@ -19,6 +19,7 @@ import {
   normalizarAdgroupSmartPlus,
   normalizarAnuncioSmartPlus,
   obterCapaVideoTikTok,
+  traduzirErroPublicacaoTikTok,
   type ChamadaTikTok
 } from "./tiktok-smart-plus";
 
@@ -371,11 +372,13 @@ describe("capa do vídeo", () => {
 });
 
 describe("CTA dinâmico", () => {
+  // Formato e textos reais de /creative/cta/recommend/ (conta do usuário 15, 2026-11-05).
   const recomendados = {
     data: {
       recommend_assets: [
-        { asset_ids: ["201902", "201404"], asset_content: "Saiba mais" },
-        { asset_ids: [], asset_content: "Inválido" },
+        { asset_ids: ["201867", "201369"], asset_content: "Tenho interesse" },
+        { asset_ids: ["201902", "201404"], asset_content: "Jogar" },
+        { asset_ids: [], asset_content: "Saber mais" },
         { asset_ids: ["202114"], asset_content: "Fale conosco" }
       ]
     }
@@ -391,7 +394,7 @@ describe("CTA dinâmico", () => {
       promotionType: "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE",
       optimizationGoal: "CLICK"
     });
-    expect(r).toEqual({ ok: true, portfolioId: "P1", ctas: ["Saiba mais", "Fale conosco"] });
+    expect(r).toEqual({ ok: true, portfolioId: "P1", ctas: ["Tenho interesse", "Fale conosco"] });
     const params = new URLSearchParams(chamadas[0].endpoint.split("?")[1]);
     expect(chamadas[0].endpoint.startsWith("/creative/cta/recommend/?")).toBe(true);
     expect(params.get("new_version")).toBe("true");
@@ -406,7 +409,7 @@ describe("CTA dinâmico", () => {
           advertiser_id: "123",
           creative_portfolio_type: "CTA",
           portfolio_content: [
-            { asset_content: "Saiba mais", asset_ids: ["201902", "201404"] },
+            { asset_content: "Tenho interesse", asset_ids: ["201867", "201369"] },
             { asset_content: "Fale conosco", asset_ids: ["202114"] }
           ]
         }
@@ -441,4 +444,35 @@ describe("CTA dinâmico", () => {
   test("montarConteudoPortfolioCta descarta itens sem ID ou texto", () => {
     expect(montarConteudoPortfolioCta([{ asset_content: "", asset_ids: ["1"] }, null as any])).toEqual([]);
   });
+
+  test("portfólio fica só com botões de lead, em pt ou inglês", () => {
+    const pt = montarConteudoPortfolioCta([
+      { asset_content: "Instalar agora", asset_ids: ["1"] },
+      { asset_content: "Enviar mensagem", asset_ids: ["2"] },
+      { asset_content: "Obter ingressos agora", asset_ids: ["3"] },
+      { asset_content: "Cadastre-se", asset_ids: ["4"] }
+    ]);
+    expect(pt.map(c => c.asset_content)).toEqual(["Enviar mensagem", "Cadastre-se"]);
+    const en = montarConteudoPortfolioCta([
+      { asset_content: "Play game", asset_ids: ["1"] },
+      { asset_content: "Learn more", asset_ids: ["2"] }
+    ]);
+    expect(en.map(c => c.asset_content)).toEqual(["Learn more"]);
+  });
+
+  test("sem nenhum botão de lead conhecido, usa a recomendação inteira", () => {
+    const todos = montarConteudoPortfolioCta([
+      { asset_content: "Novo texto do TikTok", asset_ids: ["1"] },
+      { asset_content: "Outro", asset_ids: ["2"] }
+    ]);
+    expect(todos).toHaveLength(2);
+  });
+});
+
+test("traduz o erro de pagamento do TikTok", () => {
+  expect(traduzirErroPublicacaoTikTok(
+    "Your account has an outstanding payment or no valid payment method. Check your billing settings to continue."
+  )).toContain("forma de pagamento");
+  expect(traduzirErroPublicacaoTikTok("Invalid campaign name")).toBeNull();
+  expect(traduzirErroPublicacaoTikTok(null)).toBeNull();
 });

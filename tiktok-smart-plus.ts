@@ -454,13 +454,36 @@ export async function obterCapaVideoTikTok(
   return { ok: false, erro: ultimoErro };
 }
 
+// Teste na conta real (2026-11-05): /creative/cta/recommend/ devolve ~24
+// botões genéricos para LEAD_GENERATION, inclusive "Jogar", "Instalar agora" e
+// "Obter ingressos agora". O portfólio fica só com os que fazem sentido para
+// captar lead (textos em pt, ou em inglês quando o pt não vem).
+export const CTAS_LEADS_TIKTOK = new Set([
+  "tenho interesse", "cadastre-se", "inscrever-se agora", "saber mais",
+  "fale conosco", "obter cotação", "ler mais", "enviar mensagem",
+  "interested", "sign up", "apply now", "learn more",
+  "contact us", "get quote", "read more", "send message"
+]);
+
 export function montarConteudoPortfolioCta(recomendados: any[]) {
-  return (Array.isArray(recomendados) ? recomendados : [])
+  const todos = (Array.isArray(recomendados) ? recomendados : [])
     .map(item => ({
       asset_content: texto(item?.asset_content),
       asset_ids: Array.isArray(item?.asset_ids) ? item.asset_ids.map(String).filter(Boolean) : []
     }))
     .filter(item => item.asset_content && item.asset_ids.length);
+  const deLead = todos.filter(item => CTAS_LEADS_TIKTOK.has(item.asset_content.toLowerCase()));
+  // Se o TikTok mudar os textos e nenhum casar, usa a recomendação inteira.
+  return deLead.length ? deLead : todos;
+}
+
+// Mensagens do TikTok que o usuário só resolve fora da plataforma.
+export function traduzirErroPublicacaoTikTok(mensagem: unknown): string | null {
+  const msg = texto(mensagem);
+  if (/outstanding payment|no valid payment method|billing/i.test(msg)) {
+    return "A conta de anúncios TikTok está sem forma de pagamento válida ou com pagamento pendente. Regularize em Pagamentos no TikTok Ads Manager e publique de novo.";
+  }
+  return null;
 }
 
 // CTA dinâmico exigido pelos guias Smart+ de Lead Generation: recomenda CTAs
