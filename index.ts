@@ -8157,7 +8157,12 @@ app.get("/auth/:plataforma/callback", async (c) => {
 
 const googleSyncEmAndamento = new Set<number>();
 
-const GOOGLE_ADS_API_VERSION = "v24";
+// v26 desde 2026-11-05 (a v24 sai do ar por volta de mai/2027; v25 em ago/2027, v26 em nov/2027).
+// Antes de trocar: as 44 consultas GAQL do código e 12 operações de escrita (validateOnly, nada criado)
+// deram o mesmo resultado na v24 e na v26 numa conta real; as quebras de v25/v26 das notas
+// oficiais (hotéis, Local Services, lifecycle goals, enhanced_conversions_for_leads_enabled) não são
+// usadas aqui. Na próxima troca repetir esse teste diferencial.
+const GOOGLE_ADS_API_VERSION = "v26";
 const GOOGLE_ADS_API = `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}`;
 // A partir de 15/06/2026 o Google bloqueou uploadClickConversions (Google Ads
 // API) pra contas novas — confirmado ao vivo em 16/09/2026, erro
@@ -12141,7 +12146,9 @@ async function buscarDetalhesCampanhaGoogle(
                 LIMIT 200`)
     ),
     opcional("extensões", () =>
-      consulta(`SELECT campaign_asset.field_type, campaign_asset.status, campaign_asset.asset
+      // campaign.id precisa estar no SELECT: o Google recusa (EXPECTED_REFERENCED_FIELD_IN_SELECT_CLAUSE)
+      // a consulta que filtra campaign_asset por campaign.id sem ele — conferido na conta real.
+      consulta(`SELECT campaign.id, campaign_asset.field_type, campaign_asset.status, campaign_asset.asset
                 FROM campaign_asset
                 WHERE campaign.id = ${id} AND campaign_asset.status != 'REMOVED'`)
     ),
@@ -12504,7 +12511,7 @@ app.get("/google/campanha-status/:campaign_id", authMiddleware, async (c) => {
     try {
       const formResults = await googleAdsQuery(
         conexao.customerId, conexao.accessToken,
-        `SELECT campaign_asset.asset
+        `SELECT campaign.id, campaign_asset.asset
          FROM campaign_asset
          WHERE campaign.id = ${campaignId}
            AND campaign_asset.field_type = 'LEAD_FORM'
