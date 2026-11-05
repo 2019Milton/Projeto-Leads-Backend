@@ -14500,16 +14500,19 @@ async function obterOuCriarFonteEventosTikTok(
 // (/event/track/), conferida na documentação oficial em 2026-11-04:
 // - lead de formulário instantâneo: event_source "crm" + CRM Event Set +
 //   lead.lead_id (só aceita evento personalizado — QualifiedLead/ClosedWon são);
-// - demais leads: event_source "web" + Pixel, casando por user.email e
-//   user.phone (E.164 com "+", hash SHA-256).
+// - demais leads: event_source "web" + Pixel, casando por user.ttclid (lead do
+//   site), user.email e user.phone (E.164 com "+", hash SHA-256). Evento web
+//   exige page.url: a página do site onde o lead se cadastrou ou, sem ela
+//   (ex.: WhatsApp), o endereço da plataforma, onde a etapa foi registrada.
 // Se o CRM Event Set não puder ser usado (ex.: permissão do app), cai no Pixel
 // com e-mail/telefone. Ainda não testado contra tráfego real: em 2026-11-04
 // nenhuma campanha TikTok tinha sido publicada pela plataforma.
 async function enviarEventoTikTokConversionLeads(
   usuarioId: number,
-  lead: any,
+  leadRecebido: any,
   eventName: "Qualified Lead" | "Closed Won"
 ): Promise<{ ok: boolean; erro?: string }> {
+  let lead = leadRecebido;
 
   if (!leadIdentificavelTikTok(lead)) {
     return { ok: false, erro: "Lead sem lead_id do TikTok, e-mail ou telefone para casar com o TikTok" };
@@ -14527,11 +14530,23 @@ async function enviarEventoTikTokConversionLeads(
     // Valor da venda informado pelo corretor ao fechar (ver eventos-meta.ts).
     const valorVenda = valorVendaInformado(lead, eventName);
 
+    // Página e ttclid do lead do site ficam em atribuicao; nem todo chamador
+    // passa a linha inteira de leads.
+    if (lead?.id && lead.atribuicao === undefined) {
+      const linha = await client.query(
+        `SELECT atribuicao FROM leads WHERE id = $1 AND usuario_id = $2`,
+        [lead.id, usuarioId]
+      );
+      lead = { ...lead, atribuicao: linha.rows[0]?.atribuicao ?? null };
+    }
+
     const fontes: FonteEventoTikTok[] = fonteEventoTikTok(lead) === "crm" ? ["crm", "web"] : ["web"];
     let ultimoErro = "Não foi possível preparar o evento do TikTok";
 
     for (const fonte of fontes) {
-      const item = montarEventoTikTok({ lead, evento: eventoTikTok, fonte, telefoneE164, valorVenda });
+      const item = montarEventoTikTok({
+        lead, evento: eventoTikTok, fonte, telefoneE164, valorVenda, paginaPadrao: obterFrontendUrl()
+      });
       if (!item) continue;
 
       const eventSourceId = await obterOuCriarFonteEventosTikTok(

@@ -55,6 +55,7 @@ test("evento web casa por telefone E.164 com +; telefone sem + não é enviado",
     fonte: "web",
     telefoneE164: "+12133734253",
     valorVenda: 1500,
+    paginaPadrao: "https://plataformadeleads.com.br",
     agoraSegundos: 1,
   });
   expect(item).toEqual({
@@ -62,15 +63,75 @@ test("evento web casa por telefone E.164 com +; telefone sem + não é enviado",
     event_time: 1,
     event_id: "5-ClosedWon",
     user: { phone: HASH_TELEFONE_DOC },
+    page: { url: "https://plataformadeleads.com.br" },
     properties: { value: 1500, currency: "BRL" },
   });
   expect(item?.lead).toBeUndefined();
 
-  expect(montarEventoTikTok({ lead: { id: 5 }, evento: "ClosedWon", fonte: "web", telefoneE164: "12133734253" })).toBeNull();
+  expect(montarEventoTikTok({
+    lead: { id: 5 }, evento: "ClosedWon", fonte: "web", telefoneE164: "12133734253",
+    paginaPadrao: "https://plataformadeleads.com.br",
+  })).toBeNull();
+});
+
+test("evento web exige page.url: sem página do site nem página padrão não monta", () => {
+  expect(montarEventoTikTok({
+    lead: { id: 5, email: "a@b.com" }, evento: "QualifiedLead", fonte: "web",
+  })).toBeNull();
+  expect(montarEventoTikTok({
+    lead: { id: 5, email: "a@b.com" }, evento: "QualifiedLead", fonte: "web", paginaPadrao: "plataformadeleads.com.br",
+  })).toBeNull();
+});
+
+test("evento web de lead do site usa a página, o ttclid, IP e navegador gravados no cadastro", () => {
+  const item = montarEventoTikTok({
+    lead: {
+      id: 9,
+      plataforma: "site",
+      atribuicao: JSON.stringify({
+        ttclid: "E.C.P.abc",
+        pagina: "https://corretor.com.br/imovel",
+        referrer: "https://www.tiktok.com/",
+        ip: "200.1.2.3",
+        user_agent: "Mozilla/5.0",
+      }),
+    },
+    evento: "QualifiedLead",
+    fonte: "web",
+    telefoneE164: "+12133734253",
+    paginaPadrao: "https://plataformadeleads.com.br",
+    agoraSegundos: 2,
+  });
+  expect(item).toEqual({
+    event: "QualifiedLead",
+    event_time: 2,
+    event_id: "9-QualifiedLead",
+    user: { ttclid: "E.C.P.abc", phone: HASH_TELEFONE_DOC, ip: "200.1.2.3", user_agent: "Mozilla/5.0" },
+    page: { url: "https://corretor.com.br/imovel", referrer: "https://www.tiktok.com/" },
+  });
+});
+
+test("evento CRM não leva page nem dados do clique", () => {
+  const item = montarEventoTikTok({
+    lead: { id: 1, lead_id: "7000", plataforma: "tiktok", atribuicao: { pagina: "https://a.com/", ttclid: "X" } },
+    evento: "QualifiedLead",
+    fonte: "crm",
+    paginaPadrao: "https://plataformadeleads.com.br",
+    agoraSegundos: 1,
+  });
+  expect(item?.page).toBeUndefined();
+  expect(item?.user).toBeUndefined();
+  expect(item?.lead).toEqual({ lead_id: "7000", lead_event_source: "Plataforma de Leads" });
 });
 
 test("sem identificador para o canal escolhido não monta evento", () => {
-  expect(montarEventoTikTok({ lead: { id: 1 }, evento: "QualifiedLead", fonte: "web" })).toBeNull();
+  expect(montarEventoTikTok({
+    lead: { id: 1 }, evento: "QualifiedLead", fonte: "web", paginaPadrao: "https://plataformadeleads.com.br",
+  })).toBeNull();
+  expect(montarEventoTikTok({
+    lead: { id: 1, atribuicao: { ip: "1.1.1.1", user_agent: "UA" } }, evento: "QualifiedLead", fonte: "web",
+    paginaPadrao: "https://plataformadeleads.com.br",
+  })).toBeNull();
   expect(montarEventoTikTok({ lead: { id: 1, email: "a@b.com" }, evento: "QualifiedLead", fonte: "crm" })).toBeNull();
 });
 

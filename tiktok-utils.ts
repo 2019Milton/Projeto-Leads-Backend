@@ -34,6 +34,63 @@ export function leadIdentificavelTikTok(lead: any): boolean {
   return fonteEventoTikTok(lead) === "crm" || Boolean(texto(lead?.email) || texto(lead?.telefone));
 }
 
+function atribuicaoDoLead(lead: any): Record<string, any> {
+  let atribuicao: any = lead?.atribuicao ?? {};
+  if (typeof atribuicao === "string") {
+    try { atribuicao = JSON.parse(atribuicao); } catch { atribuicao = {}; }
+  }
+  return atribuicao && typeof atribuicao === "object" ? atribuicao : {};
+}
+
+function urlHttp(valor: unknown): string {
+  const url = texto(valor);
+  return /^https?:\/\//i.test(url) ? url : "";
+}
+
+function contatoComHashTikTok(lead: any, telefoneE164: unknown): Record<string, string> {
+  const usuario: Record<string, string> = {};
+  const email = texto(lead?.email);
+  if (email) usuario.email = sha256Normalizado(email);
+  const telefone = texto(telefoneE164);
+  if (/^\+\d{8,15}$/.test(telefone)) usuario.phone = sha256Normalizado(telefone);
+  return usuario;
+}
+
+// Usuário de um evento web (Events API 2.0, event_source "web"): casa por
+// ttclid (gravado pelo formulário do site a partir da URL do clique), e-mail
+// e telefone com hash. IP e navegador só complementam — sozinhos não
+// identificam o lead.
+function usuarioEventoWebTikTok(
+  lead: any,
+  atribuicao: Record<string, any>,
+  telefoneE164: unknown
+): Record<string, string> | null {
+  const ttclid = texto(atribuicao.ttclid);
+  const usuario: Record<string, string> = {
+    ...(ttclid ? { ttclid } : {}),
+    ...contatoComHashTikTok(lead, telefoneE164),
+  };
+  if (!Object.keys(usuario).length) return null;
+  const ip = texto(atribuicao.ip);
+  if (ip) usuario.ip = ip;
+  const navegador = texto(atribuicao.user_agent);
+  if (navegador) usuario.user_agent = navegador;
+  return usuario;
+}
+
+// page de um evento web: a Events API 2.0 exige page.url (conferido na
+// documentação em 2026-11-05). Vale a página do site onde o lead se cadastrou;
+// sem ela (ex.: lead de WhatsApp), a página informada por quem chama.
+function paginaEventoWebTikTok(
+  atribuicao: Record<string, any>,
+  paginaPadrao?: string | null
+): { url: string; referrer?: string } | null {
+  const url = urlHttp(atribuicao.pagina) || urlHttp(paginaPadrao);
+  if (!url) return null;
+  const referrer = urlHttp(atribuicao.referrer);
+  return { url, ...(referrer ? { referrer } : {}) };
+}
+
 export function montarEventoTikTok(params: {
   lead: any;
   evento: EventoConversaoTikTok;
@@ -42,18 +99,25 @@ export function montarEventoTikTok(params: {
   // normalizarTelefoneE164Google no index.ts).
   telefoneE164?: string | null;
   valorVenda?: number | null;
+  // page.url do evento web quando o lead não tem a página do site (ex.: lead
+  // de WhatsApp). Sem nenhuma das duas o evento web não é montado.
+  paginaPadrao?: string | null;
   agoraSegundos?: number;
 }): Record<string, any> | null {
   const { lead, evento, fonte } = params;
-  const email = texto(lead?.email);
-  const telefone = texto(params.telefoneE164);
-  const usuario: Record<string, string> = {};
-  if (email) usuario.email = sha256Normalizado(email);
-  if (/^\+\d{8,15}$/.test(telefone)) usuario.phone = sha256Normalizado(telefone);
-
   const leadId = texto(lead?.lead_id);
-  if (fonte === "crm" && !leadId) return null;
-  if (fonte === "web" && !Object.keys(usuario).length) return null;
+  let usuario: Record<string, string> | null;
+  let pagina: { url: string; referrer?: string } | null = null;
+
+  if (fonte === "crm") {
+    if (!leadId) return null;
+    usuario = contatoComHashTikTok(lead, params.telefoneE164);
+  } else {
+    const atribuicao = atribuicaoDoLead(lead);
+    usuario = usuarioEventoWebTikTok(lead, atribuicao, params.telefoneE164);
+    pagina = paginaEventoWebTikTok(atribuicao, params.paginaPadrao);
+    if (!usuario || !pagina) return null;
+  }
 
   const item: Record<string, any> = {
     event: evento,
@@ -63,6 +127,7 @@ export function montarEventoTikTok(params: {
     ...(texto(lead?.id) ? { event_id: `${texto(lead.id)}-${evento}` } : {}),
   };
   if (Object.keys(usuario).length) item.user = usuario;
+  if (pagina) item.page = pagina;
   if (fonte === "crm") {
     item.lead = { lead_id: leadId, lead_event_source: NOME_FONTE_EVENTOS_TIKTOK };
   }
@@ -74,42 +139,23 @@ export function montarEventoTikTok(params: {
 
 // Evento padrão "Lead" (optimization_event FORM) quando chega lead pelo
 // formulário do site vindo de anúncio do TikTok — é com ele que a campanha
-// Smart+ de site aprende. Events API 2.0, conferida em 2026-11-05: evento web
-// exige page.url; o casamento usa user.ttclid (vem na URL do clique), e-mail,
-// telefone, IP e navegador.
+// Smart+ de site aprende. Só sai com a página do site (sem página padrão).
 export function montarEventoLeadSiteTikTok(params: {
   lead: any;
   telefoneE164?: string | null;
   agoraSegundos?: number;
 }): Record<string, any> | null {
   const { lead } = params;
-  let atribuicao: any = lead?.atribuicao ?? {};
-  if (typeof atribuicao === "string") {
-    try { atribuicao = JSON.parse(atribuicao); } catch { atribuicao = {}; }
-  }
-  const pagina = texto(atribuicao?.pagina);
-  if (!/^https?:\/\//i.test(pagina)) return null;
-
-  const usuario: Record<string, string> = {};
-  const ttclid = texto(atribuicao?.ttclid);
-  if (ttclid) usuario.ttclid = ttclid;
-  const email = texto(lead?.email);
-  if (email) usuario.email = sha256Normalizado(email);
-  const telefone = texto(params.telefoneE164);
-  if (/^\+\d{8,15}$/.test(telefone)) usuario.phone = sha256Normalizado(telefone);
-  if (!Object.keys(usuario).length) return null;
-  const ip = texto(atribuicao?.ip);
-  if (ip) usuario.ip = ip;
-  const navegador = texto(atribuicao?.user_agent);
-  if (navegador) usuario.user_agent = navegador;
-
-  const referrer = texto(atribuicao?.referrer);
+  const atribuicao = atribuicaoDoLead(lead);
+  const pagina = paginaEventoWebTikTok(atribuicao);
+  const usuario = usuarioEventoWebTikTok(lead, atribuicao, params.telefoneE164);
+  if (!pagina || !usuario) return null;
   return {
     event: "Lead",
     event_time: params.agoraSegundos ?? Math.floor(Date.now() / 1000),
     ...(texto(lead?.id) ? { event_id: `${texto(lead.id)}-Lead` } : {}),
     user: usuario,
-    page: { url: pagina, ...(/^https?:\/\//i.test(referrer) ? { referrer } : {}) }
+    page: pagina
   };
 }
 
