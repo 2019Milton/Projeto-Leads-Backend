@@ -96,11 +96,14 @@ import { validarCopiaAnuncioEmConjuntoExistente, copiarAnuncioEmConjuntoExistent
   from "./meta-anuncios-conjunto-existente";
 import { validarWhatsappAdsMeta } from "./meta-whatsapp-numeros-ads";
 import {
+  CORTE_FLUXO_LEGADO_TIKTOK_MS,
   criarPortfolioCtaDinamicoTikTok,
+  criativoAceitoNoSmartPlus,
   decidirFluxoCriacaoTikTok,
   ehFluxoSmartPlusTikTok,
   endpointsStatusTikTok,
   erroIdentidadeSmartPlus,
+  erroPixelTikTok,
   gerarRequestIdTikTok,
   limparNomeTikTok,
   montarCriativoVideoSmartPlus,
@@ -112,8 +115,10 @@ import {
   normalizarAdgroupSmartPlus,
   normalizarAnuncioSmartPlus,
   obterCapaVideoTikTok,
+  pixelDaPlataformaTikTok,
   traduzirErroPublicacaoTikTok,
-  type FluxoCriacaoTikTok
+  type FluxoCriacaoTikTok,
+  type SituacaoSiteSmartPlus
 } from "./tiktok-smart-plus";
 
 import {
@@ -157,6 +162,7 @@ import {
   inicioAgendaTikTok,
   interpretarDataHoraBrasil,
   leadIdentificavelTikTok,
+  montarEventoLeadSiteTikTok,
   montarEventoTikTok,
   valorCsvPorChavesPossiveis,
   type FonteEventoTikTok,
@@ -12849,7 +12855,9 @@ type SucessoPreflightTikTok = {
     nome: string | null;
   };
   formulario?: { page_id: string; nome: string | null; campos: number };
-  site?: { url: string; otimizacao: "CLICK" };
+  // Smart+ otimiza por lead (evento FORM no Pixel da plataforma); legado,
+  // por clique.
+  site?: { url: string; otimizacao: "CLICK" } | { url: string; otimizacao: "LEAD"; pixel_id: string };
   whatsapp?: { final_numero: string; otimizacao: "CLICK"; mmt_verificavel: false };
   avisos: string[];
 };
@@ -13156,6 +13164,68 @@ async function validarWhatsappTikTok(
   return { ok: true, numero };
 }
 
+// Pixel da plataforma (o mesmo dos eventos de qualificação, ver
+// obterOuCriarFonteEventosTikTok) com o pixel_id numérico que o grupo Smart+
+// de site exige. criar=false só consulta; com criar=true, cria o Pixel se
+// ainda não existir. Erro de permissão vira texto para o usuário.
+async function obterPixelSiteTikTok(
+  usuarioId: number,
+  conexao: ConexaoTikTokAtiva,
+  criar: boolean
+): Promise<{ ok: true; pixelId: string | null } | { ok: false; erro: string }> {
+  const advertiserId = String(conexao.advertiserId || "");
+  if (!advertiserId) return { ok: false, erro: "a conta de anúncios TikTok não foi escolhida" };
+  try {
+    const lista = await tiktokFetch(
+      `/pixel/list/?${new URLSearchParams({ advertiser_id: advertiserId, name: NOME_FONTE_EVENTOS_TIKTOK, page_size: "20" })}`,
+      conexao.token
+    );
+    if (!lista.ok) {
+      console.warn(`[tiktok] Pixel indisponível para o usuário ${usuarioId}:`, lista.error);
+      return { ok: false, erro: erroPixelTikTok(lista.error) };
+    }
+    const existente = pixelDaPlataformaTikTok(lista.data, { nome: NOME_FONTE_EVENTOS_TIKTOK });
+    if (existente || !criar) return { ok: true, pixelId: existente?.pixelId ?? null };
+
+    const pixelCode = await obterOuCriarFonteEventosTikTok(usuarioId, advertiserId, conexao.token, "pixel");
+    if (!pixelCode) {
+      return { ok: false, erro: "não foi possível criar o Pixel da plataforma na conta de anúncios" };
+    }
+    const criado = await tiktokFetch(
+      `/pixel/list/?${new URLSearchParams({ advertiser_id: advertiserId, code: pixelCode })}`,
+      conexao.token
+    );
+    const pixel = criado.ok ? pixelDaPlataformaTikTok(criado.data, { codigo: pixelCode }) : null;
+    if (!pixel) {
+      return { ok: false, erro: "o TikTok não informou o ID do Pixel da plataforma; tente publicar de novo" };
+    }
+    return { ok: true, pixelId: pixel.pixelId };
+  } catch (err: any) {
+    console.error(`[tiktok] erro ao obter o Pixel do usuário ${usuarioId}:`, err?.message || err);
+    return { ok: false, erro: "não foi possível consultar os Pixels da conta de anúncios no TikTok" };
+  }
+}
+
+// Destino site no Smart+: os leads do formulário do site chegam ao Pixel?
+// (mesma regra e mesmo gate de plano da Meta, ver situacaoOtimizacaoSiteMeta)
+// e o Pixel pode ser usado na conta? Só consulta — não cria nada.
+async function situacaoSiteSmartPlusTikTok(
+  usuarioId: number,
+  conexao: ConexaoTikTokAtiva
+): Promise<{ situacao: SituacaoSiteSmartPlus; pixelId: string | null }> {
+  const eventos = await situacaoOtimizacaoSiteMeta(usuarioId);
+  const pixel = await obterPixelSiteTikTok(usuarioId, conexao, false);
+  return {
+    situacao: {
+      eventos: eventos.otimizacao === "lead",
+      semEventosPorPlano: !eventos.tem_recurso_eventos,
+      pixel: pixel.ok,
+      erroPixel: "erro" in pixel ? pixel.erro : null
+    },
+    pixelId: "pixelId" in pixel ? pixel.pixelId : null
+  };
+}
+
 async function executarPreflightPublicacaoTikTok(
   usuarioId: number,
   entrada: any
@@ -13223,7 +13293,21 @@ async function executarPreflightPublicacaoTikTok(
   const formatoCriativo = (entrada?.formato_criativo ?? avancadas.formato_criativo) === "imagem"
     ? "imagem"
     : "video";
-  const decisao = decidirFluxoCriacaoTikTok({ destino, formato: formatoCriativo, identityType });
+  // Site com vídeo Spark: Smart+ depende do código do formulário e do Pixel
+  // (só consulta aqui; o Pixel é criado depois das validações, se faltar).
+  let situacaoSite: SituacaoSiteSmartPlus | undefined;
+  let pixelIdSite: string | null = null;
+  if (destino === "site" && criativoAceitoNoSmartPlus(formatoCriativo, identityType)) {
+    const consulta = await situacaoSiteSmartPlusTikTok(usuarioId, conexao);
+    situacaoSite = consulta.situacao;
+    pixelIdSite = consulta.pixelId;
+  }
+  const decisao = decidirFluxoCriacaoTikTok({
+    destino,
+    formato: formatoCriativo,
+    identityType,
+    site: situacaoSite
+  });
   if ("erro" in decisao) {
     return { ok: false, status: 409, codigo: decisao.codigo, erro: decisao.erro };
   }
@@ -13275,8 +13359,25 @@ async function executarPreflightPublicacaoTikTok(
   } else if (destino === "site") {
     const site = await validarUrlTikTok(conexao, entrada?.url_destino ?? avancadas.url_destino);
     if (!site.ok) return site;
-    base.site = { url: site.url, otimizacao: "CLICK" };
-    avisos.push("Este modo direciona ao site e otimiza por clique. Conversões do formulário exigem Pixel/evento instalado no site.");
+    if (decisao.fluxo === "smart_plus") {
+      let pixelId = pixelIdSite;
+      if (!pixelId) {
+        const pixel = await obterPixelSiteTikTok(usuarioId, conexao, true);
+        if ("erro" in pixel || !pixel.pixelId) {
+          return {
+            ok: false,
+            status: 502,
+            codigo: "TIKTOK_PIXEL_UNAVAILABLE",
+            erro: `Não foi possível preparar o Pixel da plataforma no TikTok: ${"erro" in pixel ? pixel.erro : "ID não informado"}.`
+          };
+        }
+        pixelId = pixel.pixelId;
+      }
+      base.site = { url: site.url, otimizacao: "LEAD", pixel_id: pixelId };
+    } else {
+      base.site = { url: site.url, otimizacao: "CLICK" };
+      avisos.push("Este modo direciona ao site e otimiza por clique. Conversões do formulário exigem Pixel/evento instalado no site.");
+    }
   } else {
     const whatsapp = await validarWhatsappTikTok(usuarioId, conexao);
     if (!whatsapp.ok) return whatsapp;
@@ -14126,6 +14227,7 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
           destino: destinoSolicitado,
           texto: textoSolicitado,
           formId: formIdSolicitado || null,
+          urlSite: urlSolicitada || null,
           criativo: criativoSmartPlus
         })
       });
@@ -15440,6 +15542,31 @@ app.post("/tiktok/preflight-publicacao", authMiddleware, async (c) => {
   }
 });
 
+// Destino site no Smart+ (tela de publicação): código do formulário do site e
+// Pixel da plataforma. Só consulta — o Pixel é criado na publicação.
+app.get("/tiktok/site-smart-plus", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const usuarioId = resolverUsuarioIdOperacao(user, c.req.query("usuario_id"));
+    if (!usuarioId) return negarAcessoConta(c);
+
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao?.advertiserId) {
+      return c.json({ error: "Selecione a conta de anúncios TikTok" }, 400);
+    }
+    const { situacao } = await situacaoSiteSmartPlusTikTok(usuarioId, conexao);
+    return c.json({
+      eventos: situacao.eventos,
+      sem_eventos_por_plano: Boolean(situacao.semEventosPorPlano),
+      pixel: situacao.pixel === true,
+      erro_pixel: situacao.erroPixel || null
+    });
+  } catch (err: any) {
+    console.error("ERRO /tiktok/site-smart-plus:", err);
+    return c.json({ error: "Não foi possível consultar o destino site do TikTok" }, 500);
+  }
+});
+
 // Cria a Campanha na TikTok Ads (equivalente ao /meta/campanha)
 app.post("/tiktok/campanha", authMiddleware, async (c) => {
   try {
@@ -15694,11 +15821,21 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
     }
 
     if (await campanhaTikTokEhSmartPlus(usuarioId, campaign_id, conexao.advertiserId)) {
-      if (destinoResolvido === "site") {
-        return c.json({ error: "O destino site não é publicado no formato Smart+ do TikTok" }, 409);
-      }
       if (fim && !interpretarDataHoraBrasil(fim)) {
         return c.json({ error: "A data de término da campanha TikTok é inválida" }, 400);
+      }
+      // Site: otimiza pelo evento "Lead" do Pixel da plataforma (o preflight
+      // da campanha já conferiu/criou o Pixel).
+      let pixelIdSite: string | null = null;
+      if (destinoResolvido === "site") {
+        const pixel = await obterPixelSiteTikTok(usuarioId, conexao, true);
+        if ("erro" in pixel || !pixel.pixelId) {
+          return c.json({
+            error: `Não foi possível usar o Pixel da plataforma no TikTok: ${"erro" in pixel ? pixel.erro : "ID não informado"}.`,
+            codigo: "TIKTOK_PIXEL_UNAVAILABLE"
+          }, 409);
+        }
+        pixelIdSite = pixel.pixelId;
       }
       const payloadSmart = montarPayloadAdgroupSmartPlus({
         advertiserId: conexao.advertiserId,
@@ -15709,7 +15846,8 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
         orcamentoDiario: orcamento,
         inicio,
         fim,
-        numeroWhatsapp: numeroWhatsappTikTok
+        numeroWhatsapp: numeroWhatsappTikTok,
+        pixelId: pixelIdSite
       });
       const respostaSmart = await tiktokFetch("/smart_plus/adgroup/create/", conexao.token, {
         method: "POST",
@@ -15937,9 +16075,9 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
 
     if (smartPlus) {
       // Smart+: só vídeo (Spark Ads Push), capa obrigatória e CTA dinâmico.
-      if (destinoResolvido === "site" || formatoCriativo !== "video") {
+      if (formatoCriativo !== "video") {
         return c.json({
-          error: "O formato Smart+ do TikTok publica só vídeo para Formulário instantâneo ou WhatsApp"
+          error: "O formato Smart+ do TikTok publica só vídeo"
         }, 409);
       }
       const identidadeSmart = {
@@ -15967,7 +16105,9 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
         promotionType: destinoResolvido === "whatsapp"
           ? "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE"
           : "LEAD_GENERATION",
-        optimizationGoal: destinoResolvido === "whatsapp" ? "CLICK" : "LEAD_GENERATION"
+        optimizationGoal: destinoResolvido === "whatsapp"
+          ? "CLICK"
+          : destinoResolvido === "site" ? "CONVERT" : "LEAD_GENERATION"
       });
       if ("erro" in ctaDinamico) {
         return c.json({ error: ctaDinamico.erro }, 400);
@@ -15980,6 +16120,7 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
           adgroupId: String(adgroup_id),
           destino: destinoResolvido,
           formId: destinoResolvido === "lead_ads" ? String(form_id) : null,
+          urlSite: urlDestino || null,
           identidade: identidadeSmart,
           videoId,
           capaImageId: capa.imageId,
@@ -24383,6 +24524,42 @@ async function enviarLeadSiteMeta(usuarioId: number, lead: any) {
   }
 }
 
+// "Lead" padrão do TikTok (optimization_event FORM) no Pixel da plataforma na
+// chegada do lead de site vindo de anúncio do TikTok — é o evento com que a
+// campanha Smart+ de site aprende (ver montarPayloadAdgroupSmartPlus). Mesmo
+// gate de plano dos demais eventos; best-effort.
+async function enviarLeadSiteTikTok(usuarioId: number, lead: any) {
+  try {
+    const usuario = await client.query(`SELECT plano FROM usuarios WHERE id = $1`, [usuarioId]);
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) return;
+    const conexao = await obterConexaoTikTok(usuarioId);
+    if (!conexao?.advertiserId) return;
+
+    const item = montarEventoLeadSiteTikTok({
+      lead,
+      telefoneE164: lead?.telefone ? normalizarTelefoneE164Google(lead.telefone) : ""
+    });
+    if (!item) {
+      console.warn(`[site] evento Lead do TikTok sem página ou dado de casamento (lead ${lead.id})`);
+      return;
+    }
+    const pixelCode = await obterOuCriarFonteEventosTikTok(usuarioId, conexao.advertiserId, conexao.token, "pixel");
+    if (!pixelCode) {
+      console.warn(`[site] evento Lead do TikTok não enviado (lead ${lead.id}): Pixel indisponível`);
+      return;
+    }
+    const resultado = await tiktokFetch("/event/track/", conexao.token, {
+      method: "POST",
+      body: { event_source: "web", event_source_id: pixelCode, data: [item] }
+    });
+    if (!resultado.ok) {
+      console.warn(`[site] evento Lead do TikTok não enviado (lead ${lead.id}): ${resultado.error}`);
+    }
+  } catch (err) {
+    console.error(`[site] erro no evento Lead do TikTok (lead ${lead?.id}):`, err);
+  }
+}
+
 app.post("/site/leads", async (c) => {
   const limite = limitarRequisicao(c, "site-leads", 10, 60 * 1000);
   if (limite) return limite;
@@ -24489,6 +24666,8 @@ app.post("/site/leads", async (c) => {
 
     if (rede === "meta") {
       enviarLeadSiteMeta(usuarioId, lead);
+    } else if (rede === "tiktok") {
+      enviarLeadSiteTikTok(usuarioId, lead);
     }
 
     avaliarEEnviarQualificacaoLead({ ...lead }, usuarioId)

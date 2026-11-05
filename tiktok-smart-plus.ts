@@ -9,13 +9,21 @@
  *  - /smart_plus/adgroup/create/   (targeting_spec, budget no grupo com CBO off)
  *  - /smart_plus/ad/create/        (creative_list, ad_text_list, page_list,
  *                                   ad_configuration.call_to_action_id)
- *  - guias "Lead Generation with Location as Instant Form" e
- *    "... optimization location as instant messaging apps" (WhatsApp).
+ *  - guias "Lead Generation with Location as Instant Form",
+ *    "... optimization location as instant messaging apps" (WhatsApp) e
+ *    "... Location as Website" (site: EXTERNAL_WEBSITE + CONVERT + pixel_id +
+ *    optimization_event FORM, que é o evento "Lead" do Pixel; conferido em
+ *    2026-11-05).
+ *
+ * Site no Smart+ usa o Pixel da plataforma (o mesmo dos eventos de
+ * qualificação) e aprende com o evento "Lead" que o servidor envia quando
+ * chega lead do formulário do site vindo do TikTok. Por isso exige o código
+ * do formulário instalado (mesma regra da Meta, decidirOtimizacaoSiteMeta) e
+ * acesso a Pixel na conta; sem isso, fluxo legado até o corte (otimiza por
+ * clique, sem Pixel).
  *
  * O que NÃO tem equivalente direto no Smart+ (por isso cai no fluxo legado
  * enquanto ele existir e é bloqueado com mensagem clara depois do corte):
- *  - destino "site": Smart+ exige Pixel + evento de otimização; a plataforma
- *    publica site otimizando por clique, sem Pixel;
  *  - formato "imagem única": Smart+ só tem vídeo, post do TikTok e carrossel
  *    (carrossel exige música, e a recomendação de música pede 2+ imagens);
  *  - identidade personalizada (CUSTOMIZED_USER) ou AUTH_CODE: anúncio não-Spark
@@ -56,10 +64,49 @@ export function ehFluxoSmartPlusTikTok(configuracoes: any): boolean {
   return texto(configuracoes?.tiktok_fluxo) === "smart_plus";
 }
 
+// Vídeo enviado pela plataforma com identidade Spark: o único criativo que a
+// plataforma publica no Smart+. Fora disso o destino nem chega a importar.
+export function criativoAceitoNoSmartPlus(formato: FormatoCriativoTikTok, identityType: unknown): boolean {
+  return formato === "video" &&
+    (IDENTIDADES_SMART_PLUS_TIKTOK as readonly string[]).includes(texto(identityType).toUpperCase());
+}
+
+// Destino site: o que a plataforma sabe antes de publicar.
+export type SituacaoSiteSmartPlus = {
+  // Leads do formulário do site chegam ao Pixel: código instalado (ou lead
+  // recente pelo site) e plano com envio de eventos.
+  eventos: boolean;
+  // Quando eventos é false porque o plano não envia eventos.
+  semEventosPorPlano?: boolean;
+  // Pixel da plataforma utilizável na conta; null = não consultado.
+  pixel: boolean | null;
+  // Por que o Pixel não pode ser usado (texto para o usuário).
+  erroPixel?: string | null;
+};
+
+export const AVISO_SMART_PLUS_TIKTOK =
+  "Publicação no formato Smart+ do TikTok: o texto do botão é escolhido automaticamente pelo TikTok (CTA dinâmico) e o vídeo é publicado como anúncio Spark da conta escolhida, visível só em anúncios.";
+
+export const AVISO_SITE_SMART_PLUS_TIKTOK =
+  "A campanha para o site otimiza por lead: cada envio do formulário do site vindo do TikTok é informado ao Pixel da plataforma (evento Lead).";
+
+function motivoEventosSite(site: SituacaoSiteSmartPlus | undefined): string {
+  return site?.semEventosPorPlano
+    ? "No formato Smart+ do TikTok, a campanha para site aprende com os leads enviados ao Pixel, e o seu plano não inclui o envio de eventos de conversão."
+    : "No formato Smart+ do TikTok, a campanha para site aprende com os leads do formulário do site, e o código do formulário da plataforma ainda não foi detectado no seu site.";
+}
+
+function motivoPixelSite(site: SituacaoSiteSmartPlus | undefined): string {
+  const detalhe = texto(site?.erroPixel) || "não foi possível usar o Pixel da plataforma nesta conta de anúncios";
+  return `No formato Smart+ do TikTok, a campanha para site precisa do Pixel da plataforma na conta de anúncios, e ${detalhe.replace(/[.\s]+$/, "")}.`;
+}
+
 export function decidirFluxoCriacaoTikTok(entrada: {
   destino: DestinoTikTokSmartPlus;
   formato: FormatoCriativoTikTok;
   identityType: string;
+  // Obrigatório para decidir site no Smart+; sem ele, site fica no legado.
+  site?: SituacaoSiteSmartPlus;
   agora?: Date;
 }): DecisaoFluxoTikTok {
   const agoraMs = (entrada.agora ?? new Date()).getTime();
@@ -68,25 +115,41 @@ export function decidirFluxoCriacaoTikTok(entrada: {
 
   let motivo = "";
   let codigo = "";
-  if (entrada.destino === "site") {
-    codigo = "TIKTOK_SMART_PLUS_SITE_REQUIRES_PIXEL";
-    motivo = "No formato Smart+ do TikTok, campanhas de leads para site exigem um Pixel TikTok instalado no site com evento de formulário, o que a plataforma ainda não configura.";
-  } else if (entrada.formato === "imagem") {
+  if (entrada.formato === "imagem") {
     codigo = "TIKTOK_SMART_PLUS_IMAGE_UNSUPPORTED";
     motivo = "O formato Smart+ do TikTok não aceita anúncio de imagem única; use um vídeo.";
   } else if (!(IDENTIDADES_SMART_PLUS_TIKTOK as readonly string[]).includes(identidade)) {
     codigo = "TIKTOK_SMART_PLUS_IDENTITY_UNSUPPORTED";
     motivo = "O formato Smart+ do TikTok só publica vídeos enviados pela plataforma com uma conta TikTok vinculada (TikTok User ou conta do Business Center). Escolha uma dessas identidades.";
+  } else if (entrada.destino === "site") {
+    const site = entrada.site;
+    if (site?.eventos && site.pixel === true) {
+      return { ok: true, fluxo: "smart_plus", avisos: [AVISO_SMART_PLUS_TIKTOK, AVISO_SITE_SMART_PLUS_TIKTOK] };
+    }
+    if (!legadoDisponivel && site?.pixel === true) {
+      // Depois do corte não há alternativa: publica, mas avisa que a
+      // campanha só aprende quando os leads do site chegarem ao Pixel.
+      return {
+        ok: true,
+        fluxo: "smart_plus",
+        avisos: [
+          AVISO_SMART_PLUS_TIKTOK,
+          `${motivoEventosSite(site)} A campanha foi publicada assim mesmo, mas o TikTok só aprende quem vira lead depois que isso for resolvido.`
+        ]
+      };
+    }
+    // Pixel indisponível pesa mais que o código: sem ele não há Smart+.
+    if (site?.pixel === false || !legadoDisponivel) {
+      codigo = "TIKTOK_SMART_PLUS_SITE_PIXEL_UNAVAILABLE";
+      motivo = motivoPixelSite(site);
+    } else {
+      codigo = "TIKTOK_SMART_PLUS_SITE_EVENTS_MISSING";
+      motivo = motivoEventosSite(site);
+    }
   }
 
   if (!motivo) {
-    return {
-      ok: true,
-      fluxo: "smart_plus",
-      avisos: [
-        "Publicação no formato Smart+ do TikTok: o texto do botão é escolhido automaticamente pelo TikTok (CTA dinâmico) e o vídeo é publicado como anúncio Spark da conta escolhida, visível só em anúncios."
-      ]
-    };
+    return { ok: true, fluxo: "smart_plus", avisos: [AVISO_SMART_PLUS_TIKTOK] };
   }
   if (legadoDisponivel) {
     return {
@@ -188,7 +251,9 @@ export function montarAgendaSmartPlus(entrada: { inicio?: unknown; fim?: unknown
 // - Instant Form: promotion_type LEAD_GENERATION + INSTANT_PAGE, objetivo
 //   LEAD_GENERATION, cobrança OCPM;
 // - WhatsApp: LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE + WHATSAPP com
-//   phone_info, objetivo CLICK, cobrança CPC (não exige conjunto de eventos).
+//   phone_info, objetivo CLICK, cobrança CPC (não exige conjunto de eventos);
+// - site: LEAD_GENERATION + EXTERNAL_WEBSITE, objetivo CONVERT no evento FORM
+//   ("Lead") do Pixel da plataforma, cobrança OCPM.
 // Segmentação MANUAL para respeitar idade/gênero/interesses escolhidos; sem
 // placement_type = posicionamento automático (igual ao fluxo legado).
 export function montarPayloadAdgroupSmartPlus(entrada: {
@@ -201,39 +266,50 @@ export function montarPayloadAdgroupSmartPlus(entrada: {
   inicio?: unknown;
   fim?: unknown;
   numeroWhatsapp?: string;
+  pixelId?: string | null;
   nome?: string;
   agora?: Date;
 }) {
-  if (entrada.destino === "site") {
-    throw new Error("Destino site não é publicado pelo fluxo Smart+");
-  }
   const whatsapp = entrada.destino === "whatsapp";
   if (whatsapp && !texto(entrada.numeroWhatsapp)) {
     throw new Error("Número do WhatsApp obrigatório para o grupo Smart+");
   }
+  if (entrada.destino === "site" && !/^\d+$/.test(texto(entrada.pixelId))) {
+    throw new Error("pixel_id obrigatório para o grupo Smart+ de site");
+  }
+  const otimizacao = whatsapp
+    ? {
+        promotion_type: "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE",
+        messaging_app_type: "WHATSAPP",
+        phone_info: {
+          phone_region_code: "BR",
+          phone_region_calling_code: "+55",
+          phone_number: texto(entrada.numeroWhatsapp)
+        },
+        optimization_goal: "CLICK",
+        billing_event: "CPC"
+      }
+    : entrada.destino === "site"
+    ? {
+        promotion_type: "LEAD_GENERATION",
+        promotion_target_type: "EXTERNAL_WEBSITE",
+        optimization_goal: "CONVERT",
+        pixel_id: texto(entrada.pixelId),
+        optimization_event: "FORM",
+        billing_event: "OCPM"
+      }
+    : {
+        promotion_type: "LEAD_GENERATION",
+        promotion_target_type: "INSTANT_PAGE",
+        optimization_goal: "LEAD_GENERATION",
+        billing_event: "OCPM"
+      };
   return {
     advertiser_id: String(entrada.advertiserId),
     campaign_id: String(entrada.campaignId),
     request_id: entrada.requestId,
     adgroup_name: limparNomeTikTok(entrada.nome, `AdGroup Leads ${Date.now()}`),
-    ...(whatsapp
-      ? {
-          promotion_type: "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE",
-          messaging_app_type: "WHATSAPP",
-          phone_info: {
-            phone_region_code: "BR",
-            phone_region_calling_code: "+55",
-            phone_number: texto(entrada.numeroWhatsapp)
-          },
-          optimization_goal: "CLICK",
-          billing_event: "CPC"
-        }
-      : {
-          promotion_type: "LEAD_GENERATION",
-          promotion_target_type: "INSTANT_PAGE",
-          optimization_goal: "LEAD_GENERATION",
-          billing_event: "OCPM"
-        }),
+    ...otimizacao,
     bid_type: "BID_TYPE_NO_BID",
     budget_mode: "BUDGET_MODE_DYNAMIC_DAILY_BUDGET",
     budget: entrada.orcamentoDiario,
@@ -295,6 +371,7 @@ export function montarPayloadAnuncioSmartPlus(entrada: {
   adgroupId: string;
   destino: DestinoTikTokSmartPlus;
   formId?: string | null;
+  urlSite?: string | null;
   identidade: IdentidadeSmartPlus;
   videoId: string;
   capaImageId: string;
@@ -302,8 +379,8 @@ export function montarPayloadAnuncioSmartPlus(entrada: {
   ctaPortfolioId: string;
   nome?: string;
 }) {
-  if (entrada.destino === "site") {
-    throw new Error("Destino site não é publicado pelo fluxo Smart+");
+  if (entrada.destino === "site" && !/^https?:\/\//i.test(texto(entrada.urlSite))) {
+    throw new Error("Endereço do site obrigatório");
   }
   if (entrada.destino === "lead_ads" && !texto(entrada.formId)) {
     throw new Error("Formulário instantâneo obrigatório");
@@ -323,9 +400,10 @@ export function montarPayloadAnuncioSmartPlus(entrada: {
       })
     ],
     ad_text_list: [{ ad_text: texto(entrada.texto) || "Quer mais clientes? 🚀" }],
-    // Instant Form vai em page_list; no WhatsApp o TikTok preenche o destino
-    // a partir do grupo (landing_page_url_list e page_list ficam vazios).
+    // Instant Form vai em page_list e o site em landing_page_url_list; no
+    // WhatsApp o TikTok preenche o destino a partir do grupo.
     ...(entrada.destino === "lead_ads" ? { page_list: [{ page_id: texto(entrada.formId) }] } : {}),
+    ...(entrada.destino === "site" ? { landing_page_url_list: [{ landing_page_url: texto(entrada.urlSite) }] } : {}),
     ad_configuration: { call_to_action_id: texto(entrada.ctaPortfolioId) },
     operation_status: "ENABLE"
   };
@@ -339,6 +417,7 @@ export function montarPayloadEdicaoAnuncioSmartPlus(entrada: {
   destino: DestinoTikTokSmartPlus;
   texto: string;
   formId?: string | null;
+  urlSite?: string | null;
   criativo?: ReturnType<typeof montarCriativoVideoSmartPlus> | null;
 }) {
   return {
@@ -347,6 +426,9 @@ export function montarPayloadEdicaoAnuncioSmartPlus(entrada: {
     ad_text_list: [{ ad_text: entrada.texto }],
     ...(entrada.destino === "lead_ads" && texto(entrada.formId)
       ? { page_list: [{ page_id: texto(entrada.formId) }] }
+      : {}),
+    ...(entrada.destino === "site" && /^https?:\/\//i.test(texto(entrada.urlSite))
+      ? { landing_page_url_list: [{ landing_page_url: texto(entrada.urlSite) }] }
       : {}),
     ...(entrada.criativo ? { creative_list: [entrada.criativo] } : {})
   };
@@ -531,4 +613,31 @@ export async function criarPortfolioCtaDinamicoTikTok(
     return { ok: false, erro: portfolio.error || "Não foi possível criar o portfólio de CTA no TikTok" };
   }
   return { ok: true, portfolioId, ctas: conteudo.map(item => item.asset_content) };
+}
+
+// Pixel da plataforma numa resposta de /pixel/list/: pelo código (quando já
+// é conhecido) ou pelo nome exato. O grupo Smart+ usa o pixel_id numérico;
+// os eventos (/event/track/) usam o pixel_code.
+export function pixelDaPlataformaTikTok(
+  payload: any,
+  filtro: { codigo?: string | null; nome?: string | null }
+): { pixelId: string; pixelCode: string } | null {
+  const lista = Array.isArray(payload?.data?.pixels) ? payload.data.pixels : [];
+  const codigo = texto(filtro.codigo);
+  const nome = texto(filtro.nome).toLowerCase();
+  const item = lista.find((p: any) =>
+    codigo ? texto(p?.pixel_code) === codigo : Boolean(nome) && texto(p?.pixel_name).toLowerCase() === nome
+  );
+  const pixelId = texto(item?.pixel_id);
+  const pixelCode = texto(item?.pixel_code);
+  return /^\d+$/.test(pixelId) && pixelCode ? { pixelId, pixelCode } : null;
+}
+
+// Teste na conta real (2026-11-05): /pixel/list/ e /crm/list/ voltam 40001
+// "advertiser does not grant you /pixel/list/:GET permission" — o app da
+// plataforma não tem a permissão de Pixel nessa autorização.
+export function erroPixelTikTok(mensagem: unknown): string {
+  return /permission|not grant/i.test(texto(mensagem))
+    ? "o TikTok não liberou o acesso a Pixels para a plataforma nesta conta de anúncios (reconecte o TikTok autorizando Pixel; se continuar, fale com o suporte)"
+    : "não foi possível consultar os Pixels da conta de anúncios no TikTok";
 }

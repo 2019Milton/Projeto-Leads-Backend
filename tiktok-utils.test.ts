@@ -8,6 +8,7 @@ import {
   inicioAgendaTikTok,
   interpretarDataHoraBrasil,
   leadIdentificavelTikTok,
+  montarEventoLeadSiteTikTok,
   montarEventoTikTok,
 } from "./tiktok-utils";
 
@@ -155,4 +156,46 @@ test("linha do CSV: data ilegível não lança erro e colunas fixas não viram r
   expect(extrairLeadCsvTikTok({ lead_id: "1", create_time: "2026-11-01T10:00:00Z" }).criadoEm)
     .toBe("2026-11-01T10:00:00.000Z");
   expect(extrairLeadCsvTikTok({ lead_id: "1" }).nome).toBe("Lead TikTok");
+});
+
+test("evento Lead do site: ttclid, hashes, IP/navegador e page.url (exigido em evento web)", () => {
+  const evento = montarEventoLeadSiteTikTok({
+    lead: {
+      id: 42,
+      email: " ALICE_abc@gmail.com ",
+      atribuicao: {
+        ttclid: "E.C.P.abc",
+        pagina: "https://corretor.com.br/imovel?ttclid=E.C.P.abc",
+        referrer: "https://www.tiktok.com/",
+        ip: "203.0.113.1",
+        user_agent: "Mozilla/5.0"
+      }
+    },
+    telefoneE164: "+12133734253",
+    agoraSegundos: 1700000000
+  });
+  expect(evento).toEqual({
+    event: "Lead",
+    event_time: 1700000000,
+    event_id: "42-Lead",
+    user: {
+      ttclid: "E.C.P.abc",
+      email: HASH_EMAIL_DOC,
+      phone: HASH_TELEFONE_DOC,
+      ip: "203.0.113.1",
+      user_agent: "Mozilla/5.0"
+    },
+    page: { url: "https://corretor.com.br/imovel?ttclid=E.C.P.abc", referrer: "https://www.tiktok.com/" }
+  });
+});
+
+test("evento Lead do site: atribuição em texto, sem página ou sem dado de casamento", () => {
+  const comTexto = montarEventoLeadSiteTikTok({
+    lead: { id: 1, atribuicao: JSON.stringify({ ttclid: "X", pagina: "https://a.com/", referrer: "" }) }
+  });
+  expect(comTexto?.user).toEqual({ ttclid: "X" });
+  expect(comTexto?.page).toEqual({ url: "https://a.com/" });
+  expect(montarEventoLeadSiteTikTok({ lead: { id: 1, atribuicao: { ttclid: "X" } } })).toBeNull();
+  expect(montarEventoLeadSiteTikTok({ lead: { id: 1, atribuicao: { pagina: "https://a.com/", ip: "1.1.1.1" } } })).toBeNull();
+  expect(montarEventoLeadSiteTikTok({ lead: { id: 1, atribuicao: "{quebrado" } })).toBeNull();
 });

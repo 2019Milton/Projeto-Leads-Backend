@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   CORTE_FLUXO_LEGADO_TIKTOK_MS,
   criarPortfolioCtaDinamicoTikTok,
+  criativoAceitoNoSmartPlus,
   decidirFluxoCriacaoTikTok,
   ehFluxoSmartPlusTikTok,
   endpointsStatusTikTok,
   erroIdentidadeSmartPlus,
+  erroPixelTikTok,
   gerarRequestIdTikTok,
   limparNomeTikTok,
   montarAgendaSmartPlus,
@@ -19,6 +21,7 @@ import {
   normalizarAdgroupSmartPlus,
   normalizarAnuncioSmartPlus,
   obterCapaVideoTikTok,
+  pixelDaPlataformaTikTok,
   traduzirErroPublicacaoTikTok,
   type ChamadaTikTok
 } from "./tiktok-smart-plus";
@@ -42,6 +45,9 @@ describe("decidirFluxoCriacaoTikTok", () => {
   test("site, imagem e identidade não-Spark ficam no legado antes do corte", () => {
     const casos = [
       { destino: "site" as const, formato: "video" as const, identityType: "BC_AUTH_TT" },
+      { destino: "site" as const, formato: "video" as const, identityType: "TT_USER", site: { eventos: false, pixel: true } },
+      { destino: "site" as const, formato: "video" as const, identityType: "TT_USER", site: { eventos: true, pixel: false } },
+      { destino: "site" as const, formato: "imagem" as const, identityType: "TT_USER", site: { eventos: true, pixel: true } },
       { destino: "lead_ads" as const, formato: "imagem" as const, identityType: "TT_USER" },
       { destino: "whatsapp" as const, formato: "video" as const, identityType: "CUSTOMIZED_USER" },
       { destino: "lead_ads" as const, formato: "video" as const, identityType: "AUTH_CODE" }
@@ -53,9 +59,52 @@ describe("decidirFluxoCriacaoTikTok", () => {
     }
   });
 
+  test("site com código do formulário e Pixel vai para Smart+ otimizando por lead", () => {
+    for (const agora of [ANTES_DO_CORTE, DEPOIS_DO_CORTE]) {
+      const d: any = decidirFluxoCriacaoTikTok({
+        destino: "site", formato: "video", identityType: "BC_AUTH_TT", agora,
+        site: { eventos: true, pixel: true }
+      });
+      expect(d).toMatchObject({ ok: true, fluxo: "smart_plus" });
+      expect(d.avisos.join(" ")).toContain("evento Lead");
+    }
+  });
+
+  test("site: motivo do legado diz o que falta (código, plano ou Pixel)", () => {
+    const motivo = (site: any) =>
+      (decidirFluxoCriacaoTikTok({ destino: "site", formato: "video", identityType: "TT_USER", agora: ANTES_DO_CORTE, site }) as any).motivo;
+    expect(motivo({ eventos: false, pixel: true })).toContain("código do formulário");
+    expect(motivo({ eventos: false, semEventosPorPlano: true, pixel: true })).toContain("plano");
+    expect(motivo({ eventos: true, pixel: false, erroPixel: "o TikTok não liberou o acesso a Pixels." }))
+      .toBe("No formato Smart+ do TikTok, a campanha para site precisa do Pixel da plataforma na conta de anúncios, e o TikTok não liberou o acesso a Pixels.");
+    // Sem Pixel pesa mais que sem código.
+    expect(motivo({ eventos: false, pixel: false })).toContain("Pixel");
+  });
+
+  test("site depois do corte: publica com Pixel mesmo sem código; sem Pixel bloqueia", () => {
+    const semCodigo: any = decidirFluxoCriacaoTikTok({
+      destino: "site", formato: "video", identityType: "TT_USER", agora: DEPOIS_DO_CORTE,
+      site: { eventos: false, pixel: true }
+    });
+    expect(semCodigo).toMatchObject({ ok: true, fluxo: "smart_plus" });
+    expect(semCodigo.avisos[1]).toContain("só aprende");
+    for (const site of [undefined, { eventos: true, pixel: false }, { eventos: true, pixel: null }]) {
+      expect(decidirFluxoCriacaoTikTok({ destino: "site", formato: "video", identityType: "TT_USER", agora: DEPOIS_DO_CORTE, site }))
+        .toMatchObject({ ok: false, codigo: "TIKTOK_SMART_PLUS_SITE_PIXEL_UNAVAILABLE" });
+    }
+  });
+
+  test("criativoAceitoNoSmartPlus: só vídeo com identidade Spark", () => {
+    expect(criativoAceitoNoSmartPlus("video", "bc_auth_tt")).toBe(true);
+    expect(criativoAceitoNoSmartPlus("video", "TT_USER")).toBe(true);
+    expect(criativoAceitoNoSmartPlus("imagem", "TT_USER")).toBe(false);
+    expect(criativoAceitoNoSmartPlus("video", "CUSTOMIZED_USER")).toBe(false);
+    expect(criativoAceitoNoSmartPlus("video", null)).toBe(false);
+  });
+
   test("depois de 01/01/2027 o que o Smart+ não cobre é bloqueado com código", () => {
-    expect(decidirFluxoCriacaoTikTok({ destino: "site", formato: "video", identityType: "TT_USER", agora: DEPOIS_DO_CORTE }))
-      .toMatchObject({ ok: false, codigo: "TIKTOK_SMART_PLUS_SITE_REQUIRES_PIXEL" });
+    expect(decidirFluxoCriacaoTikTok({ destino: "site", formato: "imagem", identityType: "TT_USER", agora: DEPOIS_DO_CORTE }))
+      .toMatchObject({ ok: false, codigo: "TIKTOK_SMART_PLUS_IMAGE_UNSUPPORTED" });
     expect(decidirFluxoCriacaoTikTok({ destino: "lead_ads", formato: "imagem", identityType: "TT_USER", agora: DEPOIS_DO_CORTE }))
       .toMatchObject({ ok: false, codigo: "TIKTOK_SMART_PLUS_IMAGE_UNSUPPORTED" });
     expect(decidirFluxoCriacaoTikTok({ destino: "lead_ads", formato: "video", identityType: "CUSTOMIZED_USER", agora: DEPOIS_DO_CORTE }))
@@ -185,9 +234,29 @@ describe("grupo de anúncios Smart+", () => {
     expect(p).not.toHaveProperty("message_event_set_id");
   });
 
-  test("recusa site e WhatsApp sem número", () => {
+  test("site otimiza por conversão no evento FORM do Pixel (guia Location as Website)", () => {
+    const p: any = montarPayloadAdgroupSmartPlus({
+      advertiserId: "123", campaignId: "456", requestId: "789", destino: "site",
+      targeting, orcamentoDiario: 40, pixelId: "7311111111111111111", agora: ANTES_DO_CORTE
+    });
+    expect(p).toMatchObject({
+      promotion_type: "LEAD_GENERATION",
+      promotion_target_type: "EXTERNAL_WEBSITE",
+      optimization_goal: "CONVERT",
+      pixel_id: "7311111111111111111",
+      optimization_event: "FORM",
+      billing_event: "OCPM",
+      bid_type: "BID_TYPE_NO_BID",
+      budget_mode: "BUDGET_MODE_DYNAMIC_DAILY_BUDGET",
+      budget: 40
+    });
+    expect(p).not.toHaveProperty("phone_info");
+  });
+
+  test("recusa site sem pixel_id numérico e WhatsApp sem número", () => {
     const base = { advertiserId: "1", campaignId: "2", requestId: "3", targeting, orcamentoDiario: 10 };
     expect(() => montarPayloadAdgroupSmartPlus({ ...base, destino: "site" })).toThrow();
+    expect(() => montarPayloadAdgroupSmartPlus({ ...base, destino: "site", pixelId: "C4ABCDEF" })).toThrow();
     expect(() => montarPayloadAdgroupSmartPlus({ ...base, destino: "whatsapp" })).toThrow();
   });
 
@@ -236,12 +305,25 @@ describe("anúncio Smart+", () => {
     expect(p.ad_text_list[0].ad_text).toBe("Quer mais clientes? 🚀");
   });
 
-  test("recusa formulário ausente, CTA ausente e identidade não-Spark", () => {
+  test("site vai em landing_page_url_list, sem page_list", () => {
+    const p: any = montarPayloadAnuncioSmartPlus({
+      advertiserId: "1", adgroupId: "2", destino: "site", urlSite: "https://corretor.com.br/imovel?x=1",
+      identidade: { identity_id: "9", identity_type: "TT_USER" },
+      videoId: "v", capaImageId: "c", texto: "t", ctaPortfolioId: "CTA"
+    });
+    expect(p.landing_page_url_list).toEqual([{ landing_page_url: "https://corretor.com.br/imovel?x=1" }]);
+    expect(p).not.toHaveProperty("page_list");
+    expect(p.ad_configuration).toEqual({ call_to_action_id: "CTA" });
+  });
+
+  test("recusa formulário ausente, site sem URL, CTA ausente e identidade não-Spark", () => {
     const base = {
       advertiserId: "1", adgroupId: "2", identidade: identidadeBc,
       videoId: "v", capaImageId: "c", texto: "t", ctaPortfolioId: "CTA"
     };
     expect(() => montarPayloadAnuncioSmartPlus({ ...base, destino: "lead_ads" })).toThrow();
+    expect(() => montarPayloadAnuncioSmartPlus({ ...base, destino: "site" })).toThrow();
+    expect(() => montarPayloadAnuncioSmartPlus({ ...base, destino: "site", urlSite: "corretor.com.br" })).toThrow();
     expect(() => montarPayloadAnuncioSmartPlus({ ...base, destino: "whatsapp", ctaPortfolioId: "" })).toThrow();
     expect(() => montarPayloadAnuncioSmartPlus({
       ...base, destino: "whatsapp", identidade: { identity_id: "1", identity_type: "CUSTOMIZED_USER" }
@@ -275,6 +357,38 @@ describe("anúncio Smart+", () => {
     });
     expect(comMidia.creative_list).toEqual([criativo]);
     expect(comMidia).not.toHaveProperty("page_list");
+    const site: any = montarPayloadEdicaoAnuncioSmartPlus({
+      advertiserId: "1", smartPlusAdId: "SP1", destino: "site", texto: "Novo", urlSite: "https://novo.com.br/"
+    });
+    expect(site.landing_page_url_list).toEqual([{ landing_page_url: "https://novo.com.br/" }]);
+  });
+});
+
+describe("Pixel da plataforma", () => {
+  const lista = {
+    code: 0,
+    data: {
+      pixels: [
+        { pixel_id: "111", pixel_code: "CODEOUTRO", pixel_name: "Plataforma de Leads antigo" },
+        { pixel_id: "7300000000000000001", pixel_code: "CABC123", pixel_name: "plataforma de leads" }
+      ]
+    }
+  };
+
+  test("acha pelo nome exato ou pelo código", () => {
+    expect(pixelDaPlataformaTikTok(lista, { nome: "Plataforma de Leads" }))
+      .toEqual({ pixelId: "7300000000000000001", pixelCode: "CABC123" });
+    expect(pixelDaPlataformaTikTok(lista, { codigo: "CODEOUTRO" })).toEqual({ pixelId: "111", pixelCode: "CODEOUTRO" });
+    expect(pixelDaPlataformaTikTok(lista, { nome: "Outro" })).toBeNull();
+    expect(pixelDaPlataformaTikTok({ data: { pixels: [{ pixel_id: "", pixel_code: "X", pixel_name: "a" }] } }, { nome: "a" }))
+      .toBeNull();
+    expect(pixelDaPlataformaTikTok(null, { nome: "a" })).toBeNull();
+  });
+
+  test("erro de permissão do teste real vira texto para o usuário", () => {
+    expect(erroPixelTikTok("advertiser does not grant you /pixel/list/:GET permission"))
+      .toContain("não liberou o acesso a Pixels");
+    expect(erroPixelTikTok("Internal error")).toContain("não foi possível consultar");
   });
 });
 

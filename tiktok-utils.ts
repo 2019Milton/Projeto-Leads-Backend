@@ -72,6 +72,47 @@ export function montarEventoTikTok(params: {
   return item;
 }
 
+// Evento padrão "Lead" (optimization_event FORM) quando chega lead pelo
+// formulário do site vindo de anúncio do TikTok — é com ele que a campanha
+// Smart+ de site aprende. Events API 2.0, conferida em 2026-11-05: evento web
+// exige page.url; o casamento usa user.ttclid (vem na URL do clique), e-mail,
+// telefone, IP e navegador.
+export function montarEventoLeadSiteTikTok(params: {
+  lead: any;
+  telefoneE164?: string | null;
+  agoraSegundos?: number;
+}): Record<string, any> | null {
+  const { lead } = params;
+  let atribuicao: any = lead?.atribuicao ?? {};
+  if (typeof atribuicao === "string") {
+    try { atribuicao = JSON.parse(atribuicao); } catch { atribuicao = {}; }
+  }
+  const pagina = texto(atribuicao?.pagina);
+  if (!/^https?:\/\//i.test(pagina)) return null;
+
+  const usuario: Record<string, string> = {};
+  const ttclid = texto(atribuicao?.ttclid);
+  if (ttclid) usuario.ttclid = ttclid;
+  const email = texto(lead?.email);
+  if (email) usuario.email = sha256Normalizado(email);
+  const telefone = texto(params.telefoneE164);
+  if (/^\+\d{8,15}$/.test(telefone)) usuario.phone = sha256Normalizado(telefone);
+  if (!Object.keys(usuario).length) return null;
+  const ip = texto(atribuicao?.ip);
+  if (ip) usuario.ip = ip;
+  const navegador = texto(atribuicao?.user_agent);
+  if (navegador) usuario.user_agent = navegador;
+
+  const referrer = texto(atribuicao?.referrer);
+  return {
+    event: "Lead",
+    event_time: params.agoraSegundos ?? Math.floor(Date.now() / 1000),
+    ...(texto(lead?.id) ? { event_id: `${texto(lead.id)}-Lead` } : {}),
+    user: usuario,
+    page: { url: pagina, ...(/^https?:\/\//i.test(referrer) ? { referrer } : {}) }
+  };
+}
+
 // Lê o ID da fonte de eventos com o nome da plataforma numa resposta de
 // /pixel/list/ (busca por nome é aproximada) ou /crm/list/.
 export function idFonteEventosTikTokNaLista(
