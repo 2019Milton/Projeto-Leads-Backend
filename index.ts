@@ -49,11 +49,16 @@ import { contarCampanhasPorRedeMeta, consultarRedesMeta, detectarRedeOrigemRefer
 import {
   aplicarOtimizacaoLeadQualificado,
   campanhaOtimizadaPorLeadQualificado,
+  erroDePermissaoLinkedIn,
   escolherRegraLeadQualificado,
+  etapasPendentesLinkedIn,
+  leadTemIdentificadorLinkedIn,
+  LIMITE_REENVIO_POR_CHAMADA,
   montarAssociacaoCampanhaConversao,
   montarCorpoRegraLeadQualificado,
   montarEventoConversaoLinkedIn,
   OTIMIZACAO_LEAD_QUALIFICADO,
+  PERIODO_REENVIO_DIAS,
   proximoStartBuscaRegras,
   regraDaConexao,
   urlBuscaRegrasConversao,
@@ -1868,10 +1873,18 @@ async function avaliarEEnviarQualificacaoTikTok(
 // Equivalente LinkedIn de avaliarEEnviarQualificacaoMeta — casa pelo lead_id
 // nativo do Lead Gen Form (leadGenFormResponse urn), mesmo mecanismo que a
 // Meta usa (ver enviarEventoLinkedInConversionLeads).
+// Devolve o que foi enviado e os erros por etapa — só o reenvio
+// (/linkedin/conversoes/reenviar) usa; os demais chamadores ignoram o retorno.
+type ResultadoAvaliacaoLinkedIn = {
+  enviados: Array<"Qualified Lead" | "Closed Won">;
+  erros: Array<{ etapa: "Qualified Lead" | "Closed Won"; erro: string; status?: number }>;
+};
+
 async function avaliarEEnviarQualificacaoLinkedIn(
   leadRow: any,
   usuarioId: number
-) {
+): Promise<ResultadoAvaliacaoLinkedIn> {
+  const retorno: ResultadoAvaliacaoLinkedIn = { enviados: [], erros: [] };
   try {
 
     // enviarEventoLinkedInConversionLeads casa o evento por e-mail hasheado
@@ -1882,7 +1895,7 @@ async function avaliarEEnviarQualificacaoLinkedIn(
     const temUrnFormulario =
       leadRow?.plataforma === "linkedin" && urnRespostaFormularioLinkedIn(leadRow?.lead_id) !== null;
     if (!leadRow?.email && !temUrnFormulario) {
-      return;
+      return retorno;
     }
 
     const usuario = await client.query(
@@ -1891,7 +1904,7 @@ async function avaliarEEnviarQualificacaoLinkedIn(
     );
 
     if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) {
-      return;
+      return retorno;
     }
 
     const scoreData = calcularScoreLead(leadRow);
@@ -1912,6 +1925,9 @@ async function avaliarEEnviarQualificacaoLinkedIn(
           `UPDATE leads SET linkedin_evento_qualificado_enviado_em = NOW() WHERE id = $1`,
           [leadRow.id]
         );
+        retorno.enviados.push("Qualified Lead");
+      } else {
+        retorno.erros.push({ etapa: "Qualified Lead", erro: resultado.erro || "Erro ao enviar evento", status: resultado.status });
       }
     }
 
@@ -1931,12 +1947,16 @@ async function avaliarEEnviarQualificacaoLinkedIn(
           `UPDATE leads SET linkedin_evento_fechado_enviado_em = NOW() WHERE id = $1`,
           [leadRow.id]
         );
+        retorno.enviados.push("Closed Won");
+      } else {
+        retorno.erros.push({ etapa: "Closed Won", erro: resultado.erro || "Erro ao enviar evento", status: resultado.status });
       }
     }
 
   } catch (err) {
     console.error("ERRO avaliarEEnviarQualificacaoLinkedIn:", err);
   }
+  return retorno;
 }
 
 // Stub Kwai de avaliarEEnviarQualificacaoMeta/Google/TikTok/LinkedIn — ainda
@@ -17108,6 +17128,151 @@ app.post("/linkedin/conversoes/configurar", authMiddleware, async (c) => {
   }
 });
 
+// Reenvia ao LinkedIn os leads dos últimos 30 dias que ficaram "quentes" ou
+// "fechados" enquanto o envio estava desligado (ou antes de a regra existir).
+// Nunca repete o que já foi enviado (colunas linkedin_evento_*_enviado_em) e
+// nunca olha além de 30 dias — o LinkedIn só aproveita isso na otimização.
+// Com { simular: true } só conta o que seria enviado, sem mandar nada.
+// Lote de LIMITE_REENVIO_POR_CHAMADA leads por chamada; "ha_mais" avisa quando
+// sobrar. Mesma chave das demais rotas de conversão e mesmo recurso de plano.
+const linkedinReenvioConversoesEmAndamento = new Set<number>();
+const LIMITE_VARREDURA_REENVIO = 2000;
+
+app.post("/linkedin/conversoes/reenviar", authMiddleware, async (c) => {
+  let reenvioDoUsuario: number | null = null;
+  try {
+    const user: any = c.get("user");
+    const corpo = await c.req.json().catch(() => ({}));
+    const usuarioId = resolverUsuarioIdOperacao(user, corpo?.usuario_id);
+    if (!usuarioId) return negarAcessoConta(c);
+    const simular = corpo?.simular === true;
+
+    if (!LINKEDIN_CONVERSOES_HABILITADO) {
+      return c.json({
+        error: "O envio de leads qualificados ao LinkedIn ainda não está habilitado (aguardando a permissão rw_conversions do LinkedIn).",
+        codigo: "conversoes_desabilitadas",
+      }, 409);
+    }
+
+    const usuario = await client.query(`SELECT plano FROM usuarios WHERE id = $1`, [usuarioId]);
+    if (!usuarioTemRecurso(usuario.rows[0], "meta_conversion_leads")) {
+      return c.json({
+        error: "O seu plano não inclui o envio de leads qualificados às plataformas de anúncio.",
+        codigo: "recurso_indisponivel",
+      }, 403);
+    }
+
+    const conn = await client.query(
+      `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
+      [usuarioId]
+    );
+    const regras = {
+      qualificado: Boolean(regraDaConexao(conn.rows[0]?.dados_conta, "Qualified Lead")),
+      fechado: Boolean(regraDaConexao(conn.rows[0]?.dados_conta, "Closed Won")),
+    };
+    if (!regras.qualificado && !regras.fechado) {
+      return c.json({
+        error: "Configure as conversões do LinkedIn antes de reenviar os leads.",
+        codigo: "regra_nao_configurada",
+      }, 409);
+    }
+
+    if (!simular) {
+      if (linkedinReenvioConversoesEmAndamento.has(usuarioId)) {
+        return c.json({ error: "Já existe um reenvio em andamento para esta conta. Aguarde terminar." }, 429);
+      }
+      linkedinReenvioConversoesEmAndamento.add(usuarioId);
+      reenvioDoUsuario = usuarioId;
+    }
+
+    // Mesma definição de "lead do LinkedIn" do painel de eventos enviados.
+    // O filtro de "quente" é calculado em código (calcularScoreLead), então a
+    // varredura traz todos os candidatos do período e o lote sai só dos que
+    // realmente têm etapa pendente.
+    const candidatos = await client.query(
+      `SELECT * FROM leads
+       WHERE usuario_id = $1
+         AND COALESCE(NULLIF(NULLIF(plataforma, 'whatsapp'), 'site'), origem, 'formulario') = 'linkedin'
+         AND criado_em >= NOW() - ($2::int * INTERVAL '1 day')
+         AND (linkedin_evento_qualificado_enviado_em IS NULL
+              OR (status = 'fechado' AND linkedin_evento_fechado_enviado_em IS NULL))
+       ORDER BY id ASC
+       LIMIT $3`,
+      [usuarioId, PERIODO_REENVIO_DIAS, LIMITE_VARREDURA_REENVIO]
+    );
+
+    const pendentes = candidatos.rows
+      .map((lead: any) => ({
+        lead,
+        etapas: etapasPendentesLinkedIn(lead, calcularScoreLead(lead).score, regras),
+      }))
+      .filter((item: any) => item.etapas.length > 0);
+
+    const contar = (etapa: string) => pendentes.filter((item: any) => item.etapas.includes(etapa)).length;
+
+    if (simular) {
+      return c.json({
+        sucesso: true,
+        simulacao: true,
+        periodo_dias: PERIODO_REENVIO_DIAS,
+        leads_analisados: candidatos.rows.length,
+        a_enviar_qualificado: contar("Qualified Lead"),
+        a_enviar_fechado: contar("Closed Won"),
+        sem_identificador: candidatos.rows.filter((lead: any) => !leadTemIdentificadorLinkedIn(lead)).length,
+        lote_maximo: LIMITE_REENVIO_POR_CHAMADA,
+        ha_mais: pendentes.length > LIMITE_REENVIO_POR_CHAMADA,
+      });
+    }
+
+    const lote = pendentes.slice(0, LIMITE_REENVIO_POR_CHAMADA);
+    let enviadosQualificado = 0;
+    let enviadosFechado = 0;
+    let comErro = 0;
+    let primeiroErro: string | null = null;
+    let interrompidoPorPermissao = false;
+
+    for (const { lead } of lote) {
+      const resultado = await avaliarEEnviarQualificacaoLinkedIn(lead, usuarioId);
+      if (resultado.enviados.includes("Qualified Lead")) enviadosQualificado++;
+      if (resultado.enviados.includes("Closed Won")) enviadosFechado++;
+      if (resultado.erros.length) {
+        comErro++;
+        primeiroErro = primeiroErro ?? resultado.erros[0].erro;
+        // Token sem a permissão: não adianta insistir nos outros leads.
+        if (resultado.erros.some(erro => erroDePermissaoLinkedIn(erro.status))) {
+          interrompidoPorPermissao = true;
+          break;
+        }
+      }
+    }
+
+    console.log(
+      `LINKEDIN reenvio de conversões (usuário ${usuarioId}): lote=${lote.length} qualificados=${enviadosQualificado} fechados=${enviadosFechado} erros=${comErro}`
+    );
+
+    return c.json({
+      sucesso: !interrompidoPorPermissao,
+      simulacao: false,
+      periodo_dias: PERIODO_REENVIO_DIAS,
+      avaliados: lote.length,
+      enviados_qualificado: enviadosQualificado,
+      enviados_fechado: enviadosFechado,
+      com_erro: comErro,
+      primeiro_erro: primeiroErro,
+      interrompido_por_permissao: interrompidoPorPermissao,
+      ...(interrompidoPorPermissao
+        ? { error: "O LinkedIn recusou o envio. Reconecte o LinkedIn Ads para conceder a permissão rw_conversions e tente de novo." }
+        : {}),
+      ha_mais: pendentes.length > lote.length,
+    }, interrompidoPorPermissao ? 403 : 200);
+  } catch (err: any) {
+    console.error("ERRO /linkedin/conversoes/reenviar:", err);
+    return c.json({ error: mensagemErroPublica(err) || "Erro ao reenviar os leads ao LinkedIn" }, 500);
+  } finally {
+    if (reenvioDoUsuario !== null) linkedinReenvioConversoesEmAndamento.delete(reenvioDoUsuario);
+  }
+});
+
 // Upload de imagem como asset do LinkedIn (equivalente ao /meta/upload-imagem
 // e /google/upload-imagem) — o LinkedIn exige um fluxo em 2 passos:
 // initializeUpload (reserva a URN e devolve uma uploadUrl assinada) e depois
@@ -18305,7 +18470,7 @@ async function enviarEventoLinkedInConversionLeads(
   usuarioId: number,
   lead: any,
   eventName: "Qualified Lead" | "Closed Won"
-): Promise<{ ok: boolean; erro?: string }> {
+): Promise<{ ok: boolean; erro?: string; status?: number }> {
   try {
     if (!LINKEDIN_CONVERSOES_HABILITADO) {
       return { ok: false, erro: "Envio de conversões do LinkedIn desativado (LINKEDIN_CONVERSIONS_ENABLED)" };
@@ -18342,7 +18507,7 @@ async function enviarEventoLinkedInConversionLeads(
 
     if (!resposta.ok) {
       console.error(`ERRO ENVIO CONVERSAO LINKEDIN (${eventName}):`, resposta.status, resposta.data);
-      return { ok: false, erro: resposta.error || "Erro ao enviar evento pro LinkedIn" };
+      return { ok: false, erro: resposta.error || "Erro ao enviar evento pro LinkedIn", status: resposta.status };
     }
 
     return { ok: true };

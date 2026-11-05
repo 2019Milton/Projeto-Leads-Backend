@@ -32,6 +32,18 @@ continua exatamente como antes.
 - **Campanha:** com a otimização ligada, `/linkedin/adgroup` cria o conjunto com `optimizationTargetType: MAX_QUALIFIED_LEAD` e `costType: CPM` (sem `unitCost`), marca `linkedin_otimizacao` em `configuracoes_avancadas` e associa a campanha à regra (`PUT /campaignConversions`). Se o LinkedIn recusar o payload otimizado, **cai automaticamente no lance manual de sempre** — a criação nunca falha por causa disso. Se só a associação falhar, a resposta traz `aviso`; `POST /linkedin/conversoes/configurar` refaz a associação.
 - **Evento:** `POST /conversionEvents` quando o score do lead vira "quente" (`Qualified Lead`) ou o status vira "fechado" (`Closed Won`, só se houver regra de venda informada em `selecionar-conta`). Identificadores enviados: **e-mail com hash SHA-256** e/ou o **URN da resposta do formulário** (`urn:li:leadGenFormResponse:<lead_id>`, só para lead importado pelo Lead Sync). Não vai nome, telefone nem IP. Exige o recurso de plano `meta_conversion_leads`.
 
+## Reenvio dos leads que ficaram para trás
+
+Leads que ficaram "quentes" ou "fechados" **antes** de o envio ser ligado não são reenviados sozinhos. Para isso existe
+`POST /linkedin/conversoes/reenviar`:
+
+- **`{ "simular": true }`** só conta o que seria enviado (nada é mandado ao LinkedIn): `a_enviar_qualificado`, `a_enviar_fechado`, `sem_identificador`.
+- **Sem `simular`** envia de verdade, em lotes de até 100 leads por chamada (`ha_mais: true` = chame de novo).
+- Só olha leads criados nos **últimos 30 dias** e **nunca repete** o que já foi enviado (colunas `linkedin_evento_*_enviado_em`).
+- Exige a chave ligada, o recurso de plano `meta_conversion_leads` e a regra de conversão configurada.
+- Se o LinkedIn responder 401/403 (token sem `rw_conversions`), o reenvio **para na hora** e pede para reconectar.
+- Uma chamada por vez por conta (a segunda recebe 429).
+
 ## Limites que vêm do LinkedIn (documentação oficial)
 
 - O evento precisa chegar em até **30 dias** para entrar na otimização (a API recusa mais de 90).

@@ -182,6 +182,48 @@ export function montarEventoConversaoLinkedIn(params: {
   return evento;
 }
 
+// ---- Reenvio dos leads que já passaram do ponto enquanto o envio estava
+// desligado. O LinkedIn só aproveita evento de lead dos últimos 30 dias na
+// otimização (a API recusa mais de 90), então o reenvio nunca olha além disso.
+export const PERIODO_REENVIO_DIAS = 30;
+export const LIMITE_REENVIO_POR_CHAMADA = 100;
+
+// Tem como casar o lead com um perfil do LinkedIn? (mesmo critério do evento:
+// e-mail com hash e/ou URN da resposta do formulário.)
+export function leadTemIdentificadorLinkedIn(lead: any): boolean {
+  return (
+    hashEmailLinkedIn(lead?.email) !== null ||
+    (lead?.plataforma === "linkedin" && urnRespostaFormularioLinkedIn(lead?.lead_id) !== null)
+  );
+}
+
+// Etapas que ainda faltam enviar para o lead — espelha a regra de
+// avaliarEEnviarQualificacaoLinkedIn (score "quente" => Qualified Lead;
+// status "fechado" => Closed Won; nunca repete o que já foi enviado) e só
+// conta a etapa se a regra de conversão dela existir. Usada pra simular o
+// reenvio sem mandar nada.
+export function etapasPendentesLinkedIn(
+  lead: any,
+  score: string | null | undefined,
+  regras: { qualificado: boolean; fechado: boolean }
+): EtapaLinkedIn[] {
+  if (!leadTemIdentificadorLinkedIn(lead)) return [];
+  const etapas: EtapaLinkedIn[] = [];
+  if (regras.qualificado && score === "quente" && !lead?.linkedin_evento_qualificado_enviado_em) {
+    etapas.push("Qualified Lead");
+  }
+  if (regras.fechado && lead?.status === "fechado" && !lead?.linkedin_evento_fechado_enviado_em) {
+    etapas.push("Closed Won");
+  }
+  return etapas;
+}
+
+// 401/403 do LinkedIn = token sem a permissão (ou sem acesso à conta): não
+// adianta insistir nos demais leads.
+export function erroDePermissaoLinkedIn(status: unknown): boolean {
+  return status === 401 || status === 403;
+}
+
 // Campanha de lead gen otimizada por lead qualificado: lance automático
 // (costType sempre CPM, sem unitCost — o doc diz que no automático o unitCost
 // assume 0) com optimizationTargetType MAX_QUALIFIED_LEAD. Só vale pro

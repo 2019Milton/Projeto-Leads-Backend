@@ -2,9 +2,14 @@ import { expect, test } from "bun:test";
 import {
   aplicarOtimizacaoLeadQualificado,
   campanhaOtimizadaPorLeadQualificado,
+  erroDePermissaoLinkedIn,
   escolherRegraLeadQualificado,
+  etapasPendentesLinkedIn,
   hashEmailLinkedIn,
   idEventoLinkedIn,
+  leadTemIdentificadorLinkedIn,
+  LIMITE_REENVIO_POR_CHAMADA,
+  PERIODO_REENVIO_DIAS,
   montarAssociacaoCampanhaConversao,
   montarCorpoRegraLeadQualificado,
   montarEventoConversaoLinkedIn,
@@ -259,4 +264,54 @@ test("otimização por lead qualificado não se aplica a outro objetivo (ex.: de
   expect(resultado).toEqual(whatsapp);
   expect(resultado).not.toBe(whatsapp);
   expect(campanhaOtimizadaPorLeadQualificado(resultado)).toBe(false);
+});
+
+test("reenvio: janela de 30 dias e lote limitado", () => {
+  expect(PERIODO_REENVIO_DIAS).toBe(30);
+  expect(LIMITE_REENVIO_POR_CHAMADA).toBeGreaterThan(0);
+  expect(LIMITE_REENVIO_POR_CHAMADA).toBeLessThanOrEqual(200);
+});
+
+test("lead tem identificador se tiver e-mail válido ou URN da resposta do formulário", () => {
+  expect(leadTemIdentificadorLinkedIn({ email: "a@b.com" })).toBe(true);
+  expect(leadTemIdentificadorLinkedIn({ email: "sem-arroba" })).toBe(false);
+  expect(leadTemIdentificadorLinkedIn({ email: "" })).toBe(false);
+  expect(leadTemIdentificadorLinkedIn({ plataforma: "linkedin", lead_id: "abcd1234-efgh" })).toBe(true);
+  expect(leadTemIdentificadorLinkedIn({ plataforma: "whatsapp", lead_id: "abcd1234-efgh" })).toBe(false);
+  expect(leadTemIdentificadorLinkedIn({ plataforma: "linkedin", lead_id: "1026108109-1790000000000" })).toBe(false);
+  expect(leadTemIdentificadorLinkedIn(null)).toBe(false);
+});
+
+test("etapas pendentes: só o que falta, só com regra e só com identificador", () => {
+  const ambas = { qualificado: true, fechado: true };
+  const lead = { email: "a@b.com", status: "novo" };
+
+  expect(etapasPendentesLinkedIn(lead, "quente", ambas)).toEqual(["Qualified Lead"]);
+  expect(etapasPendentesLinkedIn(lead, "morno", ambas)).toEqual([]);
+  expect(etapasPendentesLinkedIn(lead, undefined, ambas)).toEqual([]);
+
+  // fechado: as duas etapas, se nenhuma foi enviada
+  expect(etapasPendentesLinkedIn({ ...lead, status: "fechado" }, "quente", ambas)).toEqual(["Qualified Lead", "Closed Won"]);
+  expect(etapasPendentesLinkedIn({ ...lead, status: "fechado" }, "frio", ambas)).toEqual(["Closed Won"]);
+
+  // nunca repete o que já foi enviado
+  const jaQualificado = { ...lead, status: "fechado", linkedin_evento_qualificado_enviado_em: "2026-11-01" };
+  expect(etapasPendentesLinkedIn(jaQualificado, "quente", ambas)).toEqual(["Closed Won"]);
+  const tudoEnviado = { ...jaQualificado, linkedin_evento_fechado_enviado_em: "2026-11-02" };
+  expect(etapasPendentesLinkedIn(tudoEnviado, "quente", ambas)).toEqual([]);
+
+  // sem a regra da etapa, ela não conta
+  expect(etapasPendentesLinkedIn({ ...lead, status: "fechado" }, "quente", { qualificado: true, fechado: false })).toEqual(["Qualified Lead"]);
+  expect(etapasPendentesLinkedIn({ ...lead, status: "fechado" }, "quente", { qualificado: false, fechado: false })).toEqual([]);
+
+  // sem identificador, nada
+  expect(etapasPendentesLinkedIn({ email: "", status: "fechado" }, "quente", ambas)).toEqual([]);
+});
+
+test("erro de permissão do LinkedIn: só 401 e 403", () => {
+  expect(erroDePermissaoLinkedIn(401)).toBe(true);
+  expect(erroDePermissaoLinkedIn(403)).toBe(true);
+  expect(erroDePermissaoLinkedIn(400)).toBe(false);
+  expect(erroDePermissaoLinkedIn(500)).toBe(false);
+  expect(erroDePermissaoLinkedIn(undefined)).toBe(false);
 });
