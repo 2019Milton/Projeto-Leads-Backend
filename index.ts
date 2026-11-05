@@ -34,6 +34,14 @@ import {
   type VeiculacaoCampanha,
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
+import {
+  dadosContaGoogleAposReconexao,
+  escaparLiteralGaql,
+  idsContasGoogleAcessiveis,
+  obterOuCriarAcaoConversaoGoogle,
+  refreshTokenGoogleAposReconexao
+} from "./google-conexao";
+import { converterDataEnvioLeadGoogle } from "./google-leads";
 import { consultarInsightsMetaPaginados } from "./meta-insights-paginados";
 
 import {
@@ -8056,6 +8064,36 @@ app.get("/auth/:plataforma/callback", async (c) => {
       return c.text("Usuario invalido", 401);
     }
 
+    // Reconectar o Google (p.ex. para ganhar o escopo datamanager) NÃO pode apagar o que a conexão
+    // já tinha: conta selecionada, MCC, ids das ações de conversão e tag do site. Antes o upsert
+    // abaixo substituía dados_conta por {} e o usuário tinha de selecionar a conta de novo; sem os
+    // ids das ações, a criação seguinte esbarrava em nome duplicado e os eventos nunca saíam.
+    // Se o novo login Google não enxerga mais a conta salva (outro login), só o que era dela é
+    // descartado (ver google-conexao.ts). Outras plataformas seguem como antes.
+    let refreshTokenFinal = refresh_token;
+    let dadosContaFinal = dadosConta;
+    if (plataforma === "google") {
+      const anterior = await client.query(
+        `SELECT refresh_token, dados_conta FROM plataforma_conexoes
+         WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+        [usuarioId]
+      );
+      if (anterior.rows.length) {
+        let acessiveis: Set<string> | null = null;
+        try {
+          acessiveis = await listarIdsContasGoogleAcessiveis(access_token);
+        } catch (errAcesso: any) {
+          // Não conseguiu conferir: preserva (o painel pede nova seleção se a conta sumiu).
+          console.warn("AVISO GOOGLE (reconexão): não foi possível conferir as contas acessíveis:", errAcesso?.message || errAcesso);
+        }
+        refreshTokenFinal = refreshTokenGoogleAposReconexao(refresh_token, anterior.rows[0].refresh_token);
+        dadosContaFinal = {
+          ...dadosContaGoogleAposReconexao(anterior.rows[0].dados_conta, acessiveis),
+          ...dadosConta
+        };
+      }
+    }
+
     await client.query(
       `INSERT INTO plataforma_conexoes
          (usuario_id, plataforma, status, access_token, refresh_token, token_expira_em, dados_conta, conectado_em, atualizado_em)
@@ -8063,7 +8101,7 @@ app.get("/auth/:plataforma/callback", async (c) => {
        ON CONFLICT (usuario_id, plataforma)
        DO UPDATE SET status = 'conectado', access_token = $3, refresh_token = $4,
                      token_expira_em = $5, dados_conta = $6, atualizado_em = NOW()`,
-      [usuarioId, plataforma, access_token, refresh_token, tokenExpiraEm, JSON.stringify(dadosConta)]
+      [usuarioId, plataforma, access_token, refreshTokenFinal, tokenExpiraEm, JSON.stringify(dadosContaFinal)]
     );
 
     return c.html(`
@@ -8147,6 +8185,18 @@ async function googleAdsQuery(customerId: string, accessToken: string, gaql: str
     throw new Error(data?.error?.message || "Erro ao consultar Google Ads");
   }
   return data.results ?? [];
+}
+
+// Ids das contas que o token consegue acessar DIRETAMENTE (clientes de uma MCC não aparecem aqui,
+// só a própria MCC). Usado ao reconectar para saber se a conta salva ainda serve ao novo login.
+async function listarIdsContasGoogleAcessiveis(accessToken: string): Promise<Set<string>> {
+  const res = await fetch(`${GOOGLE_ADS_API}/customers:listAccessibleCustomers`, {
+    headers: googleAdsHeaders(accessToken),
+    signal: AbortSignal.timeout(8000),
+  });
+  const data = await res.json() as any;
+  if (!res.ok) throw new Error(data?.error?.message || "Erro ao listar contas do Google Ads");
+  return idsContasGoogleAcessiveis(data.resourceNames);
 }
 
 type ContaGoogleAds = {
@@ -8847,83 +8897,90 @@ async function sincronizarGoogleAdsUsuario(usuarioId: number) {
     let totalLeads = 0;
 
     for (const row of leadsResults as any[]) {
-      const dadosLead = row.leadFormSubmissionData;
-      const leadId = String(dadosLead.id);
+      try {
+        const dadosLead = row.leadFormSubmissionData;
+        const leadId = String(dadosLead.id);
 
-      const jaExiste = await client.query(
-        `SELECT id FROM leads
-         WHERE lead_id = $1 AND usuario_id = $2 AND plataforma = 'google'`,
-        [leadId, usuarioId]
-      );
-      if (jaExiste.rows.length > 0) continue;
-
-      let nomeCampanha = "Campanha Google Ads";
-      let nichoId: number | null = null;
-      // lead_form_submission_data.campaign vem como resource name
-      // ("customers/123/campaigns/456"), nao como ID numerico direto.
-      const campaignIdLead = String(dadosLead.campaign || "").split("/").pop() || "";
-      if (campaignIdLead) {
-        const campRow = await client.query(
-          `SELECT nome, nicho_id FROM campanhas
-           WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
-             AND conta_anuncios_id = $3
-           LIMIT 1`,
-          [campaignIdLead, usuarioId, String(customerId)]
+        const jaExiste = await client.query(
+          `SELECT id FROM leads
+           WHERE lead_id = $1 AND usuario_id = $2 AND plataforma = 'google'`,
+          [leadId, usuarioId]
         );
-        if (campRow.rows.length) {
-          nomeCampanha = campRow.rows[0].nome;
-          nichoId = campRow.rows[0].nicho_id ?? null;
+        if (jaExiste.rows.length > 0) continue;
+
+        let nomeCampanha = "Campanha Google Ads";
+        let nichoId: number | null = null;
+        // lead_form_submission_data.campaign vem como resource name
+        // ("customers/123/campaigns/456"), nao como ID numerico direto.
+        const campaignIdLead = String(dadosLead.campaign || "").split("/").pop() || "";
+        if (campaignIdLead) {
+          const campRow = await client.query(
+            `SELECT nome, nicho_id FROM campanhas
+             WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'google'
+               AND conta_anuncios_id = $3
+             LIMIT 1`,
+            [campaignIdLead, usuarioId, String(customerId)]
+          );
+          if (campRow.rows.length) {
+            nomeCampanha = campRow.rows[0].nome;
+            nichoId = campRow.rows[0].nicho_id ?? null;
+          }
         }
+
+        let nome = "";
+        let email = "";
+        let telefone = "";
+        const respostasQualificacao: any[] = [];
+
+        for (const field of dadosLead.leadFormSubmissionFields ?? []) {
+          const tipo = String(field.fieldType ?? "").toUpperCase();
+          if (tipo === "FULL_NAME" || tipo === "FIRST_NAME") nome = field.fieldValue ?? "";
+          else if (tipo === "EMAIL") email = field.fieldValue ?? "";
+          else if (tipo === "PHONE_NUMBER") telefone = field.fieldValue ?? "";
+          else respostasQualificacao.push({ pergunta: field.fieldType, resposta: field.fieldValue ?? "" });
+        }
+
+        // O Google devolve "yyyy-mm-dd hh:mm:ss-08:00" (com fuso); o formato antigo, sem fuso, continua
+        // valendo como UTC. Valor ilegível vira null e o INSERT usa o horário da importação.
+        const criadoEm = converterDataEnvioLeadGoogle(dadosLead.submissionDateTime);
+
+        const leadInseridoGoogle = await client.query(
+          `INSERT INTO leads
+             (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+              origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em, gclid)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'google','google','novo',$8,$9,COALESCE($10::timestamptz, NOW()),$11)
+           RETURNING id`,
+          [
+            usuarioId, leadId, nome || "Lead Google Ads", email, telefone,
+            nomeCampanha, String(customerId),
+            JSON.stringify(respostasQualificacao), nichoId, criadoEm,
+            textoOpcional(dadosLead.gclid)
+          ]
+        );
+
+        await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
+
+        avaliarEEnviarQualificacaoLead(
+          {
+            id: leadInseridoGoogle.rows[0]?.id,
+            lead_id: leadId,
+            plataforma: "google",
+            status: "novo",
+            gclid: textoOpcional(dadosLead.gclid),
+            respostas_qualificacao: respostasQualificacao
+          },
+          usuarioId
+        ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync google):", err));
+
+        iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInseridoGoogle.rows[0]?.id)
+          .catch(err => console.error("ERRO contato WhatsApp formulário (sync google):", err));
+        totalLeads++;
+      } catch (errLead: any) {
+        // Um lead com dado inesperado não pode travar a importação dos outros nem a atualização do
+        // status da conexão: registra e segue. Se o lead chegou a ser gravado, o próximo ciclo o
+        // reconhece pelo lead_id e não duplica.
+        console.error("ERRO GOOGLE IMPORTAR LEAD:", String(row?.leadFormSubmissionData?.id ?? "?"), errLead?.message || errLead);
       }
-
-      let nome = "";
-      let email = "";
-      let telefone = "";
-      const respostasQualificacao: any[] = [];
-
-      for (const field of dadosLead.leadFormSubmissionFields ?? []) {
-        const tipo = String(field.fieldType ?? "").toUpperCase();
-        if (tipo === "FULL_NAME" || tipo === "FIRST_NAME") nome = field.fieldValue ?? "";
-        else if (tipo === "EMAIL") email = field.fieldValue ?? "";
-        else if (tipo === "PHONE_NUMBER") telefone = field.fieldValue ?? "";
-        else respostasQualificacao.push({ pergunta: field.fieldType, resposta: field.fieldValue ?? "" });
-      }
-
-      const criadoEm = dadosLead.submissionDateTime
-        ? new Date(String(dadosLead.submissionDateTime).replace(" ", "T") + "Z").toISOString()
-        : null;
-
-      const leadInseridoGoogle = await client.query(
-        `INSERT INTO leads
-           (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
-            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em, gclid)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'google','google','novo',$8,$9,COALESCE($10::timestamptz, NOW()),$11)
-         RETURNING id`,
-        [
-          usuarioId, leadId, nome || "Lead Google Ads", email, telefone,
-          nomeCampanha, String(customerId),
-          JSON.stringify(respostasQualificacao), nichoId, criadoEm,
-          textoOpcional(dadosLead.gclid)
-        ]
-      );
-
-      await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
-
-      avaliarEEnviarQualificacaoLead(
-        {
-          id: leadInseridoGoogle.rows[0]?.id,
-          lead_id: leadId,
-          plataforma: "google",
-          status: "novo",
-          gclid: textoOpcional(dadosLead.gclid),
-          respostas_qualificacao: respostasQualificacao
-        },
-        usuarioId
-      ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync google):", err));
-
-      iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInseridoGoogle.rows[0]?.id)
-        .catch(err => console.error("ERRO contato WhatsApp formulário (sync google):", err));
-      totalLeads++;
     }
 
     await client.query(
@@ -9056,65 +9113,71 @@ async function obterOuCriarConversionActionGoogle(
   chave: "qualified" | "closed",
   nomeEvento: string
 ): Promise<string | null> {
-  const campoJson =
-    chave === "qualified"
-      ? "conversion_action_qualified_id"
-      : "conversion_action_closed_id";
-
   try {
-    const conexao = await client.query(
-      `SELECT id, dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
-      [usuarioId]
-    );
-
-    if (!conexao.rows.length) return null;
-
-    const dadosConta = conexao.rows[0].dados_conta ?? {};
-    const existente = dadosConta[campoJson];
-
-    if (existente) {
-      return existente;
-    }
-
-    // Categoria de funil de lead do Google: QUALIFIED_LEAD (qualificado) e
-    // CONVERTED_LEAD (fechado) — validadas com validateOnly em duas contas
-    // reais em 05/10/2026, e outra ferramenta já usa QUALIFIED_LEAD em
-    // UPLOAD_CLICKS numa conta conectada. Antes ia tudo em DEFAULT ("Outros"),
-    // misturando qualificado, venda e qualquer outra ação da conta na mesma
-    // meta. ("LEAD" não existe no enum e "IMPORTED_LEAD" foi recusado ao vivo
-    // em 16/09/2026.) Se a conta recusar, cai pra DEFAULT como antes.
-    const criarAcao = (categoria: string) => googleAdsMutate(
-      customerId, accessToken, "conversionActions",
-      [
-        {
-          create: {
-            name: `Plataforma de Leads - ${nomeEvento}`,
-            type: "UPLOAD_CLICKS",
-            category: categoria,
-            status: "ENABLED",
-          },
+    // A decisão (usar a guardada → reaproveitar pelo nome → criar) está em google-conexao.ts,
+    // com testes. Aqui ficam só o banco e as chamadas ao Google.
+    return await obterOuCriarAcaoConversaoGoogle(
+      {
+        lerDadosConta: async () => {
+          const conexao = await client.query(
+            `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'google' LIMIT 1`,
+            [usuarioId]
+          );
+          return conexao.rows.length ? (conexao.rows[0].dados_conta ?? {}) : null;
         },
-      ],
-      loginCustomerId
+        // Grava só a chave (jsonb ||), sem reescrever o dados_conta inteiro — não pisa na conta
+        // selecionada nem na tag do site se algo mudar a conexão ao mesmo tempo.
+        gravarCampo: async (campo, valor) => {
+          await client.query(
+            `UPDATE plataforma_conexoes
+             SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object($1::text, $2::text)
+             WHERE usuario_id = $3 AND plataforma = 'google'`,
+            [campo, valor, usuarioId]
+          );
+        },
+        // Conexão refeita (ou id perdido): a ação já existe no Google com este nome, e criar de novo
+        // esbarra em nome duplicado.
+        buscarPorNome: async (nome) => {
+          const linhas = await googleAdsQuery(
+            customerId, accessToken,
+            `SELECT conversion_action.resource_name
+             FROM conversion_action
+             WHERE conversion_action.name = '${escaparLiteralGaql(nome)}'
+               AND conversion_action.type = 'UPLOAD_CLICKS'
+               AND conversion_action.status != 'REMOVED'
+             LIMIT 1`,
+            loginCustomerId
+          );
+          return (linhas as any[])[0]?.conversionAction?.resourceName ?? null;
+        },
+        // Categoria de funil de lead do Google: QUALIFIED_LEAD (qualificado) e
+        // CONVERTED_LEAD (fechado) — validadas com validateOnly em duas contas
+        // reais em 05/10/2026, e outra ferramenta já usa QUALIFIED_LEAD em
+        // UPLOAD_CLICKS numa conta conectada. Antes ia tudo em DEFAULT ("Outros"),
+        // misturando qualificado, venda e qualquer outra ação da conta na mesma
+        // meta. ("LEAD" não existe no enum e "IMPORTED_LEAD" foi recusado ao vivo
+        // em 16/09/2026.) Se a conta recusar, cai pra DEFAULT como antes.
+        criar: async (nome, categoria) => {
+          const resultados = await googleAdsMutate(
+            customerId, accessToken, "conversionActions",
+            [
+              {
+                create: {
+                  name: nome,
+                  type: "UPLOAD_CLICKS",
+                  category: categoria,
+                  status: "ENABLED",
+                },
+              },
+            ],
+            loginCustomerId
+          );
+          return resultados[0]?.resourceName ?? null;
+        },
+        aviso: (mensagem, detalhe) => console.warn(mensagem, detalhe),
+      },
+      { customerId, chave, nomeEvento, categoria: CATEGORIA_ACAO_GOOGLE[chave] }
     );
-
-    let resultados: any[];
-    try {
-      resultados = await criarAcao(CATEGORIA_ACAO_GOOGLE[chave]);
-    } catch (errCategoria: any) {
-      console.warn(`AVISO GOOGLE: categoria ${CATEGORIA_ACAO_GOOGLE[chave]} recusada, criando a ação em DEFAULT:`, errCategoria?.message);
-      resultados = await criarAcao("DEFAULT");
-    }
-
-    const resourceName = resultados[0]?.resourceName;
-    if (!resourceName) return null;
-
-    await client.query(
-      `UPDATE plataforma_conexoes SET dados_conta = $1 WHERE id = $2`,
-      [JSON.stringify({ ...dadosConta, [campoJson]: resourceName }), conexao.rows[0].id]
-    );
-
-    return resourceName;
   } catch (err) {
     console.error("ERRO obterOuCriarConversionActionGoogle:", err);
     return null;
