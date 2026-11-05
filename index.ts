@@ -90,6 +90,25 @@ import { atribuirJanelaSomenteSeSolicitada, erroMetaLimiteChamadas, MENSAGEM_LIM
 import { validarCopiaAnuncioEmConjuntoExistente, copiarAnuncioEmConjuntoExistente }
   from "./meta-anuncios-conjunto-existente";
 import { validarWhatsappAdsMeta } from "./meta-whatsapp-numeros-ads";
+import {
+  criarPortfolioCtaDinamicoTikTok,
+  decidirFluxoCriacaoTikTok,
+  ehFluxoSmartPlusTikTok,
+  endpointsStatusTikTok,
+  erroIdentidadeSmartPlus,
+  gerarRequestIdTikTok,
+  limparNomeTikTok,
+  montarCriativoVideoSmartPlus,
+  montarPayloadAdgroupSmartPlus,
+  montarPayloadAnuncioSmartPlus,
+  montarPayloadCampanhaSmartPlus,
+  montarPayloadEdicaoAnuncioSmartPlus,
+  montarTargetingSpecSmartPlus,
+  normalizarAdgroupSmartPlus,
+  normalizarAnuncioSmartPlus,
+  obterCapaVideoTikTok,
+  type FluxoCriacaoTikTok
+} from "./tiktok-smart-plus";
 
 import {
   MODELO_SUGERIDO,
@@ -12777,8 +12796,16 @@ type FalhaPreflightTikTok = {
 type SucessoPreflightTikTok = {
   ok: true;
   destino: DestinoCampanhaTikTok;
+  // smart_plus = APIs Upgraded Smart+; legado = /campaign|adgroup|ad/create/,
+  // aceito pelo TikTok só até 31/12/2026 (ver tiktok-smart-plus.ts).
+  fluxo: FluxoCriacaoTikTok;
   advertiser_id: string;
-  identidade: { identity_id: string; identity_type: string; nome: string | null };
+  identidade: {
+    identity_id: string;
+    identity_type: string;
+    identity_authorized_bc_id: string | null;
+    nome: string | null;
+  };
   formulario?: { page_id: string; nome: string | null; campos: number };
   site?: { url: string; otimizacao: "CLICK" };
   whatsapp?: { final_numero: string; otimizacao: "CLICK"; mmt_verificavel: false };
@@ -12799,7 +12826,10 @@ async function validarIdentidadeTikTok(
   conexao: ConexaoTikTokAtiva,
   identityId: string,
   identityType: string
-): Promise<{ ok: true; nome: string | null } | FalhaPreflightTikTok> {
+): Promise<
+  | { ok: true; nome: string | null; identity_authorized_bc_id: string | null }
+  | FalhaPreflightTikTok
+> {
   const params = new URLSearchParams({ advertiser_id: String(conexao.advertiserId) });
   const resposta = await tiktokFetch(`/identity/get/?${params}`, conexao.token);
   if (!resposta.ok) {
@@ -12830,7 +12860,9 @@ async function validarIdentidadeTikTok(
     ok: true,
     nome: textoOpcional(
       identidade.display_name ?? identidade.identity_name ?? identidade.user_name ?? identidade.name
-    ) || null
+    ) || null,
+    // Necessário no criativo Smart+ quando a identidade é BC_AUTH_TT.
+    identity_authorized_bc_id: textoOpcional(identidade.identity_authorized_bc_id) || null
   };
 }
 
@@ -13143,15 +13175,45 @@ async function executarPreflightPublicacaoTikTok(
     }
   }
 
+  // Decide entre Upgraded Smart+ e o fluxo legado antes de qualquer consulta
+  // remota: o que o Smart+ não cobre só passa enquanto o TikTok aceitar o
+  // fluxo antigo (até 31/12/2026).
+  const formatoCriativo = (entrada?.formato_criativo ?? avancadas.formato_criativo) === "imagem"
+    ? "imagem"
+    : "video";
+  const decisao = decidirFluxoCriacaoTikTok({ destino, formato: formatoCriativo, identityType });
+  if ("erro" in decisao) {
+    return { ok: false, status: 409, codigo: decisao.codigo, erro: decisao.erro };
+  }
+
   const identidade = await validarIdentidadeTikTok(conexao, identityId, identityType);
   if (!identidade.ok) return identidade;
 
-  const avisos: string[] = [];
+  if (
+    decisao.fluxo === "smart_plus" &&
+    identityType.toUpperCase() === "BC_AUTH_TT" &&
+    !identidade.identity_authorized_bc_id
+  ) {
+    return {
+      ok: false,
+      status: 409,
+      codigo: "TIKTOK_IDENTITY_BC_MISSING",
+      erro: "O TikTok não informou o Business Center da identidade escolhida. Atualize as identidades e escolha novamente."
+    };
+  }
+
+  const avisos: string[] = [...decisao.avisos];
   const base: SucessoPreflightTikTok = {
     ok: true,
     destino,
+    fluxo: decisao.fluxo,
     advertiser_id: String(conexao.advertiserId),
-    identidade: { identity_id: identityId, identity_type: identityType, nome: identidade.nome },
+    identidade: {
+      identity_id: identityId,
+      identity_type: identityType,
+      identity_authorized_bc_id: identidade.identity_authorized_bc_id,
+      nome: identidade.nome
+    },
     avisos
   };
 
@@ -13354,7 +13416,9 @@ type EstruturaCampanhaTikTok = {
 };
 
 async function listarEntidadesTikTok(
-  endpoint: "/campaign/get/" | "/adgroup/get/" | "/ad/get/",
+  endpoint:
+    | "/campaign/get/" | "/adgroup/get/" | "/ad/get/"
+    | "/smart_plus/campaign/get/" | "/smart_plus/adgroup/get/" | "/smart_plus/ad/get/",
   conexao: { token: string; advertiserId: string | null },
   fields: string[],
   filtering: Record<string, unknown>
@@ -13365,11 +13429,56 @@ async function listarEntidadesTikTok(
   const params = new URLSearchParams({
     advertiser_id: conexao.advertiserId,
     filtering: JSON.stringify(filtering),
-    fields: JSON.stringify(fields),
     page: "1",
     page_size: "100"
   });
+  // Sem "fields" o TikTok devolve todos os campos (usado no Smart+, cuja
+  // lista de campos é diferente da do fluxo legado).
+  if (fields.length) params.set("fields", JSON.stringify(fields));
   return tiktokFetch(`${endpoint}?${params.toString()}`, conexao.token);
+}
+
+// Estrutura de uma campanha Upgraded Smart+, devolvida no mesmo formato da
+// legada (targeting achatado, smart_plus_ad_id em ad_id, texto em ad_text).
+async function buscarEstruturaCampanhaTikTokSmartPlus(
+  conexao: { token: string; advertiserId: string | null },
+  campaignId: string,
+  adgroupIdPreferido?: unknown,
+  adIdPreferido?: unknown
+): Promise<EstruturaCampanhaTikTok> {
+  const avisos: string[] = [];
+
+  const campanhaRes = await listarEntidadesTikTok(
+    "/smart_plus/campaign/get/", conexao, [], { campaign_ids: [campaignId] }
+  );
+  if (!campanhaRes.ok) avisos.push(campanhaRes.error || "Não foi possível consultar a campanha TikTok");
+  const campanhas = Array.isArray(campanhaRes.data?.data?.list) ? campanhaRes.data.data.list : [];
+  const campanha = campanhas.find((item: any) => String(item.campaign_id) === campaignId) || campanhas[0] || null;
+
+  const adgroupRes = await listarEntidadesTikTok(
+    "/smart_plus/adgroup/get/", conexao, [], { campaign_ids: [campaignId] }
+  );
+  if (!adgroupRes.ok) avisos.push(adgroupRes.error || "Não foi possível consultar o grupo de anúncios TikTok");
+  const adgroups = (Array.isArray(adgroupRes.data?.data?.list) ? adgroupRes.data.data.list : [])
+    .map(normalizarAdgroupSmartPlus)
+    .filter(Boolean);
+  const adgroupId = textoOpcional(adgroupIdPreferido);
+  const adgroup = adgroups.find((item: any) => adgroupId && String(item.adgroup_id) === adgroupId) || adgroups[0] || null;
+
+  let anuncio: any | null = null;
+  if (adgroup?.adgroup_id) {
+    const adRes = await listarEntidadesTikTok(
+      "/smart_plus/ad/get/", conexao, [], { adgroup_ids: [String(adgroup.adgroup_id)] }
+    );
+    if (!adRes.ok) avisos.push(adRes.error || "Não foi possível consultar o anúncio TikTok");
+    const anuncios = (Array.isArray(adRes.data?.data?.list) ? adRes.data.data.list : [])
+      .map(normalizarAnuncioSmartPlus)
+      .filter(Boolean);
+    const adId = textoOpcional(adIdPreferido);
+    anuncio = anuncios.find((item: any) => adId && String(item.ad_id) === adId) || anuncios[0] || null;
+  }
+
+  return { campanha, adgroup, anuncio, avisos };
 }
 
 // Recupera a estrutura real (campanha -> ad group -> anúncio) antes de editar.
@@ -13379,8 +13488,12 @@ async function buscarEstruturaCampanhaTikTok(
   conexao: { token: string; advertiserId: string | null },
   campaignId: string,
   adgroupIdPreferido?: unknown,
-  adIdPreferido?: unknown
+  adIdPreferido?: unknown,
+  smartPlus = false
 ): Promise<EstruturaCampanhaTikTok> {
+  if (smartPlus) {
+    return buscarEstruturaCampanhaTikTokSmartPlus(conexao, campaignId, adgroupIdPreferido, adIdPreferido);
+  }
   const avisos: string[] = [];
 
   const campanhaRes = await listarEntidadesTikTok(
@@ -13480,7 +13593,8 @@ app.get("/tiktok/campanhas/:id/configuracao-edicao", authMiddleware, async (c) =
       conexao,
       campaignId,
       linha.adset_id,
-      linha.ad_id
+      linha.ad_id,
+      ehFluxoSmartPlusTikTok(configuracoesLocais)
     );
     const adgroup = estrutura.adgroup;
     const anuncio = estrutura.anuncio;
@@ -13703,11 +13817,15 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
     }
 
+    // Campanhas Upgraded Smart+ (criadas pela plataforma ou marcadas pela sync)
+    // usam /smart_plus/*/update/. O fluxo vem do banco, nunca do corpo.
+    const smartPlus = ehFluxoSmartPlusTikTok(cfgBanco);
     const estrutura = await buscarEstruturaCampanhaTikTok(
       conexao,
       campaignIdBanco,
       campanhaLocal.adset_id,
-      campanhaLocal.ad_id
+      campanhaLocal.ad_id,
+      smartPlus
     );
     const adgroupId = textoOpcional(estrutura.adgroup?.adgroup_id) || textoOpcional(campanhaLocal.adset_id);
     const adId = textoOpcional(estrutura.anuncio?.ad_id) || textoOpcional(campanhaLocal.ad_id);
@@ -13804,6 +13922,58 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       }
     }
 
+    // Smart+: o criativo (vídeo + capa + identidade) só é reenviado quando a
+    // mídia ou a identidade muda, porque creative_list substitui a lista
+    // inteira. Capa e identidade são conferidas aqui, antes da 1ª mutação.
+    let criativoSmartPlus: ReturnType<typeof montarCriativoVideoSmartPlus> | null = null;
+    if (smartPlus) {
+      if (midiaFoiAlterada && formatoCriativoSolicitado !== "video") {
+        return c.json({
+          error: "Campanhas no formato Smart+ do TikTok só aceitam vídeo. Envie um vídeo para trocar a mídia."
+        }, 400);
+      }
+      const identidadeSmart = {
+        identity_id: identidadeId,
+        identity_type: identidadeTipo,
+        identity_authorized_bc_id: identidadeValidada.identity_authorized_bc_id
+      };
+      const identidadeMudou =
+        identidadeId !== textoOpcional(estrutura.anuncio?.identity_id) ||
+        identidadeTipo.toUpperCase() !== textoOpcional(estrutura.anuncio?.identity_type).toUpperCase();
+      if (adId && (midiaFoiAlterada || identidadeMudou)) {
+        if (erroIdentidadeSmartPlus(identidadeSmart)) {
+          return c.json({
+            error: "A identidade escolhida não pode publicar vídeos no formato Smart+ do TikTok. Escolha a conta TikTok vinculada (TikTok User ou conta do Business Center)."
+          }, 409);
+        }
+        const videoCriativo = midiaFoiAlterada ? videoIdSolicitado : textoOpcional(estrutura.anuncio?.video_id);
+        if (!videoCriativo) {
+          return c.json({
+            error: "O vídeo atual do anúncio não foi localizado no TikTok. Envie o vídeo de novo para trocar a identidade."
+          }, 409);
+        }
+        let capaId = midiaFoiAlterada ? "" : textoOpcional(estrutura.anuncio?.capa_image_id);
+        if (!capaId) {
+          const capa = await obterCapaVideoTikTok(
+            (endpoint, opts) => tiktokFetch(endpoint, conexao.token, opts),
+            conexao.advertiserId,
+            videoCriativo
+          );
+          if ("erro" in capa) {
+            return c.json({
+              error: `O TikTok ainda não gerou a capa do vídeo (${capa.erro}). Aguarde alguns instantes e salve de novo.`
+            }, 409);
+          }
+          capaId = capa.imageId;
+        }
+        criativoSmartPlus = montarCriativoVideoSmartPlus({
+          videoId: videoCriativo,
+          capaImageId: capaId,
+          identidade: identidadeSmart
+        });
+      }
+    }
+
     const targeting = montarTargetingTikTok(configuracoesEdicao);
     if (!targeting.location_ids?.length && Array.isArray(estrutura.adgroup?.location_ids)) {
       targeting.location_ids = estrutura.adgroup.location_ids.map(String).filter(Boolean);
@@ -13836,28 +14006,67 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       payloadAdgroup.schedule_end_time = formatarDataHoraTikTok(fimData);
     }
 
-    const adgroupRes = await tiktokFetch("/adgroup/update/", conexao.token, {
-      method: "POST",
-      body: payloadAdgroup
-    });
-    if (!adgroupRes.ok) {
-      return c.json({
-        error: adgroupRes.error || "Erro ao atualizar público, orçamento ou agenda no TikTok",
-        detalhe: adgroupRes.data
-      }, 400);
-    }
-
     const avisos = [...estrutura.avisos];
-    let nomeFinal = campanhaLocal.nome;
-    if (nomeSolicitado !== campanhaLocal.nome) {
-      const campanhaRes = await tiktokFetch("/campaign/update/", conexao.token, {
+    let orcamentoAtualizado = true;
+    if (smartPlus) {
+      // Smart+: público e agenda em /smart_plus/adgroup/update/ (incremental,
+      // targeting dentro de targeting_spec); orçamento em endpoint próprio.
+      const agendaSmart = Object.fromEntries(
+        Object.entries(payloadAdgroup).filter(([chave]) => chave.startsWith("schedule_"))
+      );
+      const adgroupRes = await tiktokFetch("/smart_plus/adgroup/update/", conexao.token, {
         method: "POST",
         body: {
           advertiser_id: conexao.advertiserId,
-          campaign_id: campaignIdBanco,
-          campaign_name: nomeSolicitado
+          adgroup_id: adgroupId,
+          targeting_spec: montarTargetingSpecSmartPlus(targeting),
+          ...agendaSmart
         }
       });
+      if (!adgroupRes.ok) {
+        return c.json({
+          error: adgroupRes.error || "Erro ao atualizar público ou agenda no TikTok",
+          detalhe: adgroupRes.data
+        }, 400);
+      }
+      const orcamentoRes = await tiktokFetch("/smart_plus/adgroup/budget/update/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          budget: [{ adgroup_id: adgroupId, budget: dailyBudgetCentavos / 100 }]
+        }
+      });
+      if (!orcamentoRes.ok) {
+        orcamentoAtualizado = false;
+        avisos.push(`O público e a agenda foram atualizados, mas o orçamento não: ${orcamentoRes.error || "erro do TikTok"}.`);
+      }
+    } else {
+      const adgroupRes = await tiktokFetch("/adgroup/update/", conexao.token, {
+        method: "POST",
+        body: payloadAdgroup
+      });
+      if (!adgroupRes.ok) {
+        return c.json({
+          error: adgroupRes.error || "Erro ao atualizar público, orçamento ou agenda no TikTok",
+          detalhe: adgroupRes.data
+        }, 400);
+      }
+    }
+
+    let nomeFinal = campanhaLocal.nome;
+    if (nomeSolicitado !== campanhaLocal.nome) {
+      const campanhaRes = await tiktokFetch(
+        smartPlus ? "/smart_plus/campaign/update/" : "/campaign/update/",
+        conexao.token,
+        {
+          method: "POST",
+          body: {
+            advertiser_id: conexao.advertiserId,
+            campaign_id: campaignIdBanco,
+            campaign_name: smartPlus ? limparNomeTikTok(nomeSolicitado, nomeSolicitado) : nomeSolicitado
+          }
+        }
+      );
       if (campanhaRes.ok) {
         nomeFinal = nomeSolicitado;
       } else {
@@ -13866,7 +14075,23 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
     }
 
     let criativoAtualizado = false;
-    if (adId) {
+    if (adId && smartPlus) {
+      const anuncioRes = await tiktokFetch("/smart_plus/ad/update/", conexao.token, {
+        method: "POST",
+        body: montarPayloadEdicaoAnuncioSmartPlus({
+          advertiserId: conexao.advertiserId,
+          smartPlusAdId: adId,
+          destino: destinoSolicitado,
+          texto: textoSolicitado,
+          formId: formIdSolicitado || null,
+          criativo: criativoSmartPlus
+        })
+      });
+      criativoAtualizado = anuncioRes.ok;
+      if (!anuncioRes.ok) {
+        avisos.push(`O público e o orçamento foram atualizados, mas o anúncio manteve o criativo anterior: ${anuncioRes.error || "erro do TikTok"}.`);
+      }
+    } else if (adId) {
       const criativo: any = {
         ad_id: adId,
         ad_text: textoSolicitado,
@@ -13907,6 +14132,14 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
     const configuracoesFinais = {
       ...cfgBanco,
       ...configuracoesSolicitadas,
+      // O cliente não escolhe o fluxo: mantém o que está no banco.
+      tiktok_fluxo: cfgBanco.tiktok_fluxo,
+      ...(smartPlus && criativoAtualizado && criativoSmartPlus
+        ? {
+            capa_image_id: criativoSmartPlus.creative_info.image_info[0]?.web_uri || null,
+            identity_authorized_bc_id: identidadeValidada.identity_authorized_bc_id
+          }
+        : {}),
       destino: destinoOriginal,
       texto: criativoAtualizado ? textoSolicitado : (cfgBanco.texto || textoOpcional(estrutura.anuncio?.ad_text)),
       cta: criativoAtualizado ? ctaSolicitado : (cfgBanco.cta || textoOpcional(estrutura.anuncio?.call_to_action)),
@@ -13945,7 +14178,7 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
         adgroupId,
         adId || null,
         destinoOriginal === "lead_ads" ? configuracoesFinais.form_id : null,
-        dailyBudgetCentavos,
+        orcamentoAtualizado ? dailyBudgetCentavos : campanhaLocal.daily_budget,
         numeroOpcional(nicho_id),
         JSON.stringify(configuracoesFinais),
         campanhaLocal.id,
@@ -14373,8 +14606,15 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
     }
 
     // 🔥 BUSCA CAMPANHAS
+    // Sem "fields": a resposta traz todos os campos, incluindo
+    // campaign_automation_type (UPGRADED_SMART_PLUS identifica as campanhas
+    // Smart+, que pausam/editam por outros endpoints).
+    const campanhasParams = new URLSearchParams({
+      advertiser_id: String(advertiserId),
+      page_size: "100"
+    });
     const campanhasRes = await fetch(
-      `${TIKTOK_API}/campaign/get/?advertiser_id=${advertiserId}&fields=["campaign_id","campaign_name","secondary_status","objective_type"]&page_size=100`,
+      `${TIKTOK_API}/campaign/get/?${campanhasParams.toString()}`,
       { headers: tiktokHeaders(token) }
     );
     const campanhasData = await campanhasRes.json() as any;
@@ -14388,6 +14628,7 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
     console.log("TIKTOK CAMPANHAS:", campanhas.length);
 
     for (const campanha of campanhas) {
+      const smartPlus = String(campanha.campaign_automation_type || "").toUpperCase() === "UPGRADED_SMART_PLUS";
       const existe = await client.query(
         `SELECT id FROM campanhas
          WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
@@ -14399,9 +14640,12 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
       if (existe.rows.length > 0) {
         await client.query(
           `UPDATE campanhas
-           SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW()
+           SET nome = $1, status = $2, conta_anuncios_id = $3, atualizado_em = NOW(),
+               configuracoes_avancadas = CASE WHEN $5::boolean
+                 THEN COALESCE(configuracoes_avancadas, '{}'::jsonb) || '{"tiktok_fluxo":"smart_plus"}'::jsonb
+                 ELSE configuracoes_avancadas END
            WHERE id = $4`,
-          [campanha.campaign_name, campanha.secondary_status, String(advertiserId), existe.rows[0].id]
+          [campanha.campaign_name, campanha.secondary_status, String(advertiserId), existe.rows[0].id, smartPlus]
         );
       } else {
         if (statusCampanhaRemotaExcluida(campanha.secondary_status)) {
@@ -14414,9 +14658,14 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
           campanha.campaign_id
         );
         await client.query(
-          `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma, atualizado_em)
-           VALUES ($1, $2, $3, $4, $5, $6, 'tiktok', NOW())`,
-          [usuarioId, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name, campanha.secondary_status, origem]
+          `INSERT INTO campanhas (usuario_id, campaign_id, conta_anuncios_id, nome, status, origem, plataforma,
+                                  configuracoes_avancadas, atualizado_em)
+           VALUES ($1, $2, $3, $4, $5, $6, 'tiktok', $7, NOW())`,
+          [
+            usuarioId, String(campanha.campaign_id), String(advertiserId), campanha.campaign_name,
+            campanha.secondary_status, origem,
+            smartPlus ? JSON.stringify({ tiktok_fluxo: "smart_plus" }) : null
+          ]
         );
       }
     }
@@ -14495,7 +14744,7 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
     }
 
     const campanhaBanco = await client.query(
-      `SELECT id, adset_id, ad_id
+      `SELECT id, adset_id, ad_id, configuracoes_avancadas
        FROM campanhas
        WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
          AND conta_anuncios_id = $3
@@ -14508,10 +14757,15 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
     }
 
     const { adset_id, ad_id } = campanhaBanco.rows[0];
+    // Campanhas Upgraded Smart+ têm endpoints de status próprios
+    // (ad_id local = smart_plus_ad_id).
+    const endpoints = endpointsStatusTikTok(
+      ehFluxoSmartPlusTikTok(campanhaBanco.rows[0].configuracoes_avancadas)
+    );
 
     const operationStatus = status === "ACTIVE" ? "ENABLE" : "DISABLE";
 
-    const campanhaRes = await tiktokFetch("/campaign/status/update/", conexao.token, {
+    const campanhaRes = await tiktokFetch(endpoints.campanha, conexao.token, {
       method: "POST",
       body: {
         advertiser_id: conexao.advertiserId,
@@ -14525,7 +14779,7 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
     }
 
     if (adset_id) {
-      const adgroupRes = await tiktokFetch("/adgroup/status/update/", conexao.token, {
+      const adgroupRes = await tiktokFetch(endpoints.adgroup, conexao.token, {
         method: "POST",
         body: {
           advertiser_id: conexao.advertiserId,
@@ -14537,11 +14791,11 @@ app.post("/tiktok/toggle-campanha", authMiddleware, async (c) => {
     }
 
     if (ad_id) {
-      const adRes = await tiktokFetch("/ad/status/update/", conexao.token, {
+      const adRes = await tiktokFetch(endpoints.anuncio, conexao.token, {
         method: "POST",
         body: {
           advertiser_id: conexao.advertiserId,
-          ad_ids: [String(ad_id)],
+          [endpoints.chaveAnuncios]: [String(ad_id)],
           operation_status: operationStatus
         }
       });
@@ -14580,7 +14834,7 @@ app.post("/tiktok/excluir-campanha", authMiddleware, async (c) => {
     }
 
     const campanha = await client.query(
-      `SELECT id FROM campanhas
+      `SELECT id, configuracoes_avancadas FROM campanhas
        WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
          AND conta_anuncios_id = $3
        LIMIT 1`,
@@ -14591,7 +14845,10 @@ app.post("/tiktok/excluir-campanha", authMiddleware, async (c) => {
       return c.json({ error: erroCampanhaOutraConta("TikTok Ads") }, 409);
     }
 
-    const del = await tiktokFetch("/campaign/status/update/", conexao.token, {
+    const endpoints = endpointsStatusTikTok(
+      ehFluxoSmartPlusTikTok(campanha.rows[0].configuracoes_avancadas)
+    );
+    const del = await tiktokFetch(endpoints.campanha, conexao.token, {
       method: "POST",
       body: {
         advertiser_id: conexao.advertiserId,
@@ -15201,18 +15458,29 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     // tempo (campanha E ad group) é ambíguo pra API da TikTok e arriscava
     // rejeição ou double-booking de orçamento. Campanha fica sempre
     // BUDGET_MODE_INFINITE; quem limita o gasto de verdade é o ad group.
-    const payloadCampanha: any = {
-      advertiser_id: conexao.advertiserId,
-      campaign_name: nome || "Campanha Leads Plataforma",
-      objective_type: "LEAD_GENERATION",
-      budget_mode: "BUDGET_MODE_INFINITE",
-      operation_status: "ENABLE"
-    };
+    // Smart+ (Instant Form/WhatsApp com vídeo e identidade Spark) usa
+    // /smart_plus/campaign/create/; o restante segue no fluxo legado enquanto
+    // o TikTok aceitar (o preflight já bloqueou o que não tem mais saída).
+    const smartPlus = preflight.fluxo === "smart_plus";
+    const payloadCampanha: any = smartPlus
+      ? montarPayloadCampanhaSmartPlus({
+          advertiserId: conexao.advertiserId,
+          nome,
+          requestId: gerarRequestIdTikTok()
+        })
+      : {
+          advertiser_id: conexao.advertiserId,
+          campaign_name: nome || "Campanha Leads Plataforma",
+          objective_type: "LEAD_GENERATION",
+          budget_mode: "BUDGET_MODE_INFINITE",
+          operation_status: "ENABLE"
+        };
 
-    const resposta = await tiktokFetch("/campaign/create/", conexao.token, {
-      method: "POST",
-      body: payloadCampanha
-    });
+    const resposta = await tiktokFetch(
+      smartPlus ? "/smart_plus/campaign/create/" : "/campaign/create/",
+      conexao.token,
+      { method: "POST", body: payloadCampanha }
+    );
 
     if (!resposta.ok || !resposta.data?.data?.campaign_id) {
       console.error("ERRO CAMPANHA TIKTOK:", resposta.data);
@@ -15236,7 +15504,9 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     );
     const configuracoesPersistidas = {
       ...(configuracoes_avancadas || {}),
-      destino: destinoResolvido
+      destino: destinoResolvido,
+      // Decide os endpoints do grupo, do anúncio, de status e da edição.
+      tiktok_fluxo: preflight.fluxo
     };
 
     if (rascunhoLocal) {
@@ -15288,6 +15558,7 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
       id: campaignId,
       campaign_id: campaignId,
       campanha_local_id: rascunhoLocal?.id || null,
+      fluxo: preflight.fluxo,
       preflight: true,
       avisos: preflight.avisos
     });
@@ -15296,6 +15567,25 @@ app.post("/tiktok/campanha", authMiddleware, async (c) => {
     return c.json({ error: "Erro ao criar campanha TikTok" }, 500);
   }
 });
+
+// Fluxo (Smart+ ou legado) gravado em /tiktok/campanha na linha local da
+// campanha. Lido do banco — nunca do corpo da requisição — e sempre dentro do
+// usuário e da conta de anúncios selecionada.
+async function campanhaTikTokEhSmartPlus(
+  usuarioId: number,
+  campaignId: unknown,
+  advertiserId: string
+): Promise<boolean> {
+  const res = await client.query(
+    `SELECT configuracoes_avancadas
+     FROM campanhas
+     WHERE campaign_id = $1 AND usuario_id = $2 AND plataforma = 'tiktok'
+       AND conta_anuncios_id = $3
+     LIMIT 1`,
+    [String(campaignId), usuarioId, String(advertiserId)]
+  );
+  return ehFluxoSmartPlusTikTok(res.rows[0]?.configuracoes_avancadas);
+}
 
 // Cria o Grupo de Anúncios (Ad Group) na TikTok Ads (equivalente ao /meta/adset)
 app.post("/tiktok/adgroup", authMiddleware, async (c) => {
@@ -15359,6 +15649,39 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
         return c.json({ error: whatsapp.erro, codigo: whatsapp.codigo }, whatsapp.status);
       }
       numeroWhatsappTikTok = whatsapp.numero;
+    }
+
+    if (await campanhaTikTokEhSmartPlus(usuarioId, campaign_id, conexao.advertiserId)) {
+      if (destinoResolvido === "site") {
+        return c.json({ error: "O destino site não é publicado no formato Smart+ do TikTok" }, 409);
+      }
+      if (fim && !interpretarDataHoraBrasil(fim)) {
+        return c.json({ error: "A data de término da campanha TikTok é inválida" }, 400);
+      }
+      const payloadSmart = montarPayloadAdgroupSmartPlus({
+        advertiserId: conexao.advertiserId,
+        campaignId: String(campaign_id),
+        requestId: gerarRequestIdTikTok(),
+        destino: destinoResolvido,
+        targeting,
+        orcamentoDiario: orcamento,
+        inicio,
+        fim,
+        numeroWhatsapp: numeroWhatsappTikTok
+      });
+      const respostaSmart = await tiktokFetch("/smart_plus/adgroup/create/", conexao.token, {
+        method: "POST",
+        body: payloadSmart
+      });
+      if (!respostaSmart.ok || !respostaSmart.data?.data?.adgroup_id) {
+        console.error("ERRO ADGROUP SMART+ TIKTOK:", respostaSmart.data);
+        return c.json({
+          error: respostaSmart.error || "Erro ao criar grupo de anúncios na TikTok",
+          detalhe: respostaSmart.data,
+          targeting_enviado: payloadSmart.targeting_spec
+        }, 400);
+      }
+      return c.json({ adgroup_id: String(respostaSmart.data.data.adgroup_id), fluxo: "smart_plus" });
     }
 
     // Mapeamento oficial da TikTok Business API v1.3:
@@ -15565,38 +15888,104 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
       }, 400);
     }
 
-    // page_id só é válido para Instant Form. No site a URL vai no criativo; no
-    // WhatsApp o destino já foi definido no ad group e a própria TikTok o preenche.
-    const criativo: any = {
-      ad_name: `Anuncio Leads ${Date.now()}`,
-      ad_format: formatoCriativo === "video" ? "SINGLE_VIDEO" : "SINGLE_IMAGE",
-      identity_id: identidadeId,
-      identity_type: identidadeTipo,
-      ad_text: texto || "Quer mais clientes? 🚀",
-      call_to_action: destinoResolvido === "whatsapp" ? "CONTACT_US" : (cta || "LEARN_MORE"),
-      ...(destinoResolvido === "lead_ads" ? { page_id: String(form_id) } : {}),
-      ...(destinoResolvido === "site" ? { landing_page_url: urlDestino } : {})
-    };
+    const smartPlus = await campanhaTikTokEhSmartPlus(usuarioId, campaign_id, conexao.advertiserId);
+    let resposta: Awaited<ReturnType<typeof tiktokFetch>>;
+    let adId: unknown;
+    let extrasSmartPlus: Record<string, unknown> = {};
 
-    if (formatoCriativo === "video") {
-      criativo.video_id = videoId;
-    } else {
-      criativo.image_ids = imagens;
-    }
-
-    const resposta = await tiktokFetch("/ad/create/", conexao.token, {
-      method: "POST",
-      body: {
-        advertiser_id: conexao.advertiserId,
-        adgroup_id: String(adgroup_id),
-        creatives: [criativo]
+    if (smartPlus) {
+      // Smart+: só vídeo (Spark Ads Push), capa obrigatória e CTA dinâmico.
+      if (destinoResolvido === "site" || formatoCriativo !== "video") {
+        return c.json({
+          error: "O formato Smart+ do TikTok publica só vídeo para Formulário instantâneo ou WhatsApp"
+        }, 409);
       }
-    });
+      const identidadeSmart = {
+        identity_id: identidadeId,
+        identity_type: identidadeTipo,
+        identity_authorized_bc_id: identidadeValidada.identity_authorized_bc_id
+      };
+      // Valida identidade/BC antes de criar o portfólio de CTA no TikTok.
+      if (erroIdentidadeSmartPlus(identidadeSmart)) {
+        return c.json({
+          error: "A identidade escolhida não pode publicar vídeos no formato Smart+ do TikTok. Escolha a conta TikTok vinculada (TikTok User ou conta do Business Center)."
+        }, 409);
+      }
 
-    const adId =
-      Array.isArray(resposta.data?.data?.ad_ids)
-        ? resposta.data.data.ad_ids[0]
-        : resposta.data?.data?.ad_id;
+      const chamarTikTok = (endpoint: string, opts?: { method?: string; body?: any }) =>
+        tiktokFetch(endpoint, conexao.token, opts);
+      const capa = await obterCapaVideoTikTok(chamarTikTok, conexao.advertiserId, videoId);
+      if ("erro" in capa) {
+        return c.json({
+          error: `O TikTok ainda não gerou a capa do vídeo (${capa.erro}). Aguarde alguns instantes e publique de novo.`
+        }, 409);
+      }
+      const ctaDinamico = await criarPortfolioCtaDinamicoTikTok(chamarTikTok, {
+        advertiserId: conexao.advertiserId,
+        promotionType: destinoResolvido === "whatsapp"
+          ? "LEAD_GEN_CLICK_TO_SOCIAL_MEDIA_APP_MESSAGE"
+          : "LEAD_GENERATION",
+        optimizationGoal: destinoResolvido === "whatsapp" ? "CLICK" : "LEAD_GENERATION"
+      });
+      if ("erro" in ctaDinamico) {
+        return c.json({ error: ctaDinamico.erro }, 400);
+      }
+
+      resposta = await tiktokFetch("/smart_plus/ad/create/", conexao.token, {
+        method: "POST",
+        body: montarPayloadAnuncioSmartPlus({
+          advertiserId: conexao.advertiserId,
+          adgroupId: String(adgroup_id),
+          destino: destinoResolvido,
+          formId: destinoResolvido === "lead_ads" ? String(form_id) : null,
+          identidade: identidadeSmart,
+          videoId,
+          capaImageId: capa.imageId,
+          texto,
+          ctaPortfolioId: ctaDinamico.portfolioId
+        })
+      });
+      adId = resposta.data?.data?.smart_plus_ad_id;
+      extrasSmartPlus = {
+        cta_portfolio_id: ctaDinamico.portfolioId,
+        ctas_dinamicos: ctaDinamico.ctas,
+        capa_image_id: capa.imageId,
+        identity_authorized_bc_id: identidadeSmart.identity_authorized_bc_id
+      };
+    } else {
+      // page_id só é válido para Instant Form. No site a URL vai no criativo; no
+      // WhatsApp o destino já foi definido no ad group e a própria TikTok o preenche.
+      const criativo: any = {
+        ad_name: `Anuncio Leads ${Date.now()}`,
+        ad_format: formatoCriativo === "video" ? "SINGLE_VIDEO" : "SINGLE_IMAGE",
+        identity_id: identidadeId,
+        identity_type: identidadeTipo,
+        ad_text: texto || "Quer mais clientes? 🚀",
+        call_to_action: destinoResolvido === "whatsapp" ? "CONTACT_US" : (cta || "LEARN_MORE"),
+        ...(destinoResolvido === "lead_ads" ? { page_id: String(form_id) } : {}),
+        ...(destinoResolvido === "site" ? { landing_page_url: urlDestino } : {})
+      };
+
+      if (formatoCriativo === "video") {
+        criativo.video_id = videoId;
+      } else {
+        criativo.image_ids = imagens;
+      }
+
+      resposta = await tiktokFetch("/ad/create/", conexao.token, {
+        method: "POST",
+        body: {
+          advertiser_id: conexao.advertiserId,
+          adgroup_id: String(adgroup_id),
+          creatives: [criativo]
+        }
+      });
+
+      adId =
+        Array.isArray(resposta.data?.data?.ad_ids)
+          ? resposta.data.data.ad_ids[0]
+          : resposta.data?.data?.ad_id;
+    }
 
     if (!resposta.ok || !adId) {
       console.error("ERRO ANUNCIO TIKTOK:", resposta.data);
@@ -15610,6 +15999,9 @@ app.post("/tiktok/anuncio", authMiddleware, async (c) => {
     // linhas TikTok, já que não existe Página do Facebook aqui; identity/form vão no JSONB)
     const configuracoesPersistidas = {
       ...avancadas,
+      ...extrasSmartPlus,
+      // O fluxo vem do banco; o corpo da requisição não pode trocá-lo.
+      tiktok_fluxo: smartPlus ? "smart_plus" : "legado",
       rascunho_plataforma_adicional: false,
       texto,
       cta,
