@@ -109,6 +109,20 @@ import {
   type EtapaFunilFormulario,
   type EtapaSite,
 } from "./eventos-meta";
+import {
+  NOME_FONTE_EVENTOS_TIKTOK,
+  dadosContaTikTokAposReconexao,
+  dataTikTokParaBrasil,
+  extrairLeadCsvTikTok,
+  fonteEventoTikTok,
+  idFonteEventosTikTokNaLista,
+  inicioAgendaTikTok,
+  interpretarDataHoraBrasil,
+  leadIdentificavelTikTok,
+  montarEventoTikTok,
+  valorCsvPorChavesPossiveis,
+  type FonteEventoTikTok,
+} from "./tiktok-utils";
 
 import {
   botaoFinalFormularioMeta,
@@ -1791,7 +1805,9 @@ async function avaliarEEnviarQualificacaoTikTok(
 ) {
   try {
 
-    if (!leadRow?.email && !leadRow?.telefone) {
+    // Formulário instantâneo casa pelo lead_id (canal CRM); os demais
+    // precisam de e-mail ou telefone.
+    if (!leadIdentificavelTikTok(leadRow)) {
       return;
     }
 
@@ -7985,7 +8001,13 @@ app.get("/auth/:plataforma/callback", async (c) => {
         tokenExpiraEm = new Date(Date.now() + Number(tokenData.data.expires_in) * 1000);
       }
       const advertiserIds: string[] = tokenData.data.advertiser_ids ?? [];
-      dadosConta = { advertiser_ids: advertiserIds };
+      // Reconectar não pode apagar a conta, a identidade e as fontes de
+      // eventos já escolhidas, enquanto a conta continuar autorizada.
+      const conexaoAnterior = await client.query(
+        `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+        [usuarioId]
+      );
+      dadosConta = dadosContaTikTokAposReconexao(conexaoAnterior.rows[0]?.dados_conta, advertiserIds);
     } else {
       const tokenRes = await fetch(cfg.tokenUrl, {
         method: "POST",
@@ -12569,21 +12591,7 @@ function parsearCsvSimples(texto: string): Record<string, string>[] {
   });
 }
 
-// Lê um valor de uma linha de CSV tentando varias chaves possiveis (a TikTok
-// nao documenta os nomes exatos das colunas do export — normaliza espaco/
-// underscore/maiusculas antes de comparar).
-function valorCsvPorChavesPossiveis(linha: Record<string, string>, chaves: string[]): string {
-  const normalizadas: Record<string, string> = {};
-  for (const chaveOriginal of Object.keys(linha)) {
-    const normalizada = chaveOriginal.trim().toLowerCase().replace(/[\s_]+/g, "_");
-    if (!(normalizada in normalizadas)) normalizadas[normalizada] = linha[chaveOriginal];
-  }
-  for (const chave of chaves) {
-    const valor = normalizadas[chave];
-    if (valor) return valor;
-  }
-  return "";
-}
+// valorCsvPorChavesPossiveis e a leitura da linha do lead ficam em tiktok-utils.ts.
 
 // Cria (ou faz polling de) uma "lead download task" da TikTok pra um Instant
 // Form especifico, baixa o CSV resultante quando pronta e devolve as linhas
@@ -13038,6 +13046,20 @@ async function executarPreflightPublicacaoTikTok(
     };
   }
 
+  // Data final inválida ou vencida só seria recusada no ad group, depois de a
+  // campanha já existir no TikTok.
+  if (textoOpcional(avancadas.fim)) {
+    const fimData = interpretarDataHoraBrasil(avancadas.fim);
+    if (!fimData || fimData.getTime() <= inicioAgendaTikTok(avancadas.inicio).getTime()) {
+      return {
+        ok: false,
+        status: 400,
+        codigo: "TIKTOK_END_DATE_INVALID",
+        erro: "A data de término da campanha TikTok precisa ser depois da data de início."
+      };
+    }
+  }
+
   const identidade = await validarIdentidadeTikTok(conexao, identityId, identityType);
   if (!identidade.ok) return identidade;
 
@@ -13331,10 +13353,9 @@ async function buscarEstruturaCampanhaTikTok(
   return { campanha, adgroup, anuncio, avisos };
 }
 
+// O TikTok devolve a agenda em UTC; o calendário da edição trabalha em Brasília.
 function dataTikTokParaFormulario(valor: unknown): string {
-  const texto = textoOpcional(valor);
-  const correspondencia = texto.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/);
-  return correspondencia ? `${correspondencia[1]}T${correspondencia[2]}` : texto;
+  return dataTikTokParaBrasil(valor);
 }
 
 app.get("/tiktok/campanhas/:id/configuracao-edicao", authMiddleware, async (c) => {
@@ -13716,15 +13737,16 @@ app.post("/tiktok/editar-campanha", authMiddleware, async (c) => {
       ...targeting,
       budget: dailyBudgetCentavos / 100
     };
+    // Datas do calendário chegam em horário de Brasília; o TikTok espera UTC.
     if (inicio) {
-      const inicioData = new Date(inicio);
-      if (Number.isFinite(inicioData.getTime()) && inicioData.getTime() > Date.now()) {
+      const inicioData = interpretarDataHoraBrasil(inicio);
+      if (inicioData && inicioData.getTime() > Date.now()) {
         payloadAdgroup.schedule_start_time = formatarDataHoraTikTok(inicioData);
       }
     }
     if (fim) {
-      const fimData = new Date(fim);
-      if (!Number.isFinite(fimData.getTime()) || fimData.getTime() <= Date.now()) {
+      const fimData = interpretarDataHoraBrasil(fim);
+      if (!fimData || fimData.getTime() <= Date.now()) {
         return c.json({ error: "A data final da campanha TikTok precisa estar no futuro" }, 400);
       }
       payloadAdgroup.schedule_type = "SCHEDULE_START_END";
@@ -13947,80 +13969,90 @@ function hashSha256(valor: string): string {
     .digest("hex");
 }
 
-// Cria (ou reaproveita) o Pixel TikTok usado como event_source_id no envio
-// de eventos de qualificacao de lead — equivalente ao dataset da Meta
-// (obterOuCriarDatasetMetaUsuario) e a Conversion Action do Google
-// (obterOuCriarConversionActionGoogle). Guardado em
-// plataforma_conexoes.dados_conta.pixel_code pra nao recriar a cada envio.
-async function obterOuCriarPixelTikTok(
+/// Fonte de eventos TikTok usada como event_source_id no envio de qualificação
+// — equivalente ao dataset da Meta (obterOuCriarDatasetMetaUsuario) e à
+// Conversion Action do Google (obterOuCriarConversionActionGoogle):
+// - "crm": CRM Event Set (/crm/list/, /crm/create/), para lead de formulário
+//   instantâneo, que casa pelo lead_id;
+// - "pixel": Pixel (/pixel/list/, /pixel/create/), para os demais (WhatsApp,
+//   site), que casam por e-mail/telefone.
+// Guardada em dados_conta junto com a conta de anúncios a que pertence: ao
+// trocar de conta, a fonte da conta antiga não é mais usada. Antes de criar,
+// procura pelo nome para não duplicar a cada reconexão ou troca de conta.
+async function obterOuCriarFonteEventosTikTok(
   usuarioId: number,
   advertiserId: string,
-  token: string
+  token: string,
+  tipo: "pixel" | "crm"
 ): Promise<string | null> {
+  const chaveId = tipo === "crm" ? "crm_event_set_id" : "pixel_code";
+  const chaveConta = tipo === "crm" ? "crm_advertiser_id" : "pixel_advertiser_id";
   try {
     const conexao = await client.query(
-      `SELECT id, dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
+      `SELECT dados_conta FROM plataforma_conexoes WHERE usuario_id = $1 AND plataforma = 'tiktok' LIMIT 1`,
       [usuarioId]
     );
-
     if (!conexao.rows.length) return null;
 
     const dadosConta = conexao.rows[0].dados_conta ?? {};
-    const existente = dadosConta.pixel_code;
-
-    if (existente) {
-      return existente;
+    if (dadosConta[chaveId] && String(dadosConta[chaveConta] || "") === advertiserId) {
+      return String(dadosConta[chaveId]);
     }
 
-    const criado = await tiktokFetch("/pixel/create/", token, {
-      method: "POST",
-      body: {
-        advertiser_id: advertiserId,
-        pixel_name: "Plataforma de Leads",
-      },
-    });
+    const filtro = new URLSearchParams({ advertiser_id: advertiserId, name: NOME_FONTE_EVENTOS_TIKTOK });
+    if (tipo === "pixel") filtro.set("page_size", "20");
+    const lista = await tiktokFetch(`/${tipo === "crm" ? "crm" : "pixel"}/list/?${filtro}`, token);
+    let id = lista.ok ? idFonteEventosTikTokNaLista(lista.data, tipo) : null;
 
-    const pixelCode = criado.data?.pixel_code || criado.data?.data?.pixel_code;
-
-    if (!criado.ok || !pixelCode) {
-      console.error("ERRO obterOuCriarPixelTikTok:", criado.error, criado.data);
-      return null;
+    if (!id) {
+      const criado = await tiktokFetch(tipo === "crm" ? "/crm/create/" : "/pixel/create/", token, {
+        method: "POST",
+        body: tipo === "crm"
+          ? { advertiser_id: advertiserId, name: NOME_FONTE_EVENTOS_TIKTOK }
+          : { advertiser_id: advertiserId, pixel_name: NOME_FONTE_EVENTOS_TIKTOK },
+      });
+      id = textoOpcional(
+        tipo === "crm"
+          ? criado.data?.data?.event_set_id
+          : criado.data?.data?.pixel_code ?? criado.data?.pixel_code
+      ) || null;
+      if (!criado.ok || !id) {
+        console.error(`ERRO obterOuCriarFonteEventosTikTok (${tipo}):`, criado.error, criado.data);
+        return null;
+      }
     }
 
+    // Só grava se a conta selecionada ainda for a mesma.
     await client.query(
-      `UPDATE plataforma_conexoes SET dados_conta = $1 WHERE id = $2`,
-      [JSON.stringify({ ...dadosConta, pixel_code: pixelCode }), conexao.rows[0].id]
+      `UPDATE plataforma_conexoes
+       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object($1::text, $2::text, $3::text, $4::text)
+       WHERE usuario_id = $5 AND plataforma = 'tiktok' AND dados_conta->>'advertiser_id' = $4::text`,
+      [chaveId, id, chaveConta, advertiserId, usuarioId]
     );
-
-    return pixelCode;
+    return id;
   } catch (err) {
-    console.error("ERRO obterOuCriarPixelTikTok:", err);
+    console.error(`ERRO obterOuCriarFonteEventosTikTok (${tipo}):`, err);
     return null;
   }
 }
 
-// Equivalente TikTok de enviarEventoMetaConversionLeads. Diferente da Meta
-// (que casa pelo lead_id nativo) e do Google (que casa pelo gclid), o lead
-// sincronizado do TikTok (/lead/get/) nao expõe nenhum click id — o
-// casamento aqui usa Advanced Matching por telefone/email hasheados
-// (SHA-256), que e o mecanismo padrao da TikTok Events API quando nao ha
-// ttclid disponivel.
-// ⚠️ ASSUMPTION: endpoint /event/track/ (Events API v2), event_source "web"
-// + event_source_id do Pixel, conferidos contra a documentacao oficial da
-// TikTok Business API em 14/08/2026, mas ainda nao testados contra tráfego
-// real — essa e a integracao com menos certeza das duas construidas agora
-// (o mecanismo de conversao offline/CRM da TikTok tem mais de uma variante
-// documentada); se o envio falhar consistentemente, o primeiro lugar a
-// conferir e se a conta precisa de um "Offline Event Set" dedicado em vez
-// de reaproveitar um Pixel comum.
+// Equivalente TikTok de enviarEventoMetaConversionLeads, pela Events API 2.0
+// (/event/track/), conferida na documentação oficial em 2026-11-04:
+// - lead de formulário instantâneo: event_source "crm" + CRM Event Set +
+//   lead.lead_id (só aceita evento personalizado — QualifiedLead/ClosedWon são);
+// - demais leads: event_source "web" + Pixel, casando por user.email e
+//   user.phone (E.164 com "+", hash SHA-256).
+// Se o CRM Event Set não puder ser usado (ex.: permissão do app), cai no Pixel
+// com e-mail/telefone. Ainda não testado contra tráfego real: em 2026-11-04
+// nenhuma campanha TikTok tinha sido publicada pela plataforma.
 async function enviarEventoTikTokConversionLeads(
   usuarioId: number,
   lead: any,
   eventName: "Qualified Lead" | "Closed Won"
 ): Promise<{ ok: boolean; erro?: string }> {
 
-  if (!lead?.email && !lead?.telefone) {
-    return { ok: false, erro: "Lead sem email ou telefone para casar com o TikTok" };
+  if (!leadIdentificavelTikTok(lead)) {
+    return { ok: false, erro: "Lead sem lead_id do TikTok, e-mail ou telefone para casar com o TikTok" };
   }
 
   const conexao = await obterConexaoTikTok(usuarioId);
@@ -14030,49 +14062,40 @@ async function enviarEventoTikTokConversionLeads(
   }
 
   try {
-
-    const pixelCode =
-      await obterOuCriarPixelTikTok(usuarioId, conexao.advertiserId, conexao.token);
-
-    if (!pixelCode) {
-      return { ok: false, erro: "Não foi possível criar o pixel do TikTok" };
-    }
-
-    const eventoTikTok =
-      eventName === "Qualified Lead" ? "QualifiedLead" : "ClosedWon";
-
-    const telefoneDigitos = String(lead.telefone || "").replace(/\D/g, "");
-
+    const eventoTikTok = eventName === "Qualified Lead" ? "QualifiedLead" : "ClosedWon";
+    const telefoneE164 = lead?.telefone ? normalizarTelefoneE164Google(lead.telefone) : "";
     // Valor da venda informado pelo corretor ao fechar (ver eventos-meta.ts).
     const valorVenda = valorVendaInformado(lead, eventName);
 
-    const resultado = await tiktokFetch("/event/track/", conexao.token, {
-      method: "POST",
-      body: {
-        event_source: "web",
-        event_source_id: pixelCode,
-        data: [
-          {
-            event: eventoTikTok,
-            event_time: Math.floor(Date.now() / 1000),
-            user: {
-              email: lead.email ? hashSha256(lead.email) : undefined,
-              phone_number: telefoneDigitos ? hashSha256(telefoneDigitos) : undefined,
-            },
-            ...(valorVenda !== null
-              ? { properties: { value: valorVenda, currency: MOEDA_VALOR_NEGOCIO } }
-              : {}),
-          },
-        ],
-      },
-    });
+    const fontes: FonteEventoTikTok[] = fonteEventoTikTok(lead) === "crm" ? ["crm", "web"] : ["web"];
+    let ultimoErro = "Não foi possível preparar o evento do TikTok";
 
-    if (!resultado.ok) {
-      console.error(`CONVERSION LEADS TIKTOK (${eventName}) erro:`, resultado.error, resultado.data);
-      return { ok: false, erro: resultado.error || "Erro ao enviar evento para o TikTok" };
+    for (const fonte of fontes) {
+      const item = montarEventoTikTok({ lead, evento: eventoTikTok, fonte, telefoneE164, valorVenda });
+      if (!item) continue;
+
+      const eventSourceId = await obterOuCriarFonteEventosTikTok(
+        usuarioId, conexao.advertiserId, conexao.token, fonte === "crm" ? "crm" : "pixel"
+      );
+      if (!eventSourceId) {
+        ultimoErro = fonte === "crm"
+          ? "Não foi possível obter o conjunto de eventos de CRM do TikTok"
+          : "Não foi possível obter o pixel do TikTok";
+        continue;
+      }
+
+      const resultado = await tiktokFetch("/event/track/", conexao.token, {
+        method: "POST",
+        body: { event_source: fonte, event_source_id: eventSourceId, data: [item] },
+      });
+
+      if (resultado.ok) return { ok: true };
+
+      console.error(`CONVERSION LEADS TIKTOK (${eventName}, ${fonte}) erro:`, resultado.error, resultado.data);
+      ultimoErro = resultado.error || "Erro ao enviar evento para o TikTok";
     }
 
-    return { ok: true };
+    return { ok: false, erro: ultimoErro };
 
   } catch (err: any) {
     console.error(`CONVERSION LEADS TIKTOK (${eventName}) excecao:`, err);
@@ -14150,9 +14173,17 @@ app.post("/tiktok/selecionar-anunciante", authMiddleware, async (c) => {
       return c.json({ error: "A conta de anunciante não está acessível nesta conexão" }, 403);
     }
 
+    // Trocar de conta descarta a identidade da conta anterior (ela pertence
+    // àquela conta). Pixel e CRM Event Set já ficam presos à conta de origem
+    // (pixel_advertiser_id / crm_advertiser_id) e são revalidados no envio.
     const vinculo = await client.query(
       `UPDATE plataforma_conexoes
-       SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || jsonb_build_object('advertiser_id', $1::text),
+       SET dados_conta = (
+             CASE WHEN COALESCE(dados_conta->>'advertiser_id', '') = $1::text
+                  THEN COALESCE(dados_conta, '{}'::jsonb)
+                  ELSE COALESCE(dados_conta, '{}'::jsonb) - 'identity_id' - 'identity_type'
+             END
+           ) || jsonb_build_object('advertiser_id', $1::text),
            atualizado_em = NOW()
        WHERE usuario_id = $2 AND plataforma = 'tiktok' AND status = 'conectado'
          AND access_token = $3 RETURNING usuario_id`,
@@ -14165,6 +14196,80 @@ app.post("/tiktok/selecionar-anunciante", authMiddleware, async (c) => {
     return c.json({ error: "Erro interno" }, 500);
   }
 });
+
+// Grava um lead do CSV de um formulário instantâneo e dispara o mesmo que
+// qualquer lead de formulário: aviso ao corretor, avaliação do sinal de
+// qualificação e primeiro contato por WhatsApp. Usada pela sincronização e
+// pelo webhook, para que os dois caminhos tratem o lead igual. Devolve true
+// quando o lead é novo.
+async function gravarLeadTikTokDoCsv(
+  usuarioId: number,
+  advertiserId: string,
+  pageId: string,
+  linha: Record<string, string>,
+  origem: "sync" | "webhook"
+): Promise<boolean> {
+  const dados = extrairLeadCsvTikTok(linha);
+  if (!dados.leadId) return false;
+
+  const jaExiste = await client.query(
+    `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
+    [dados.leadId, usuarioId]
+  );
+  if (jaExiste.rows.length > 0) return false;
+
+  // Identifica a campanha pelo campaign_id do CSV (mais preciso) e, na falta
+  // dele, pelo formulário.
+  let nomeCampanha = dados.campaignName || "Campanha TikTok";
+  let nichoId: number | null = null;
+  const campRow = await client.query(
+    `SELECT nome, nicho_id FROM campanhas
+     WHERE usuario_id = $1 AND plataforma = 'tiktok' AND conta_anuncios_id = $2
+       AND (($3 <> '' AND campaign_id = $3) OR form_id = $4)
+     LIMIT 1`,
+    [usuarioId, advertiserId, dados.campaignId, pageId]
+  );
+  if (campRow.rows.length) {
+    nomeCampanha = campRow.rows[0].nome;
+    nichoId = campRow.rows[0].nicho_id ?? null;
+  }
+
+  const leadInserido = await client.query(
+    `INSERT INTO leads
+       (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
+        origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))
+     RETURNING id`,
+    [
+      usuarioId, dados.leadId, dados.nome, dados.email, dados.telefone,
+      nomeCampanha, advertiserId,
+      JSON.stringify(dados.respostas), nichoId, dados.criadoEm
+    ]
+  );
+  const novoId = leadInserido.rows[0]?.id;
+
+  await notificarNovoLeadWhatsApp(usuarioId, {
+    nome: dados.nome, telefone: dados.telefone, email: dados.email, campanha: nomeCampanha
+  });
+
+  avaliarEEnviarQualificacaoLead(
+    {
+      id: novoId,
+      lead_id: dados.leadId,
+      plataforma: "tiktok",
+      status: "novo",
+      email: dados.email,
+      telefone: dados.telefone,
+      respostas_qualificacao: dados.respostas
+    },
+    usuarioId
+  ).catch(err => console.error(`ERRO avaliarEEnviarQualificacaoLead (${origem} tiktok):`, err));
+
+  iniciarContatoWhatsAppLeadFormulario(usuarioId, novoId)
+    .catch(err => console.error(`ERRO contato WhatsApp formulário (${origem} tiktok):`, err));
+
+  return true;
+}
 
 // Sincroniza campanhas e leads do TikTok Ads. Compartilhada entre o botão
 // manual e o ciclo automático.
@@ -14255,81 +14360,9 @@ async function sincronizarTikTokAdsUsuario(usuarioId: number) {
       if (!linhasCsv) continue;
 
       for (const linha of linhasCsv) {
-        const leadId = valorCsvPorChavesPossiveis(linha, ["lead_id"]);
-        if (!leadId) continue;
-
-        const jaExiste = await client.query(
-          `SELECT id FROM leads WHERE lead_id = $1 AND usuario_id = $2`,
-          [leadId, usuarioId]
-        );
-        if (jaExiste.rows.length > 0) continue;
-
-        // Identifica campanha pelo campaign_id do CSV (mais preciso) e, na falta
-        // dele, pelo form_id (mesmo comportamento anterior)
-        const campaignIdCsv = valorCsvPorChavesPossiveis(linha, ["campaign_id"]);
-        let nomeCampanha = valorCsvPorChavesPossiveis(linha, ["campaign_name"]) || "Campanha TikTok";
-        let nichoId: number | null = null;
-        const campRow = await client.query(
-          `SELECT nome, nicho_id FROM campanhas
-           WHERE usuario_id = $1 AND plataforma = 'tiktok' AND conta_anuncios_id = $2
-             AND (($3 <> '' AND campaign_id = $3) OR form_id = $4)
-           LIMIT 1`,
-          [usuarioId, String(advertiserId), campaignIdCsv, pageId]
-        );
-        if (campRow.rows.length) {
-          nomeCampanha = campRow.rows[0].nome;
-          nichoId = campRow.rows[0].nicho_id ?? null;
+        if (await gravarLeadTikTokDoCsv(usuarioId, String(advertiserId), pageId, linha, "sync")) {
+          totalLeads++;
         }
-
-        const nome = valorCsvPorChavesPossiveis(linha, ["full_name", "name", "first_name"]) || "Lead TikTok";
-        const email = valorCsvPorChavesPossiveis(linha, ["email"]);
-        const telefone = valorCsvPorChavesPossiveis(linha, ["phone_number", "phone"]);
-
-        const camposConhecidos = new Set([
-          "lead_id", "campaign_id", "campaign_name", "full_name", "name", "first_name",
-          "last_name", "email", "phone_number", "phone", "create_time", "submit_time",
-          "page_id", "adgroup_id", "adgroup_name", "ad_id", "ad_name",
-        ]);
-        const respostasQualificacao = Object.keys(linha)
-          .filter(chave => !camposConhecidos.has(chave.trim().toLowerCase().replace(/[\s_]+/g, "_")))
-          .map(chave => ({ pergunta: chave, resposta: linha[chave] }));
-
-        const criadoEmTexto = valorCsvPorChavesPossiveis(linha, ["create_time", "submit_time"]);
-        const criadoEm = criadoEmTexto ? new Date(criadoEmTexto).toISOString() : null;
-        const criadoEmValido = criadoEm && !Number.isNaN(new Date(criadoEm).getTime()) ? criadoEm : null;
-
-        const leadInseridoTikTok = await client.query(
-          `INSERT INTO leads
-             (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
-              origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))
-           RETURNING id`,
-          [
-            usuarioId, leadId, nome, email, telefone,
-            nomeCampanha, String(advertiserId),
-            JSON.stringify(respostasQualificacao), nichoId, criadoEmValido
-          ]
-        );
-
-        await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
-
-        avaliarEEnviarQualificacaoLead(
-          {
-            id: leadInseridoTikTok.rows[0]?.id,
-            lead_id: leadId,
-            plataforma: "tiktok",
-            status: "novo",
-            email,
-            telefone,
-            respostas_qualificacao: respostasQualificacao
-          },
-          usuarioId
-        ).catch(err => console.error("ERRO avaliarEEnviarQualificacaoLead (sync tiktok):", err));
-
-        iniciarContatoWhatsAppLeadFormulario(usuarioId, leadInseridoTikTok.rows[0]?.id)
-          .catch(err => console.error("ERRO contato WhatsApp formulário (sync tiktok):", err));
-
-        totalLeads++;
       }
     }
 
@@ -15276,15 +15309,19 @@ app.post("/tiktok/adgroup", authMiddleware, async (c) => {
       optimization_goal: ehFormulario ? "LEAD_GENERATION" : "CLICK",
       bid_type: "BID_TYPE_NO_BID",
       pacing: "PACING_MODE_SMOOTH",
-      schedule_start_time: formatarDataHoraTikTok(
-        inicio ? new Date(inicio) : new Date(Date.now() + 60000)
-      ),
+      // Calendário em horário de Brasília -> UTC do TikTok; sem data (ou com
+      // data já vencida) começa daqui a 1 minuto.
+      schedule_start_time: formatarDataHoraTikTok(inicioAgendaTikTok(inicio)),
       operation_status: "ENABLE"
     };
 
     if (fim) {
+      const fimData = interpretarDataHoraBrasil(fim);
+      if (!fimData) {
+        return c.json({ error: "A data de término da campanha TikTok é inválida" }, 400);
+      }
       payloadAdgroup.schedule_type = "SCHEDULE_START_END";
-      payloadAdgroup.schedule_end_time = formatarDataHoraTikTok(new Date(fim));
+      payloadAdgroup.schedule_end_time = formatarDataHoraTikTok(fimData);
     } else {
       payloadAdgroup.schedule_type = "SCHEDULE_FROM_NOW";
     }
@@ -25830,17 +25867,34 @@ app.post("/webhook/tiktok", async (c) => {
 
       if (!leadId || !advertiserId) continue;
 
-      // Identifica o usuário pela conta de anunciante
+      // Busca os dados completos do lead — nao existe um /lead/get/ por lead_id
+      // isolado (ver baixarLeadsTikTokPorFormulario); baixa o CSV do formulario
+      // inteiro (task assincrona) e filtra a linha pelo lead_id do evento.
+      if (!formId) {
+        console.error("TIKTOK WEBHOOK: evento sem form_id, nao e possivel buscar o lead:", leadId);
+        continue;
+      }
+
+      // Mesma regra da sincronização: só entra lead de formulário usado por uma
+      // campanha da plataforma, na conta de anúncios conectada do usuário. Isso
+      // também resolve o dono quando a mesma conta aparece em mais de um usuário.
       const conn = await client.query(
-        `SELECT usuario_id, access_token
-         FROM plataforma_conexoes
-         WHERE plataforma = 'tiktok'
-           AND dados_conta->>'advertiser_id' = $1
+        `SELECT pc.usuario_id, pc.access_token
+         FROM plataforma_conexoes pc
+         WHERE pc.plataforma = 'tiktok'
+           AND pc.status = 'conectado'
+           AND pc.dados_conta->>'advertiser_id' = $1
+           AND EXISTS (
+             SELECT 1 FROM campanhas c
+             WHERE c.usuario_id = pc.usuario_id AND c.plataforma = 'tiktok'
+               AND c.conta_anuncios_id = $1 AND c.form_id = $2
+           )
+         ORDER BY pc.atualizado_em DESC
          LIMIT 1`,
-        [advertiserId]
+        [advertiserId, formId]
       );
       if (!conn.rows.length) {
-        console.log("TikTok webhook: anunciante nao identificado:", advertiserId);
+        console.log("TikTok webhook: formulario sem campanha da plataforma nesta conta:", advertiserId, formId);
         continue;
       }
 
@@ -25853,13 +25907,6 @@ app.post("/webhook/tiktok", async (c) => {
       );
       if (jaExiste.rows.length > 0) continue;
 
-      // Busca os dados completos do lead — nao existe um /lead/get/ por lead_id
-      // isolado (ver baixarLeadsTikTokPorFormulario); baixa o CSV do formulario
-      // inteiro (task assincrona) e filtra a linha pelo lead_id do evento.
-      if (!formId) {
-        console.error("TIKTOK WEBHOOK: evento sem form_id, nao e possivel buscar o lead:", leadId);
-        continue;
-      }
       const linhasCsv = await baixarLeadsTikTokPorFormulario(advertiserId, formId, token);
       const linha = linhasCsv?.find(l => valorCsvPorChavesPossiveis(l, ["lead_id"]) === leadId);
       if (!linha) {
@@ -25867,51 +25914,9 @@ app.post("/webhook/tiktok", async (c) => {
         continue;
       }
 
-      const campaignIdCsv = valorCsvPorChavesPossiveis(linha, ["campaign_id"]);
-      let nomeCampanha = valorCsvPorChavesPossiveis(linha, ["campaign_name"]) || "Campanha TikTok";
-      let nichoId: number | null = null;
-      const campRow = await client.query(
-        `SELECT nome, nicho_id FROM campanhas
-         WHERE usuario_id = $1 AND plataforma = 'tiktok'
-           AND (($2 <> '' AND campaign_id = $2) OR form_id = $3)
-         LIMIT 1`,
-        [usuarioId, campaignIdCsv, formId]
-      );
-      if (campRow.rows.length) {
-        nomeCampanha = campRow.rows[0].nome;
-        nichoId = campRow.rows[0].nicho_id ?? null;
+      if (await gravarLeadTikTokDoCsv(usuarioId, advertiserId, formId, linha, "webhook")) {
+        console.log("✅ TIKTOK LEAD SALVO:", leadId, "usuario:", usuarioId);
       }
-
-      const camposConhecidos = new Set([
-        "lead_id", "campaign_id", "campaign_name", "full_name", "name", "first_name",
-        "last_name", "email", "phone_number", "phone", "create_time", "submit_time",
-        "page_id", "adgroup_id", "adgroup_name", "ad_id", "ad_name",
-      ]);
-      const nome = valorCsvPorChavesPossiveis(linha, ["full_name", "name", "first_name"]) || "Lead TikTok";
-      const email = valorCsvPorChavesPossiveis(linha, ["email"]);
-      const telefone = valorCsvPorChavesPossiveis(linha, ["phone_number", "phone"]);
-      const respostasQualificacao = Object.keys(linha)
-        .filter(chave => !camposConhecidos.has(chave.trim().toLowerCase().replace(/[\s_]+/g, "_")))
-        .map(chave => ({ pergunta: chave, resposta: linha[chave] }));
-
-      const criadoEmTexto = valorCsvPorChavesPossiveis(linha, ["create_time", "submit_time"]);
-      const criadoEmData = criadoEmTexto ? new Date(criadoEmTexto) : null;
-      const criadoEm = criadoEmData && !Number.isNaN(criadoEmData.getTime()) ? criadoEmData.toISOString() : null;
-
-      await client.query(
-        `INSERT INTO leads
-           (usuario_id, lead_id, nome, email, telefone, campanha, conta_anuncios_id,
-            origem, plataforma, status, respostas_qualificacao, nicho_id, criado_em)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'tiktok','tiktok','novo',$8,$9,COALESCE($10::timestamptz, NOW()))`,
-        [
-          usuarioId, leadId, nome || "Lead TikTok", email, telefone,
-          nomeCampanha, advertiserId,
-          JSON.stringify(respostasQualificacao), nichoId, criadoEm
-        ]
-      );
-
-      console.log("✅ TIKTOK LEAD SALVO:", leadId, "usuario:", usuarioId);
-      await notificarNovoLeadWhatsApp(usuarioId, { nome, telefone, email, campanha: nomeCampanha });
     }
 
     return c.json({ sucesso: true });
