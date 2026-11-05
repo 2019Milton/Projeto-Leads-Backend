@@ -52,6 +52,49 @@ export function montarCorpoRegraLeadQualificado(adAccountId: unknown) {
   };
 }
 
+export const NOME_REGRA_VENDA_FECHADA = "Plataforma de Leads - Venda fechada";
+
+// Venda fechada ("Closed Won") vira PURCHASE: é o tipo que carrega o valor da
+// venda (valueType DYNAMIC) e alimenta ROAS no Campaign Manager. Não entra na
+// otimização — só em relatório e atribuição. Mesmas janelas da regra de lead
+// qualificado.
+export function montarCorpoRegraVendaFechada(adAccountId: unknown) {
+  return {
+    name: NOME_REGRA_VENDA_FECHADA,
+    account: `urn:li:sponsoredAccount:${idNumerico(adAccountId, "adAccountId")}`,
+    conversionMethod: "CONVERSIONS_API",
+    type: "PURCHASE",
+    postClickAttributionWindowSize: 90,
+    viewThroughAttributionWindowSize: 30,
+    attributionType: "LAST_TOUCH_BY_CAMPAIGN"
+  };
+}
+
+// POST /conversions. Com associarPorObjetivo o LinkedIn já associa as
+// campanhas existentes (ACTIVE, PAUSED e DRAFT) cujo objetivo combina com o
+// tipo da regra — PURCHASE vale para lead gen e para visita ao site.
+export function urlCriarRegraConversao(associarPorObjetivo: boolean): string {
+  return associarPorObjetivo ? "/conversions?autoAssociationType=OBJECTIVE_BASED" : "/conversions";
+}
+
+// Diferente da regra de lead qualificado, a de venda só é reaproveitada se
+// tiver o NOME da plataforma: uma regra PURCHASE de outra integração (loja,
+// CRM) existente na conta não pode receber o valor das nossas vendas.
+export function escolherRegraVendaFechada(elementos: unknown): string | null {
+  if (!Array.isArray(elementos)) return null;
+  const candidatas = elementos
+    .filter((el: any) =>
+      el?.name === NOME_REGRA_VENDA_FECHADA &&
+      el?.type === "PURCHASE" &&
+      el?.conversionMethod === "CONVERSIONS_API" &&
+      el?.enabled !== false &&
+      (el?.ownershipType === undefined || el?.ownershipType === "OWNED") &&
+      urnRegraConversao(el?.id) !== null
+    )
+    .sort((a: any, b: any) => Number(a.id) - Number(b.id));
+  return candidatas.length ? urnRegraConversao(candidatas[0].id) : null;
+}
+
 // GET /conversions?q=account&account=<urn codificado> (formato do exemplo
 // oficial: só os ":" do URN vão codificados).
 export function urlBuscaRegrasConversao(adAccountId: unknown, start?: number): string {

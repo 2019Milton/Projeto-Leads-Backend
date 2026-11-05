@@ -4,6 +4,7 @@ import {
   campanhaOtimizadaPorLeadQualificado,
   erroDePermissaoLinkedIn,
   escolherRegraLeadQualificado,
+  escolherRegraVendaFechada,
   etapasPendentesLinkedIn,
   hashEmailLinkedIn,
   idEventoLinkedIn,
@@ -12,11 +13,14 @@ import {
   PERIODO_REENVIO_DIAS,
   montarAssociacaoCampanhaConversao,
   montarCorpoRegraLeadQualificado,
+  montarCorpoRegraVendaFechada,
   montarEventoConversaoLinkedIn,
   NOME_REGRA_LEAD_QUALIFICADO,
+  NOME_REGRA_VENDA_FECHADA,
   proximoStartBuscaRegras,
   regraDaConexao,
   urlBuscaRegrasConversao,
+  urlCriarRegraConversao,
   urnRegraConversao,
   urnRespostaFormularioLinkedIn
 } from "./linkedin-conversoes";
@@ -314,4 +318,43 @@ test("erro de permissão do LinkedIn: só 401 e 403", () => {
   expect(erroDePermissaoLinkedIn(400)).toBe(false);
   expect(erroDePermissaoLinkedIn(500)).toBe(false);
   expect(erroDePermissaoLinkedIn(undefined)).toBe(false);
+});
+
+test("regra de venda fechada: PURCHASE via API, mesmas janelas da regra de lead qualificado", () => {
+  expect(montarCorpoRegraVendaFechada("559746166")).toEqual({
+    name: NOME_REGRA_VENDA_FECHADA,
+    account: "urn:li:sponsoredAccount:559746166",
+    conversionMethod: "CONVERSIONS_API",
+    type: "PURCHASE",
+    postClickAttributionWindowSize: 90,
+    viewThroughAttributionWindowSize: 30,
+    attributionType: "LAST_TOUCH_BY_CAMPAIGN"
+  });
+  expect(() => montarCorpoRegraVendaFechada("abc")).toThrow();
+  expect(NOME_REGRA_VENDA_FECHADA).not.toBe(NOME_REGRA_LEAD_QUALIFICADO);
+});
+
+test("criar regra: associação automática por objetivo só quando pedida", () => {
+  expect(urlCriarRegraConversao(true)).toBe("/conversions?autoAssociationType=OBJECTIVE_BASED");
+  expect(urlCriarRegraConversao(false)).toBe("/conversions");
+});
+
+test("venda fechada só reaproveita regra com o nome da plataforma (nunca a PURCHASE de outra integração)", () => {
+  const regra = (extra: any) => ({
+    id: 200, type: "PURCHASE", conversionMethod: "CONVERSIONS_API", enabled: true, ownershipType: "OWNED", name: NOME_REGRA_VENDA_FECHADA, ...extra
+  });
+  expect(escolherRegraVendaFechada([])).toBeNull();
+  expect(escolherRegraVendaFechada(undefined)).toBeNull();
+  expect(escolherRegraVendaFechada([regra({})])).toBe("urn:lla:llaPartnerConversion:200");
+  // PURCHASE de loja/CRM com outro nome: não pode ser usada
+  expect(escolherRegraVendaFechada([regra({ name: "Compras da loja" })])).toBeNull();
+  expect(escolherRegraVendaFechada([regra({ type: "QUALIFIED_LEAD" })])).toBeNull();
+  expect(escolherRegraVendaFechada([regra({ conversionMethod: "INSIGHT_TAG" })])).toBeNull();
+  expect(escolherRegraVendaFechada([regra({ enabled: false })])).toBeNull();
+  expect(escolherRegraVendaFechada([regra({ ownershipType: "SHARED" })])).toBeNull();
+  expect(escolherRegraVendaFechada([regra({ id: "x" })])).toBeNull();
+  // a regra de lead qualificado com o nome certo mas tipo errado também não vale
+  expect(escolherRegraVendaFechada([regra({ name: NOME_REGRA_LEAD_QUALIFICADO })])).toBeNull();
+  // empate: menor id
+  expect(escolherRegraVendaFechada([regra({ id: 9 }), regra({ id: 5 })])).toBe("urn:lla:llaPartnerConversion:5");
 });

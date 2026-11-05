@@ -61,17 +61,20 @@ import {
   campanhaOtimizadaPorLeadQualificado,
   erroDePermissaoLinkedIn,
   escolherRegraLeadQualificado,
+  escolherRegraVendaFechada,
   etapasPendentesLinkedIn,
   leadTemIdentificadorLinkedIn,
   LIMITE_REENVIO_POR_CHAMADA,
   montarAssociacaoCampanhaConversao,
   montarCorpoRegraLeadQualificado,
+  montarCorpoRegraVendaFechada,
   montarEventoConversaoLinkedIn,
   OTIMIZACAO_LEAD_QUALIFICADO,
   PERIODO_REENVIO_DIAS,
   proximoStartBuscaRegras,
   regraDaConexao,
   urlBuscaRegrasConversao,
+  urlCriarRegraConversao,
   urnRegraConversao,
   urnRespostaFormularioLinkedIn
 } from "./linkedin-conversoes";
@@ -16817,15 +16820,22 @@ async function resolverConexaoLinkedIn(
   };
 }
 
-// URN da regra de conversão "lead qualificado" guardada na conexão — só vale
-// pra conta de anúncios atualmente selecionada (ver regraDaConexao).
-async function obterRegraLeadQualificadoDaConexao(usuarioId: number): Promise<string | null> {
+// URNs das regras de conversão (lead qualificado e venda fechada) guardadas na
+// conexão — só valem pra conta de anúncios atualmente selecionada (ver
+// regraDaConexao).
+async function obterRegrasConversaoDaConexao(
+  usuarioId: number
+): Promise<{ qualificado: string | null; fechado: string | null }> {
   const conn = await client.query(
     `SELECT dados_conta FROM plataforma_conexoes
      WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
     [usuarioId]
   );
-  return regraDaConexao(conn.rows[0]?.dados_conta, "Qualified Lead");
+  const dados = conn.rows[0]?.dados_conta;
+  return {
+    qualificado: regraDaConexao(dados, "Qualified Lead"),
+    fechado: regraDaConexao(dados, "Closed Won"),
+  };
 }
 
 type ContaLinkedInDisponivel = {
@@ -17132,6 +17142,7 @@ app.get("/linkedin/status-completo", authMiddleware, async (c) => {
         habilitado: LINKEDIN_CONVERSOES_HABILITADO,
         otimizacao_lead_qualificado: LINKEDIN_OTIMIZACAO_LEAD_QUALIFICADO_HABILITADA,
         regra_lead_qualificado_configurada: Boolean(regraDaConexao(conexao.dados_conta, "Qualified Lead")),
+        regra_venda_fechada_configurada: Boolean(regraDaConexao(conexao.dados_conta, "Closed Won")),
       },
     });
   } catch (err: any) {
@@ -17409,8 +17420,11 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
     // lead gen e só com a regra de conversão já criada. Se o LinkedIn recusar
     // o payload otimizado, cai no payload de sempre — a criação da campanha
     // nunca falha por causa disso.
+    const regrasConversao = LINKEDIN_CONVERSOES_HABILITADO
+      ? await obterRegrasConversaoDaConexao(usuarioId)
+      : null;
     const regraQualificadoUrn = LINKEDIN_OTIMIZACAO_LEAD_QUALIFICADO_HABILITADA
-      ? await obterRegraLeadQualificadoDaConexao(usuarioId)
+      ? regrasConversao?.qualificado ?? null
       : null;
     let respostaOtimizada: Awaited<ReturnType<typeof linkedinFetch>> | null = null;
     if (regraQualificadoUrn) {
@@ -17448,6 +17462,25 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
          AND conta_anuncios_id = $5`,
       [String(resposta.id), orcamento, String(campaign_id), usuarioId, conexao.adAccountId]
     );
+
+    // Regra de venda fechada (PURCHASE): associa toda campanha nova para o
+    // LinkedIn atribuir as vendas e o valor a ela. Só relatório — não muda a
+    // entrega — por isso falha só vira log; /linkedin/conversoes/configurar
+    // refaz a associação das campanhas existentes.
+    if (regrasConversao?.fechado) {
+      try {
+        const associacaoVenda = montarAssociacaoCampanhaConversao(String(resposta.id), regrasConversao.fechado);
+        const associouVenda = await linkedinFetch(associacaoVenda.url, conexao.accessToken, {
+          method: "PUT",
+          body: associacaoVenda.body
+        });
+        if (!associouVenda.ok) {
+          console.warn("AVISO LINKEDIN adgroup: campanha não associada à regra de venda fechada:", associouVenda.status, associouVenda.data);
+        }
+      } catch (err: any) {
+        console.warn("AVISO LINKEDIN adgroup: erro ao associar à regra de venda fechada:", err?.message);
+      }
+    }
 
     // Campanha otimizada por lead qualificado: registra no banco e associa à
     // regra de conversão (a auto-associação do LinkedIn só vale na criação da
@@ -17490,9 +17523,10 @@ app.post("/linkedin/adgroup", authMiddleware, async (c) => {
   }
 });
 
-// Cria (ou reaproveita) a Conversion Rule "lead qualificado" da conta de
-// anúncios selecionada e associa a ela as campanhas já otimizadas por lead
-// qualificado. Idempotente: pode ser chamada de novo pra refazer associações.
+// Cria (ou reaproveita) as Conversion Rules da conta de anúncios selecionada —
+// "lead qualificado" (QUALIFIED_LEAD, usada na otimização) e "venda fechada"
+// (PURCHASE, leva o valor da venda; só relatório) — e associa as campanhas.
+// Idempotente: pode ser chamada de novo pra refazer associações.
 // Só funciona com LINKEDIN_CONVERSIONS_ENABLED e depois de reconectar o
 // LinkedIn com o escopo rw_conversions (ver LINKEDIN-CONVERSOES.md).
 // ASSUMPTION: formatos conferidos só contra a documentação oficial — não
@@ -17517,13 +17551,17 @@ app.post("/linkedin/conversoes/configurar", authMiddleware, async (c) => {
     const semPermissao = (status: number) => status === 401 || status === 403;
     const MSG_RECONECTAR = "O LinkedIn recusou o acesso às conversões. Reconecte o LinkedIn Ads para conceder a permissão rw_conversions e tente de novo.";
 
-    // 1) A regra já está guardada para esta conta?
-    let regraUrn = await obterRegraLeadQualificadoDaConexao(usuarioId);
+    // 1) As regras já estão guardadas para esta conta?
+    const guardadas = await obterRegrasConversaoDaConexao(usuarioId);
+    let regraUrn = guardadas.qualificado;
+    let regraFechadaUrn = guardadas.fechado;
     let criada = false;
+    let criadaFechada = false;
 
     // 2) Senão, procura na conta (uma chamada anterior pode ter criado a regra
-    // e falhado depois). Só pagina se a própria resposta indicar mais páginas.
-    if (!regraUrn) {
+    // e falhado depois). A mesma busca serve às duas regras. Só pagina se a
+    // própria resposta indicar mais páginas.
+    if (!regraUrn || !regraFechadaUrn) {
       const elementos: any[] = [];
       let start: number | null = 0;
       for (let pagina = 0; pagina < 10 && start !== null; pagina++) {
@@ -17540,7 +17578,8 @@ app.post("/linkedin/conversoes/configurar", authMiddleware, async (c) => {
         elementos.push(...(Array.isArray(busca.data?.elements) ? busca.data.elements : []));
         start = proximoStartBuscaRegras(busca.data);
       }
-      regraUrn = escolherRegraLeadQualificado(elementos);
+      if (!regraUrn) regraUrn = escolherRegraLeadQualificado(elementos);
+      if (!regraFechadaUrn) regraFechadaUrn = escolherRegraVendaFechada(elementos);
     }
 
     // 3) Não existe: cria (type QUALIFIED_LEAD, conversionMethod CONVERSIONS_API).
@@ -17574,6 +17613,41 @@ app.post("/linkedin/conversoes/configurar", authMiddleware, async (c) => {
       ]
     );
 
+    // 4b) Venda fechada (PURCHASE, leva o valor da venda; só relatório). Mesma
+    // lógica; se falhar, a regra de lead qualificado acima já ficou salva e o
+    // próximo clique só tenta esta. Ao criar, o LinkedIn já associa as
+    // campanhas existentes cujo objetivo combina (autoAssociationType).
+    if (!regraFechadaUrn) {
+      const criacaoFechada = await linkedinFetch(urlCriarRegraConversao(true), conexao.accessToken, {
+        method: "POST",
+        body: montarCorpoRegraVendaFechada(conexao.adAccountId),
+      });
+      regraFechadaUrn = criacaoFechada.ok ? urnRegraConversao(criacaoFechada.id) : null;
+      if (!regraFechadaUrn) {
+        console.error("ERRO LINKEDIN criar regra de venda fechada:", criacaoFechada.status, criacaoFechada.data);
+        const complemento = " A regra de lead qualificado já foi configurada.";
+        return semPermissao(criacaoFechada.status)
+          ? c.json({ error: MSG_RECONECTAR + complemento }, 403)
+          : c.json({ error: (criacaoFechada.error || "Erro ao criar a regra de venda fechada no LinkedIn.") + complemento }, 400);
+      }
+      criadaFechada = true;
+    }
+    if (regraFechadaUrn !== guardadas.fechado) {
+      await client.query(
+        `UPDATE plataforma_conexoes
+         SET dados_conta = COALESCE(dados_conta, '{}'::jsonb) || $1::jsonb,
+             atualizado_em = NOW()
+         WHERE usuario_id = $2 AND plataforma = 'linkedin'`,
+        [
+          JSON.stringify({
+            conversion_rule_closed_urn: regraFechadaUrn,
+            conversion_rule_closed_conta_id: conexao.adAccountId,
+          }),
+          usuarioId,
+        ]
+      );
+    }
+
     // 5) Refaz a associação das campanhas já otimizadas por lead qualificado
     // (campanha nova é associada na própria criação, em /linkedin/adgroup).
     const campanhas = await client.query(
@@ -17601,12 +17675,44 @@ app.post("/linkedin/conversoes/configurar", authMiddleware, async (c) => {
       }
     }
 
+    // 6) Venda fechada: se a regra já existia (não acabou de ser criada com
+    // associação automática), associa as campanhas existentes — idempotente.
+    let associadasVenda = 0;
+    const falhasVenda: string[] = [];
+    if (!criadaFechada && regraFechadaUrn) {
+      const todas = await client.query(
+        `SELECT adset_id FROM campanhas
+         WHERE usuario_id = $1 AND plataforma = 'linkedin' AND conta_anuncios_id = $2
+           AND adset_id IS NOT NULL
+           AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')
+         LIMIT 200`,
+        [usuarioId, conexao.adAccountId]
+      );
+      for (const linha of todas.rows) {
+        try {
+          const associacao = montarAssociacaoCampanhaConversao(linha.adset_id, regraFechadaUrn);
+          const resposta = await linkedinFetch(associacao.url, conexao.accessToken, {
+            method: "PUT",
+            body: associacao.body,
+          });
+          if (resposta.ok) associadasVenda++;
+          else falhasVenda.push(String(linha.adset_id));
+        } catch {
+          falhasVenda.push(String(linha.adset_id));
+        }
+      }
+    }
+
     return c.json({
       sucesso: true,
       regra_urn: regraUrn,
       criada,
       campanhas_associadas: associadas,
       campanhas_com_falha: falhas,
+      regra_fechada_urn: regraFechadaUrn,
+      regra_fechada_criada: criadaFechada,
+      campanhas_associadas_venda: associadasVenda,
+      campanhas_venda_com_falha: falhasVenda,
     });
   } catch (err: any) {
     console.error("ERRO /linkedin/conversoes/configurar:", err);
