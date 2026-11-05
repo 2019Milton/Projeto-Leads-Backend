@@ -34,6 +34,7 @@ import {
   type VeiculacaoCampanha,
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
+import { diasPeriodoBrasil, extrairLeadsActionsMeta } from "./performance-meta";
 import { juntarPaginasGoogleAds } from "./google-paginacao";
 import {
   avisoReconexaoGoogle,
@@ -6641,45 +6642,6 @@ async function verificarSaldoMetaEAlertar(
   } catch (err) {
     console.error("ERRO ALERTA SALDO META:", usuarioId, err);
   }
-}
-
-function extrairLeadsActionsMeta(actions: any[] = []) {
-  const prioridade = [
-    "onsite_conversion.lead_grouped",
-    "onsite_conversion.lead",
-    "lead",
-    "offsite_conversion.fb_pixel_lead",
-    // Campanha de destino WhatsApp (Click-to-WhatsApp) não gera nenhuma action
-    // com "lead" no nome — a Meta reporta como conversa iniciada. Confirmado
-    // direto na API: era por isso que campanha de WhatsApp sempre contava 0
-    // leads aqui, mesmo com conversas reais acontecendo (CPL ficava
-    // indefinido e a tela de Ganho Projetado caía na mensagem de "conecte
-    // sua conta", mesmo já conectada).
-    "onsite_conversion.messaging_conversation_started_7d"
-  ];
-
-  for (const tipo of prioridade) {
-    const item = actions.find(
-      (action: any) =>
-        String(action.action_type || "").toLowerCase() === tipo
-    );
-
-    if (item) {
-      return Number(item.value || 0);
-    }
-  }
-
-  return actions
-    .filter((action: any) =>
-      String(action.action_type || "")
-        .toLowerCase()
-        .includes("lead")
-    )
-    .reduce(
-      (total: number, action: any) =>
-        total + Number(action.value || 0),
-      0
-    );
 }
 
 async function listarCampaignIdsMetaDoUsuario(
@@ -37296,18 +37258,9 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         nichoId
       );
 
-    const inicio = new Date();
-    inicio.setDate(inicio.getDate() - (dias - 1));
-    inicio.setHours(0, 0, 0, 0);
-
-    const fim = new Date();
-    fim.setHours(23, 59, 59, 999);
-
-    const since =
-      inicio.toISOString().slice(0, 10);
-
-    const until =
-      fim.toISOString().slice(0, 10);
+    const datasPeriodo = diasPeriodoBrasil(dias);
+    const since = datasPeriodo[0];
+    const until = datasPeriodo[datasPeriodo.length - 1];
 
     const timeRange =
       encodeURIComponent(
@@ -37326,31 +37279,31 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
       }
     );
 
+    // criado_em está em UTC e a Meta fecha o dia no fuso da conta: agrupar por DATE(criado_em)
+    // jogava os leads depois das 21h para o dia seguinte, longe do gasto que os trouxe.
     const leadsBanco = await client.query(
       `
       SELECT
-        DATE(criado_em) AS dia,
+        to_char(criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD') AS dia,
         COUNT(*) AS total
       FROM leads
       WHERE usuario_id = $1
       AND conta_anuncios_id = $2
-      AND criado_em >= $3
+      AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date >= $3::date
       AND ($4::int IS NULL OR nicho_id = $4)
-      GROUP BY DATE(criado_em)
+      GROUP BY 1
       `,
       [
         user.id,
         adAccountId,
-        inicio,
+        since,
         nichoId
       ]
     );
 
     const leadsBancoPorDia = new Map(
       leadsBanco.rows.map((row: any) => [
-        new Date(row.dia)
-          .toISOString()
-          .slice(0, 10),
+        String(row.dia),
         Number(row.total || 0)
       ])
     );
@@ -37386,15 +37339,6 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
 
       metaPorDia.set(dataLinha, atual);
     }
-
-    const datasPeriodo = Array.from(
-      { length: dias },
-      (_, index) => {
-        const data = new Date(inicio);
-        data.setDate(inicio.getDate() + index);
-        return data.toISOString().slice(0, 10);
-      }
-    );
 
     const diasPerformance = datasPeriodo
       .map((data) => {
@@ -38453,7 +38397,7 @@ app.get("/meta/performance-diaria/:data/campanhas", authMiddleware, async (c: an
        FROM leads l
        LEFT JOIN campanhas c ON c.id = l.campanha_id AND c.usuario_id = l.usuario_id
        WHERE l.usuario_id = $1 AND l.conta_anuncios_id = $2
-         AND DATE(l.criado_em) = $3::date
+         AND (l.criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = $3::date
        GROUP BY 1, 2`,
       [user.id, adAccountId, data]
     );
