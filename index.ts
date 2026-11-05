@@ -37837,13 +37837,11 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
       return c.json({ error: "Google Ads nao conectado" }, 400);
     }
 
-    const inicio = new Date();
-    inicio.setDate(inicio.getDate() - (dias - 1));
-    inicio.setHours(0, 0, 0, 0);
-    const fim = new Date();
-    fim.setHours(23, 59, 59, 999);
-    const since = inicio.toISOString().slice(0, 10);
-    const until = fim.toISOString().slice(0, 10);
+    // O dia do relatório do Google Ads segue o fuso da conta (America/Sao_Paulo em todas as
+    // contas conectadas, conferido em 2026-11-05). Mesma correção de /meta/performance-diaria.
+    const datasPeriodo = diasPeriodoBrasil(dias);
+    const since = datasPeriodo[0];
+    const until = datasPeriodo[datasPeriodo.length - 1];
 
     const accessToken = await obterAccessTokenGoogle(row.refresh_token);
 
@@ -37932,21 +37930,17 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
     }
 
     const leadsBanco = await client.query(
-      `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
-       FROM leads WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads') AND criado_em >= $2
+      `SELECT to_char(criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD') AS dia,
+              COUNT(*) AS total
+       FROM leads WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads')
+         AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date >= $2::date
          AND ($3::int IS NULL OR nicho_id = $3)
-       GROUP BY DATE(criado_em)`,
-      [user.id, inicio, nichoId]
+       GROUP BY 1`,
+      [user.id, since, nichoId]
     );
     const leadsBancoPorDia = new Map(
-      leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
+      leadsBanco.rows.map((r: any) => [String(r.dia), Number(r.total || 0)])
     );
-
-    const datasPeriodo = Array.from({ length: dias }, (_, index) => {
-      const data = new Date(inicio);
-      data.setDate(inicio.getDate() + index);
-      return data.toISOString().slice(0, 10);
-    });
 
     const diasPerformance = datasPeriodo.map((data) => {
       const linha = googlePorDia.get(data) || { spend: 0, clicks: 0, impressions: 0, reach: 0 };
@@ -38045,7 +38039,8 @@ app.get("/google/performance-diaria/:data/campanhas", authMiddleware, async (c: 
     const leadsResult = await client.query(
       `SELECT campanha, COUNT(*)::int AS total
        FROM leads
-       WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads') AND DATE(criado_em) = $2::date
+       WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads')
+         AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = $2::date
        GROUP BY campanha`,
       [user.id, data]
     );
@@ -38089,13 +38084,11 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
       return c.json({ error: "TikTok Ads nao conectado" }, 400);
     }
 
-    const inicio = new Date();
-    inicio.setDate(inicio.getDate() - (dias - 1));
-    inicio.setHours(0, 0, 0, 0);
-    const fim = new Date();
-    fim.setHours(23, 59, 59, 999);
-    const since = inicio.toISOString().slice(0, 10);
-    const until = fim.toISOString().slice(0, 10);
+    // O dia do relatório do TikTok segue o fuso da conta (America/Sao_Paulo em todas as
+    // contas conectadas, conferido em 2026-11-05). Mesma correção de /meta/performance-diaria.
+    const datasPeriodo = diasPeriodoBrasil(dias);
+    const since = datasPeriodo[0];
+    const until = datasPeriodo[datasPeriodo.length - 1];
 
     const campanhaIdsResult = await client.query(
       `SELECT DISTINCT campaign_id FROM campanhas
@@ -38126,21 +38119,17 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
     }
 
     const leadsBanco = await client.query(
-      `SELECT DATE(criado_em) AS dia, COUNT(*) AS total
-       FROM leads WHERE usuario_id = $1 AND plataforma IN ('tiktok', 'tiktok_ads') AND criado_em >= $2
+      `SELECT to_char(criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD') AS dia,
+              COUNT(*) AS total
+       FROM leads WHERE usuario_id = $1 AND plataforma IN ('tiktok', 'tiktok_ads')
+         AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date >= $2::date
          AND ($3::int IS NULL OR nicho_id = $3)
-       GROUP BY DATE(criado_em)`,
-      [user.id, inicio, nichoId]
+       GROUP BY 1`,
+      [user.id, since, nichoId]
     );
     const leadsBancoPorDia = new Map(
-      leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
+      leadsBanco.rows.map((r: any) => [String(r.dia), Number(r.total || 0)])
     );
-
-    const datasPeriodo = Array.from({ length: dias }, (_, index) => {
-      const data = new Date(inicio);
-      data.setDate(inicio.getDate() + index);
-      return data.toISOString().slice(0, 10);
-    });
 
     const diasPerformance = datasPeriodo.map((data) => {
       const linha = tiktokPorDia.get(data) || { spend: 0, clicks: 0, impressions: 0, reach: 0 };
@@ -38214,6 +38203,8 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
     }
     const accessToken = await obterAccessTokenLinkedInValido(user.id, row.access_token, row.refresh_token);
 
+    // Fica em UTC de propósito, ao contrário de Meta, Google e TikTok: a Ad Analytics fecha o
+    // dia em UTC ("Date is specified in UTC", na documentação de dateRange).
     const inicio = new Date();
     inicio.setDate(inicio.getDate() - (dias - 1));
     inicio.setHours(0, 0, 0, 0);

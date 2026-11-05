@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { diaNoBrasil, diasPeriodoBrasil, extrairLeadsActionsMeta } from "./performance-meta";
 
 const acao = (action_type: string, value: string | number) => ({ action_type, value: String(value) });
@@ -94,5 +95,37 @@ describe("diasPeriodoBrasil", () => {
     const dias = diasPeriodoBrasil(3, new Date("2027-01-01T12:00:00Z"));
     expect(dias).toEqual(["2026-12-30", "2026-12-31", "2027-01-01"]);
     expect(diasPeriodoBrasil(365, new Date("2027-01-01T12:00:00Z"))).toHaveLength(365);
+  });
+});
+
+describe("fuso do dia nas rotas de performance", () => {
+  const codigo = readFileSync(new URL("./index.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+  const rota = (caminhoRota: string) => {
+    const inicio = codigo.indexOf(`app.get("${caminhoRota}"`);
+    expect(inicio).toBeGreaterThan(-1);
+    // Só o corpo da rota e sem comentários: o comentário da Meta cita o agrupamento antigo.
+    return codigo.slice(inicio, codigo.indexOf("\n});\n", inicio)).replace(/^\s*\/\/.*$/gm, "");
+  };
+
+  test.each(["/meta/performance-diaria", "/google/performance-diaria", "/tiktok/performance-diaria"])(
+    "%s fecha o dia e agrupa os leads no calendário do Brasil",
+    (caminhoRota) => {
+      const bloco = rota(caminhoRota);
+      expect(bloco).toContain("diasPeriodoBrasil(dias)");
+      expect(bloco).toContain("AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo'");
+      expect(bloco).not.toContain("DATE(criado_em)");
+    }
+  );
+
+  test("o detalhe do dia no Google usa o mesmo calendário do resumo", () => {
+    const bloco = rota("/google/performance-diaria/:data/campanhas");
+    expect(bloco).toContain("AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = $2::date");
+    expect(bloco).not.toContain("DATE(criado_em)");
+  });
+
+  test("o LinkedIn continua em UTC, porque a Ad Analytics fecha o dia em UTC", () => {
+    const bloco = rota("/linkedin/performance-diaria");
+    expect(bloco).toContain("DATE(criado_em)");
+    expect(bloco).not.toContain("diasPeriodoBrasil");
   });
 });
