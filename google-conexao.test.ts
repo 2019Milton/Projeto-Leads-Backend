@@ -185,3 +185,42 @@ test("falha da criação em DEFAULT também propaga (quem chama trata e devolve 
   const { deps } = montarDeps({}, { criar: async () => { throw new Error("DUPLICATE_NAME"); } });
   await expect(obterOuCriarAcaoConversaoGoogle(deps, params)).rejects.toThrow("DUPLICATE_NAME");
 });
+
+// ---------- aviso "Reconecte o Google Ads" ----------
+
+import { avisoReconexaoGoogle } from "./google-conexao";
+
+const ESCOPO_ADWORDS = "https://www.googleapis.com/auth/adwords";
+const ESCOPO_DATAMANAGER = "https://www.googleapis.com/auth/datamanager";
+
+test("token revogado/expirado (invalid_grant) pede reconexão, com a flag ligada ou não", () => {
+  expect(avisoReconexaoGoogle({ erroCodigo: "invalid_grant", pedirDatamanager: false })?.motivo).toBe("token_revogado");
+  expect(avisoReconexaoGoogle({ erroCodigo: "invalid_grant", escopo: ESCOPO_ADWORDS, pedirDatamanager: true })?.motivo).toBe("token_revogado");
+});
+
+test("flag do datamanager ligada e conexão só com adwords → pede reconexão para ganhar a permissão", () => {
+  const aviso = avisoReconexaoGoogle({ escopo: ESCOPO_ADWORDS, pedirDatamanager: true });
+  expect(aviso?.motivo).toBe("sem_permissao_conversoes");
+  expect(aviso?.mensagem).toContain("reconecte o Google Ads");
+});
+
+test("flag ligada e conexão que já tem o datamanager → sem aviso", () => {
+  expect(avisoReconexaoGoogle({ escopo: `${ESCOPO_ADWORDS} ${ESCOPO_DATAMANAGER}`, pedirDatamanager: true })).toBeNull();
+  expect(avisoReconexaoGoogle({ escopo: `${ESCOPO_DATAMANAGER}  ${ESCOPO_ADWORDS}`, pedirDatamanager: true })).toBeNull();
+});
+
+test("flag desligada nunca pede reconexão por permissão (o Google bloquearia o consentimento)", () => {
+  expect(avisoReconexaoGoogle({ escopo: ESCOPO_ADWORDS, pedirDatamanager: false })).toBeNull();
+});
+
+test("escopo desconhecido ou outros erros não afirmam nada", () => {
+  expect(avisoReconexaoGoogle({ pedirDatamanager: true })).toBeNull();
+  expect(avisoReconexaoGoogle({ escopo: "", pedirDatamanager: true })).toBeNull();
+  expect(avisoReconexaoGoogle({ escopo: null, pedirDatamanager: true })).toBeNull();
+  expect(avisoReconexaoGoogle({ erroCodigo: "invalid_client", pedirDatamanager: true })).toBeNull();
+  expect(avisoReconexaoGoogle({ erroCodigo: undefined, pedirDatamanager: false })).toBeNull();
+});
+
+test("o escopo datamanager precisa ser exatamente esse, não um parecido", () => {
+  expect(avisoReconexaoGoogle({ escopo: `${ESCOPO_ADWORDS} https://www.googleapis.com/auth/datamanager.readonly`, pedirDatamanager: true })?.motivo).toBe("sem_permissao_conversoes");
+});

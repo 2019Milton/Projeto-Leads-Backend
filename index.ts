@@ -34,7 +34,9 @@ import {
   type VeiculacaoCampanha,
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
+import { juntarPaginasGoogleAds } from "./google-paginacao";
 import {
+  avisoReconexaoGoogle,
   dadosContaGoogleAposReconexao,
   escaparLiteralGaql,
   idsContasGoogleAcessiveis,
@@ -7756,7 +7758,7 @@ app.get("/auth/meta/callback", async (c) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("ERRO META CALLBACK:", msg, err);
-    return c.text(`Erro ao conectar Meta: ${msg}`);
+    return c.text(`Erro ao conectar Meta: ${mensagemErroPublica(err) || "não foi possível concluir a conexão. Tente novamente em instantes."}`, 500);
   }
 });
 
@@ -8134,7 +8136,8 @@ app.get("/auth/:plataforma/callback", async (c) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`ERRO CALLBACK ${plataforma.toUpperCase()}:`, msg, err);
-    return c.text(`Erro ao conectar ${plataforma}: ${msg}`);
+    // Só mensagem de domínio vai ao navegador; erro interno (banco, runtime) fica no log.
+    return c.text(`Erro ao conectar ${plataforma}: ${mensagemErroPublica(err) || "não foi possível concluir a conexão. Tente novamente em instantes."}`, 500);
   }
 });
 
@@ -8160,7 +8163,9 @@ const GOOGLE_ADS_API = `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSIO
 const DATA_MANAGER_API = "https://datamanager.googleapis.com/v1";
 const googleLoginCustomerIdPorToken = new Map<string, string>();
 
-async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
+// Devolve também o escopo concedido (o Google o informa na renovação) — usado para saber se a
+// conexão já tem a permissão de conversões (datamanager).
+async function obterAccessTokenGoogleComEscopo(refreshToken: string): Promise<{ accessToken: string; escopo: string }> {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -8174,9 +8179,16 @@ async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
   const data = await res.json() as any;
   if (!res.ok || !data.access_token) {
     console.error("ERRO REFRESH TOKEN GOOGLE:", data);
-    throw new Error(data.error_description || "Erro ao renovar token do Google Ads");
+    const erro: any = new Error(data.error_description || "Erro ao renovar token do Google Ads");
+    // "invalid_grant" = acesso revogado ou expirado: o painel pede para reconectar.
+    erro.codigoGoogle = typeof data.error === "string" ? data.error : undefined;
+    throw erro;
   }
-  return data.access_token;
+  return { accessToken: data.access_token, escopo: typeof data.scope === "string" ? data.scope : "" };
+}
+
+async function obterAccessTokenGoogle(refreshToken: string): Promise<string> {
+  return (await obterAccessTokenGoogleComEscopo(refreshToken)).accessToken;
 }
 
 function googleAdsHeaders(accessToken: string, loginCustomerId?: string | null) {
@@ -8190,20 +8202,27 @@ function googleAdsHeaders(accessToken: string, loginCustomerId?: string | null) 
 }
 
 async function googleAdsQuery(customerId: string, accessToken: string, gaql: string, loginCustomerId?: string | null) {
-  const res = await fetch(
-    `${GOOGLE_ADS_API}/customers/${customerId}/googleAds:search`,
-    {
-      method: "POST",
-      headers: googleAdsHeaders(accessToken, loginCustomerId),
-      body: JSON.stringify({ query: gaql }),
-    }
+  // O Google devolve no máximo 10 mil linhas por página; o resto vem pelo nextPageToken
+  // (ver google-paginacao.ts). Antes só a primeira página era lida.
+  return juntarPaginasGoogleAds(
+    async (pageToken) => {
+      const res = await fetch(
+        `${GOOGLE_ADS_API}/customers/${customerId}/googleAds:search`,
+        {
+          method: "POST",
+          headers: googleAdsHeaders(accessToken, loginCustomerId),
+          body: JSON.stringify({ query: gaql, ...(pageToken ? { pageToken } : {}) }),
+        }
+      );
+      const data = await res.json() as any;
+      if (!res.ok) {
+        console.error("ERRO GOOGLE ADS QUERY:", customerId, JSON.stringify(data, null, 2));
+        throw new Error(data?.error?.message || "Erro ao consultar Google Ads");
+      }
+      return data;
+    },
+    { aviso: (mensagem) => console.warn(mensagem, customerId) }
   );
-  const data = await res.json() as any;
-  if (!res.ok) {
-    console.error("ERRO GOOGLE ADS QUERY:", customerId, JSON.stringify(data, null, 2));
-    throw new Error(data?.error?.message || "Erro ao consultar Google Ads");
-  }
-  return data.results ?? [];
 }
 
 // Ids das contas que o token consegue acessar DIRETAMENTE (clientes de uma MCC não aparecem aqui,
@@ -8676,8 +8695,11 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
       return c.json({ ...base, conta: null, gasto_hoje: null });
     }
 
+    // Só pede a permissão de conversões quando o app já a solicita (ver GOOGLE_ADS_PEDIR_DATAMANAGER).
+    const pedirDatamanager = Bun.env.GOOGLE_ADS_PEDIR_DATAMANAGER === "1";
+
     try {
-      const accessToken = await obterAccessTokenGoogle(conn.rows[0].refresh_token);
+      const { accessToken, escopo: escopoGoogle } = await obterAccessTokenGoogleComEscopo(conn.rows[0].refresh_token);
 
       // Cada consulta é isolada em seu próprio try/catch — antes rodavam num único
       // Promise.all, e a conta/pagamento (que funcionam normalmente) ficavam null
@@ -8732,10 +8754,19 @@ app.get("/google/status-completo", authMiddleware, async (c) => {
         } : null,
         gasto_hoje: gastoMicros === null ? null : gastoMicros / 1_000_000,
         pagamento,
+        // null = nada a pedir; senão { motivo, mensagem } para o card mostrar "Reconecte o Google Ads".
+        reconectar: avisoReconexaoGoogle({ escopo: escopoGoogle, pedirDatamanager }),
       });
     } catch (errApi: any) {
       console.error("ERRO /google/status-completo (API Google):", errApi.message);
-      return c.json({ ...base, conta: null, gasto_hoje: null, pagamento: null, aviso: "Nao foi possivel consultar dados ao vivo do Google Ads" });
+      return c.json({
+        ...base,
+        conta: null,
+        gasto_hoje: null,
+        pagamento: null,
+        aviso: "Nao foi possivel consultar dados ao vivo do Google Ads",
+        reconectar: avisoReconexaoGoogle({ erroCodigo: errApi?.codigoGoogle, pedirDatamanager }),
+      });
     }
   } catch (err: any) {
     console.error("ERRO /google/status-completo:", err);

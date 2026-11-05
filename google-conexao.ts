@@ -73,6 +73,41 @@ export function refreshTokenGoogleAposReconexao(novo: unknown, anterior: unknown
   return b || null;
 }
 
+// Quando o painel deve pedir "Reconecte o Google Ads". Só afirma o que sabe:
+// - token_revogado: o Google recusou renovar o token (invalid_grant) — acesso revogado ou
+//   expirado; sem reconectar, nada sincroniza (antes o card seguia "Conectado" com um aviso vago).
+// - sem_permissao_conversoes: o app já pede o escopo datamanager (flag ligada) e esta conexão foi
+//   feita sem ele, então lead qualificado e venda não chegam ao Google. Com a flag desligada não
+//   existe como ganhar o escopo (o Google bloquearia a tela), então não se pede nada — e se o
+//   escopo da resposta for desconhecido também não se afirma nada.
+export type AvisoReconexaoGoogle = {
+  motivo: "token_revogado" | "sem_permissao_conversoes";
+  mensagem: string;
+};
+
+export function avisoReconexaoGoogle(entrada: {
+  erroCodigo?: unknown;
+  escopo?: unknown;
+  pedirDatamanager: boolean;
+}): AvisoReconexaoGoogle | null {
+  if (String(entrada.erroCodigo ?? "") === "invalid_grant") {
+    return {
+      motivo: "token_revogado",
+      mensagem:
+        "O acesso ao Google Ads foi revogado ou expirou. Clique em Reconectar para voltar a sincronizar campanhas e leads."
+    };
+  }
+  const escopo = typeof entrada.escopo === "string" ? entrada.escopo.trim() : "";
+  if (entrada.pedirDatamanager && escopo && !escopo.split(/\s+/).some((e) => e.endsWith("/auth/datamanager"))) {
+    return {
+      motivo: "sem_permissao_conversoes",
+      mensagem:
+        "Para enviar lead qualificado e venda ao Google Ads, reconecte o Google Ads e aceite a nova permissão de conversões."
+    };
+  }
+  return null;
+}
+
 // Escapa para um literal entre aspas simples em GAQL.
 export function escaparLiteralGaql(valor: string): string {
   return valor.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
