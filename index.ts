@@ -11348,7 +11348,7 @@ app.post("/google/anuncio", authMiddleware, async (c) => {
       id: String(adId),
       ad_id: String(adId),
       ...(avisosPublicacao.length ? { aviso: avisosPublicacao.join(" ") } : {}),
-      ...(destinoGoogle === "lead_ads" ? { lead_form_goal_configured: metaFormularioOtimizada } : {}),
+      ...(destinoGoogle === "lead_ads" ? { lead_form_goal_configured: metaConversaoOtimizada } : {}),
       ...(businessMessageAssetResourceName ? { business_message_asset: businessMessageAssetResourceName } : {})
     });
   } catch (err: any) {
