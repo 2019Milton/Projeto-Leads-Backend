@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { diaNoBrasil, diasPeriodoBrasil, extrairLeadsActionsMeta } from "./performance-meta";
+import {
+  avisoCaptacaoImportadas,
+  diaNoBrasil,
+  diasPeriodoBrasil,
+  extrairLeadsActionsMeta,
+  painelComGastoSemLead,
+} from "./performance-meta";
 
 const acao = (action_type: string, value: string | number) => ({ action_type, value: String(value) });
 const CONVERSA = "onsite_conversion.messaging_conversation_started_7d";
@@ -128,4 +134,74 @@ describe("fuso do dia nas rotas de performance", () => {
     expect(bloco).toContain("DATE(criado_em)");
     expect(bloco).not.toContain("diasPeriodoBrasil");
   });
+});
+
+describe("painelComGastoSemLead", () => {
+  test("gasto sem lead salvo", () => {
+    expect(painelComGastoSemLead([{ gasto: 75.19, leads_plataforma: 0 }, { gasto: 0, leads_plataforma: 0 }])).toBe(true);
+  });
+
+  test("com lead em qualquer dia, não", () => {
+    expect(painelComGastoSemLead([{ gasto: 75.19, leads_plataforma: 0 }, { gasto: 10, leads_plataforma: 1 }])).toBe(false);
+  });
+
+  test("sem gasto, não", () => {
+    expect(painelComGastoSemLead([{ gasto: 0, leads_plataforma: 0 }])).toBe(false);
+    expect(painelComGastoSemLead([])).toBe(false);
+  });
+
+  test("os leads contados pela Meta não valem como lead salvo", () => {
+    expect(painelComGastoSemLead([{ gasto: 100, leads: 32, leads_plataforma: 0 } as any])).toBe(true);
+  });
+});
+
+describe("avisoCaptacaoImportadas", () => {
+  const conta = { campanhas_importadas: 46, campanhas_proprias: 0, codigo_site_visto: false, whatsapp_conectado: false };
+
+  test("só importadas, sem código e sem WhatsApp (usuário 17 no Google, 05/11/2026)", () => {
+    expect(avisoCaptacaoImportadas(conta)).toEqual({
+      campanhas_importadas: 46,
+      codigo_site_visto: false,
+      whatsapp_conectado: false,
+    });
+  });
+
+  test("com alguma campanha criada na plataforma, não afirma a causa", () => {
+    expect(avisoCaptacaoImportadas({ ...conta, campanhas_proprias: 1 })).toBeNull();
+  });
+
+  test("sem campanha importada, não avisa", () => {
+    expect(avisoCaptacaoImportadas({ ...conta, campanhas_importadas: 0 })).toBeNull();
+  });
+
+  test("com só um dos caminhos ligado, avisa o que falta", () => {
+    expect(avisoCaptacaoImportadas({ ...conta, codigo_site_visto: true })).toEqual({
+      campanhas_importadas: 46,
+      codigo_site_visto: true,
+      whatsapp_conectado: false,
+    });
+    expect(avisoCaptacaoImportadas({ ...conta, whatsapp_conectado: true })?.whatsapp_conectado).toBe(true);
+  });
+
+  test("com código e WhatsApp ligados, a causa é outra", () => {
+    expect(avisoCaptacaoImportadas({ ...conta, codigo_site_visto: true, whatsapp_conectado: true })).toBeNull();
+  });
+
+  test("sem dados, não avisa", () => {
+    expect(avisoCaptacaoImportadas(undefined)).toBeNull();
+  });
+});
+
+describe("aviso de captação nas rotas de performance", () => {
+  const codigo = readFileSync(new URL("./index.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+
+  test.each(["/meta/performance-diaria", "/google/performance-diaria", "/tiktok/performance-diaria", "/linkedin/performance-diaria"])(
+    "%s devolve o aviso",
+    (caminhoRota) => {
+      const inicio = codigo.indexOf(`app.get("${caminhoRota}"`);
+      expect(inicio).toBeGreaterThan(-1);
+      const bloco = codigo.slice(inicio, codigo.indexOf("\n});\n", inicio));
+      expect(bloco).toContain("aviso_captacao: await avisoCaptacaoPainelPerformance(");
+    }
+  );
 });

@@ -34,7 +34,12 @@ import {
   type VeiculacaoCampanha,
 } from "./veiculacao-meta";
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
-import { diasPeriodoBrasil, extrairLeadsActionsMeta } from "./performance-meta";
+import {
+  avisoCaptacaoImportadas,
+  diasPeriodoBrasil,
+  extrairLeadsActionsMeta,
+  painelComGastoSemLead,
+} from "./performance-meta";
 import { juntarPaginasGoogleAds } from "./google-paginacao";
 import {
   avisoReconexaoGoogle,
@@ -37186,6 +37191,41 @@ app.get("/admin/ranking-plataformas/status", authMiddleware, async (c) => {
 });
 
 // 🔄 sincroniza campanhas + leads da Meta
+// Aviso do painel de performance para a conta que paga anúncio e não recebe lead: as campanhas
+// importadas seguem levando o cliente para o site ou o WhatsApp de fora da plataforma. Só consulta
+// o banco quando há gasto sem lead, porque o dashboard e o ranking também chamam estas rotas, e
+// não vale com filtro de nicho, em que o zero pode vir do filtro. Se falhar, o painel continua.
+async function avisoCaptacaoPainelPerformance(
+  usuarioId: number,
+  plataformasCampanha: string[],
+  nichoId: number | null,
+  diasPerformance: any[]
+) {
+  if (nichoId !== null || !painelComGastoSemLead(diasPerformance)) return null;
+  try {
+    const situacao = await client.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE origem NOT IN ('plataforma', 'manual'))::int AS campanhas_importadas,
+         COUNT(*) FILTER (WHERE origem IS NULL OR origem IN ('plataforma', 'manual'))::int AS campanhas_proprias,
+         (SELECT site_codigo_visto_em IS NOT NULL FROM usuarios WHERE id = $1) AS codigo_site_visto,
+         EXISTS (
+           SELECT 1 FROM plataforma_conexoes
+           WHERE usuario_id = $1 AND plataforma = 'whatsapp' AND status = 'conectado'
+         ) AS whatsapp_conectado
+       FROM campanhas
+       WHERE usuario_id = $1
+         AND LOWER(COALESCE(plataforma, 'meta')) = ANY($2::text[])
+         AND campaign_id IS NOT NULL
+         AND UPPER(COALESCE(status, '')) NOT IN ('DELETED', 'REMOVED')`,
+      [usuarioId, plataformasCampanha]
+    );
+    return avisoCaptacaoImportadas(situacao.rows[0]);
+  } catch (err: any) {
+    console.warn("AVISO CAPTAÇÃO DO PAINEL:", err?.message || err);
+    return null;
+  }
+}
+
 app.get("/meta/performance-diaria", authMiddleware, async (c) => {
 
   try {
@@ -37472,7 +37512,10 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
             : "acima_da_media"
       },
       dias: diasPerformance,
-      registros
+      registros,
+      aviso_captacao: await avisoCaptacaoPainelPerformance(
+        Number(user.id), ["meta", "facebook", "instagram"], nichoId, diasPerformance
+      )
     });
 
   } catch (err: any) {
@@ -37845,9 +37888,9 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
 
     const accessToken = await obterAccessTokenGoogle(row.refresh_token);
 
-    // Mesmo filtro que a Meta já faz (só soma gasto de campanhas criadas por essa plataforma,
-    // não a conta inteira) — evita mostrar gasto de campanhas do Google Ads que nunca passaram
-    // por aqui.
+    // Soma o gasto das campanhas que estão na tabela campanhas, criadas aqui ou importadas pela
+    // sincronização (que traz todas as da conta), então uma conta só com campanhas importadas
+    // mostra gasto. A Meta filtra diferente: ver listarCampaignIdsMetaDoUsuario.
     const campanhaIdsResult = await client.query(
       `SELECT DISTINCT campaign_id FROM campanhas
        WHERE usuario_id = $1 AND LOWER(COALESCE(plataforma, '')) IN ('google', 'google_ads') AND campaign_id IS NOT NULL
@@ -37977,6 +38020,9 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
       dias: diasPerformance,
       registros,
       conversoes_google: conversoesConta,
+      aviso_captacao: await avisoCaptacaoPainelPerformance(
+        Number(user.id), ["google", "google_ads"], nichoId, diasPerformance
+      ),
     });
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA GOOGLE:", err);
@@ -38165,6 +38211,9 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
       resumo,
       dias: diasPerformance,
       registros,
+      aviso_captacao: await avisoCaptacaoPainelPerformance(
+        Number(user.id), ["tiktok", "tiktok_ads"], nichoId, diasPerformance
+      ),
     });
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA TIKTOK:", err);
@@ -38312,6 +38361,9 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
       resumo,
       dias: diasPerformance,
       registros,
+      aviso_captacao: await avisoCaptacaoPainelPerformance(
+        Number(user.id), ["linkedin"], nichoId, diasPerformance
+      ),
     });
   } catch (err: any) {
     console.error("ERRO PERFORMANCE DIARIA LINKEDIN:", err);

@@ -69,3 +69,46 @@ export function diasPeriodoBrasil(dias: number, agora: Date = new Date()): strin
     new Date(hojeUtc - (dias - 1 - indice) * UM_DIA_MS).toISOString().slice(0, 10)
   );
 }
+
+export type SituacaoCaptacaoPainel = {
+  campanhas_importadas: number;
+  campanhas_proprias: number;
+  codigo_site_visto: boolean;
+  whatsapp_conectado: boolean;
+};
+
+export type AvisoCaptacaoPainel = Omit<SituacaoCaptacaoPainel, "campanhas_proprias">;
+
+// Gasto no período e nenhum lead salvo. Olha leads_plataforma, e não leads: no painel da Meta,
+// leads é o que a própria Meta contabilizou.
+export function painelComGastoSemLead(
+  dias: Array<{ gasto?: number | null; leads_plataforma?: number | null }> = []
+): boolean {
+  let gasto = 0;
+  let leads = 0;
+  for (const dia of dias) {
+    gasto += Number(dia?.gasto || 0);
+    leads += Number(dia?.leads_plataforma || 0);
+  }
+  return gasto > 0 && leads === 0;
+}
+
+// Só avisa quando todas as campanhas da rede foram importadas: com alguma criada na plataforma,
+// não dá para dizer de qual delas veio o gasto sem lead. Com o código no site e o WhatsApp
+// conectado, a causa é outra e o aviso não teria o que pedir.
+export function avisoCaptacaoImportadas(
+  situacao: Partial<SituacaoCaptacaoPainel> | null | undefined
+): AvisoCaptacaoPainel | null {
+  const campanhasImportadas = Number(situacao?.campanhas_importadas || 0);
+  if (campanhasImportadas === 0 || Number(situacao?.campanhas_proprias || 0) > 0) return null;
+
+  const codigoSiteVisto = Boolean(situacao?.codigo_site_visto);
+  const whatsappConectado = Boolean(situacao?.whatsapp_conectado);
+  if (codigoSiteVisto && whatsappConectado) return null;
+
+  return {
+    campanhas_importadas: campanhasImportadas,
+    codigo_site_visto: codigoSiteVisto,
+    whatsapp_conectado: whatsappConectado,
+  };
+}
