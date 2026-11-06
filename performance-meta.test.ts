@@ -192,6 +192,23 @@ describe("avisoCaptacaoImportadas", () => {
   });
 });
 
+describe("leads de site e WhatsApp nos painéis de Google e TikTok", () => {
+  const codigo = readFileSync(new URL("./index.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+
+  // /site/leads grava plataforma = 'site' e criarLeadDeConversaGoogle/TikTok gravam
+  // plataforma = 'whatsapp', ambos com a rede em origem.
+  test.each([
+    ["/google/performance-diaria", "google"],
+    ["/google/performance-diaria/:data/campanhas", "google"],
+    ["/tiktok/performance-diaria", "tiktok"],
+  ])("%s conta os leads em que a rede está em origem", (caminhoRota, rede) => {
+    const inicio = codigo.indexOf(`app.get("${caminhoRota}"`);
+    expect(inicio).toBeGreaterThan(-1);
+    const bloco = codigo.slice(inicio, codigo.indexOf("\n});\n", inicio));
+    expect(bloco).toContain(`(plataforma IN ('site', 'whatsapp') AND origem = '${rede}')`);
+  });
+});
+
 describe("aviso de captação nas rotas de performance", () => {
   const codigo = readFileSync(new URL("./index.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 

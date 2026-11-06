@@ -37972,10 +37972,13 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
       }
     }
 
+    // Formulário do Google tem plataforma = 'google'; o lead do código do site e o da conversa no
+    // WhatsApp têm plataforma = 'site' e 'whatsapp', com a rede em origem. Os três contam aqui.
     const leadsBanco = await client.query(
       `SELECT to_char(criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD') AS dia,
               COUNT(*) AS total
-       FROM leads WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads')
+       FROM leads WHERE usuario_id = $1
+         AND (plataforma IN ('google', 'google_ads') OR (plataforma IN ('site', 'whatsapp') AND origem = 'google'))
          AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date >= $2::date
          AND ($3::int IS NULL OR nicho_id = $3)
        GROUP BY 1`,
@@ -38085,7 +38088,8 @@ app.get("/google/performance-diaria/:data/campanhas", authMiddleware, async (c: 
     const leadsResult = await client.query(
       `SELECT campanha, COUNT(*)::int AS total
        FROM leads
-       WHERE usuario_id = $1 AND plataforma IN ('google', 'google_ads')
+       WHERE usuario_id = $1
+         AND (plataforma IN ('google', 'google_ads') OR (plataforma IN ('site', 'whatsapp') AND origem = 'google'))
          AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date = $2::date
        GROUP BY campanha`,
       [user.id, data]
@@ -38164,10 +38168,12 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
       }
     }
 
+    // Mesma regra do Google: lead do código do site e da conversa no WhatsApp têm a rede em origem.
     const leadsBanco = await client.query(
       `SELECT to_char(criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD') AS dia,
               COUNT(*) AS total
-       FROM leads WHERE usuario_id = $1 AND plataforma IN ('tiktok', 'tiktok_ads')
+       FROM leads WHERE usuario_id = $1
+         AND (plataforma IN ('tiktok', 'tiktok_ads') OR (plataforma IN ('site', 'whatsapp') AND origem = 'tiktok'))
          AND (criado_em AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date >= $2::date
          AND ($3::int IS NULL OR nicho_id = $3)
        GROUP BY 1`,
