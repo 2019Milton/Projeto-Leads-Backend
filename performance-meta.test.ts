@@ -3,9 +3,11 @@ import { readFileSync } from "node:fs";
 import {
   avisoCaptacaoImportadas,
   diaNoBrasil,
+  diasDoMes,
   diasPeriodoBrasil,
   extrairLeadsActionsMeta,
   painelComGastoSemLead,
+  periodoPerformanceSolicitado,
 } from "./performance-meta";
 
 const acao = (action_type: string, value: string | number) => ({ action_type, value: String(value) });
@@ -104,6 +106,49 @@ describe("diasPeriodoBrasil", () => {
   });
 });
 
+describe("periodoPerformanceSolicitado", () => {
+  const hoje = "2026-11-11";
+
+  test("mês passado: do dia 1 ao último, dia a dia", () => {
+    const r = periodoPerformanceSolicitado("mes", "2026-10", hoje);
+    expect(r.periodo).toBe("mes");
+    expect(r.mes).toBe("2026-10");
+    expect(r.dias).toBe(31);
+    expect(r.datas[0]).toBe("2026-10-01");
+    expect(r.datas.at(-1)).toBe("2026-10-31");
+  });
+
+  test("mês corrente: do dia 1 até hoje", () => {
+    const r = periodoPerformanceSolicitado("MES", "2026-11", hoje);
+    expect(r.datas).toHaveLength(11);
+    expect(r.datas.at(-1)).toBe(hoje);
+  });
+
+  test("fevereiro de ano bissexto e virada do ano", () => {
+    expect(diasDoMes("2028-02", "2028-12-31")).toHaveLength(29);
+    expect(diasDoMes("2026-02", "2026-12-31")).toHaveLength(28);
+    expect(periodoPerformanceSolicitado("mes", "2025-12", hoje).datas.at(-1)).toBe("2025-12-31");
+  });
+
+  test("mês futuro ou inválido cai no semanal", () => {
+    for (const mes of ["2026-12", "2026-13", "11/2026", "", null]) {
+      const r = periodoPerformanceSolicitado("mes", mes, hoje);
+      expect(r.periodo).toBe("semanal");
+      expect(r.mes).toBeNull();
+      expect(r.datas).toHaveLength(7);
+    }
+  });
+
+  test("semanal, mensal e anual continuam terminando hoje", () => {
+    expect(periodoPerformanceSolicitado("semanal", null, hoje).datas).toEqual(diasPeriodoBrasil(7, new Date("2026-11-11T15:00:00Z")));
+    expect(periodoPerformanceSolicitado("mensal", "2026-10", hoje)).toMatchObject({ periodo: "mensal", mes: null, dias: 30 });
+    const anual = periodoPerformanceSolicitado("anual", undefined, hoje);
+    expect(anual.dias).toBe(365);
+    expect(anual.datas.at(-1)).toBe(hoje);
+    expect(periodoPerformanceSolicitado("qualquer", null, hoje).periodo).toBe("semanal");
+  });
+});
+
 describe("fuso do dia nas rotas de performance", () => {
   const codigo = readFileSync(new URL("./index.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   const rota = (caminhoRota: string) => {
@@ -117,7 +162,9 @@ describe("fuso do dia nas rotas de performance", () => {
     "%s fecha o dia e agrupa os leads no calendário do Brasil",
     (caminhoRota) => {
       const bloco = rota(caminhoRota);
-      expect(bloco).toContain("diasPeriodoBrasil(dias)");
+      // O período (inclusive o mês pedido) sai de periodoPerformanceSolicitado, que fecha o
+      // dia no Brasil quando não recebe outro "hoje".
+      expect(bloco).toContain('periodoPerformanceSolicitado(c.req.query("periodo"), c.req.query("mes"))');
       expect(bloco).toContain("AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo'");
       expect(bloco).not.toContain("DATE(criado_em)");
     }
@@ -133,6 +180,7 @@ describe("fuso do dia nas rotas de performance", () => {
     const bloco = rota("/linkedin/performance-diaria");
     expect(bloco).toContain("DATE(criado_em)");
     expect(bloco).not.toContain("diasPeriodoBrasil");
+    expect(bloco).toContain('c.req.query("mes"), new Date().toISOString().slice(0, 10)');
   });
 });
 

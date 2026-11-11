@@ -64,10 +64,54 @@ export function diaNoBrasil(agora: Date = new Date()): string {
 // mesmo das contas de anúncios. O servidor roda em UTC: montar isso com new Date() fazia o
 // "hoje" do painel virar o dia seguinte a partir das 21h, com gasto e leads zerados.
 export function diasPeriodoBrasil(dias: number, agora: Date = new Date()): string[] {
-  const hojeUtc = Date.parse(`${diaNoBrasil(agora)}T00:00:00Z`);
+  return ultimosDiasAte(dias, diaNoBrasil(agora));
+}
+
+function ultimosDiasAte(dias: number, hoje: string): string[] {
+  const hojeUtc = Date.parse(`${hoje}T00:00:00Z`);
   return Array.from({ length: dias }, (_, indice) =>
     new Date(hojeUtc - (dias - 1 - indice) * UM_DIA_MS).toISOString().slice(0, 10)
   );
+}
+
+// Dias de um mês do calendário (AAAA-MM), do dia 1 até o último — ou até hoje, no mês
+// corrente. Mês futuro ou inválido: lista vazia.
+export function diasDoMes(mes: string, hoje: string): string[] {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mes)) return [];
+  const [ano, numeroMes] = mes.split("-").map(Number);
+  const ultimoDia = new Date(Date.UTC(ano, numeroMes, 0)).getUTCDate();
+  const datas: string[] = [];
+  for (let dia = 1; dia <= ultimoDia; dia += 1) {
+    const data = `${mes}-${String(dia).padStart(2, "0")}`;
+    if (data > hoje) break;
+    datas.push(data);
+  }
+  return datas;
+}
+
+export type PeriodoPerformance = "semanal" | "mensal" | "anual" | "mes";
+
+// Período pedido ao painel de performance: os últimos 7, 30 ou 365 dias (o anual vem agrupado
+// por mês) ou um mês do calendário (periodo=mes&mes=AAAA-MM), dia a dia. Mês futuro ou
+// inválido cai no semanal. `hoje` é o dia que fecha o período: o do Brasil para Meta, Google
+// e TikTok; o do UTC para o LinkedIn, cuja Ad Analytics fecha o dia em UTC.
+export function periodoPerformanceSolicitado(
+  periodoParam: unknown,
+  mesParam: unknown,
+  hoje: string = diaNoBrasil()
+): { periodo: PeriodoPerformance; mes: string | null; dias: number; datas: string[] } {
+  const texto = String(periodoParam || "semanal").toLowerCase();
+
+  if (texto === "mes") {
+    const mes = String(mesParam || "");
+    const datas = diasDoMes(mes, hoje);
+    if (datas.length) return { periodo: "mes", mes, dias: datas.length, datas };
+  }
+
+  const periodo: PeriodoPerformance =
+    texto === "anual" || texto === "mensal" ? texto : "semanal";
+  const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
+  return { periodo, mes: null, dias, datas: ultimosDiasAte(dias, hoje) };
 }
 
 export type SituacaoCaptacaoPainel = {

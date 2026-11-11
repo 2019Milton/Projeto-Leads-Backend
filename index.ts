@@ -36,9 +36,9 @@ import {
 import { montarCampanhasDiaGoogle } from "./performance-campanhas-dia";
 import {
   avisoCaptacaoImportadas,
-  diasPeriodoBrasil,
   extrairLeadsActionsMeta,
   painelComGastoSemLead,
+  periodoPerformanceSolicitado,
 } from "./performance-meta";
 import { juntarPaginasGoogleAds } from "./google-paginacao";
 import {
@@ -37236,21 +37236,9 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
       ? nichoSolicitado
       : null;
 
-    const periodoParam =
-      String(c.req.query("periodo") || "semanal")
-        .toLowerCase();
-
-    const periodo =
-      ["semanal", "mensal", "anual"].includes(periodoParam)
-        ? periodoParam
-        : "semanal";
-
-    const dias =
-      periodo === "anual"
-        ? 365
-        : periodo === "mensal"
-        ? 30
-        : 7;
+    // Últimos 7, 30 ou 365 dias, ou um mês do calendário (periodo=mes&mes=AAAA-MM).
+    const { periodo, dias, datas: datasPeriodo } =
+      periodoPerformanceSolicitado(c.req.query("periodo"), c.req.query("mes"));
 
     const conn = await client.query(
       `
@@ -37298,7 +37286,6 @@ app.get("/meta/performance-diaria", authMiddleware, async (c) => {
         nichoId
       );
 
-    const datasPeriodo = diasPeriodoBrasil(dias);
     const since = datasPeriodo[0];
     const until = datasPeriodo[datasPeriodo.length - 1];
 
@@ -37859,9 +37846,9 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
       ? nichoSolicitado
       : null;
 
-    const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
-    const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
-    const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
+    // Últimos 7, 30 ou 365 dias, ou um mês do calendário (periodo=mes&mes=AAAA-MM).
+    const { periodo, dias, datas: datasPeriodo } =
+      periodoPerformanceSolicitado(c.req.query("periodo"), c.req.query("mes"));
 
     if (!Bun.env.GOOGLE_ADS_DEVELOPER_TOKEN) {
       return c.json({ error: "Google Ads nao configurado" }, 400);
@@ -37882,7 +37869,6 @@ app.get("/google/performance-diaria", authMiddleware, async (c) => {
 
     // O dia do relatório do Google Ads segue o fuso da conta (America/Sao_Paulo em todas as
     // contas conectadas, conferido em 2026-11-05). Mesma correção de /meta/performance-diaria.
-    const datasPeriodo = diasPeriodoBrasil(dias);
     const since = datasPeriodo[0];
     const until = datasPeriodo[datasPeriodo.length - 1];
 
@@ -38119,9 +38105,9 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
       ? nichoSolicitado
       : null;
 
-    const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
-    const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
-    const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
+    // Últimos 7, 30 ou 365 dias, ou um mês do calendário (periodo=mes&mes=AAAA-MM).
+    const { periodo, dias, datas: datasPeriodo } =
+      periodoPerformanceSolicitado(c.req.query("periodo"), c.req.query("mes"));
 
     const conn = await client.query(
       `SELECT access_token, dados_conta FROM plataforma_conexoes
@@ -38136,7 +38122,6 @@ app.get("/tiktok/performance-diaria", authMiddleware, async (c) => {
 
     // O dia do relatório do TikTok segue o fuso da conta (America/Sao_Paulo em todas as
     // contas conectadas, conferido em 2026-11-05). Mesma correção de /meta/performance-diaria.
-    const datasPeriodo = diasPeriodoBrasil(dias);
     const since = datasPeriodo[0];
     const until = datasPeriodo[datasPeriodo.length - 1];
 
@@ -38242,10 +38227,6 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
       ? nichoSolicitado
       : null;
 
-    const periodoParam = String(c.req.query("periodo") || "semanal").toLowerCase();
-    const periodo = ["semanal", "mensal", "anual"].includes(periodoParam) ? periodoParam : "semanal";
-    const dias = periodo === "anual" ? 365 : periodo === "mensal" ? 30 : 7;
-
     const conn = await client.query(
       `SELECT access_token, refresh_token, dados_conta FROM plataforma_conexoes
        WHERE usuario_id = $1 AND plataforma = 'linkedin' LIMIT 1`,
@@ -38260,13 +38241,12 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
 
     // Fica em UTC de propósito, ao contrário de Meta, Google e TikTok: a Ad Analytics fecha o
     // dia em UTC ("Date is specified in UTC", na documentação de dateRange).
-    const inicio = new Date();
-    inicio.setDate(inicio.getDate() - (dias - 1));
-    inicio.setHours(0, 0, 0, 0);
-    const fim = new Date();
-    fim.setHours(23, 59, 59, 999);
-    const since = inicio.toISOString().slice(0, 10);
-    const until = fim.toISOString().slice(0, 10);
+    const { periodo, dias, datas: datasPeriodo } = periodoPerformanceSolicitado(
+      c.req.query("periodo"), c.req.query("mes"), new Date().toISOString().slice(0, 10)
+    );
+    const since = datasPeriodo[0];
+    const until = datasPeriodo[datasPeriodo.length - 1];
+    const inicio = new Date(`${since}T00:00:00Z`);
 
     const campanhaIdsResult = await client.query(
       `SELECT DISTINCT campaign_id FROM campanhas
@@ -38326,12 +38306,6 @@ app.get("/linkedin/performance-diaria", authMiddleware, async (c) => {
     const leadsBancoPorDia = new Map(
       leadsBanco.rows.map((r: any) => [new Date(r.dia).toISOString().slice(0, 10), Number(r.total || 0)])
     );
-
-    const datasPeriodo = Array.from({ length: dias }, (_, index) => {
-      const data = new Date(inicio);
-      data.setDate(inicio.getDate() + index);
-      return data.toISOString().slice(0, 10);
-    });
 
     const diasPerformance = datasPeriodo.map((data) => {
       const linha = linkedinPorDia.get(data) || { spend: 0, clicks: 0, impressions: 0 };
