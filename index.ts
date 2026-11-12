@@ -2516,6 +2516,7 @@ async function limparErroPublicacaoCampanha(campanhaId: number) {
 }
 
 import { lookup } from "node:dns/promises";
+import { mapearComLimite } from "./lote-concorrente";
 
 // Bloqueia SSRF nos endpoints que buscam uma URL fornecida pelo corretor
 // (upload de imagem/vídeo por link, "reaproveitar imagem/vídeo já publicado"):
@@ -35735,6 +35736,9 @@ async function carregarMetricasKwaiCampanhas(
 }
 
 // 📊 métricas reais das campanhas
+// Campanhas consultadas ao mesmo tempo na Meta (cada uma faz 3 chamadas de insights).
+const LIMITE_CAMPANHAS_META_SIMULTANEAS = 6;
+
 app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
   try {
@@ -36066,6 +36070,76 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
       campanha.nicho_confirmado = Boolean(campanha.nicho_id);
     }
 
+    // Insights da Meta de todas as campanhas antes do laço, poucas por vez.
+    // Uma a uma, uma conta com 50 campanhas levava mais de 10 s e a conexão
+    // caía (502 do Railway, que o navegador mostra como erro de CORS).
+    const campanhaUsaInsightsMeta = (campanha: any) =>
+      Boolean(token) &&
+      Boolean(campanha.campaign_id) &&
+      ["meta", "facebook", "instagram"].includes(String(campanha.plataforma || "meta").toLowerCase()) &&
+      String(campanha.status || "").toUpperCase() !== "DELETED";
+
+    const insightsMetaPorCampanha = new Map<any, {
+      dados: any;
+      grafico: any[];
+      gastoHoje: number;
+      disponivel: boolean;
+      erro: string | null;
+    }>();
+
+    await mapearComLimite(
+      (campanhasConsolidadas as any[]).filter(campanhaUsaInsightsMeta),
+      LIMITE_CAMPANHAS_META_SIMULTANEAS,
+      async (campanha: any) => {
+        try {
+          const [insightsTotais, insightsGrafico, insightsHoje] = await Promise.all([
+            fetch(
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&time_range=${timeRangeMeta}&access_token=${token}`
+            ).then(r => r.json()),
+            fetch(
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,ctr&time_increment=1&time_range=${timeRangeMeta}&access_token=${token}`
+            ).then(r => r.json()),
+            fetch(
+              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=spend&date_preset=today&access_token=${token}`
+            ).then(r => r.json())
+          ]);
+
+          if (insightsTotais.error) {
+            insightsMetaPorCampanha.set(campanha, {
+              dados: {},
+              grafico: [],
+              gastoHoje: 0,
+              disponivel: false,
+              erro: insightsTotais.error.message || "Métricas indisponíveis na Meta",
+            });
+            return;
+          }
+
+          insightsMetaPorCampanha.set(campanha, {
+            dados: insightsTotais.data?.[0] || {},
+            grafico: (insightsGrafico.data || []).map((d: any) => ({
+              data: d.date_start,
+              clicks: Number(d.clicks || 0),
+              ctr: Number(d.ctr || 0),
+              gasto: Number(d.spend || 0),
+              impressoes: Number(d.impressions || 0)
+            })),
+            gastoHoje: Number(insightsHoje.data?.[0]?.spend || 0),
+            disponivel: true,
+            erro: null,
+          });
+        } catch {
+          insightsMetaPorCampanha.set(campanha, {
+            dados: {},
+            grafico: [],
+            gastoHoje: 0,
+            disponivel: false,
+            erro: "Métricas indisponíveis na Meta",
+          });
+        }
+      }
+    );
+
     const metricas = [];
 
     for (const campanha of campanhasConsolidadas) {
@@ -36081,47 +36155,15 @@ app.get("/meta/metricas-campanhas", authMiddleware, async (c) => {
 
       const plataformaCampanha = String(campanha.plataforma || "meta").toLowerCase();
 
-      if (
-        token &&
-        campanha.campaign_id &&
-        ["meta", "facebook", "instagram"].includes(plataformaCampanha) &&
-        String(campanha.status || "").toUpperCase() !== "DELETED"
-      ) {
-        try {
-          const [insightsTotais, insightsGrafico, insightsHoje] = await Promise.all([
-            fetch(
-              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,cpc,ctr,reach,actions,cost_per_action_type&time_range=${timeRangeMeta}&access_token=${token}`
-            ).then(r => r.json()),
-            fetch(
-              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=impressions,clicks,spend,ctr&time_increment=1&time_range=${timeRangeMeta}&access_token=${token}`
-            ).then(r => r.json()),
-            fetch(
-              `https://graph.facebook.com/v19.0/${campanha.campaign_id}/insights?fields=spend&date_preset=today&access_token=${token}`
-            ).then(r => r.json())
-          ]);
-
-          if (insightsTotais.error) {
-            erroMeta =
-              insightsTotais.error.message ||
-              "Métricas indisponíveis na Meta";
-          } else {
-            dados = insightsTotais.data?.[0] || {};
-
-            const diasGrafico = insightsGrafico.data || [];
-
-            grafico = diasGrafico.map((d: any) => ({
-              data: d.date_start,
-              clicks: Number(d.clicks || 0),
-              ctr: Number(d.ctr || 0),
-              gasto: Number(d.spend || 0),
-              impressoes: Number(d.impressions || 0)
-            }));
-
-            gastoHojeCampanha = Number(insightsHoje.data?.[0]?.spend || 0);
-
-            metaDisponivel = true;
-          }
-        } catch {
+      if (campanhaUsaInsightsMeta(campanha)) {
+        const insights = insightsMetaPorCampanha.get(campanha);
+        if (insights) {
+          dados = insights.dados;
+          grafico = insights.grafico;
+          gastoHojeCampanha = insights.gastoHoje;
+          metaDisponivel = insights.disponivel;
+          erroMeta = insights.erro;
+        } else {
           erroMeta = "Métricas indisponíveis na Meta";
         }
       } else if (campanha.campaign_id && plataformaCampanha === "google") {
@@ -50396,4 +50438,7 @@ if (Bun.env.COBRANCA_GESTORES_AUTO !== "0") {
 Bun.serve({
   port: Number(Bun.env.PORT) || 3000,
   fetch: app.fetch,
+  // O padrão do Bun (10 s) fechava a conexão de rotas que esperam as redes de
+  // anúncios; o Railway devolvia 502 sem CORS. Máximo aceito pelo Bun: 255 s.
+  idleTimeout: 120,
 });
