@@ -1240,9 +1240,9 @@ function listaOpcional(value: unknown) {
 async function listarPaginasComInstagram(
   token: string
 ) {
-  const pages = await fetch(
+  const pages = await buscarTodasPaginasGraph(
     `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,instagram_business_account{id,username,profile_picture_url}&access_token=${token}`
-  ).then(r => r.json());
+  );
 
   console.log("META /me/accounts resposta:", JSON.stringify({ total: pages.data?.length ?? 0, error: pages.error ?? null }));
 
@@ -2517,6 +2517,7 @@ async function limparErroPublicacaoCampanha(campanhaId: number) {
 
 import { lookup } from "node:dns/promises";
 import { mapearComLimite } from "./lote-concorrente";
+import { buscarTodasPaginasGraph } from "./graph-paginacao";
 import {
   avisoLarguraVideoInstagram,
   escolherMiniaturaVideoMeta,
@@ -6138,17 +6139,24 @@ const masterMiddleware = async (c: any, next: any) => {
 
 async function listarContasAnuncios(token: string) {
 
-  const adAccounts = await fetch(
+  // Todas as páginas: sem isso a Meta devolve só 25 contas e um gestor com mais
+  // contas não conseguia escolher as outras.
+  const adAccounts = await buscarTodasPaginasGraph(
     `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,account_status,disable_reason,currency,balance,funding_source,funding_source_details,is_prepay_account,spend_cap,amount_spent,business{id,name}&access_token=${token}`
-  ).then(r => r.json());
+  );
 
   if (
-    adAccounts.error
+    adAccounts.error &&
+    adAccounts.data.length === 0
   ) {
 
     throw new Error(
       adAccounts.error.message
     );
+  }
+
+  if (adAccounts.error || adAccounts.incompleto) {
+    console.warn("META contas de anúncios: lista incompleta:", adAccounts.error?.message || "limite de páginas");
   }
 
   if (
@@ -6986,9 +6994,9 @@ async function sincronizarLeadsMetaUsuario(
   token: string,
   adAccountId: string
 ) {
-  const paginas = await fetch(
+  const paginas = await buscarTodasPaginasGraph(
     `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
-  ).then(r => r.json());
+  );
 
   for (const pagina of paginas.data || []) {
     const pageToken = pagina.access_token;
@@ -20110,9 +20118,9 @@ app.post("/meta/formulario", authMiddleware, async (c) => {
     const userToken = conn.rows[0].access_token;
 
     // 🔥 pega PAGE TOKEN (IMPORTANTE)
-    const pages = await fetch(
+    const pages = await buscarTodasPaginasGraph(
       `https://graph.facebook.com/v19.0/me/accounts?access_token=${userToken}`
-    ).then(r => r.json());
+    );
 
     const page = pages.data.find((p: any) => p.id === page_id);
 
@@ -41046,9 +41054,9 @@ app.post("/campanhas/:id/publicar-recebida", authMiddleware, async (c) => {
 
     const adAccountId = contaAds.id;
 
-    const pages = await fetch(
+    const pages = await buscarTodasPaginasGraph(
       `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}&access_token=${token}`
-    ).then(r => r.json());
+    );
 
     if (!Array.isArray(pages.data) || !pages.data.length) {
       return await falhar(
@@ -50158,9 +50166,9 @@ app.post("/campanhas/rascunho/:id/ativar", authMiddleware, async (c) => {
     }
 
     // 4. Cria formulário de lead
-    const pagesDetalhes = await fetch(
+    const pagesDetalhes = await buscarTodasPaginasGraph(
       `https://graph.facebook.com/v19.0/me/accounts?access_token=${token}`
-    ).then(r => r.json());
+    );
 
     const pagina = pagesDetalhes.data?.find((p: any) => p.id === pageId);
     let formId: string | null = null;
