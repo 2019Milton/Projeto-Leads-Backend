@@ -22,5 +22,6 @@ test("sem perfil separado retorna null, inclusive com id residual desconectado",
 test("contrato inclui perfil com e sem selecao de conta de anuncios", () => {
   expect((route.match(/instagram_perfil_separado: instagramSeparado/g) || []).length).toBe(2);
   expect(route.indexOf('const instagramSeparado')).toBeLessThan(route.indexOf('if (!contaAds)'));
-  expect(route).toContain('const instagram = instagramDaConta || instagramDetectadoMeta || instagramSeparado;');
+  // O perfil separado segue como último recurso; antes dele, só o Instagram da conta de anúncios escolhida.
+  expect(route).toContain('const instagram = instagramConta.instagram || instagramSeparado;');
 });

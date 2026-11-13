@@ -1370,6 +1370,46 @@ async function listarContasInstagramAnuncio(
   }
 }
 
+// Páginas que a conta de anúncios pode promover, com o Instagram de cada uma.
+// null = a Meta não respondeu (quem chama mantém o comportamento anterior).
+async function listarPaginasDaContaAnuncios(
+  token: string,
+  adAccountId: string
+): Promise<any[] | null> {
+  const resposta = await buscarTodasPaginasGraph(
+    `https://graph.facebook.com/v19.0/${adAccountId}/promote_pages?fields=id,name,instagram_business_account{id,username,profile_picture_url}&access_token=${token}`
+  );
+  if (resposta.error && !resposta.data.length) {
+    console.warn("META promote_pages indisponível:", resposta.error?.message);
+    return null;
+  }
+  return resposta.data;
+}
+
+// Instagram da conta de anúncios: candidatos (liberados para a conta + vinculados
+// às Páginas dela) e o escolhido (escolha salva, ou o único). Ver meta-instagram-conta.ts.
+async function resolverInstagramDaContaAnuncios(
+  token: string,
+  adAccountId: string,
+  escolhidoId: string | null
+) {
+  const contaAct = "act_" + normalizarIdContaAnunciosMeta(adAccountId);
+  const [autorizados, paginasDaConta] = await Promise.all([
+    listarContasInstagramAnuncio(token, contaAct),
+    listarPaginasDaContaAnuncios(token, contaAct),
+  ]);
+  const candidatos = montarCandidatosInstagramConta({
+    autorizados,
+    paginasDaConta: paginasDaConta || [],
+  });
+  return {
+    autorizados,
+    paginasDaConta,
+    candidatos,
+    ...escolherInstagramParaConta(candidatos, escolhidoId),
+  };
+}
+
 function urlOpcional(value: unknown, fallback: string) {
   const url = textoOpcional(value);
 
@@ -2518,6 +2558,13 @@ async function limparErroPublicacaoCampanha(campanhaId: number) {
 import { lookup } from "node:dns/promises";
 import { mapearComLimite } from "./lote-concorrente";
 import { buscarTodasPaginasGraph } from "./graph-paginacao";
+import {
+  escolhaInstagramSalva,
+  escolherInstagramParaConta,
+  montarCandidatosInstagramConta,
+  normalizarIdContaAnunciosMeta,
+  ordenarPaginasPelaConta,
+} from "./meta-instagram-conta";
 import {
   avisoLarguraVideoInstagram,
   escolherMiniaturaVideoMeta,
@@ -19536,7 +19583,7 @@ app.get("/meta/instagram/autorizacao-anuncios", authMiddleware, async (c) => {
   const user: any = c.get("user");
   try {
     const conexao = await client.query(
-      "SELECT access_token, conta_anuncios_id, instagram_id, instagram_username FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      "SELECT access_token, conta_anuncios_id, instagram_id, instagram_username, instagram_anuncios_id, instagram_anuncios_conta FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
       [user.id]
     );
     if (!conexao.rows.length) {
@@ -19545,11 +19592,14 @@ app.get("/meta/instagram/autorizacao-anuncios", authMiddleware, async (c) => {
     const atual = conexao.rows[0];
     // Se o login Instagram foi separado, usar seu identificador. Caso
     // contrário, procurar a identidade já detectada pela Página.
-    const paginas = await listarPaginasComInstagram(atual.access_token);
-    const perfilPagina = await detectarInstagramMeta(atual.access_token, paginas);
+    // Só Instagram ligado à conta escolhida — nunca o primeiro entre todas as
+    // Páginas do usuário (para um gestor, o de outro cliente).
     const conta = atual.conta_anuncios_id ? String(atual.conta_anuncios_id).replace(/^act_/, "") : null;
-    const inventario = conta ? await listarContasInstagramAnuncio(atual.access_token, "act_" + conta) : [];
-    const identidadeAds = escolherInstagramDaContaAnuncios(inventario, perfilPagina);
+    const instagramConta = conta
+      ? await resolverInstagramDaContaAnuncios(atual.access_token, conta, escolhaInstagramSalva(atual, conta))
+      : null;
+    const perfilPagina = instagramConta?.instagram || null;
+    const identidadeAds = perfilPagina?.liberado_na_conta ? perfilPagina : null;
     const perfilAvulso = atual.instagram_id ? {
       id: String(atual.instagram_id),
       username: atual.instagram_username || null
@@ -21252,6 +21302,7 @@ app.get(
       `
       SELECT access_token, ultimo_sync, conta_anuncios_id,
         instagram_id, instagram_username, instagram_profile_picture_url,
+        instagram_anuncios_id, instagram_anuncios_conta,
         (instagram_token IS NOT NULL OR instagram_id IS NOT NULL) AS instagram_conexao_separada
       FROM meta_conexoes
       WHERE usuario_id = $1
@@ -21435,16 +21486,25 @@ app.get(
     // Consultar primeiro os ativos da conta de anuncios selecionada.
     // A conta profissional pode estar autorizada para publicidade sem estar
     // exposta no /me/accounts nem no portfolio Business do usuario.
-    const contasInstagramAnuncio =
-      await listarContasInstagramAnuncio(token, adAccountId);
-    const instagramDetectadoMeta = await detectarInstagramMeta(token, paginas);
-    // Quando há um único Instagram autorizado para esta conta de anuncios,
-    // ele é inequivocamente a identidade de anuncio. Nunca escolher o primeiro
-    // elemento de uma lista com multiplas contas.
-    const instagramDaConta = escolherInstagramDaContaAnuncios(
-      contasInstagramAnuncio, instagramDetectadoMeta
+    const instagramConta = await resolverInstagramDaContaAnuncios(
+      token, adAccountId, escolhaInstagramSalva(conn.rows[0], adAccountId)
     );
-    const instagram = instagramDaConta || instagramDetectadoMeta || instagramSeparado;
+    const contasInstagramAnuncio = instagramConta.autorizados;
+
+    // Páginas desta conta de anúncios primeiro: a primeira é a que o status mostra
+    // e a que vem marcada no formulário de campanha.
+    if (instagramConta.paginasDaConta) {
+      const ordenadas = ordenarPaginasPelaConta(
+        paginas,
+        instagramConta.paginasDaConta.map((pagina: any) => pagina.id)
+      );
+      paginas.splice(0, paginas.length, ...ordenadas);
+    }
+
+    // Só Instagram ligado a esta conta (liberado para ela ou vinculado a uma
+    // Página dela) — nunca o primeiro entre todas as Páginas do usuário. Com mais
+    // de um e nenhuma escolha salva, fica null e o front pede a escolha.
+    const instagram = instagramConta.instagram || instagramSeparado;
 
     // Não atribuir artificialmente a todas as Paginas um Instagram encontrado
     // somente por meio da conta de anuncios. Vinculos de Pagina sao distintos.
@@ -21885,6 +21945,9 @@ app.get(
         profile_picture_url: conta.profile_picture_url || null
       })),
 
+      instagram_candidatos: instagramConta.candidatos,
+      instagram_selecao_pendente: instagramConta.selecao_pendente,
+
       metricas: {
         campanhas: campanhasBancoTotal,
         campanhas_ativas: campanhasBancoAtivas,
@@ -22044,6 +22107,53 @@ app.post("/meta/tos-aceitar", authMiddleware, async (c) => {
 // conta de anúncios sem exigir passo manual no Gerenciador de Negócios.
 // A Meta pode recusar (ex: Página já pertence a outro Business confirmado,
 // permissão insuficiente) — nesse caso, cai no fluxo manual existente.
+// Salva qual Instagram usar nos anúncios da conta de anúncios atual. Só aceita
+// um Instagram ligado a ela (liberado ou vinculado a uma Página dela); vazio limpa.
+app.post("/meta/instagram/escolher", authMiddleware, async (c) => {
+  try {
+    const user: any = c.get("user");
+    const body = await c.req.json().catch(() => ({}));
+    const instagramId = textoOpcional(body?.instagram_id);
+
+    if (instagramId && !/^\d+$/.test(instagramId)) {
+      return c.json({ error: "Instagram inválido." }, 400);
+    }
+
+    const conn = await client.query(
+      "SELECT id, access_token, conta_anuncios_id FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [user.id]
+    );
+
+    if (!conn.rows.length) {
+      return c.json({ error: "Meta não conectada" }, 400);
+    }
+
+    const contaAnunciosId = conn.rows[0].conta_anuncios_id;
+    if (!contaAnunciosId) {
+      return c.json({ error: "Escolha a conta de anúncios antes do Instagram." }, 400);
+    }
+
+    if (instagramId) {
+      const { candidatos } = await resolverInstagramDaContaAnuncios(
+        conn.rows[0].access_token, contaAnunciosId, null
+      );
+      if (!candidatos.some((candidato) => candidato.id === instagramId)) {
+        return c.json({ error: "Esse Instagram não está ligado a esta conta de anúncios." }, 400);
+      }
+    }
+
+    await client.query(
+      "UPDATE meta_conexoes SET instagram_anuncios_id = $1, instagram_anuncios_conta = $2 WHERE id = $3",
+      [instagramId || null, instagramId ? normalizarIdContaAnunciosMeta(contaAnunciosId) : null, conn.rows[0].id]
+    );
+
+    return c.json({ sucesso: true, instagram_id: instagramId || null });
+  } catch (err) {
+    console.error("ERRO ESCOLHER INSTAGRAM:", err);
+    return c.json({ error: "Erro ao salvar o Instagram escolhido" }, 500);
+  }
+});
+
 app.post("/meta/instagram/vincular-business", authMiddleware, async (c) => {
   try {
     const user: any = c.get("user");
@@ -22082,19 +22192,28 @@ app.post("/meta/instagram/vincular-business", authMiddleware, async (c) => {
       }, 400);
     }
 
-    const paginas = await listarPaginasComInstagram(token);
-    const instagram = await detectarInstagramMeta(token, paginas);
+    // Só o Instagram desta conta de anúncios. Antes ia o primeiro entre todas as
+    // Páginas do usuário: um gestor adicionaria ao portfólio do cliente a Página
+    // de outro cliente.
+    const escolhaConexao = await client.query(
+      "SELECT instagram_anuncios_id, instagram_anuncios_conta FROM meta_conexoes WHERE usuario_id = $1 ORDER BY id DESC LIMIT 1",
+      [usuarioId]
+    );
+    const instagramConta = await resolverInstagramDaContaAnuncios(
+      token, contaAds.id, escolhaInstagramSalva(escolhaConexao.rows[0], contaAds.id)
+    );
+    const instagram = instagramConta.instagram;
 
     if (!instagram?.id) {
       return c.json({
-        error: "Não encontramos nenhum Instagram vinculado a uma Página para adicionar ao Business Manager.",
+        error: instagramConta.selecao_pendente
+          ? "Escolha primeiro qual Instagram usar nesta conta de anúncios."
+          : "Não encontramos nenhum Instagram vinculado a uma Página desta conta de anúncios para adicionar ao Business Manager.",
         precisa_manual: true
       }, 400);
     }
 
-    const paginaComInstagram =
-      paginas.find((p: any) => p.instagram?.id === instagram.id) ||
-      paginas[0];
+    const paginaComInstagram = instagram.paginas[0] || null;
 
     if (!paginaComInstagram?.id) {
       return c.json({
@@ -30772,7 +30891,9 @@ await client.query(`
 
 await client.query(`
   ALTER TABLE meta_conexoes
-    ADD COLUMN IF NOT EXISTS dataset_id TEXT;
+    ADD COLUMN IF NOT EXISTS dataset_id TEXT,
+    ADD COLUMN IF NOT EXISTS instagram_anuncios_id TEXT,
+    ADD COLUMN IF NOT EXISTS instagram_anuncios_conta TEXT;
 `);
 
 /* =========================
