@@ -2517,6 +2517,11 @@ async function limparErroPublicacaoCampanha(campanhaId: number) {
 
 import { lookup } from "node:dns/promises";
 import { mapearComLimite } from "./lote-concorrente";
+import {
+  avisoLarguraVideoInstagram,
+  escolherMiniaturaVideoMeta,
+  larguraNativaVideoMeta,
+} from "./miniatura-video-meta";
 
 // Bloqueia SSRF nos endpoints que buscam uma URL fornecida pelo corretor
 // (upload de imagem/vídeo por link, "reaproveitar imagem/vídeo já publicado"):
@@ -20683,13 +20688,38 @@ app.post("/meta/upload-video", authMiddleware, async (c) => {
   }
 });
 
-// Aguarda vídeo ficar pronto na Meta e retorna o thumbnail URL gerado automaticamente
+// O `picture` do vídeo vem reduzido (até 160 px). Como miniatura do anúncio, o
+// Instagram recusa por mídia estreita; as miniaturas de `thumbnails` têm o tamanho
+// original. Falha aqui não impede nada: quem chama cai no `picture`.
+async function buscarMiniaturaOriginalVideoMeta(
+  token: string,
+  videoId: string
+): Promise<{ miniatura: string | null; largura: number | null }> {
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/v19.0/${videoId}?fields=format{filter,width,height},thumbnails{uri,width,height,is_preferred}&access_token=${token}`
+    ).then(r => r.json());
+    if (res?.error) {
+      console.warn("[video-ready] miniatura original indisponível:", res.error?.message);
+      return { miniatura: null, largura: null };
+    }
+    return {
+      miniatura: escolherMiniaturaVideoMeta(res?.thumbnails?.data),
+      largura: larguraNativaVideoMeta(res),
+    };
+  } catch (e) {
+    console.warn("[video-ready] erro ao buscar miniatura original:", e);
+    return { miniatura: null, largura: null };
+  }
+}
+
+// Aguarda vídeo ficar pronto na Meta e retorna a miniatura (tamanho original) e a largura
 async function aguardarVideoMetaReady(
   token: string,
   videoId: string,
   maxTentativas = 12,
   intervaloMs = 5000
-): Promise<{ ready: boolean; picture: string | null }> {
+): Promise<{ ready: boolean; picture: string | null; largura?: number | null }> {
   for (let i = 0; i < maxTentativas; i++) {
     try {
       const res = await fetch(
@@ -20698,7 +20728,12 @@ async function aguardarVideoMetaReady(
 
       const videoStatus = res?.status?.video_status;
       if (videoStatus === "ready") {
-        return { ready: true, picture: res.picture || null };
+        const original = await buscarMiniaturaOriginalVideoMeta(token, videoId);
+        return {
+          ready: true,
+          picture: original.miniatura || res.picture || null,
+          largura: original.largura,
+        };
       }
       if (res.error) {
         console.warn(`[video-ready] erro na verificação de status:`, res.error);
@@ -40418,6 +40453,7 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
     // ver "atualizado com sucesso" enquanto o anúncio real continua com o
     // criativo antigo.
     let criativoAtualizadoComErro: any = null;
+    let avisoLarguraVideo: string | null = null;
 
     // Só recria o criativo quando algo visual realmente mudou.
     // Alterações de orçamento, público, lance ou agendamento não devem tocar
@@ -40446,6 +40482,12 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
             valorVisual(avancadas, "video_id", "videoId") !== valorVisual(configuracoesBanco, "video_id", "videoId") ||
             valorVisual(avancadas, "instagram_actor_id") !== valorVisual(configuracoesBanco, "instagram_actor_id")
           );
+
+    // Vídeo novo enviado nesta edição (não é remoção nem o mesmo de antes).
+    const videoTrocadoNaEdicao =
+      !videoRemovidoSolicitado &&
+      Boolean(valorVisual(avancadas, "video_id", "videoId")) &&
+      valorVisual(avancadas, "video_id", "videoId") !== valorVisual(configuracoesBanco, "video_id", "videoId");
 
     if (criativoFoiAlterado) {
       // 🎨 ATUALIZAR CRIATIVO somente quando imagem/vídeo/texto/CTA etc. mudaram.
@@ -40537,15 +40579,31 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
           linkDestino
         );
 
-        // Carrossel misto (imagens + vídeo) exige uma miniatura (picture) no card do
-        // vídeo — sem ela a Meta rejeita o object_story_spec inteiro com "picture or
-        // image_hash é obrigatório". Na criação isso já vem de aguardarVideoMetaReady
-        // (chamado logo após o upload do vídeo); na edição o vídeo já existe e nunca
-        // era buscado, então essa miniatura ficava sempre null.
+        // Todo criativo de vídeo precisa de miniatura (video_data.image_url ou o
+        // picture do card no carrossel misto) — sem ela a Meta recusa o criativo e o
+        // anúncio fica com o vídeo antigo. Vídeo recém-enviado ainda pode estar em
+        // processamento: espera como na criação (até ~75 s).
         let videoThumbnailUrl: string | null = null;
-        if (videoId && imageHashes.length > 0) {
-          const { picture } = await aguardarVideoMetaReady(token, videoId, 1, 0);
-          videoThumbnailUrl = picture;
+        if (videoId) {
+          const videoMeta = videoTrocadoNaEdicao
+            ? await aguardarVideoMetaReady(token, videoId, 15, 5000)
+            : await aguardarVideoMetaReady(token, videoId, 1, 0);
+
+          if (videoTrocadoNaEdicao && !videoMeta.ready) {
+            throw new Error(
+              "a Meta ainda está processando o vídeo novo (ou ele não está disponível nesta conta de anúncios). Aguarde alguns minutos, envie o vídeo de novo e salve"
+            );
+          }
+
+          videoThumbnailUrl = videoMeta.picture;
+
+          const instagramMarcado =
+            Array.isArray(avancadas?.plataformas) && avancadas.plataformas.includes("instagram");
+          const videoVaiProInstagram =
+            imageHashes.length === 0 || textoOpcional(avancadas.escolha_midia_instagram) !== "imagens";
+          if (instagramMarcado && videoVaiProInstagram) {
+            avisoLarguraVideo = avisoLarguraVideoInstagram(videoMeta.largura);
+          }
         }
 
         const conteudoCriativo = montarConteudoCriativoMeta({
@@ -40671,6 +40729,13 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
             if (avancadas.criativo) {
               avancadas.criativo.creative_id = novoCreativo.id;
             }
+            if (videoTrocadoNaEdicao && videoThumbnailUrl) {
+              avancadas.video_thumbnail_url = videoThumbnailUrl;
+              avancadas.videoThumbnailUrl = videoThumbnailUrl;
+              if (avancadas.criativo) {
+                avancadas.criativo.video_thumbnail_url = videoThumbnailUrl;
+              }
+            }
           }
         } else {
           criativoAtualizadoComErro = novoCreativo?.error || { message: "Erro desconhecido ao criar criativo" };
@@ -40687,6 +40752,28 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       }
     } else {
       console.log("EDITAR CAMPANHA: criativo preservado; alteração sem mudança visual.");
+    }
+
+    if (videoTrocadoNaEdicao && criativoAtualizadoComErro) {
+      // O anúncio na Meta continua com o vídeo anterior. Sem voltar o registro, a
+      // tela mostraria um vídeo que não está no ar e salvar de novo nem tentaria
+      // atualizar (o vídeo já "seria" o salvo).
+      for (const chave of [
+        "video_id", "videoId", "video_url", "videoUrl", "video_nome", "video_tipo",
+        "video_tamanho", "video_thumbnail_url", "videoThumbnailUrl", "criativo_tipo"
+      ]) {
+        avancadas[chave] = configuracoesBanco[chave] ?? null;
+      }
+      if (avancadas.criativo) {
+        avancadas.criativo = {
+          ...avancadas.criativo,
+          video_id: configuracoesBanco.criativo?.video_id ?? null,
+          video_url: configuracoesBanco.criativo?.video_url ?? null,
+          video_thumbnail_url: configuracoesBanco.criativo?.video_thumbnail_url ?? null,
+          tipo: configuracoesBanco.criativo?.tipo ?? avancadas.criativo.tipo
+        };
+      }
+      avisoLarguraVideo = null;
     }
 
     if (videoRemovidoSolicitado && criativoAtualizadoComErro) {
@@ -40748,13 +40835,18 @@ app.post("/meta/editar-campanha", authMiddleware, async (c) => {
       ]
     );
 
-    return c.json({
-      sucesso: true,
-      aviso: criativoAtualizadoComErro
+    const avisosEdicao = [
+      criativoAtualizadoComErro
         ? "As demais alterações foram salvas, mas não foi possível atualizar o criativo (imagem/vídeo/texto) do anúncio na Meta: " +
           (criativoAtualizadoComErro.error_user_msg || criativoAtualizadoComErro.message || "erro desconhecido") +
           ". O anúncio publicado continua com o criativo anterior."
-        : null
+        : null,
+      avisoLarguraVideo
+    ].filter(Boolean);
+
+    return c.json({
+      sucesso: true,
+      aviso: avisosEdicao.length ? avisosEdicao.join("\n\n") : null
     });
 
   } catch (err) {
